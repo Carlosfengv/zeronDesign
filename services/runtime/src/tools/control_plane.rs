@@ -36,7 +36,7 @@ pub fn control_plane_executor() -> ToolExecutor {
 }
 
 pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor {
-    match config.sandbox_backend_mode {
+    let executor = match config.sandbox_backend_mode {
         SandboxBackendMode::Kubernetes => control_plane_executor_with_backends(
             sandbox_backend_for_config(config),
             Arc::new(sandbox::SandboxChannelWorkspaceBackend::new()),
@@ -45,7 +45,8 @@ pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor
         SandboxBackendMode::PhaseAContract => {
             control_plane_executor_with_sandbox_backend(sandbox_backend_for_config(config))
         }
-    }
+    };
+    executor.with_workspace_root(&config.workspace_root)
 }
 
 pub fn control_plane_executor_with_sandbox_backend(

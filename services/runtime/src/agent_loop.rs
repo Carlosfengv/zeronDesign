@@ -929,7 +929,7 @@ fn system_prompt_for_run(run: &AgentRun) -> String {
             "Create a structured Brief draft from the provided content, then request user confirmation before completing."
         }
         AgentPhase::Build => {
-            "Generate or update the sandbox workspace, build the Astro website, verify preview readiness, and only complete after preview promotion."
+            "Generate or update the sandbox workspace using the confirmed Brief's recommended template, build it, verify preview readiness, and only complete after preview promotion."
         }
         AgentPhase::Edit => {
             "Apply focused changes to the existing project version, rebuild, verify, and emit a promoted preview before completing."
