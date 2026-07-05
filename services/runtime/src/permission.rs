@@ -1,0 +1,582 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
+
+use crate::tools::runtime::{Tool, ToolContext};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSource {
+    Org,
+    Project,
+    Profile,
+    Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PermissionReason {
+    Rule {
+        source: RuleSource,
+        rule_content: String,
+    },
+    SafetyCheck {
+        classifier_approvable: bool,
+    },
+    Mode {
+        mode: String,
+    },
+    Hook {
+        hook_name: String,
+        reason: Option<String>,
+    },
+    AsyncAgent {
+        reason: String,
+    },
+    Other {
+        reason: String,
+    },
+}
+
+impl PermissionReason {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Rule { rule_content, .. } => rule_content.clone(),
+            Self::SafetyCheck {
+                classifier_approvable,
+            } => format!("safety_check approvable={classifier_approvable}"),
+            Self::Mode { mode } => format!("permission mode: {mode}"),
+            Self::Hook { hook_name, reason } => reason
+                .as_ref()
+                .map(|reason| format!("{hook_name}: {reason}"))
+                .unwrap_or_else(|| hook_name.clone()),
+            Self::AsyncAgent { reason } | Self::Other { reason } => reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionUpdate {
+    pub tool: String,
+    pub decision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum PermissionResult {
+    Allow {
+        updated_input: Value,
+        reason: PermissionReason,
+    },
+    Ask {
+        message: String,
+        reason: PermissionReason,
+        suggestions: Option<Vec<PermissionUpdate>>,
+    },
+    Deny {
+        message: String,
+        reason: PermissionReason,
+    },
+    Passthrough {
+        message: String,
+    },
+}
+
+impl PermissionResult {
+    pub fn decision(&self) -> &'static str {
+        match self {
+            Self::Allow { .. } => "allow",
+            Self::Ask { .. } => "ask",
+            Self::Deny { .. } => "deny",
+            Self::Passthrough { .. } => "passthrough",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Allow { reason, .. } => reason.summary(),
+            Self::Ask { message, .. }
+            | Self::Deny { message, .. }
+            | Self::Passthrough { message } => message.clone(),
+        }
+    }
+
+    pub fn reason_summary(&self) -> String {
+        match self {
+            Self::Allow { reason, .. } | Self::Ask { reason, .. } | Self::Deny { reason, .. } => {
+                reason.summary()
+            }
+            Self::Passthrough { message } => message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionRules {
+    deny_tools: BTreeSet<String>,
+    ask_tools: BTreeSet<String>,
+    always_allowed_tools: BTreeSet<String>,
+    pre_tool_use_hooks: BTreeMap<String, PreToolUseHookDecision>,
+    permission_request_hooks: BTreeMap<String, PermissionRequestHookDecision>,
+    pub bypass_permissions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreToolUseHookDecision {
+    Allow {
+        reason: String,
+        updated_input: Option<Value>,
+    },
+    Ask {
+        reason: String,
+        updated_input: Option<Value>,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+impl PreToolUseHookDecision {
+    pub fn allow(reason: impl Into<String>, updated_input: Option<Value>) -> Self {
+        Self::Allow {
+            reason: reason.into(),
+            updated_input,
+        }
+    }
+
+    pub fn ask(reason: impl Into<String>, updated_input: Option<Value>) -> Self {
+        Self::Ask {
+            reason: reason.into(),
+            updated_input,
+        }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermissionRequestHookDecision {
+    Allow {
+        reason: String,
+        updated_input: Option<Value>,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+impl PermissionRequestHookDecision {
+    pub fn allow(reason: impl Into<String>, updated_input: Option<Value>) -> Self {
+        Self::Allow {
+            reason: reason.into(),
+            updated_input,
+        }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl PermissionRules {
+    pub fn deny_tool(mut self, tool: impl Into<String>) -> Self {
+        self.deny_tools.insert(tool.into());
+        self
+    }
+
+    pub fn ask_tool(mut self, tool: impl Into<String>) -> Self {
+        self.ask_tools.insert(tool.into());
+        self
+    }
+
+    pub fn always_allow_tool(mut self, tool: impl Into<String>) -> Self {
+        self.always_allowed_tools.insert(tool.into());
+        self
+    }
+
+    pub fn pre_tool_use_hook(
+        mut self,
+        tool: impl Into<String>,
+        decision: PreToolUseHookDecision,
+    ) -> Self {
+        self.pre_tool_use_hooks.insert(tool.into(), decision);
+        self
+    }
+
+    pub fn permission_request_hook(
+        mut self,
+        tool: impl Into<String>,
+        decision: PermissionRequestHookDecision,
+    ) -> Self {
+        self.permission_request_hooks.insert(tool.into(), decision);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionEngine {
+    rules: PermissionRules,
+}
+
+impl PermissionEngine {
+    pub fn new(rules: PermissionRules) -> Self {
+        Self { rules }
+    }
+
+    pub async fn decide(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        ctx: &ToolContext,
+    ) -> PermissionResult {
+        if let Some(hook_decision) = self.rules.pre_tool_use_hooks.get(tool.name()) {
+            return self
+                .resolve_pre_tool_use_hook(tool, input, ctx, hook_decision)
+                .await;
+        }
+        self.decide_without_pre_tool_use(tool, input, ctx).await
+    }
+
+    async fn resolve_pre_tool_use_hook(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        ctx: &ToolContext,
+        hook_decision: &PreToolUseHookDecision,
+    ) -> PermissionResult {
+        match hook_decision {
+            PreToolUseHookDecision::Deny { reason } => PermissionResult::Deny {
+                message: reason.clone(),
+                reason: PermissionReason::Hook {
+                    hook_name: "PreToolUse".to_string(),
+                    reason: Some(reason.clone()),
+                },
+            },
+            PreToolUseHookDecision::Ask {
+                reason,
+                updated_input,
+            } => {
+                let hook_input = updated_input.as_ref().unwrap_or(input);
+                self.resolve_ask(
+                    tool,
+                    hook_input,
+                    ctx,
+                    PermissionResult::Ask {
+                        message: reason.clone(),
+                        reason: PermissionReason::Hook {
+                            hook_name: "PreToolUse".to_string(),
+                            reason: Some(reason.clone()),
+                        },
+                        suggestions: None,
+                    },
+                )
+            }
+            PreToolUseHookDecision::Allow {
+                reason,
+                updated_input,
+            } => {
+                let hook_input = updated_input.as_ref().unwrap_or(input);
+                let decision = self
+                    .decide_without_pre_tool_use(tool, hook_input, ctx)
+                    .await;
+                match decision {
+                    PermissionResult::Allow {
+                        updated_input: Value::Null,
+                        ..
+                    } => PermissionResult::Allow {
+                        updated_input: hook_input.clone(),
+                        reason: PermissionReason::Hook {
+                            hook_name: "PreToolUse".to_string(),
+                            reason: Some(reason.clone()),
+                        },
+                    },
+                    PermissionResult::Allow { updated_input, .. } => PermissionResult::Allow {
+                        updated_input,
+                        reason: PermissionReason::Hook {
+                            hook_name: "PreToolUse".to_string(),
+                            reason: Some(reason.clone()),
+                        },
+                    },
+                    PermissionResult::Ask { .. }
+                    | PermissionResult::Deny { .. }
+                    | PermissionResult::Passthrough { .. } => decision,
+                }
+            }
+        }
+    }
+
+    async fn decide_without_pre_tool_use(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        ctx: &ToolContext,
+    ) -> PermissionResult {
+        if self.rules.deny_tools.contains(tool.name()) {
+            return PermissionResult::Deny {
+                message: format!("{} denied by runtime rule", tool.name()),
+                reason: PermissionReason::Rule {
+                    source: RuleSource::Runtime,
+                    rule_content: format!("deny {}", tool.name()),
+                },
+            };
+        }
+
+        if self.rules.ask_tools.contains(tool.name()) {
+            return self.resolve_ask(
+                tool,
+                input,
+                ctx,
+                PermissionResult::Ask {
+                    message: format!("{} requires approval", tool.name()),
+                    reason: PermissionReason::Rule {
+                        source: RuleSource::Runtime,
+                        rule_content: format!("ask {}", tool.name()),
+                    },
+                    suggestions: None,
+                },
+            );
+        }
+
+        let tool_decision = tool.check_permission(input, ctx).await;
+        match tool_decision {
+            PermissionResult::Deny { .. } => tool_decision,
+            PermissionResult::Ask { .. } => self.resolve_ask(tool, input, ctx, tool_decision),
+            PermissionResult::Allow { .. } => tool_decision,
+            PermissionResult::Passthrough { .. } => {
+                if self.rules.bypass_permissions {
+                    return PermissionResult::Allow {
+                        updated_input: input.clone(),
+                        reason: PermissionReason::Mode {
+                            mode: "bypass_permissions".to_string(),
+                        },
+                    };
+                }
+                if self.rules.always_allowed_tools.contains(tool.name()) {
+                    return PermissionResult::Allow {
+                        updated_input: input.clone(),
+                        reason: PermissionReason::Rule {
+                            source: RuleSource::Runtime,
+                            rule_content: format!("always_allow {}", tool.name()),
+                        },
+                    };
+                }
+                self.resolve_ask(
+                    tool,
+                    input,
+                    ctx,
+                    PermissionResult::Ask {
+                        message: format!("{} requires approval", tool.name()),
+                        reason: PermissionReason::Other {
+                            reason: "tool did not declare an allow rule".to_string(),
+                        },
+                        suggestions: None,
+                    },
+                )
+            }
+        }
+    }
+
+    fn resolve_ask(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        ctx: &ToolContext,
+        ask: PermissionResult,
+    ) -> PermissionResult {
+        if ctx.should_avoid_permission_prompts {
+            if let Some(hook_decision) = self.rules.permission_request_hooks.get(tool.name()) {
+                return match hook_decision {
+                    PermissionRequestHookDecision::Allow {
+                        reason,
+                        updated_input,
+                    } => PermissionResult::Allow {
+                        updated_input: updated_input.clone().unwrap_or_else(|| input.clone()),
+                        reason: PermissionReason::Hook {
+                            hook_name: "PermissionRequest".to_string(),
+                            reason: Some(reason.clone()),
+                        },
+                    },
+                    PermissionRequestHookDecision::Deny { reason } => PermissionResult::Deny {
+                        message: reason.clone(),
+                        reason: PermissionReason::Hook {
+                            hook_name: "PermissionRequest".to_string(),
+                            reason: Some(reason.clone()),
+                        },
+                    },
+                };
+            }
+            return PermissionResult::Deny {
+                message: "Permission prompts are not available".to_string(),
+                reason: PermissionReason::AsyncAgent {
+                    reason: format!("{} asked in headless mode", tool.name()),
+                },
+            };
+        }
+        ask
+    }
+}
+
+pub fn allow_reason(reason: impl Into<String>) -> PermissionResult {
+    PermissionResult::Allow {
+        updated_input: Value::Null,
+        reason: PermissionReason::Other {
+            reason: reason.into(),
+        },
+    }
+}
+
+pub fn check_command_policy(argv: &[String]) -> PermissionResult {
+    let cmd = argv.first().map(String::as_str).unwrap_or("");
+    const ALWAYS_DENY: &[&str] = &[
+        "sh", "bash", "zsh", "fish", "kubectl", "docker", "ssh", "scp", "sudo",
+    ];
+    if ALWAYS_DENY.contains(&cmd) {
+        return PermissionResult::Deny {
+            message: format!("{cmd} is not allowed"),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "always-deny command".to_string(),
+            },
+        };
+    }
+
+    for arg in argv {
+        if is_deny_pattern(arg) {
+            return PermissionResult::Deny {
+                message: format!("argument contains denied pattern: {arg}"),
+                reason: PermissionReason::SafetyCheck {
+                    classifier_approvable: false,
+                },
+            };
+        }
+    }
+
+    match (cmd, argv.get(1).map(String::as_str)) {
+        ("pnpm", Some("install" | "add")) | ("npm", Some("install")) => PermissionResult::Deny {
+            message: "Use package.install for dependency installation".to_string(),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "dependency installation must use package.install".to_string(),
+            },
+        },
+        ("pnpm", Some("build" | "dev" | "lint" | "test" | "run"))
+        | ("npm", Some("run"))
+        | ("node", _)
+        | ("ls", _)
+        | ("pwd", _)
+        | ("find", _)
+        | ("rg", _)
+        | ("cat", _)
+        | ("sed", _) => PermissionResult::Allow {
+            updated_input: Value::Null,
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "command allowlist".to_string(),
+            },
+        },
+        ("npx", _) | ("git", _) => PermissionResult::Ask {
+            message: format!("{cmd} requires platform policy approval"),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "command asklist".to_string(),
+            },
+            suggestions: None,
+        },
+        _ => PermissionResult::Deny {
+            message: format!("{cmd} not in allowlist"),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "command not allowed".to_string(),
+            },
+        },
+    }
+}
+
+fn is_deny_pattern(arg: &str) -> bool {
+    [
+        "rm -rf",
+        "/etc/passwd",
+        "id_rsa",
+        "id_ed25519",
+        "kubeconfig",
+    ]
+    .iter()
+    .any(|pattern| arg.contains(pattern))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionError {
+    CannotResolve(PathBuf),
+    ExternalDirectory(PathBuf),
+    SecretPath(PathBuf),
+    InvalidPathComponent(PathBuf),
+}
+
+pub fn check_existing_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
+    let real =
+        std::fs::canonicalize(path).map_err(|_| PermissionError::CannotResolve(path.to_owned()))?;
+    ensure_workspace_path(&real, workspace_root)?;
+    ensure_not_secret_path(&real)?;
+    Ok(real)
+}
+
+pub fn check_create_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| PermissionError::CannotResolve(path.to_owned()))?;
+    let real_parent = std::fs::canonicalize(parent)
+        .map_err(|_| PermissionError::CannotResolve(parent.to_owned()))?;
+    ensure_workspace_path(&real_parent, workspace_root)?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| PermissionError::CannotResolve(path.to_owned()))?;
+    if file_name == "." || file_name == ".." {
+        return Err(PermissionError::InvalidPathComponent(path.to_owned()));
+    }
+
+    let normalized = real_parent.join(file_name);
+    ensure_workspace_path(&normalized, workspace_root)?;
+    ensure_not_secret_path(&normalized)?;
+    Ok(normalized)
+}
+
+fn ensure_workspace_path(real: &Path, workspace_root: &Path) -> Result<(), PermissionError> {
+    let workspace_root = std::fs::canonicalize(workspace_root)
+        .map_err(|_| PermissionError::CannotResolve(workspace_root.to_owned()))?;
+    if !real.starts_with(&workspace_root) {
+        return Err(PermissionError::ExternalDirectory(real.to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_not_secret_path(real: &Path) -> Result<(), PermissionError> {
+    if is_secret_path(real.to_str().unwrap_or("")) {
+        return Err(PermissionError::SecretPath(real.to_owned()));
+    }
+    Ok(())
+}
+
+fn is_secret_path(path: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        ".env",
+        "kubeconfig",
+        ".ssh/",
+        "id_rsa",
+        "id_ed25519",
+        ".token",
+        "credentials",
+        "private_key",
+    ];
+    PATTERNS.iter().any(|pattern| path.contains(pattern))
+}
