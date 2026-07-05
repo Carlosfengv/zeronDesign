@@ -17,14 +17,44 @@ impl SandboxBackendMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProvider {
+    InternalGateway,
+    DeepSeek,
+    KimiGlobal,
+    KimiChina,
+}
+
+impl ModelProvider {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "deepseek" => Self::DeepSeek,
+            "kimi" | "kimi_global" | "kimi-global" | "kimi_overseas" | "kimi-overseas"
+            | "moonshot" | "moonshot_global" | "moonshot-global" => Self::KimiGlobal,
+            "kimi_cn" | "kimi-cn" | "kimi_china" | "kimi-china" | "moonshot_cn" | "moonshot-cn"
+            | "moonshot_china" | "moonshot-china" => Self::KimiChina,
+            _ => Self::InternalGateway,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeConfig {
     pub host: String,
     pub port: u16,
     pub model_gateway_url: String,
+    pub model_provider: ModelProvider,
+    pub deepseek_api_key: Option<String>,
+    pub deepseek_base_url: String,
+    pub kimi_api_key: Option<String>,
+    pub kimi_base_url: String,
+    pub kimi_cn_api_key: Option<String>,
+    pub kimi_cn_base_url: String,
     pub database_url: String,
     pub object_storage_url: String,
     pub runtime_storage_dir: PathBuf,
+    pub workspace_root: PathBuf,
     pub k8s_namespace: String,
     pub sandbox_backend_mode: SandboxBackendMode,
     pub enable_internal_promote_api: bool,
@@ -41,6 +71,20 @@ impl RuntimeConfig {
                 .unwrap_or(8080),
             model_gateway_url: env::var("MODEL_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            model_provider: env::var("MODEL_PROVIDER")
+                .ok()
+                .map(|value| ModelProvider::from_env_value(&value))
+                .unwrap_or(ModelProvider::InternalGateway),
+            deepseek_api_key: secret_env("DEEPSEEK_API_KEY"),
+            deepseek_base_url: env::var("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
+            kimi_api_key: secret_env("KIMI_API_KEY").or_else(|| secret_env("MOONSHOT_API_KEY")),
+            kimi_base_url: env::var("KIMI_BASE_URL")
+                .or_else(|_| env::var("MOONSHOT_API_BASE"))
+                .unwrap_or_else(|_| "https://api.moonshot.ai/v1".to_string()),
+            kimi_cn_api_key: secret_env("KIMI_CN_API_KEY"),
+            kimi_cn_base_url: env::var("KIMI_CN_BASE_URL")
+                .unwrap_or_else(|_| "https://api.moonshot.cn/v1".to_string()),
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://runtime.db".to_string()),
             object_storage_url: env::var("OBJECT_STORAGE_URL")
@@ -48,6 +92,9 @@ impl RuntimeConfig {
             runtime_storage_dir: env::var("RUNTIME_STORAGE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("anydesign-runtime")),
+            workspace_root: env::var("RUNTIME_WORKSPACE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/workspace")),
             k8s_namespace: env::var("K8S_NAMESPACE")
                 .unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
             sandbox_backend_mode: env::var("SANDBOX_BACKEND_MODE")
@@ -68,4 +115,8 @@ impl RuntimeConfig {
             .parse()
             .expect("runtime host and port should form a socket address")
     }
+}
+
+fn secret_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
