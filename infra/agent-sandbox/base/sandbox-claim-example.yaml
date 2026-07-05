@@ -1,0 +1,18 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: project-example-abc123
+  namespace: anydesign-sandboxes
+  labels:
+    anydesign.dev/workspace-pvc: workspace-project-example-abc123
+  annotations:
+    anydesign.dev/workspace-scope: sandbox+pvc
+spec:
+  additionalPodMetadata:
+    annotations:
+      anydesign.dev/workspace-pvc: workspace-project-example-abc123
+      anydesign.dev/workspace-scope: sandbox+pvc
+  warmPoolRef:
+    name: anydesign-astro-website-pool
+  lifecycle:
+    ttlSecondsAfterFinished: 14400

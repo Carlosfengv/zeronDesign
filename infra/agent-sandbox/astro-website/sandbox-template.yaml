@@ -1,0 +1,40 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: anydesign-astro-website
+  namespace: anydesign-sandboxes
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - name: astro-website
+          image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0
+          env:
+            - name: WORKSPACE_CHANNEL_PORT
+              value: "3001"
+          command:
+            - /bin/sh
+            - -lc
+            - /opt/anydesign/bootstrap/workspace-init.sh && exec node /opt/anydesign/bootstrap/workspace-channel-server.js
+          ports:
+            - name: workspace
+              containerPort: 3001
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      restartPolicy: OnFailure
+  service: true
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+        labels:
+          anydesign.dev/workspace-scope: sandbox-pvc
+        annotations:
+          anydesign.dev/workspace-scope: sandbox+pvc
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+  volumeClaimTemplatesPolicy: Allowed
