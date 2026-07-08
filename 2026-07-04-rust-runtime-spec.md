@@ -1052,7 +1052,10 @@ pub async fn patch(path: &Path, old_str: &str, new_str: &str) -> Result<(), Tool
 |---|---|---|---|
 | `shell.run` | false | false | command policy（见 Section 3.4）|
 | `package.install` | false | false | ask（platform policy）|
-| `preview.start` | false | false | allow |
+| `project.init` | false | false | allow（template policy）|
+| `project.detect_root` | true | true | allow |
+| `project.build` | false | false | allow（command policy + template policy）|
+| `preview.start` | false | false | allow（默认 cwd = appRoot）|
 | `preview.status` | true | true | allow |
 | `preview.stop` | false | false | allow |
 | `diagnostics.build_log` | true | true | allow |
@@ -1072,23 +1075,57 @@ pub struct ShellRunInput {
 }
 ```
 
-**`package.install` 内部 registry 限制：**
+**Template lifecycle tools：**
+
+`project.*` 工具是模板生命周期原子能力，不是 `generate_website` 这类业务黑盒：
+
+- `project.init` 只负责创建 deterministic 模板骨架、写入 `/workspace/state/project.json` 并锁定 `appRoot`。
+- `project.detect_root` 读取或发现当前 `appRoot`，用于修复 `project/project` 等路径分裂。
+- `project.build` 按模板运行 build，并写入 `/workspace/outputs/build/latest.json` 作为 promotion gate 的 build 输入。
+- 页面内容、布局、样式和信息架构仍由 agent 通过 `fs.*` 生成。
+- `project.init` 必须由模板版本决定依赖版本、package manager、lockfile 策略和 registry 来源，保证相同模板版本下可复现。
+- Build/Edit 阶段的 source 写入必须 appRoot-aware；创建第二个 package root（如 `/workspace/project/project/package.json`）返回 recoverable guidance。
+- `preview.start` 默认读取 `/workspace/state/project.json.appRoot` 作为 cwd，并把实际 cwd 写入 `/workspace/state/preview.json`。
+
+**`package.install` registry 限制：**
 
 ```rust
 pub struct PackageInstallInput {
     pub packages: Vec<String>,
-    pub registry: Option<String>,  // 必须是内部 registry URL，public npm 被拒绝
+    pub cwd: Option<String>,       // 默认 /workspace/state/project.json.appRoot
+    pub registry: Option<String>,  // 默认 RUNTIME_NPM_REGISTRY / 内部 registry/proxy
 }
 
-fn check_permission(input: &PackageInstallInput, _: &ToolContext) -> PermissionResult {
-    for pkg in &input.packages {
-        if looks_like_public_registry(pkg) {
-            return PermissionResult::Ask { message: "Installing from public registry requires approval", .. };
-        }
+fn check_permission(input: &PackageInstallInput, ctx: &ToolContext) -> PermissionResult {
+    if input.registry.is_none() {
+        return PermissionResult::Passthrough { .. };
     }
-    PermissionResult::Passthrough { .. }
+
+    if is_internal_registry(input.registry.as_ref().unwrap(), ctx) {
+        return PermissionResult::Passthrough { .. };
+    }
+
+    if ctx.policy_profile == RuntimePolicyProfile::LocalE2e && is_public_npm_registry(input.registry.as_ref().unwrap()) {
+        return PermissionResult::Ask { message: "Public npm registry allowed only for local E2E/dev profile", .. };
+    }
+
+    PermissionResult::Deny { message: "Production-like sandboxes must use the internal package registry/proxy", .. }
 }
 ```
+
+**Runtime policy profile：**
+
+```rust
+pub enum RuntimePolicyProfile {
+    Production,
+    LocalE2e,
+}
+```
+
+- 默认值为 `Production`，不能由模型输入覆盖。
+- `LocalE2e` 只能由 runtime 配置或测试 harness 显式启用。
+- public npm registry 只在 `LocalE2e` 下进入 ask/allow 路径；production-like profile 必须 deny。
+- 任何 public registry ask/allow 都必须写 audit record，包含 `runId`、`projectId`、`registry`、`packages`、`toolUseId`。
 
 ### 6.4 MCP Adapter 与 Deferred Tools 边界
 
@@ -1236,7 +1273,7 @@ Build/Edit Agent 构建成功
   ↓
 emit preview.candidate (versionId, url, screenshotId?)
   ↓
-gate: build_log 无 terminal error + browser 无 console error + screenshot 成功
+gate: latest build success + preview 可访问 + browser 无 console error + screenshot 成功
   ↓ 通过
 promote_preview(projectId, runId, candidateVersionId)
   ↓
@@ -1254,10 +1291,10 @@ pub async fn check_promotion_gate(
     candidate_version_id: &str,
     ctx: &BuildContext,
 ) -> Result<(), GateError> {
-    // 1. build log 无 terminal error
-    let build_log = ctx.read_build_log().await?;
-    if has_terminal_error(&build_log) {
-        return Err(GateError::BuildFailed(extract_error_summary(&build_log)));
+    // 1. 最近一次 project.build 成功
+    let latest_build = ctx.read_latest_build_status().await?;
+    if latest_build.status != BuildStatus::Success {
+        return Err(GateError::BuildFailed(latest_build.summary));
     }
 
     // 2. preview server 可访问
@@ -1371,8 +1408,9 @@ Content-Type: application/json
 {
   "projectId": "string",
   "phase": "brief" | "build" | "repair" | "review" | "edit" | "export",
-  "agentProfile": "string",
-  "inputContext": {
+    "agentProfile": "string",
+    "policyProfile": "production" | "local-e2e", // optional；仅测试/管理员路径可设置，默认 production
+    "inputContext": {
     "contentSources": [...],     // brief phase 用
     "briefId": "string",         // build/edit phase 用
     "sandboxBindingId": "string", // sandbox phase 用
@@ -1485,7 +1523,8 @@ Phase A 是 runtime 独立验证阶段。验收时不存在 `apps/web` 代码。
 
 **Sandbox Build Agent 闭环（Astro Website）**
 
-- [ ] Brief 确认后，`POST /runs`（phase=build）→ sandbox claim → wait_ready → workspace 初始化 → Astro 项目生成 → build 成功 → preview 可访问
+- [ ] Brief 确认后，`POST /runs`（phase=build）→ sandbox claim → wait_ready → workspace 初始化 → `project.init` 锁定 appRoot → Astro 项目生成 → `project.build` 成功并写 latest build status → preview 可访问
+- [ ] preview 从 `state/project.json.appRoot` 启动，并在 `state/preview.json` 记录实际 cwd
 - [ ] SSE stream 依次包含：`preview.rebuilding` → `preview.candidate` → `preview.updated`
 - [ ] `preview.updated` 早于 `run.completed`（或同时），不允许反序
 - [ ] 在 `output_version_id` 未 promoted 时调用 `run.complete` → agent 收到 error result，不进入终态
@@ -1518,11 +1557,12 @@ Phase A 是 runtime 独立验证阶段。验收时不存在 `apps/web` 代码。
 - [ ] `fs.read("/workspace/../etc/passwd")`（路径穿越）→ realpath 解析后 denied
 - [ ] `/workspace` 内创建指向外部路径的 symlink，再 `fs.read` → realpath 解析后 denied
 - [ ] `fs.read(".env")` → secret path check denied
+- [ ] Build/Edit 阶段 `fs.write("/workspace/project/project/package.json")` → recoverable guidance，不能静默创建 nested package root
 - [ ] `shell.run(["sh", "-c", "pnpm build"])` → argv[0] = "sh"，直接 denied
 - [ ] `shell.run(["kubectl", "get", "pods"])` → denied
-- [ ] `shell.run(["pnpm", "build"])` → allowed
+- [ ] `shell.run(["pnpm", "build"])` → allowed for diagnostics/repair, but does not write formal promotion evidence
 - [ ] `shell.run(["pnpm", "install"])` / `shell.run(["npm", "install"])` → denied，提示使用 `package.install`
-- [ ] `package.install` 指定 public registry URL → ask（platform policy）
+- [ ] `package.install` 指定 public registry URL → local E2E/dev profile ask/allow with audit；production-like profile deny
 - [ ] 网络请求到 public internet → denied（NetworkPolicy 层）
 - [ ] sandbox 无法访问控制面 DB
 - [ ] 每次工具调用都有对应 audit record（按 projectId/runId/tool 可查）
@@ -1660,7 +1700,7 @@ async fn brief_agent_full_loop() {
 | `secret_path_denied` | `.env`、`kubeconfig`、`id_rsa` → deny |
 | `sh_dash_c_denied` | `argv = ["sh", "-c", "pnpm build"]` → deny（argv[0] = sh）|
 | `kubectl_denied` | `argv = ["kubectl", "get", "pods"]` → deny |
-| `pnpm_build_allowed` | `argv = ["pnpm", "build"]` → allow |
+| `pnpm_build_allowed_for_diagnostics` | `argv = ["pnpm", "build"]` → allow，但不写 promotion build evidence |
 | `pnpm_install_requires_package_tool` | `argv = ["pnpm", "install"]` → deny，提示使用 `package.install` |
 | `passthrough_to_ask` | tool 返回 Passthrough，pipeline 步骤 3 转为 Ask |
 | `safety_check_bypass_immune` | SafetyCheck 类型的 Ask 在 bypass mode 下仍返回 Ask |
@@ -1771,7 +1811,7 @@ async fn brief_agent_full_loop() {
 
 **E2E-3: 修复循环上限**
 ```
-1. 配置 sandbox 使 pnpm build 始终返回同类型错误
+1. 配置 sandbox 使 project.build 始终返回同类型错误
 2. 触发 Build Agent
 3. 验证 run 在 3 次修复后进入 partial
 4. 验证最后一条 ConversationItem 包含中文可操作摘要

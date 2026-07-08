@@ -45,7 +45,7 @@ Phase A delivers a standalone Rust service with no product UI dependencies.
 - Shared TypeScript/Rust schemas for AgentRun, AgentEvent, ConversationItem, Brief.
 - Agent loop, tool registry, tool executor.
 - Control-plane tools: `content.*`, `brief.*`, `run.*`, `user.ask`.
-- Sandbox tools: `fs.*`, `shell.run`, `package.install`, `preview.*`, `diagnostics.*`, `browser.*`.
+- Sandbox tools: `fs.*`, `shell.run`, `package.install`, `project.*`, `preview.*`, `diagnostics.*`, `browser.*`.
 - Permission engine: deny-by-default, path policy, command policy (exec array), network policy, audit.
 - Agent profiles: `brief`, `build`, `repair`, `visual-review`, `edit`.
 - Review/Repair child run graph with bounded repair loop.
@@ -528,9 +528,11 @@ POST   /api/permissions/{permissionId}/decision
 
 - `fs.read("/etc/passwd")` denied and file contents never reach ToolResult, run log, SSE, or ConversationItem.
 - `/workspace` symlink escape denied after realpath on `fs.read`, `fs.patch`, and `fs.delete`.
-- `shell.run(["sh", "-c", "pnpm build"])` denied; `shell.run(["pnpm", "build"])` allowed.
+- `shell.run(["sh", "-c", "pnpm build"])` denied; `shell.run(["pnpm", "build"])` allowed only for diagnostics/repair, while formal promotion evidence comes from `project.build`.
 - `shell.run(["pnpm", "install"])` denied with guidance to use `package.install`.
-- `package.install` using internal registry allowed or platform-approved; public registry URL becomes platform ask.
+- `package.install` using internal registry/proxy allowed or platform-approved; public registry URL becomes platform ask only in explicit local E2E/dev profile and is denied in production-like sandboxes.
+- Build/Edit source writes that create nested package roots are denied with recoverable guidance.
+- `preview.start` uses `state/project.json.appRoot` and records actual cwd in `state/preview.json`.
 - Network egress to public internet denied at policy and NetworkPolicy layers.
 - Every sandbox tool call has one audit record.
 
@@ -552,7 +554,7 @@ POST   /api/permissions/{permissionId}/decision
 
 **Approach**
 
-- Build Agent: reads `brief.md`, generates `/workspace/project`, installs deps through `package.install`, builds, starts preview, screenshots, emits `preview.candidate`. Runtime orchestrator runs promotion gate, performs internal promote, emits `preview.updated`, then the agent can call `run.complete`.
+- Build Agent: reads `brief.md`, establishes appRoot with `project.init` / `project.detect_root`, generates source under `/workspace/project`, installs deps through `package.install`, builds through `project.build`, starts preview, screenshots, emits `preview.candidate`. Runtime orchestrator runs promotion gate, performs internal promote, emits `preview.updated`, then the agent can call `run.complete`.
 - `run.complete` for build/edit phase rejects if `output_version_id` is not yet `promoted` (tool-layer enforcement, not prompt).
 - Preview promotion is atomic and runtime-controlled: `preview.candidate` → gate check → internal promote → `preview.updated` → update `current_version_id`.
 - `PromotePreview` production path is an in-process runtime orchestrator call. The HTTP route is disabled by default, enabled only for integration tests or admin break-glass operations, and must require internal network, service auth, and audit.
@@ -941,8 +943,10 @@ Every agent run must be either in one recoverable paused state or one explicit t
 - Reads allowed only for current project content sources and `/workspace`.
 - Writes allowed only where agent profile permits.
 - Shell denied unless command policy allows; uses exec array, not string; `sh -c`/`bash -c` always denied; dependency installation must use `package.install`, not `shell.run`.
+- Template lifecycle work uses `project.init`, `project.detect_root`, and `project.build`; these are deterministic runtime tools, not black-box website generators.
 - Path checks apply realpath/canonicalize before boundary check for existing paths; create operations canonicalize the nearest existing parent before validating the final target.
-- Public internet denied; internal model gateway, package registry, object storage, preview router allowlisted per environment.
+- Public internet denied; internal model gateway, package registry/proxy, object storage, preview router allowlisted per environment. Public npm registry is allowed only in an explicit local E2E/dev profile and must be visible in audit.
+- Runtime policy profile defaults to `production`; `local-e2e` can be set only by test/admin configuration, never by model output.
 - Secrets and secret-like paths denied.
 
 Designer-facing confirmations: Brief, project type / template, major direction change, export.
@@ -955,6 +959,8 @@ Admin-only: public network access, external publish, cross-project asset read, h
 
 - Prompt / Markdown → Brief Agent produces structured Brief and waits for confirmation.
 - Confirmed Brief → Build Agent generates runnable Astro website in isolated sandbox.
+- Build/Edit formal build evidence is written by `project.build`; shell build commands are diagnostics/repair only.
+- Build/Edit preview starts from appRoot and nested package roots are rejected before they can corrupt the workspace.
 - `run.complete` rejected when preview not yet promoted.
 - Candidate promoted atomically; `preview.updated` emitted before run completes.
 - Edit via `ContinueRun` modifies existing project, rebuilds, promotes new version.
@@ -989,6 +995,7 @@ Require confirmation before RA4:
 - Which sandbox channel protocol (gRPC / WebSocket / other)?
 - Which internal model gateway should runtime call?
 - Which object storage bucket/prefix stores attachments, screenshots, exports, run logs?
-- Which internal package registry/proxy should sandbox use?
+- Which internal package registry/proxy should sandbox use, and what local E2E profile may opt into public npm?
+- Which configuration source is allowed to set `RuntimePolicyProfile=local-e2e`, and how is it audited?
 - Will screenshot/browser checks run inside the same sandbox or a separate checker sandbox?
 - Preview routing strategy: pod IP / internal DNS, or explicit Service creation?

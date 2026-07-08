@@ -324,6 +324,7 @@ MVP 可以先不急着把所有业务对象做成 CRD。建议分两阶段：
     reports/
   /state
     context.md
+    project.json
     run-log.jsonl
     tasks.json
     preview.json
@@ -335,12 +336,14 @@ MVP 可以先不急着把所有业务对象做成 CRD。建议分两阶段：
 - `brief.md` 是一次生成的契约。
 - `design.md` 是风格和设计规则上下文。
 - `context.md` 记录 agent 对该作品的长期理解和历史决策。
+- `project.json` 记录 runtime 锁定的 `appRoot`、模板、框架、包管理器、模板版本和 lockfile 策略；由 harness 写入，agent 只通过受控工具读取或更新。
 - `tasks.json` 记录本次 run 的任务拆分和进度，由 Build/Edit/Repair agent 在 run 开始时写入并持续更新。
-- `preview.json` 记录 preview server 状态、端口、URL 和截图路径，供 harness 和 Review agent 读取。
+- `preview.json` 记录 preview server 状态、实际 cwd、端口、URL、candidate version 和截图路径，供 harness 和 Review agent 读取。
 - `run-log.jsonl` 记录机器可读任务事件。
 - `project/` 是用户最终可导出的源码。
+- Build/Edit 阶段的源码写入应以 `project.json.appRoot` 为准，禁止静默创建 nested package root。
 
-**SandboxTemplate 初始化要求：** 模板启动脚本必须预创建 `/workspace/inputs`、`/workspace/outputs`（含子目录）、`/workspace/state` 目录，并写入空的 `tasks.json`（`[]`）和 `preview.json`（`{}`），避免 agent 首次写入时遇到目录不存在错误。
+**SandboxTemplate 初始化要求：** 模板启动脚本必须预创建 `/workspace/inputs`、`/workspace/outputs`（含子目录）、`/workspace/state` 目录，并写入空的 `tasks.json`（`[]`）、`preview.json`（`{}`）和可由 runtime 覆盖的 `project.json`（`{}`），避免 agent 首次写入时遇到目录不存在错误。
 
 ---
 

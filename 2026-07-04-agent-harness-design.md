@@ -304,6 +304,7 @@ type AgentCheckpoint = {
     reports/
   /state
     context.md
+    project.json
     run-log.jsonl
     tasks.json
     preview.json
@@ -315,8 +316,9 @@ type AgentCheckpoint = {
 - `/workspace/inputs/brief.md`：已确认的生成契约，Build/Edit 必读。
 - `/workspace/inputs/design.md`：风格约束，可选但长期重要。
 - `/workspace/state/context.md`：agent 对该作品的长期记忆，生成后持续更新。
+- `/workspace/state/project.json`：runtime 锁定的 appRoot、模板版本、框架、包管理器和 lockfile 策略。
 - `/workspace/state/tasks.json`：本次 run 的任务拆分和进度。
-- `/workspace/state/preview.json`：preview server、端口、URL、截图状态。
+- `/workspace/state/preview.json`：preview server、实际 cwd、端口、URL、candidate version、截图状态。
 - `/workspace/project`：唯一可导出的作品源码。
 
 ---
@@ -389,7 +391,10 @@ type AgentCheckpoint = {
 |---|---|---|---|
 | `shell.run` | build/edit/repair/export | shell | 执行命令，受 command policy 限制 |
 | `package.install` | build/repair | package | 安装依赖，默认走内部 registry |
-| `preview.start` | build/edit/repair | preview | 启动或重启 preview server |
+| `project.init` | build | template | 创建 deterministic 模板骨架并锁定 appRoot，不生成业务页面内容 |
+| `project.detect_root` | build/edit/repair | template | 读取或发现当前 appRoot，避免 `project/project` 路径分裂 |
+| `project.build` | build/edit/repair | template | 执行框架 build 并写入结构化 latest build status |
+| `preview.start` | build/edit/repair | preview | 从 appRoot 启动或重启 preview server，并写入 preview 状态 |
 | `preview.status` | all sandbox agents | read-preview | 读取 preview 状态 |
 | `preview.stop` | build/edit/repair/export | preview | 停止 preview server |
 | `diagnostics.typescript` | build/edit/review/repair | diagnostics | 获取 TS/LSP 诊断 |
@@ -512,6 +517,8 @@ deny（第一个参数匹配以下之一，或参数列表中出现以下 patter
 - `content_sources`：sandbox 只能读取当前 project 绑定的内容源和附件索引。
 - `network`：默认 deny public internet，只允许内部 LLM 网关、内部 package registry、对象存储和 preview router。
 - `package_install`：默认走内部 registry/proxy；禁止或隔离 npm lifecycle scripts，除非模板策略明确允许。
+- `runtime_policy_profile`：默认 `production`；只有测试 harness 或管理员路径可以显式启用 `local-e2e`，用于 public npm 等本地 E2E 例外，且必须写 audit。
+- `app_root`：Build/Edit 阶段源码写入必须落在 runtime 锁定的 appRoot 下；创建 nested package root（如 `/workspace/project/project/package.json`）必须返回 recoverable guidance。
 - `egress_audit`：所有 sandbox 外联请求必须记录目标、runId、projectId 和 agentProfile。
 
 ---
@@ -592,14 +599,15 @@ You run inside an isolated sandbox and create a high-quality Website or Docs pro
 
 1. Inspect the workspace.
 2. Create or update a short task list.
-3. Generate project files.
-4. Install dependencies if needed.
-5. Build or run checks.
-6. Start preview.
-7. Inspect preview with browser tools.
-8. Fix recoverable issues.
-9. Update context.md with decisions.
-10. Call run.complete.
+3. Use project.init or project.detect_root to establish the app root.
+4. Generate project files and content under the app root.
+5. Install dependencies if needed.
+6. Build with project.build.
+7. Start preview.
+8. Inspect preview with browser tools.
+9. Fix recoverable issues.
+10. Update context.md with decisions.
+11. Call run.complete.
 
 ## Boundaries
 
@@ -607,6 +615,7 @@ You run inside an isolated sandbox and create a high-quality Website or Docs pro
 - Do not call public internet unless a tool result says it is allowed.
 - Do not expose internal content in external links.
 - Do not stop after writing files; verify by building and previewing.
+- project.* tools manage template lifecycle only; source, content, layout, and style remain agent-generated through fs.*.
 ```
 
 ### 11.4 Edit Agent prompt 骨架
@@ -662,20 +671,21 @@ You are the Edit Agent for an existing generated Website or Docs project.
 6. fs.write(/workspace/inputs/content-sources.json)
 7. fs.list(/workspace)
 8. fs.write(/workspace/state/tasks.json)
-9. fs.write project files under /workspace/project
-10. package.install or shell.run("pnpm install")
-11. shell.run("pnpm build")
-12. emit preview.rebuilding
-13. preview.start
-14. browser.open(preview_url)
-15. browser.screenshot
-16. diagnostics.build_log / browser.inspect
-17. emit preview.candidate(versionId)
-18. repair loop if needed
-19. visual review if policy requires
-20. promote candidate with emit preview.updated(versionId)
-21. fs.write(/workspace/state/context.md)
-22. run.complete(status=success)
+9. project.init(template=astro-website, path=/workspace/project) or project.detect_root
+10. fs.write project files under appRoot
+11. package.install if additional dependencies are needed
+12. project.build
+13. emit preview.rebuilding
+14. preview.start(cwd=appRoot)
+15. browser.open(preview_url)
+16. browser.screenshot
+17. diagnostics.build_log / browser.inspect
+18. emit preview.candidate(versionId)
+19. repair loop if needed
+20. visual review if policy requires
+21. promote candidate with emit preview.updated(versionId)
+22. fs.write(/workspace/state/context.md)
+23. run.complete(status=success)
 ```
 
 **sandbox.wait_ready 说明：** `sandbox.claim` 提交后 sandbox 进入 `starting` 状态，必须等待 ready 信号才能调用 `open_channel`。实现上应使用 K8s watch 监听 `SandboxClaim.status.phase == Ready`，并设置超时上限（建议 120 秒）。超时后 orchestrator 应重试 claim 或向用户报告 `sandbox_unavailable`，不得直接进入 `open_channel`。WarmPool 命中时通常在几秒内就绪；冷启动路径可能需要更长等待，前端应在 `sandbox.claiming` 状态下展示有意义的等待提示（如"正在准备生成环境，首次启动需要较长时间"），不得显示超时错误直到超限。
@@ -707,9 +717,9 @@ You are the Edit Agent for an existing generated Website or Docs project.
 2. brief.read or fs.read(/workspace/inputs/brief.md)
 3. fs.search relevant files
 4. fs.patch focused changes
-5. shell.run("pnpm build") or template-specific check
+5. project.build; shell.run("pnpm build") may be used only for diagnostics/repair and does not write formal gate evidence
 6. emit preview.rebuilding(previousVersionId)
-7. preview.start
+7. preview.start(cwd=appRoot)
 8. browser.screenshot
 9. emit preview.candidate(versionId)
 10. repair/review if needed
@@ -1074,9 +1084,12 @@ agents:
         "/workspace/project/**": allow
         "/workspace/state/**": allow
         "*": deny
+      appRoot:
+        sourceWrites: require_app_root
+        nestedPackageRoot: recoverable_error
       shell:
-        "pnpm install": allow
-        "pnpm build": allow
+        "pnpm install": deny  # use package.install
+        "pnpm build": allow   # diagnostics/repair only; formal gate evidence comes from project.build
         "pnpm dev": allow
         "rm -rf *": deny
       package.install:
@@ -1199,9 +1212,10 @@ Harness:
 
 Build Agent:
   fs.read(brief.md)
+  project.init(template=astro-website)
   fs.write(project files)
-  shell.run(pnpm install)
-  shell.run(pnpm build)
+  package.install(if needed)
+  project.build
   emit preview.rebuilding
   preview.start
   browser.screenshot
@@ -1216,7 +1230,7 @@ User:
 Edit Agent:
   fs.read(context.md, brief.md, relevant files)
   fs.patch
-  shell.run(pnpm build)
+  project.build
   emit preview.rebuilding(previousVersionId)
   preview.start
   browser.screenshot
