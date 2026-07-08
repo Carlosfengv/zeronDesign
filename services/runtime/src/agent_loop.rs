@@ -1,6 +1,9 @@
 use crate::{
     conversation::RuntimeStore,
-    model_gateway::{ModelClient, ModelRequest, ModelResponse, ToolCall},
+    model_gateway::{
+        ModelClient, ModelRequest, ModelResponse, ToolCall, ToolInputParseFailure,
+        ToolInputTooLargeFailure,
+    },
     tools::{
         self,
         runtime::ToolExecutor,
@@ -17,9 +20,11 @@ use serde_json::{json, Value};
 use std::{fs, sync::Arc};
 
 const EMPTY_TURN_LIMIT: u32 = 3;
-const MAX_TURNS: u32 = 12;
-const COMPACT_MESSAGE_THRESHOLD: usize = 8;
-const COMPACT_KEEP_RECENT: usize = 4;
+const MAX_TURNS: u32 = 80;
+const COMPACT_MESSAGE_THRESHOLD: usize = 32;
+const COMPACT_KEEP_RECENT: usize = 16;
+const RECOVERABLE_ERROR_STRONG_GUIDANCE_ATTEMPT: u32 = 2;
+const RECOVERABLE_ERROR_PARTIAL_ATTEMPT: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ToolResultMessage {
@@ -27,6 +32,22 @@ pub struct ToolResultMessage {
     pub tool_name: String,
     pub is_error: bool,
     pub content: Value,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoverableErrorState {
+    fingerprint: String,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+struct RecoverableErrorFingerprint {
+    key: String,
+    tool: String,
+    error_kind: String,
+    normalized_path: String,
+    guidance: String,
 }
 
 #[derive(Clone)]
@@ -103,6 +124,7 @@ impl AgentLoop {
         let mut empty_turns = 0;
         let mut results = Vec::new();
         let mut message_window = self.recovered_message_window(run_id).await;
+        let mut recoverable_error_state: Option<RecoverableErrorState> = None;
 
         for turn in 1..=MAX_TURNS {
             self.save_checkpoint(
@@ -186,10 +208,9 @@ impl AgentLoop {
                             "toolName": result.tool_name,
                             "isError": result.is_error,
                             "content": result.content,
+                            "metadata": result.metadata,
                         }));
                     }
-                    self.save_turn_checkpoint(run_id, turn, &message_window)
-                        .await?;
                     let completion = tool_results
                         .iter()
                         .find(|result| result.tool_name == "run.complete" && !result.is_error)
@@ -204,7 +225,24 @@ impl AgentLoop {
                                     .to_string(),
                             )
                         });
+                    let guard_summary = self
+                        .apply_recoverable_error_guard(
+                            run_id,
+                            turn,
+                            current_run.phase,
+                            &tool_results,
+                            &mut message_window,
+                            &mut recoverable_error_state,
+                        )
+                        .await?;
+                    self.save_turn_checkpoint(run_id, turn, &message_window)
+                        .await?;
                     results.extend(tool_results);
+                    if let Some(summary) = guard_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     if let Some((status, summary)) = completion {
                         self.finalize(run_id, status, &summary, &message_window)
                             .await?;
@@ -215,6 +253,146 @@ impl AgentLoop {
                         Some(status) if status.is_terminal() || status == AgentRunStatus::NeedsUserInput
                     );
                     if should_stop {
+                        return Ok(results);
+                    }
+                    self.compact_if_needed(run_id, &mut message_window).await?;
+                }
+                Ok(ModelResponse::ToolInputParseFailed {
+                    parsed_calls,
+                    failures,
+                }) => {
+                    empty_turns = 0;
+                    let failure_calls = failures
+                        .iter()
+                        .map(tool_input_parse_failure_call)
+                        .collect::<Vec<_>>();
+                    let all_calls = parsed_calls
+                        .iter()
+                        .chain(failure_calls.iter())
+                        .collect::<Vec<_>>();
+                    message_window.push(json!({
+                        "role": "assistant",
+                        "turn": turn,
+                        "toolCalls": all_calls
+                            .iter()
+                            .map(|call| json!({
+                                "id": call.id,
+                                "name": call.name,
+                                "input": call.input,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
+                    let mut tool_results = if parsed_calls.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.execute_tools(run_id, parsed_calls).await
+                    };
+                    self.record_tool_starts(run_id, &failure_calls).await;
+                    tool_results
+                        .extend(self.emit_tool_input_parse_failures(run_id, &failures).await);
+                    for result in &tool_results {
+                        message_window.push(json!({
+                            "role": "tool",
+                            "turn": turn,
+                            "toolUseId": result.tool_use_id,
+                            "toolName": result.tool_name,
+                            "isError": result.is_error,
+                            "content": result.content,
+                            "metadata": result.metadata,
+                        }));
+                    }
+                    message_window.push(json!({
+                        "role": "system",
+                        "turn": turn,
+                        "text": "One or more tool-call JSON arguments could not be parsed. Switch strategy: use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files. Do not retry the same full fs.write payload.",
+                    }));
+                    let guard_summary = self
+                        .apply_recoverable_error_guard(
+                            run_id,
+                            turn,
+                            current_run.phase,
+                            &tool_results,
+                            &mut message_window,
+                            &mut recoverable_error_state,
+                        )
+                        .await?;
+                    self.save_turn_checkpoint(run_id, turn, &message_window)
+                        .await?;
+                    results.extend(tool_results);
+                    if let Some(summary) = guard_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
+                    self.compact_if_needed(run_id, &mut message_window).await?;
+                }
+                Ok(ModelResponse::ToolInputTooLarge {
+                    parsed_calls,
+                    failures,
+                }) => {
+                    empty_turns = 0;
+                    let failure_calls = failures
+                        .iter()
+                        .map(tool_input_too_large_failure_call)
+                        .collect::<Vec<_>>();
+                    let all_calls = parsed_calls
+                        .iter()
+                        .chain(failure_calls.iter())
+                        .collect::<Vec<_>>();
+                    message_window.push(json!({
+                        "role": "assistant",
+                        "turn": turn,
+                        "toolCalls": all_calls
+                            .iter()
+                            .map(|call| json!({
+                                "id": call.id,
+                                "name": call.name,
+                                "input": call.input,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
+                    let mut tool_results = if parsed_calls.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.execute_tools(run_id, parsed_calls).await
+                    };
+                    self.record_tool_starts(run_id, &failure_calls).await;
+                    tool_results.extend(
+                        self.emit_tool_input_too_large_failures(run_id, &failures)
+                            .await,
+                    );
+                    for result in &tool_results {
+                        message_window.push(json!({
+                            "role": "tool",
+                            "turn": turn,
+                            "toolUseId": result.tool_use_id,
+                            "toolName": result.tool_name,
+                            "isError": result.is_error,
+                            "content": result.content,
+                            "metadata": result.metadata,
+                        }));
+                    }
+                    message_window.push(json!({
+                        "role": "system",
+                        "turn": turn,
+                        "text": "A streaming tool-call input exceeded the safe argument budget. Switch strategy: use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files. Do not retry the same full fs.write payload.",
+                    }));
+                    let guard_summary = self
+                        .apply_recoverable_error_guard(
+                            run_id,
+                            turn,
+                            current_run.phase,
+                            &tool_results,
+                            &mut message_window,
+                            &mut recoverable_error_state,
+                        )
+                        .await?;
+                    self.save_turn_checkpoint(run_id, turn, &message_window)
+                        .await?;
+                    results.extend(tool_results);
+                    if let Some(summary) = guard_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
                         return Ok(results);
                     }
                     self.compact_if_needed(run_id, &mut message_window).await?;
@@ -243,6 +421,7 @@ impl AgentLoop {
                             "toolName": result.tool_name,
                             "isError": result.is_error,
                             "content": result.content,
+                            "metadata": result.metadata,
                         }));
                     }
                     self.save_turn_checkpoint(run_id, turn, &message_window)
@@ -282,6 +461,7 @@ impl AgentLoop {
                             "toolName": result.tool_name,
                             "isError": result.is_error,
                             "content": result.content,
+                            "metadata": result.metadata,
                         }));
                     }
                     results.extend(missing_results);
@@ -302,6 +482,7 @@ impl AgentLoop {
                     }));
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
+                    recoverable_error_state = None;
                     self.compact_if_needed(run_id, &mut message_window).await?;
                     continue;
                 }
@@ -331,6 +512,7 @@ impl AgentLoop {
                     empty_turns += 1;
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
+                    recoverable_error_state = None;
                     if empty_turns >= EMPTY_TURN_LIMIT {
                         self.finalize(
                             run_id,
@@ -542,6 +724,7 @@ impl AgentLoop {
                     error: error.clone(),
                     tool_use_id: call.id.clone(),
                     recoverable: false,
+                    metadata: None,
                     timestamp: Utc::now(),
                 })
                 .await;
@@ -566,9 +749,311 @@ impl AgentLoop {
                 tool_name: call.name.clone(),
                 is_error: true,
                 content: json!({ "error": error }),
+                metadata: None,
             });
         }
         messages
+    }
+
+    async fn emit_tool_input_parse_failures(
+        &self,
+        run_id: &str,
+        failures: &[ToolInputParseFailure],
+    ) -> Vec<ToolResultMessage> {
+        let mut messages = Vec::new();
+        for failure in failures {
+            let guidance = "Tool-call JSON arguments could not be parsed, likely because a large file payload was truncated. Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files; do not retry the same full fs.write payload.";
+            let error = format!(
+                "tool input JSON parse failed for {}; {guidance}",
+                failure.tool_name
+            );
+            let metadata = json!({
+                "errorKind": "tool.input_json_parse_failed",
+                "recoverable": true,
+                "rawLen": failure.raw_len,
+                "rawSha256": failure.raw_sha256,
+                "endsWithJsonClose": failure.ends_with_json_close,
+                "bracketBalance": failure.bracket_balance,
+                "quoteClosed": failure.quote_closed,
+                "likelyTruncated": failure.likely_truncated,
+                "guidance": guidance,
+            });
+            self.store
+                .append_event(AgentEvent::ToolFailed {
+                    run_id: run_id.to_string(),
+                    tool: failure.tool_name.clone(),
+                    error: error.clone(),
+                    tool_use_id: failure.tool_call_id.clone(),
+                    recoverable: true,
+                    metadata: Some(metadata.clone()),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            self.append_synthetic_tool_input_failure_audit(
+                run_id,
+                &failure.tool_name,
+                format!(
+                    "toolUseId={} rawLen={} rawSha256={} endsWithJsonClose={} bracketBalance={} quoteClosed={} likelyTruncated={}",
+                    failure.tool_call_id,
+                    failure.raw_len,
+                    failure.raw_sha256,
+                    failure.ends_with_json_close,
+                    failure.bracket_balance,
+                    failure.quote_closed,
+                    failure.likely_truncated
+                ),
+                format!(
+                    "tool.input_json_parse_failed: OpenAI-compatible tool arguments could not be parsed; {guidance}"
+                ),
+            )
+            .await;
+            self.record_tool_input_failure_health(json!({
+                "runId": run_id,
+                "tool": failure.tool_name,
+                "toolUseId": failure.tool_call_id,
+                "errorKind": "tool.input_json_parse_failed",
+                "rawLen": failure.raw_len,
+                "rawSha256": failure.raw_sha256,
+                "endsWithJsonClose": failure.ends_with_json_close,
+                "bracketBalance": failure.bracket_balance,
+                "quoteClosed": failure.quote_closed,
+                "likelyTruncated": failure.likely_truncated,
+                "createdAt": Utc::now(),
+            }));
+            self.emit_metric(
+                run_id,
+                "tool_input_json_parse_failed",
+                json!({
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "rawLen": failure.raw_len,
+                    "rawSha256": failure.raw_sha256,
+                    "likelyTruncated": failure.likely_truncated,
+                }),
+            )
+            .await;
+            self.append_tool_conversation_item(
+                run_id,
+                "tool_failed",
+                format!(
+                    "{} failed: {}",
+                    failure.tool_name,
+                    truncate_conversation_text(&error)
+                ),
+                json!({
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "recoverable": true,
+                    "synthetic": true,
+                    "metadata": metadata,
+                }),
+            )
+            .await;
+            messages.push(ToolResultMessage {
+                tool_use_id: failure.tool_call_id.clone(),
+                tool_name: failure.tool_name.clone(),
+                is_error: true,
+                content: json!({ "error": error }),
+                metadata: Some(metadata),
+            });
+        }
+        messages
+    }
+
+    async fn emit_tool_input_too_large_failures(
+        &self,
+        run_id: &str,
+        failures: &[ToolInputTooLargeFailure],
+    ) -> Vec<ToolResultMessage> {
+        let mut messages = Vec::new();
+        for failure in failures {
+            let guidance = "Streaming tool-call JSON arguments exceeded the safe input budget. Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files; do not retry the same full fs.write payload.";
+            let error = format!("tool input too large for {}; {guidance}", failure.tool_name);
+            let metadata = json!({
+                "errorKind": "tool.input_too_large",
+                "recoverable": true,
+                "inputChars": failure.input_chars,
+                "maxInputChars": failure.max_input_chars,
+                "rawSha256": failure.raw_sha256,
+                "guidance": guidance,
+            });
+            self.store
+                .append_event(AgentEvent::ToolFailed {
+                    run_id: run_id.to_string(),
+                    tool: failure.tool_name.clone(),
+                    error: error.clone(),
+                    tool_use_id: failure.tool_call_id.clone(),
+                    recoverable: true,
+                    metadata: Some(metadata.clone()),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            self.append_synthetic_tool_input_failure_audit(
+                run_id,
+                &failure.tool_name,
+                format!(
+                    "toolUseId={} inputChars={} maxInputChars={} rawSha256={}",
+                    failure.tool_call_id,
+                    failure.input_chars,
+                    failure.max_input_chars,
+                    failure.raw_sha256
+                ),
+                format!(
+                    "tool.input_too_large: streaming tool arguments exceeded the safe input budget; {guidance}"
+                ),
+            )
+            .await;
+            self.record_tool_input_failure_health(json!({
+                "runId": run_id,
+                "tool": failure.tool_name,
+                "toolUseId": failure.tool_call_id,
+                "errorKind": "tool.input_too_large",
+                "inputChars": failure.input_chars,
+                "maxInputChars": failure.max_input_chars,
+                "rawSha256": failure.raw_sha256,
+                "createdAt": Utc::now(),
+            }));
+            self.emit_metric(
+                run_id,
+                "tool_input_too_large",
+                json!({
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "inputChars": failure.input_chars,
+                    "maxInputChars": failure.max_input_chars,
+                    "rawSha256": failure.raw_sha256,
+                }),
+            )
+            .await;
+            self.append_tool_conversation_item(
+                run_id,
+                "tool_failed",
+                format!(
+                    "{} failed: {}",
+                    failure.tool_name,
+                    truncate_conversation_text(&error)
+                ),
+                json!({
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "recoverable": true,
+                    "synthetic": true,
+                    "metadata": metadata,
+                }),
+            )
+            .await;
+            messages.push(ToolResultMessage {
+                tool_use_id: failure.tool_call_id.clone(),
+                tool_name: failure.tool_name.clone(),
+                is_error: true,
+                content: json!({ "error": error }),
+                metadata: Some(metadata),
+            });
+        }
+        messages
+    }
+
+    async fn append_synthetic_tool_input_failure_audit(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        input_summary: String,
+        reason: String,
+    ) {
+        let Some(run) = self.store.get_run(run_id).await else {
+            return;
+        };
+        self.store
+            .append_audit_record(
+                &run.project_id,
+                run_id,
+                tool_name,
+                input_summary,
+                "deny",
+                reason,
+            )
+            .await;
+    }
+
+    fn record_tool_input_failure_health(&self, entry: Value) {
+        let state_dir = self.tool_executor.workspace_root().join("state");
+        if !state_dir.is_dir() {
+            return;
+        }
+        let path = state_dir.join("run-health.json");
+        let mut health = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let failures = health
+            .as_object_mut()
+            .and_then(|object| object.get_mut("toolInputFailures"))
+            .and_then(Value::as_array_mut);
+        match failures {
+            Some(entries) => {
+                entries.push(entry);
+                if entries.len() > 20 {
+                    let drain_count = entries.len() - 20;
+                    entries.drain(0..drain_count);
+                }
+            }
+            None => {
+                health["toolInputFailures"] = json!([entry]);
+            }
+        }
+        let Ok(text) = serde_json::to_string_pretty(&health) else {
+            return;
+        };
+        let _ = fs::write(path, text);
+    }
+
+    fn record_tool_input_failure_health_from_metadata(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        tool_use_id: &str,
+        metadata: Option<&Value>,
+    ) {
+        let Some(metadata) = metadata else {
+            return;
+        };
+        let Some(error_kind) = metadata.get("errorKind").and_then(Value::as_str) else {
+            return;
+        };
+        if !matches!(
+            error_kind,
+            "tool.input_json_parse_failed" | "tool.input_schema_invalid" | "tool.input_too_large"
+        ) {
+            return;
+        }
+        let mut entry = json!({
+            "runId": run_id,
+            "tool": tool_name,
+            "toolUseId": tool_use_id,
+            "errorKind": error_kind,
+            "createdAt": Utc::now(),
+        });
+        if let Some(object) = entry.as_object_mut() {
+            for key in [
+                "path",
+                "inputChars",
+                "serializedBytes",
+                "maxInputChars",
+                "maxSerializedBytes",
+                "rawLen",
+                "rawSha256",
+                "endsWithJsonClose",
+                "bracketBalance",
+                "quoteClosed",
+                "likelyTruncated",
+            ] {
+                if let Some(value) = metadata.get(key) {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        self.record_tool_input_failure_health(entry);
     }
 
     async fn record_tool_result(
@@ -578,6 +1063,7 @@ impl AgentLoop {
     ) -> ToolResultMessage {
         if result.result.is_error {
             let error = tool_result_error_text(&result.result);
+            let metadata = result.result.metadata.clone();
             let recoverable = result
                 .result
                 .metadata
@@ -592,9 +1078,48 @@ impl AgentLoop {
                     error: error.clone(),
                     tool_use_id: result.tool_use_id.clone(),
                     recoverable,
+                    metadata: metadata.clone(),
                     timestamp: Utc::now(),
                 })
                 .await;
+            self.record_tool_input_failure_health_from_metadata(
+                run_id,
+                &result.tool_name,
+                &result.tool_use_id,
+                metadata.as_ref(),
+            );
+            if metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("errorKind"))
+                .and_then(Value::as_str)
+                == Some("tool.input_too_large")
+            {
+                self.emit_metric(
+                    run_id,
+                    "tool_input_too_large",
+                    json!({
+                        "tool": result.tool_name,
+                        "toolUseId": result.tool_use_id,
+                        "source": "tool_result",
+                    }),
+                )
+                .await;
+            }
+            if matches!(
+                result.tool_name.as_str(),
+                "fs.write_chunk" | "fs.commit_chunks"
+            ) {
+                self.emit_metric(
+                    run_id,
+                    "tool_chunk_write_failed",
+                    json!({
+                        "tool": result.tool_name,
+                        "toolUseId": result.tool_use_id,
+                        "recoverable": recoverable,
+                    }),
+                )
+                .await;
+            }
             self.append_tool_conversation_item(
                 run_id,
                 "tool_failed",
@@ -607,6 +1132,7 @@ impl AgentLoop {
                     "tool": result.tool_name.clone(),
                     "toolUseId": result.tool_use_id.clone(),
                     "recoverable": recoverable,
+                    "metadata": metadata.clone(),
                 }),
             )
             .await;
@@ -615,17 +1141,19 @@ impl AgentLoop {
                 tool_name: result.tool_name,
                 is_error: true,
                 content: json!({ "error": error }),
+                metadata,
             };
         }
 
         let summary = tool_summary(&result.tool_name, false);
+        let metadata = result.result.metadata.clone();
         self.store
             .append_event(AgentEvent::ToolCompleted {
                 run_id: run_id.to_string(),
                 tool: result.tool_name.clone(),
                 summary: summary.clone(),
                 tool_use_id: result.tool_use_id.clone(),
-                metadata: None,
+                metadata: metadata.clone(),
                 timestamp: Utc::now(),
             })
             .await;
@@ -644,7 +1172,112 @@ impl AgentLoop {
             tool_name: result.tool_name,
             is_error: false,
             content: result.result.content,
+            metadata,
         }
+    }
+
+    async fn apply_recoverable_error_guard(
+        &self,
+        run_id: &str,
+        turn: u32,
+        phase: AgentPhase,
+        tool_results: &[ToolResultMessage],
+        message_window: &mut Vec<Value>,
+        state: &mut Option<RecoverableErrorState>,
+    ) -> Result<Option<String>> {
+        let Some(fingerprint) = tool_results
+            .iter()
+            .filter_map(|result| recoverable_error_fingerprint(phase, result))
+            .next()
+        else {
+            *state = None;
+            return Ok(None);
+        };
+
+        let attempts = match state {
+            Some(existing) if existing.fingerprint == fingerprint.key => {
+                existing.attempts += 1;
+                existing.attempts
+            }
+            _ => {
+                *state = Some(RecoverableErrorState {
+                    fingerprint: fingerprint.key.clone(),
+                    attempts: 1,
+                });
+                1
+            }
+        };
+
+        if attempts >= RECOVERABLE_ERROR_STRONG_GUIDANCE_ATTEMPT {
+            let guidance = format!(
+                "检测到同一类可恢复工具输入失败已连续出现 {attempts} 次：tool={tool}, errorKind={error_kind}, path={path}。{base_guidance} 请立即切换策略：已有文件用 fs.patch 的小片段修改，新建大文件用 fs.write_chunk 后接 fs.commit_chunks；不要再次提交相同的大段工具输入。",
+                error_kind = fingerprint.error_kind,
+                tool = fingerprint.tool,
+                path = fingerprint.normalized_path,
+                base_guidance = fingerprint.guidance,
+            );
+            self.store
+                .append_event(AgentEvent::ToolRecoverySuggested {
+                    run_id: run_id.to_string(),
+                    tool: fingerprint.tool.clone(),
+                    error_kind: fingerprint.error_kind.clone(),
+                    fingerprint: fingerprint.key.clone(),
+                    attempt: attempts,
+                    guidance: guidance.clone(),
+                    metadata: Some(json!({
+                        "phase": format!("{phase:?}"),
+                        "normalizedPath": fingerprint.normalized_path,
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            self.emit_metric(
+                run_id,
+                "tool_input_retry_same_large_write",
+                json!({
+                    "tool": fingerprint.tool,
+                    "errorKind": fingerprint.error_kind,
+                    "fingerprint": fingerprint.key,
+                    "attempt": attempts,
+                    "normalizedPath": fingerprint.normalized_path,
+                }),
+            )
+            .await;
+            message_window.push(json!({
+                "role": "system",
+                "turn": turn,
+                "kind": "tool_recovery_suggested",
+                "text": guidance,
+                "metadata": {
+                    "fingerprint": fingerprint.key,
+                    "attempt": attempts,
+                    "errorKind": fingerprint.error_kind,
+                    "tool": fingerprint.tool,
+                }
+            }));
+        }
+
+        if attempts >= RECOVERABLE_ERROR_PARTIAL_ATTEMPT {
+            return Ok(Some(format!(
+                "已停止自动重试：同一类可恢复工具输入失败连续出现 {attempts} 次，tool={tool}, errorKind={error_kind}。请改用可恢复写入策略：已有文件先 fs.read 再用 fs.patch 小片段修改；新建或较大的页面用 fs.write_chunk 分块写入，再调用 fs.commit_chunks 提交。当前 run 已以 partial 结束，最近成功的预览会保留。",
+                tool = fingerprint.tool,
+                error_kind = fingerprint.error_kind,
+            )));
+        }
+
+        Ok(None)
+    }
+
+    async fn emit_metric(&self, run_id: &str, name: &str, metadata: Value) {
+        self.store
+            .append_event(AgentEvent::MetricRecorded {
+                run_id: run_id.to_string(),
+                name: name.to_string(),
+                value: 1,
+                metadata: Some(metadata),
+                timestamp: Utc::now(),
+            })
+            .await;
     }
 
     async fn finalize(
@@ -657,6 +1290,18 @@ impl AgentLoop {
         if status == AgentRunStatus::Partial {
             self.save_checkpoint(run_id, message_window, summary.to_string())
                 .await?;
+        }
+        if matches!(
+            status,
+            AgentRunStatus::Partial
+                | AgentRunStatus::Blocked
+                | AgentRunStatus::Failed
+                | AgentRunStatus::Cancelled
+        ) {
+            tools::sandbox::cleanup_staged_writes_for_run(
+                &self.tool_executor.workspace_root(),
+                run_id,
+            );
         }
         self.store.update_run_status(run_id, status).await?;
         self.store
@@ -923,16 +1568,123 @@ fn status_from_value(content: &Value) -> AgentRunStatus {
     }
 }
 
+fn recoverable_error_fingerprint(
+    phase: AgentPhase,
+    result: &ToolResultMessage,
+) -> Option<RecoverableErrorFingerprint> {
+    if !result.is_error {
+        return None;
+    }
+    let metadata = result.metadata.as_ref()?;
+    let recoverable = metadata
+        .get("recoverable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !recoverable {
+        return None;
+    }
+    let error_kind = metadata
+        .get("errorKind")
+        .and_then(Value::as_str)
+        .unwrap_or("tool.error")
+        .to_string();
+    if !matches!(
+        error_kind.as_str(),
+        "tool.input_json_parse_failed" | "tool.input_too_large"
+    ) {
+        return None;
+    }
+    let normalized_path = metadata
+        .get("path")
+        .or_else(|| metadata.get("normalizedPath"))
+        .or_else(|| result.content.get("path"))
+        .and_then(Value::as_str)
+        .map(normalize_fingerprint_path)
+        .unwrap_or_else(|| "unknown".to_string());
+    let guidance = metadata
+        .get("guidance")
+        .and_then(Value::as_str)
+        .unwrap_or(
+            "Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large files.",
+        )
+        .to_string();
+    let key = format!(
+        "{phase:?}|{}|{}|{}",
+        result.tool_name, error_kind, normalized_path
+    );
+    Some(RecoverableErrorFingerprint {
+        key,
+        tool: result.tool_name.clone(),
+        error_kind,
+        normalized_path,
+        guidance,
+    })
+}
+
+fn normalize_fingerprint_path(path: &str) -> String {
+    let path = path
+        .trim()
+        .trim_start_matches("/workspace/")
+        .trim_start_matches("./")
+        .replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        "unknown".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn tool_input_parse_failure_call(failure: &ToolInputParseFailure) -> ToolCall {
+    ToolCall::new(
+        failure.tool_call_id.clone(),
+        failure.tool_name.clone(),
+        json!({
+            "runtimeDiagnostic": "tool_input_json_parse_failed",
+            "rawLen": failure.raw_len,
+            "rawSha256": failure.raw_sha256,
+            "endsWithJsonClose": failure.ends_with_json_close,
+            "bracketBalance": failure.bracket_balance,
+            "quoteClosed": failure.quote_closed,
+            "likelyTruncated": failure.likely_truncated,
+            "guidance": "Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files. Do not retry the same full fs.write payload."
+        }),
+    )
+}
+
+fn tool_input_too_large_failure_call(failure: &ToolInputTooLargeFailure) -> ToolCall {
+    ToolCall::new(
+        failure.tool_call_id.clone(),
+        failure.tool_name.clone(),
+        json!({
+            "runtimeDiagnostic": "tool_input_too_large",
+            "inputChars": failure.input_chars,
+            "maxInputChars": failure.max_input_chars,
+            "rawSha256": failure.raw_sha256,
+            "guidance": "Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large new files. Do not retry the same full fs.write payload."
+        }),
+    )
+}
+
 fn system_prompt_for_run(run: &AgentRun) -> String {
     let phase_instruction = match run.phase {
         AgentPhase::Brief => {
-            "Create a structured Brief draft from the provided content, then request user confirmation before completing."
+            "Create a structured Brief draft from the provided content sources only. Use content.list_sources and content.read_source to inspect user inputs. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to astro-website for website projects or fumadocs-docs for docs projects. Call brief.write_draft with the complete Brief, then call brief.request_confirmation and wait for user confirmation before completing."
         }
         AgentPhase::Build => {
-            "Generate or update the sandbox workspace using the confirmed Brief's recommended template, build it, verify preview readiness, and only complete after preview promotion."
+            "Use the runtime project workflow. Read inputs/brief.md, inputs/content-sources.json, and inputs/design.md when present. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; treat state/project.json appRoot as the only app root after initialization. Use package.install for dependencies; it runs the real npm/pnpm package manager under runtime policy control. Use package.install({\"mode\":\"restore\"}) to install package.json dependencies and package.install({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. Edit app source with fs.* under the appRoot, run project.build, then call preview.start only after project.build succeeds. Report a preview candidate and only complete after preview promotion. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns tool.input_json_parse_failed or tool.input_too_large, switch strategy immediately and do not retry the same full fs.write payload."
         }
         AgentPhase::Edit => {
-            "Apply focused changes to the existing project version, rebuild, verify, and emit a promoted preview before completing."
+            "Use the runtime project workflow. Use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read new user content sources such as design.md or docs markdown, apply focused code/content/style changes under appRoot with fs.* tools, use package.install for dependency changes; it runs the real npm/pnpm package manager under runtime policy control. Use package.install({\"mode\":\"restore\"}) to install package.json dependencies and package.install({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. Run project.build, call preview.start only after project.build succeeds, report a preview candidate, and only complete after preview promotion. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns tool.input_json_parse_failed or tool.input_too_large, switch strategy immediately and do not retry the same full fs.write payload."
         }
         AgentPhase::Review => {
             "Review the candidate preview using read-only tools and report actionable findings."

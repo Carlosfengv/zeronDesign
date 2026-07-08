@@ -2,10 +2,11 @@ use crate::{
     profiles::policy,
     repair_loop::RepairAttempt,
     types::{
-        AgentCheckpoint, AgentEvent, AgentRun, AgentRunStatus, AuditRecord, Brief, BriefStatus,
-        ContentSource, ConversationItem, PendingPermission, ProjectVersion, ProjectVersionStatus,
-        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
-        ReviewFindingStatus, SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol,
+        AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, AuditRecord, Brief,
+        BriefStatus, ContentSource, ConversationItem, PendingPermission, ProjectVersion,
+        ProjectVersionStatus, ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence,
+        ReviewFindingSeverity, ReviewFindingStatus, SandboxBinding, SandboxBindingStatus,
+        SandboxChannelProtocol,
     },
 };
 use anyhow::{anyhow, Result};
@@ -52,6 +53,8 @@ struct RuntimeStoreInner {
     content_sources: HashMap<String, Vec<ContentSource>>,
     briefs: HashMap<String, Brief>,
     brief_statuses: HashMap<String, BriefStatus>,
+    brief_run_ids: HashMap<String, String>,
+    brief_content_sources: HashMap<String, Vec<ContentSource>>,
     audit_records: Vec<AuditRecord>,
     pending_permissions: HashMap<String, PendingPermission>,
     review_findings: HashMap<String, ReviewFinding>,
@@ -888,6 +891,56 @@ impl RuntimeStore {
         snapshot.sources
     }
 
+    pub async fn content_sources_for_brief(&self, brief_id: &str) -> Vec<ContentSource> {
+        if let Some(sources) = self
+            .inner
+            .read()
+            .await
+            .brief_content_sources
+            .get(brief_id)
+            .cloned()
+        {
+            return sources;
+        }
+        if let Some(run_id) = self.inner.read().await.brief_run_ids.get(brief_id).cloned() {
+            let sources = self.content_sources(&run_id).await;
+            self.inner
+                .write()
+                .await
+                .brief_content_sources
+                .insert(brief_id.to_string(), sources.clone());
+            return sources;
+        }
+        let run_id = self
+            .inner
+            .read()
+            .await
+            .runs
+            .values()
+            .find(|run| {
+                run.phase == AgentPhase::Brief && run.brief_version.as_deref() == Some(brief_id)
+            })
+            .map(|run| run.id.clone());
+        if let Some(run_id) = run_id {
+            return self.content_sources(&run_id).await;
+        }
+        let Ok(Some(snapshot)) = self.read_brief_snapshot(brief_id) else {
+            return Vec::new();
+        };
+        self.inner
+            .write()
+            .await
+            .brief_run_ids
+            .insert(brief_id.to_string(), snapshot.run_id.clone());
+        let sources = self.content_sources(&snapshot.run_id).await;
+        self.inner
+            .write()
+            .await
+            .brief_content_sources
+            .insert(brief_id.to_string(), sources.clone());
+        sources
+    }
+
     pub async fn write_brief(&self, run_id: &str, brief: Brief) -> Result<String> {
         brief.validate_for_runtime().map_err(|err| anyhow!(err))?;
         let brief_id = self.next_id("brief");
@@ -909,11 +962,18 @@ impl RuntimeStore {
             status: BriefStatus::Confirmed,
             brief: brief.clone(),
         };
+        let content_sources = self.content_sources(run_id).await;
         let mut inner = self.inner.write().await;
         inner.briefs.insert(brief_id.clone(), brief);
         inner
             .brief_statuses
             .insert(brief_id.clone(), BriefStatus::Confirmed);
+        inner
+            .brief_run_ids
+            .insert(brief_id.clone(), run_id.to_string());
+        inner
+            .brief_content_sources
+            .insert(brief_id.clone(), content_sources);
         drop(inner);
         self.append_brief_snapshot(&snapshot)?;
         self.set_run_brief_version(run_id, brief_id.clone()).await?;
@@ -960,11 +1020,18 @@ impl RuntimeStore {
             status: BriefStatus::Draft,
             brief: brief.clone(),
         };
+        let content_sources = self.content_sources(run_id).await;
         let mut inner = self.inner.write().await;
         inner.briefs.insert(brief_id.clone(), brief);
         inner
             .brief_statuses
             .insert(brief_id.clone(), BriefStatus::Draft);
+        inner
+            .brief_run_ids
+            .insert(brief_id.clone(), run_id.to_string());
+        inner
+            .brief_content_sources
+            .insert(brief_id.clone(), content_sources);
         drop(inner);
         self.append_brief_snapshot(&snapshot)?;
         self.set_run_brief_version(run_id, brief_id.clone()).await?;
@@ -987,6 +1054,7 @@ impl RuntimeStore {
             status: BriefStatus::Confirmed,
             brief: brief.clone(),
         };
+        let content_sources = self.content_sources(run_id).await;
         let brief_checkpoint_summary = json!({
             "projectType": brief.project_type.clone(),
             "recommendedTemplate": brief.recommended_template.clone(),
@@ -1000,6 +1068,12 @@ impl RuntimeStore {
             inner
                 .brief_statuses
                 .insert(brief_id.to_string(), BriefStatus::Confirmed);
+            inner
+                .brief_run_ids
+                .insert(brief_id.to_string(), run_id.to_string());
+            inner
+                .brief_content_sources
+                .insert(brief_id.to_string(), content_sources);
         }
         self.append_brief_snapshot(&snapshot)?;
         self.save_checkpoint(AgentCheckpoint {
@@ -1041,6 +1115,9 @@ impl RuntimeStore {
             .brief_statuses
             .insert(brief_id.to_string(), snapshot.status);
         inner
+            .brief_run_ids
+            .insert(brief_id.to_string(), snapshot.run_id);
+        inner
             .briefs
             .insert(brief_id.to_string(), snapshot.brief.clone());
         Some(snapshot.brief)
@@ -1065,6 +1142,9 @@ impl RuntimeStore {
         inner
             .brief_statuses
             .insert(brief_id.to_string(), snapshot.status);
+        inner
+            .brief_run_ids
+            .insert(brief_id.to_string(), snapshot.run_id);
         Some(snapshot.status)
     }
 

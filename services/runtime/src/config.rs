@@ -39,12 +39,29 @@ impl ModelProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimePolicyProfile {
+    Production,
+    LocalE2e,
+}
+
+impl RuntimePolicyProfile {
+    pub fn from_env_value(value: &str) -> Self {
+        match value {
+            "local-e2e" | "local_e2e" | "local" | "e2e" => Self::LocalE2e,
+            _ => Self::Production,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeConfig {
     pub host: String,
     pub port: u16,
     pub model_gateway_url: String,
     pub model_provider: ModelProvider,
+    pub agent_model: String,
     pub deepseek_api_key: Option<String>,
     pub deepseek_base_url: String,
     pub kimi_api_key: Option<String>,
@@ -57,12 +74,20 @@ pub struct RuntimeConfig {
     pub workspace_root: PathBuf,
     pub k8s_namespace: String,
     pub sandbox_backend_mode: SandboxBackendMode,
+    pub policy_profile: RuntimePolicyProfile,
+    pub npm_registry: String,
     pub enable_internal_promote_api: bool,
     pub internal_admin_token: Option<String>,
+    pub model_streaming: bool,
+    pub model_strict_tools: bool,
 }
 
 impl RuntimeConfig {
     pub fn from_env() -> Self {
+        let model_provider = env::var("MODEL_PROVIDER")
+            .ok()
+            .map(|value| ModelProvider::from_env_value(&value))
+            .unwrap_or(ModelProvider::InternalGateway);
         Self {
             host: env::var("RUNTIME_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: env::var("RUNTIME_PORT")
@@ -71,10 +96,8 @@ impl RuntimeConfig {
                 .unwrap_or(8080),
             model_gateway_url: env::var("MODEL_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
-            model_provider: env::var("MODEL_PROVIDER")
-                .ok()
-                .map(|value| ModelProvider::from_env_value(&value))
-                .unwrap_or(ModelProvider::InternalGateway),
+            model_provider,
+            agent_model: agent_model_from_env(model_provider),
             deepseek_api_key: secret_env("DEEPSEEK_API_KEY"),
             deepseek_base_url: env::var("DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
@@ -101,12 +124,24 @@ impl RuntimeConfig {
                 .ok()
                 .map(|value| SandboxBackendMode::from_env_value(&value))
                 .unwrap_or(SandboxBackendMode::Kubernetes),
+            policy_profile: env::var("RUNTIME_POLICY_PROFILE")
+                .ok()
+                .map(|value| RuntimePolicyProfile::from_env_value(&value))
+                .unwrap_or(RuntimePolicyProfile::Production),
+            npm_registry: env::var("RUNTIME_NPM_REGISTRY")
+                .unwrap_or_else(|_| "https://registry.internal.example/npm/".to_string()),
             enable_internal_promote_api: env::var("ENABLE_INTERNAL_PROMOTE_API")
                 .ok()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             internal_admin_token: env::var("RUNTIME_INTERNAL_ADMIN_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            model_streaming: env::var("MODEL_STREAMING")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            model_strict_tools: env::var("MODEL_STRICT_TOOLS")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
         }
     }
 
@@ -119,4 +154,30 @@ impl RuntimeConfig {
 
 fn secret_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn agent_model_from_env(provider: ModelProvider) -> String {
+    if let Ok(value) = env::var("AGENT_MODEL").or_else(|_| env::var("MODEL_NAME")) {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    match provider {
+        ModelProvider::InternalGateway => "internal-balanced".to_string(),
+        ModelProvider::DeepSeek => env::var("DEEPSEEK_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "deepseek-chat".to_string()),
+        ModelProvider::KimiGlobal => env::var("KIMI_MODEL")
+            .or_else(|_| env::var("MOONSHOT_MODEL"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "moonshot-v1-8k".to_string()),
+        ModelProvider::KimiChina => env::var("KIMI_CN_MODEL")
+            .or_else(|_| env::var("KIMI_MODEL"))
+            .or_else(|_| env::var("MOONSHOT_MODEL"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "moonshot-v1-8k".to_string()),
+    }
 }

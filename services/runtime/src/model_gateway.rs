@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::VecDeque, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -10,6 +15,8 @@ use crate::{
     tools::registry::{McpToolInfo, ToolLoadingPolicy},
     types::AgentPhase,
 };
+
+const MAX_STREAMING_TOOL_ARGUMENT_CHARS: usize = 96_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -23,7 +30,7 @@ impl ToolCall {
         Self {
             id: id.into(),
             name: name.into(),
-            input,
+            input: normalize_tool_input(input),
         }
     }
 }
@@ -31,6 +38,14 @@ impl ToolCall {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelResponse {
     ToolCalls(Vec<ToolCall>),
+    ToolInputParseFailed {
+        parsed_calls: Vec<ToolCall>,
+        failures: Vec<ToolInputParseFailure>,
+    },
+    ToolInputTooLarge {
+        parsed_calls: Vec<ToolCall>,
+        failures: Vec<ToolInputTooLargeFailure>,
+    },
     ToolCallsThenError {
         calls: Vec<ToolCall>,
         error: String,
@@ -41,6 +56,27 @@ pub enum ModelResponse {
     },
     TextOnly(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInputParseFailure {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub raw_len: usize,
+    pub raw_sha256: String,
+    pub ends_with_json_close: bool,
+    pub bracket_balance: i32,
+    pub quote_closed: bool,
+    pub likely_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInputTooLargeFailure {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub input_chars: usize,
+    pub max_input_chars: usize,
+    pub raw_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -88,7 +124,9 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     config.deepseek_base_url.clone(),
                     api_key,
                     Some("deepseek"),
-                ),
+                )
+                .with_streaming(config.model_streaming)
+                .with_strict_tools(config.model_strict_tools),
             ))
         }
         ModelProvider::KimiGlobal => {
@@ -100,7 +138,9 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     config.kimi_base_url.clone(),
                     api_key,
                     Some("kimi_global"),
-                ),
+                )
+                .with_streaming(config.model_streaming)
+                .with_strict_tools(config.model_strict_tools),
             ))
         }
         ModelProvider::KimiChina => {
@@ -114,7 +154,9 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     config.kimi_cn_base_url.clone(),
                     api_key,
                     Some("kimi_cn"),
-                ),
+                )
+                .with_streaming(config.model_streaming)
+                .with_strict_tools(config.model_strict_tools),
             ))
         }
     }
@@ -201,6 +243,8 @@ pub struct OpenAiCompatibleModelClient {
     provider_id: String,
     endpoint: String,
     api_key: String,
+    streaming: bool,
+    strict_tools: bool,
     client: reqwest::Client,
 }
 
@@ -216,8 +260,20 @@ impl OpenAiCompatibleModelClient {
             provider_id: provider_id.unwrap_or("openai_compatible").to_string(),
             endpoint,
             api_key: api_key.into(),
+            streaming: false,
+            strict_tools: false,
             client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    pub fn with_strict_tools(mut self, strict_tools: bool) -> Self {
+        self.strict_tools = strict_tools;
+        self
     }
 
     pub fn provider_id(&self) -> &str {
@@ -232,7 +288,10 @@ impl OpenAiCompatibleModelClient {
 #[async_trait]
 impl ModelClient for OpenAiCompatibleModelClient {
     async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let body = openai_chat_request(&request);
+        let (mut body, tool_name_map) = openai_chat_request(&request, self.strict_tools);
+        if self.streaming {
+            body["stream"] = Value::Bool(true);
+        }
         let response = self
             .client
             .post(&self.endpoint)
@@ -250,8 +309,11 @@ impl ModelClient for OpenAiCompatibleModelClient {
                 body
             ));
         }
+        if self.streaming {
+            return openai_streaming_model_response(response, &tool_name_map).await;
+        }
         let response = response.json::<OpenAiChatCompletionResponse>().await?;
-        Ok(response.into_model_response())
+        Ok(response.into_model_response(&tool_name_map))
     }
 }
 
@@ -315,22 +377,19 @@ struct OpenAiToolCallFunction {
 }
 
 impl OpenAiChatCompletionResponse {
-    fn into_model_response(self) -> ModelResponse {
+    fn into_model_response(self, tool_name_map: &HashMap<String, String>) -> ModelResponse {
         let Some(choice) = self.choices.into_iter().next() else {
             return ModelResponse::Error("model returned no choices".to_string());
         };
         if !choice.message.tool_calls.is_empty() {
-            let calls = choice
-                .message
-                .tool_calls
-                .into_iter()
-                .map(|call| {
-                    let input = serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| json!({ "arguments": call.function.arguments }));
-                    ToolCall::new(call.id, call.function.name, input)
-                })
-                .collect();
-            return ModelResponse::ToolCalls(calls);
+            return openai_tool_calls_to_model_response(
+                choice
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| (call.id, call.function.name, call.function.arguments)),
+                tool_name_map,
+            );
         }
         let text = match choice.message.content {
             Some(Value::String(text)) => text,
@@ -339,6 +398,249 @@ impl OpenAiChatCompletionResponse {
         };
         ModelResponse::TextOnly(text)
     }
+}
+
+async fn openai_streaming_model_response(
+    response: reqwest::Response,
+    tool_name_map: &HashMap<String, String>,
+) -> Result<ModelResponse> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut text = String::new();
+    let mut tool_calls = BTreeMap::<u64, OpenAiStreamingToolCall>::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.push_str(std::str::from_utf8(&chunk)?);
+        while let Some(boundary) = buffer.find("\n\n") {
+            let event = buffer.drain(..boundary + 2).collect::<String>();
+            if process_openai_stream_event(&event, &mut text, &mut tool_calls)? {
+                return Ok(openai_stream_accumulators_to_model_response(
+                    text,
+                    tool_calls,
+                    tool_name_map,
+                ));
+            }
+            if let Some(failure) = streaming_tool_input_too_large(&tool_calls, tool_name_map) {
+                return Ok(ModelResponse::ToolInputTooLarge {
+                    parsed_calls: Vec::new(),
+                    failures: vec![failure],
+                });
+            }
+        }
+    }
+    if !buffer.trim().is_empty() {
+        process_openai_stream_event(&buffer, &mut text, &mut tool_calls)?;
+        if let Some(failure) = streaming_tool_input_too_large(&tool_calls, tool_name_map) {
+            return Ok(ModelResponse::ToolInputTooLarge {
+                parsed_calls: Vec::new(),
+                failures: vec![failure],
+            });
+        }
+    }
+    Ok(openai_stream_accumulators_to_model_response(
+        text,
+        tool_calls,
+        tool_name_map,
+    ))
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+fn process_openai_stream_event(
+    event: &str,
+    text: &mut String,
+    tool_calls: &mut BTreeMap<u64, OpenAiStreamingToolCall>,
+) -> Result<bool> {
+    for line in event.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(data)?;
+        for choice in value
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                text.push_str(content);
+            }
+            for call in delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let accumulator = tool_calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    accumulator.id = Some(id.to_string());
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        accumulator.name = Some(name.to_string());
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        accumulator.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn streaming_tool_input_too_large(
+    tool_calls: &BTreeMap<u64, OpenAiStreamingToolCall>,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<ToolInputTooLargeFailure> {
+    tool_calls.iter().find_map(|(index, call)| {
+        let input_chars = call.arguments.chars().count();
+        if input_chars <= MAX_STREAMING_TOOL_ARGUMENT_CHARS {
+            return None;
+        }
+        let api_name = call
+            .name
+            .clone()
+            .unwrap_or_else(|| "unknown_tool".to_string());
+        let tool_name = tool_name_map.get(&api_name).cloned().unwrap_or(api_name);
+        Some(ToolInputTooLargeFailure {
+            tool_call_id: call
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("stream-tool-call-{index}")),
+            tool_name,
+            input_chars,
+            max_input_chars: MAX_STREAMING_TOOL_ARGUMENT_CHARS,
+            raw_sha256: sha256_hex(call.arguments.as_bytes()),
+        })
+    })
+}
+
+fn openai_stream_accumulators_to_model_response(
+    text: String,
+    tool_calls: BTreeMap<u64, OpenAiStreamingToolCall>,
+    tool_name_map: &HashMap<String, String>,
+) -> ModelResponse {
+    if tool_calls.is_empty() {
+        return ModelResponse::TextOnly(text);
+    }
+    openai_tool_calls_to_model_response(
+        tool_calls.into_iter().map(|(index, call)| {
+            (
+                call.id
+                    .unwrap_or_else(|| format!("stream-tool-call-{index}")),
+                call.name.unwrap_or_else(|| "unknown_tool".to_string()),
+                call.arguments,
+            )
+        }),
+        tool_name_map,
+    )
+}
+
+fn openai_tool_calls_to_model_response(
+    calls: impl IntoIterator<Item = (String, String, String)>,
+    tool_name_map: &HashMap<String, String>,
+) -> ModelResponse {
+    let mut parsed_calls = Vec::new();
+    let mut failures = Vec::new();
+    for (id, api_name, arguments) in calls {
+        let name = tool_name_map.get(&api_name).cloned().unwrap_or(api_name);
+        match serde_json::from_str::<Value>(&arguments) {
+            Ok(input) => {
+                parsed_calls.push(ToolCall::new(id, name, input));
+            }
+            Err(_) => {
+                failures.push(tool_input_parse_failure(id, name, &arguments));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return ModelResponse::ToolInputParseFailed {
+            parsed_calls,
+            failures,
+        };
+    }
+    ModelResponse::ToolCalls(parsed_calls)
+}
+
+fn tool_input_parse_failure(
+    tool_call_id: String,
+    tool_name: String,
+    raw_arguments: &str,
+) -> ToolInputParseFailure {
+    let (bracket_balance, quote_closed) = json_shape_diagnostics(raw_arguments);
+    let trimmed = raw_arguments.trim_end();
+    let ends_with_json_close = trimmed.ends_with('}') || trimmed.ends_with(']');
+    let has_large_write_signal = ["\"text\"", "<html", "---", "<style", "class="]
+        .iter()
+        .any(|signal| raw_arguments.contains(signal));
+    ToolInputParseFailure {
+        tool_call_id,
+        tool_name,
+        raw_len: raw_arguments.len(),
+        raw_sha256: sha256_hex(raw_arguments.as_bytes()),
+        ends_with_json_close,
+        bracket_balance,
+        quote_closed,
+        likely_truncated: !ends_with_json_close
+            || !quote_closed
+            || bracket_balance != 0
+            || has_large_write_signal,
+    }
+}
+
+fn json_shape_diagnostics(raw: &str) -> (i32, bool) {
+    let mut balance = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => balance += 1,
+            '}' | ']' => balance -= 1,
+            _ => {}
+        }
+    }
+    (balance, !in_string)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,21 +661,20 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     }
 }
 
-fn openai_chat_request(request: &ModelRequest) -> Value {
+fn openai_chat_request(
+    request: &ModelRequest,
+    strict_tools: bool,
+) -> (Value, HashMap<String, String>) {
+    let tool_name_map = openai_tool_name_map(request);
     let mut messages = vec![json!({
         "role": "system",
         "content": request.system_prompt,
     })];
-    messages.extend(
-        request
-            .messages
-            .iter()
-            .filter_map(openai_message_from_runtime),
-    );
+    messages.extend(openai_messages_from_runtime(&request.messages));
     let tools = request
         .tools
         .iter()
-        .map(openai_tool_definition)
+        .map(|tool| openai_tool_definition(tool, strict_tools))
         .collect::<Vec<_>>();
     let mut body = json!({
         "model": request.model,
@@ -383,7 +684,43 @@ fn openai_chat_request(request: &ModelRequest) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    body
+    (body, tool_name_map)
+}
+
+fn openai_messages_from_runtime(messages: &[Value]) -> Vec<Value> {
+    let mut output = Vec::new();
+    let mut pending_tool_call_ids = HashSet::new();
+    for message in messages {
+        let Some(openai_message) = openai_message_from_runtime(message) else {
+            continue;
+        };
+        match openai_message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                pending_tool_call_ids.clear();
+                if let Some(tool_calls) = openai_message.get("tool_calls").and_then(Value::as_array)
+                {
+                    pending_tool_call_ids.extend(tool_calls.iter().filter_map(|call| {
+                        call.get("id").and_then(Value::as_str).map(str::to_string)
+                    }));
+                }
+                output.push(openai_message);
+            }
+            Some("tool") => {
+                let Some(tool_call_id) = openai_message.get("tool_call_id").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if pending_tool_call_ids.remove(tool_call_id) {
+                    output.push(openai_message);
+                }
+            }
+            _ => {
+                pending_tool_call_ids.clear();
+                output.push(openai_message);
+            }
+        }
+    }
+    output
 }
 
 fn openai_message_from_runtime(message: &Value) -> Option<Value> {
@@ -436,28 +773,60 @@ fn openai_message_from_runtime(message: &Value) -> Option<Value> {
 fn openai_tool_call_from_runtime(call: &Value) -> Option<Value> {
     let id = call.get("id").and_then(Value::as_str)?;
     let name = call.get("name").and_then(Value::as_str)?;
+    let api_name = openai_tool_name(name);
     let arguments = call.get("input").cloned().unwrap_or_else(|| json!({}));
     Some(json!({
         "id": id,
         "type": "function",
         "function": {
-            "name": name,
+            "name": api_name,
             "arguments": arguments.to_string(),
         }
     }))
 }
 
-fn openai_tool_definition(tool: &ModelToolDefinition) -> Value {
-    json!({
+fn openai_tool_definition(tool: &ModelToolDefinition, strict_tools: bool) -> Value {
+    let name = openai_tool_name(&tool.name);
+    let mut definition = json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": name,
             "parameters": tool
                 .input_json_schema
                 .as_ref()
                 .unwrap_or(&tool.input_schema),
         }
-    })
+    });
+    if strict_tools {
+        definition["function"]["strict"] = Value::Bool(true);
+    }
+    definition
+}
+
+fn openai_tool_name_map(request: &ModelRequest) -> HashMap<String, String> {
+    request
+        .tools
+        .iter()
+        .chain(request.deferred_tools.iter())
+        .map(|tool| (openai_api_tool_name(&tool.name), tool.name.clone()))
+        .collect()
+}
+
+fn openai_tool_name(runtime_name: &str) -> String {
+    openai_api_tool_name(runtime_name)
+}
+
+fn openai_api_tool_name(runtime_name: &str) -> String {
+    runtime_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn message_text(message: &Value) -> String {
@@ -486,12 +855,28 @@ fn value_to_content_string(value: &Value) -> String {
 
 impl From<ModelGatewayToolCall> for ToolCall {
     fn from(call: ModelGatewayToolCall) -> Self {
-        Self {
-            id: call.id,
-            name: call.name,
-            input: call.input,
-        }
+        Self::new(call.id, call.name, call.input)
     }
+}
+
+fn normalize_tool_input(mut input: Value) -> Value {
+    for _ in 0..3 {
+        if !input.as_object().is_some_and(|object| object.len() == 1) {
+            return input;
+        };
+        let Some(arguments) = input.get("arguments") else {
+            return input;
+        };
+        match arguments {
+            Value::String(arguments) => match serde_json::from_str::<Value>(arguments) {
+                Ok(parsed) => input = parsed,
+                Err(_) => return input,
+            },
+            Value::Object(_) => input = arguments.clone(),
+            _ => return input,
+        };
+    }
+    input
 }
 
 impl From<ModelGatewayTurnResponse> for ModelResponse {

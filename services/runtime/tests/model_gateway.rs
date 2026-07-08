@@ -7,7 +7,7 @@ use anydesign_runtime::{
     tools::registry::ToolLoadingPolicy,
     types::AgentPhase,
 };
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::{net::TcpListener, sync::Mutex};
@@ -108,6 +108,14 @@ async fn openai_compatible_client_posts_chat_completion_and_maps_tool_calls() {
             system_prompt: "You are a runtime agent.".to_string(),
             messages: vec![
                 json!({
+                    "role": "tool",
+                    "turn": 1,
+                    "toolUseId": "orphan-call",
+                    "toolName": "fs.list",
+                    "isError": false,
+                    "content": { "entries": [] }
+                }),
+                json!({
                     "role": "assistant",
                     "turn": 1,
                     "toolCalls": [
@@ -151,12 +159,14 @@ async fn openai_compatible_client_posts_chat_completion_and_maps_tool_calls() {
     assert_eq!(request["messages"][1]["role"], "assistant");
     assert_eq!(
         request["messages"][1]["tool_calls"][0]["function"]["name"],
-        "content.list_sources"
+        "content_list_sources"
     );
     assert_eq!(request["messages"][2]["role"], "tool");
     assert_eq!(request["messages"][2]["tool_call_id"], "call-prev");
+    assert_eq!(request["messages"].as_array().unwrap().len(), 3);
     assert_eq!(request["tools"][0]["type"], "function");
-    assert_eq!(request["tools"][0]["function"]["name"], "run.complete");
+    assert_eq!(request["tools"][0]["function"]["name"], "run_complete");
+    assert!(request["tools"][0]["function"].get("strict").is_none());
     assert_eq!(
         response,
         ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
@@ -165,6 +175,159 @@ async fn openai_compatible_client_posts_chat_completion_and_maps_tool_calls() {
             json!({ "status": "completed", "summary": "done" }),
         )])
     );
+}
+
+#[tokio::test]
+async fn openai_compatible_client_can_enable_strict_tool_definitions() {
+    let captured_request = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(capture_chat_completion))
+        .with_state(captured_request.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None)
+        .with_strict_tools(true);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 1,
+            model: "deepseek-v4-pro".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "Use strict tool calling.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "run.complete".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "status": { "type": "string" },
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["status", "summary"]
+                }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    let request = captured_request.lock().await.clone().unwrap();
+    assert_eq!(request["tools"][0]["function"]["name"], "run_complete");
+    assert_eq!(request["tools"][0]["function"]["strict"], true);
+    assert_eq!(
+        request["tools"][0]["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        response,
+        ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
+            "call-1",
+            "run.complete",
+            json!({ "status": "completed", "summary": "done" }),
+        )])
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_client_streams_tool_call_argument_deltas() {
+    let captured_request = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(capture_streaming_chat_completion),
+        )
+        .with_state(captured_request.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None)
+        .with_streaming(true);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 2,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "You are a runtime agent.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "fs.write".to_string(),
+                input_schema: json!({ "type": "object" }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    let request = captured_request.lock().await.clone().unwrap();
+    assert_eq!(request["stream"], true);
+    assert_eq!(
+        response,
+        ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
+            "call-stream",
+            "fs.write",
+            json!({ "path": "project/src/pages/index.astro", "text": "ok" }),
+        )])
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_streaming_reports_tool_arguments_over_budget() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(capture_streaming_oversized_tool_arguments),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None)
+        .with_streaming(true);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 2,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "You are a runtime agent.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "fs.write".to_string(),
+                input_schema: json!({ "type": "object" }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    match response {
+        ModelResponse::ToolInputTooLarge {
+            parsed_calls,
+            failures,
+        } => {
+            assert!(parsed_calls.is_empty());
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].tool_call_id, "call-large");
+            assert_eq!(failures[0].tool_name, "fs.write");
+            assert!(failures[0].input_chars > 96_000);
+            assert_eq!(failures[0].max_input_chars, 96_000);
+            assert_eq!(failures[0].raw_sha256.len(), 64);
+        }
+        other => panic!("expected ToolInputTooLarge, got {other:?}"),
+    }
 }
 
 #[test]
@@ -278,8 +441,195 @@ async fn capture_chat_completion(
                             "id": "call-1",
                             "type": "function",
                             "function": {
-                                "name": "run.complete",
+                                "name": "run_complete",
                                 "arguments": "{\"status\":\"completed\",\"summary\":\"done\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ]
+    }))
+}
+
+async fn capture_streaming_chat_completion(
+    State(captured_request): State<Arc<Mutex<Option<Value>>>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    *captured_request.lock().await = Some(body);
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-stream\",\"type\":\"function\",\"function\":{\"name\":\"fs_write\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"project/src/pages/index.astro\\\",\\\"text\\\":\\\"ok\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    ([("content-type", "text/event-stream")], stream)
+}
+
+async fn capture_streaming_oversized_tool_arguments(Json(_body): Json<Value>) -> impl IntoResponse {
+    let oversized = "x".repeat(96_001);
+    let event = json!({
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-large",
+                            "type": "function",
+                            "function": {
+                                "name": "fs_write",
+                                "arguments": oversized
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    });
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {event}\n\ndata: [DONE]\n\n"),
+    )
+}
+
+#[tokio::test]
+async fn openai_compatible_client_unwraps_object_arguments_wrapper() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(capture_wrapped_object_arguments_completion),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 2,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "You are a runtime agent.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "fs.write".to_string(),
+                input_schema: json!({ "type": "object" }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
+            "call-1",
+            "fs.write",
+            json!({ "path": "project/src/pages/index.astro", "text": "ok" }),
+        )])
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_client_reports_invalid_tool_arguments_without_wrapping_raw_text() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(capture_invalid_tool_arguments_completion),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 2,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "You are a runtime agent.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "fs.write".to_string(),
+                input_schema: json!({ "type": "object" }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    match response {
+        ModelResponse::ToolInputParseFailed {
+            parsed_calls,
+            failures,
+        } => {
+            assert!(parsed_calls.is_empty());
+            assert_eq!(failures.len(), 1);
+            let failure = &failures[0];
+            assert_eq!(failure.tool_call_id, "call-bad");
+            assert_eq!(failure.tool_name, "fs.write");
+            assert!(failure.raw_len > 0);
+            assert_eq!(failure.raw_sha256.len(), 64);
+            assert!(!failure.ends_with_json_close);
+            assert!(failure.bracket_balance > 0);
+            assert!(!failure.quote_closed);
+            assert!(failure.likely_truncated);
+        }
+        other => panic!("expected ToolInputParseFailed, got {other:?}"),
+    }
+}
+
+async fn capture_wrapped_object_arguments_completion(Json(_body): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "fs_write",
+                                "arguments": "{\"arguments\":{\"path\":\"project/src/pages/index.astro\",\"text\":\"ok\"}}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ]
+    }))
+}
+
+async fn capture_invalid_tool_arguments_completion(Json(_body): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-bad",
+                            "type": "function",
+                            "function": {
+                                "name": "fs_write",
+                                "arguments": "{\"path\":\"project/src/pages/index.astro\",\"text\":\"<html>"
                             }
                         }
                     ]
