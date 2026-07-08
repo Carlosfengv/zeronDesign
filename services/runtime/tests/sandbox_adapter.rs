@@ -2,9 +2,10 @@ use anydesign_runtime::{
     conversation::RuntimeStore,
     sandbox_adapter::{
         find_sandbox_channel_service, parse_claim_phase, parse_claim_phase_from_json,
-        sandbox_channel_endpoint, sandbox_claim_name, warm_pool_name, workspace_pvc_name,
-        CommandOutput, CommandRunner, KubectlSandboxClient, SandboxAdapter, SandboxAdapterConfig,
-        SandboxClaimManifest, SandboxClaimPhase, SandboxKubeClient, SANDBOX_CLAIM_API_VERSION,
+        sandbox_channel_endpoint, sandbox_channel_endpoint_with_overrides, sandbox_claim_name,
+        warm_pool_name, workspace_pvc_name, CommandOutput, CommandRunner, KubectlSandboxClient,
+        SandboxAdapter, SandboxAdapterConfig, SandboxClaimManifest, SandboxClaimPhase,
+        SandboxKubeClient, SANDBOX_CLAIM_API_VERSION,
     },
     types::{SandboxBindingStatus, SandboxChannelProtocol},
 };
@@ -226,6 +227,20 @@ fn sandbox_channel_endpoint_uses_selected_protocol_and_internal_dns() {
             SandboxChannelProtocol::Grpc
         ),
         "grpc://project-demo-sandbox.anydesign-sandboxes.svc.cluster.local:3001/workspace"
+    );
+}
+
+#[test]
+fn sandbox_channel_endpoint_can_target_local_port_forward_for_desktop_runtime() {
+    assert_eq!(
+        sandbox_channel_endpoint_with_overrides(
+            "project-demo-sandbox",
+            "anydesign-sandboxes",
+            SandboxChannelProtocol::Websocket,
+            Some("127.0.0.1".to_string()),
+            Some(39001),
+        ),
+        "ws://127.0.0.1:39001/workspace"
     );
 }
 

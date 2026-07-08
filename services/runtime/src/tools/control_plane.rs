@@ -46,7 +46,9 @@ pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor
             control_plane_executor_with_sandbox_backend(sandbox_backend_for_config(config))
         }
     };
-    executor.with_workspace_root(&config.workspace_root)
+    executor
+        .with_policy_profile_and_registry(config.policy_profile, config.npm_registry.clone())
+        .with_workspace_root(&config.workspace_root)
 }
 
 pub fn control_plane_executor_with_sandbox_backend(
@@ -411,7 +413,11 @@ impl Tool for BriefWriteDraftTool {
                 "contentHierarchy": { "type": "array", "items": { "type": "string" } },
                 "pageStructure": { "type": "array" },
                 "visualDirection": string_schema("Visual direction"),
-                "recommendedTemplate": string_schema("Template key"),
+                "recommendedTemplate": {
+                    "type": "string",
+                    "enum": ["astro-website", "fumadocs-docs"],
+                    "description": "Template key. Use astro-website for website projects and fumadocs-docs for docs projects."
+                },
                 "assumptions": { "type": "array", "items": { "type": "string" } },
                 "missingInformation": { "type": "array", "items": { "type": "string" } }
             }),
@@ -440,6 +446,7 @@ impl Tool for BriefWriteDraftTool {
         input: Value,
         _ctx: &ToolContext,
     ) -> Result<Value, ValidationError> {
+        let input = brief::normalize_draft_input(input);
         let brief: Brief = serde_json::from_value(input.clone()).map_err(|error| {
             ValidationError::new(format!(
                 "brief.write_draft received invalid brief JSON: {error}"

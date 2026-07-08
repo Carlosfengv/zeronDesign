@@ -553,8 +553,39 @@ fn command_policy_denies_shell_wrappers_and_install_bypass() {
         check_command_policy(&["kubectl".to_string(), "get".to_string(), "pods".to_string()]),
         PermissionResult::Deny { .. }
     ));
+    match check_command_policy(&["pnpm".to_string(), "install".to_string()]) {
+        PermissionResult::Deny { message, .. } => {
+            assert!(message.contains("package.install"));
+            assert!(message.contains("mode"));
+        }
+        other => panic!("expected pnpm install deny, got {other:?}"),
+    }
+    match check_command_policy(&["yarn".to_string(), "add".to_string(), "astro".to_string()]) {
+        PermissionResult::Deny { message, .. } => {
+            assert!(message.contains("package.install"));
+        }
+        other => panic!("expected yarn add deny, got {other:?}"),
+    }
+    match check_command_policy(&["bun".to_string(), "install".to_string()]) {
+        PermissionResult::Deny { message, .. } => {
+            assert!(message.contains("package.install"));
+        }
+        other => panic!("expected bun install deny, got {other:?}"),
+    }
     assert!(matches!(
-        check_command_policy(&["pnpm".to_string(), "install".to_string()]),
+        check_command_policy(&[
+            "npm".to_string(),
+            "create".to_string(),
+            "astro@latest".to_string()
+        ]),
+        PermissionResult::Deny { .. }
+    ));
+    assert!(matches!(
+        check_command_policy(&["npx".to_string(), "serve".to_string(), "dist".to_string()]),
+        PermissionResult::Deny { .. }
+    ));
+    assert!(matches!(
+        check_command_policy(&["npm".to_string(), "run".to_string(), "preview".to_string()]),
         PermissionResult::Deny { .. }
     ));
     assert!(matches!(
@@ -579,6 +610,16 @@ fn path_policy_blocks_external_and_secret_paths() {
 
     let created = check_create_path(&workspace.join("project").join("new.md"), &workspace);
     assert!(created.is_ok());
+    let nested = check_create_path(
+        &workspace.join("inputs").join("generated").join("brief.md"),
+        &workspace,
+    );
+    assert!(nested.is_ok());
+    let traversal = check_create_path(
+        &workspace.join("project").join("..").join("x.md"),
+        &workspace,
+    );
+    assert!(traversal.is_err());
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

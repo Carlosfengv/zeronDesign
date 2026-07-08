@@ -302,6 +302,15 @@ pub enum AgentEvent {
         metadata: Option<Value>,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "tool.output", rename_all = "camelCase")]
+    ToolOutput {
+        run_id: String,
+        tool: String,
+        tool_use_id: String,
+        stream: String,
+        text: String,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "tool.failed", rename_all = "camelCase")]
     ToolFailed {
         run_id: String,
@@ -309,6 +318,51 @@ pub enum AgentEvent {
         error: String,
         tool_use_id: String,
         recoverable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "tool.recovery_suggested", rename_all = "camelCase")]
+    ToolRecoverySuggested {
+        run_id: String,
+        tool: String,
+        error_kind: String,
+        fingerprint: String,
+        attempt: u32,
+        guidance: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "chunk.received", rename_all = "camelCase")]
+    ChunkReceived {
+        run_id: String,
+        path: String,
+        session_id: String,
+        index: u64,
+        total: u64,
+        bytes: usize,
+        chars: usize,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "chunk.committed", rename_all = "camelCase")]
+    ChunkCommitted {
+        run_id: String,
+        path: String,
+        session_id: String,
+        total: u64,
+        bytes: usize,
+        chars: usize,
+        sha256: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "metric.recorded", rename_all = "camelCase")]
+    MetricRecorded {
+        run_id: String,
+        name: String,
+        value: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
         timestamp: DateTime<Utc>,
     },
     #[serde(rename = "permission.requested", rename_all = "camelCase")]
@@ -378,7 +432,12 @@ impl AgentEvent {
             | Self::AgentMessage { run_id, .. }
             | Self::ToolStarted { run_id, .. }
             | Self::ToolCompleted { run_id, .. }
+            | Self::ToolOutput { run_id, .. }
             | Self::ToolFailed { run_id, .. }
+            | Self::ToolRecoverySuggested { run_id, .. }
+            | Self::ChunkReceived { run_id, .. }
+            | Self::ChunkCommitted { run_id, .. }
+            | Self::MetricRecorded { run_id, .. }
             | Self::PermissionRequested { run_id, .. }
             | Self::PermissionDenied { run_id, .. }
             | Self::StateChanged { run_id, .. }

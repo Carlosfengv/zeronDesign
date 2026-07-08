@@ -93,6 +93,58 @@ async fn prompt_and_markdown_produce_structured_brief_draft_and_wait_for_confirm
 }
 
 #[tokio::test]
+async fn brief_write_draft_normalizes_common_model_field_aliases() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![ContentSource::readable(
+                "source-1",
+                "prompt",
+                "Make a website",
+            )],
+        )
+        .await;
+    let model = MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
+        ToolCall::new(
+            "tool-1",
+            "brief.write_draft",
+            json!({
+                "project_type": "Website",
+                "audience": "enterprise designers",
+                "content_hierarchy": ["hero", "features"],
+                "page_structure": [
+                    {
+                        "title": "Home",
+                        "purpose": "Explain the product",
+                        "keyContent": ["hero", "proof"]
+                    }
+                ],
+                "visual_direction": "polished product launch",
+                "template": "website",
+                "assumptions": [],
+                "missing_information": []
+            }),
+        ),
+        ToolCall::new("tool-2", "brief.request_confirmation", json!({})),
+    ])]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model.clone()));
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    model.assert_all_consumed().await;
+    let paused = store.get_run(&run.id).await.unwrap();
+    let brief_id = paused.brief_version.expect("brief should be stored");
+    let brief: Brief = store.get_brief(&brief_id).await.unwrap();
+    assert_eq!(brief.project_type, "website");
+    assert_eq!(brief.recommended_template, "astro-website");
+    assert_eq!(brief.visual_direction, "polished product launch");
+}
+
+#[tokio::test]
 async fn empty_input_pauses_with_needs_user_input() {
     let store = RuntimeStore::new();
     let run = store

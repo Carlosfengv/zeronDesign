@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{collections::HashMap, process::Stdio, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, process::Stdio, sync::Arc, time::Duration};
 use tokio::time::{self, Instant};
 use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -726,12 +726,32 @@ pub fn sandbox_channel_endpoint(
     namespace: &str,
     protocol: SandboxChannelProtocol,
 ) -> String {
-    let host = format!("{service_name}.{namespace}.svc.cluster.local");
+    sandbox_channel_endpoint_with_overrides(
+        service_name,
+        namespace,
+        protocol,
+        env::var("SANDBOX_CHANNEL_HOST_OVERRIDE")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        env::var("SANDBOX_CHANNEL_PORT_OVERRIDE")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok()),
+    )
+}
+
+pub fn sandbox_channel_endpoint_with_overrides(
+    service_name: &str,
+    namespace: &str,
+    protocol: SandboxChannelProtocol,
+    host_override: Option<String>,
+    port_override: Option<u16>,
+) -> String {
+    let host =
+        host_override.unwrap_or_else(|| format!("{service_name}.{namespace}.svc.cluster.local"));
+    let port = port_override.unwrap_or(WORKSPACE_CHANNEL_PORT);
     match protocol {
-        SandboxChannelProtocol::Websocket => {
-            format!("ws://{host}:{WORKSPACE_CHANNEL_PORT}/workspace")
-        }
-        SandboxChannelProtocol::Grpc => format!("grpc://{host}:{WORKSPACE_CHANNEL_PORT}/workspace"),
+        SandboxChannelProtocol::Websocket => format!("ws://{host}:{port}/workspace"),
+        SandboxChannelProtocol::Grpc => format!("grpc://{host}:{port}/workspace"),
     }
 }
 

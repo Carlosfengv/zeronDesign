@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use crate::tools::runtime::{Tool, ToolContext};
@@ -461,17 +461,46 @@ pub fn check_command_policy(argv: &[String]) -> PermissionResult {
         }
     }
 
+    if is_interactive_project_scaffold(argv) {
+        return PermissionResult::Deny {
+            message: "Use project.init/package.install/fs.* instead of interactive framework scaffold commands".to_string(),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "interactive scaffold commands must use project tools".to_string(),
+            },
+        };
+    }
+
+    if is_preview_server_command(argv) {
+        return PermissionResult::Deny {
+            message:
+                "Use preview.start instead of launching long-running preview servers with shell.run"
+                    .to_string(),
+            reason: PermissionReason::Rule {
+                source: RuleSource::Runtime,
+                rule_content: "preview servers must be managed by preview.start".to_string(),
+            },
+        };
+    }
+
     match (cmd, argv.get(1).map(String::as_str)) {
-        ("pnpm", Some("install" | "add")) | ("npm", Some("install")) => PermissionResult::Deny {
-            message: "Use package.install for dependency installation".to_string(),
+        ("pnpm", Some("install" | "add"))
+        | ("npm", Some("install"))
+        | ("yarn", Some("install" | "add"))
+        | ("bun", Some("install" | "add")) => PermissionResult::Deny {
+            message: "Dependency installation must use package.install. Use package.install({ \"mode\": \"restore\", \"packageManager\": \"pnpm\" }) for package.json installs or package.install({ \"mode\": \"add\", \"packages\": [\"...\"], \"packageManager\": \"pnpm\" }) for new dependencies.".to_string(),
             reason: PermissionReason::Rule {
                 source: RuleSource::Runtime,
                 rule_content: "dependency installation must use package.install".to_string(),
             },
         },
         ("pnpm", Some("build" | "dev" | "lint" | "test" | "run"))
+        | ("npm", Some("create" | "exec"))
         | ("npm", Some("run"))
+        | ("npx", _)
         | ("node", _)
+        | ("mkdir", _)
+        | ("which", _)
         | ("ls", _)
         | ("pwd", _)
         | ("find", _)
@@ -484,7 +513,7 @@ pub fn check_command_policy(argv: &[String]) -> PermissionResult {
                 rule_content: "command allowlist".to_string(),
             },
         },
-        ("npx", _) | ("git", _) => PermissionResult::Ask {
+        ("git", _) => PermissionResult::Ask {
             message: format!("{cmd} requires platform policy approval"),
             reason: PermissionReason::Rule {
                 source: RuleSource::Runtime,
@@ -500,6 +529,46 @@ pub fn check_command_policy(argv: &[String]) -> PermissionResult {
             },
         },
     }
+}
+
+fn is_preview_server_command(argv: &[String]) -> bool {
+    let cmd = argv.first().map(String::as_str).unwrap_or("");
+    match (cmd, argv.get(1).map(String::as_str)) {
+        ("npx", _) => argv
+            .iter()
+            .skip(1)
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+        ("npm" | "pnpm" | "yarn", Some("run")) => argv
+            .get(2)
+            .is_some_and(|script| matches!(script.as_str(), "preview" | "dev" | "start")),
+        ("npm", Some("exec")) => argv
+            .iter()
+            .skip(2)
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+        ("pnpm" | "yarn", Some("preview" | "dev" | "start")) => true,
+        ("astro", Some("preview" | "dev")) | ("vite", Some("--host" | "--port")) => true,
+        ("serve", _) => true,
+        _ => false,
+    }
+}
+
+fn is_interactive_project_scaffold(argv: &[String]) -> bool {
+    let cmd = argv.first().map(String::as_str).unwrap_or("");
+    if cmd == "npm" && argv.get(1).map(String::as_str) == Some("create") {
+        return true;
+    }
+    if cmd == "npx" && argv.iter().any(|arg| arg == "astro") && argv.iter().any(|arg| arg == "add")
+    {
+        return true;
+    }
+    if cmd == "npm"
+        && argv.get(1).map(String::as_str) == Some("exec")
+        && argv.iter().any(|arg| arg == "astro")
+        && argv.iter().any(|arg| arg == "add")
+    {
+        return true;
+    }
+    false
 }
 
 fn is_deny_pattern(arg: &str) -> bool {
@@ -530,22 +599,46 @@ pub fn check_existing_path(path: &Path, workspace_root: &Path) -> Result<PathBuf
     Ok(real)
 }
 
-pub fn check_create_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| PermissionError::CannotResolve(path.to_owned()))?;
-    let real_parent = std::fs::canonicalize(parent)
-        .map_err(|_| PermissionError::CannotResolve(parent.to_owned()))?;
-    ensure_workspace_path(&real_parent, workspace_root)?;
+pub fn check_workspace_path(
+    path: &Path,
+    workspace_root: &Path,
+) -> Result<PathBuf, PermissionError> {
+    if path.exists() {
+        check_existing_path(path, workspace_root)
+    } else {
+        check_create_path(path, workspace_root)
+    }
+}
 
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| PermissionError::CannotResolve(path.to_owned()))?;
-    if file_name == "." || file_name == ".." {
+pub fn check_create_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err(PermissionError::InvalidPathComponent(path.to_owned()));
     }
 
-    let normalized = real_parent.join(file_name);
+    let mut existing_ancestor = path;
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or_else(|| PermissionError::CannotResolve(path.to_owned()))?;
+    }
+    let real_ancestor = std::fs::canonicalize(existing_ancestor)
+        .map_err(|_| PermissionError::CannotResolve(existing_ancestor.to_owned()))?;
+    ensure_workspace_path(&real_ancestor, workspace_root)?;
+
+    let missing_suffix = path
+        .strip_prefix(existing_ancestor)
+        .map_err(|_| PermissionError::CannotResolve(path.to_owned()))?;
+    if missing_suffix
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(PermissionError::InvalidPathComponent(path.to_owned()));
+    }
+
+    let normalized = real_ancestor.join(missing_suffix);
     ensure_workspace_path(&normalized, workspace_root)?;
     ensure_not_secret_path(&normalized)?;
     Ok(normalized)

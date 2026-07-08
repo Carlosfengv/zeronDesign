@@ -1,4 +1,5 @@
 use crate::{
+    config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::ModelToolDefinition,
     permission::{PermissionEngine, PermissionResult, PermissionRules},
@@ -36,13 +37,30 @@ pub enum SearchReadKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     pub message: String,
+    pub error_kind: Option<String>,
+    pub metadata: Option<Value>,
 }
 
 impl ValidationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            error_kind: None,
+            metadata: None,
         }
+    }
+
+    pub fn with_kind(message: impl Into<String>, error_kind: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error_kind: Some(error_kind.into()),
+            metadata: None,
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 }
 
@@ -96,6 +114,31 @@ impl ToolResult {
             metadata: Some(json!({ "recoverable": recoverable })),
         }
     }
+
+    pub fn typed_error(
+        message: impl Into<String>,
+        error_kind: impl Into<String>,
+        recoverable: bool,
+        metadata: Value,
+    ) -> Self {
+        let mut metadata = metadata;
+        let error_kind = error_kind.into();
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("recoverable".to_string(), Value::Bool(recoverable));
+            object.insert("errorKind".to_string(), Value::String(error_kind.clone()));
+        } else {
+            metadata = json!({
+                "recoverable": recoverable,
+                "errorKind": error_kind,
+                "details": metadata,
+            });
+        }
+        Self {
+            content: json!({ "error": message.into() }),
+            is_error: true,
+            metadata: Some(metadata),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +148,8 @@ pub struct ToolContext {
     pub project_id: String,
     pub should_avoid_permission_prompts: bool,
     pub workspace_root: PathBuf,
+    pub policy_profile: RuntimePolicyProfile,
+    pub npm_registry: String,
 }
 
 impl ToolContext {
@@ -117,6 +162,8 @@ impl ToolContext {
             run,
             should_avoid_permission_prompts,
             workspace_root,
+            policy_profile: RuntimePolicyProfile::Production,
+            npm_registry: "https://registry.internal.example/npm/".to_string(),
         }
     }
 }
@@ -148,6 +195,32 @@ impl ProgressSink {
                 tool: "progress".to_string(),
                 summary: summary.into(),
                 tool_use_id: self.tool_use_id.clone(),
+                timestamp: Utc::now(),
+            })
+            .await;
+    }
+
+    pub fn tool_use_id(&self) -> &str {
+        &self.tool_use_id
+    }
+
+    pub async fn emit_tool_output(
+        &self,
+        tool: impl Into<String>,
+        stream: impl Into<String>,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        if text.is_empty() {
+            return;
+        }
+        self.store
+            .append_event(AgentEvent::ToolOutput {
+                run_id: self.run_id.clone(),
+                tool: tool.into(),
+                tool_use_id: self.tool_use_id.clone(),
+                stream: stream.into(),
+                text,
                 timestamp: Utc::now(),
             })
             .await;
@@ -237,6 +310,8 @@ pub struct ToolExecutor {
     tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
     permission_engine: PermissionEngine,
     workspace_root: Arc<PathBuf>,
+    policy_profile: RuntimePolicyProfile,
+    npm_registry: Arc<String>,
 }
 
 impl ToolExecutor {
@@ -260,6 +335,22 @@ impl ToolExecutor {
             tools: Arc::new(map),
             permission_engine: PermissionEngine::new(permission_rules),
             workspace_root: Arc::new(normalize_workspace_root(workspace_root.into())),
+            policy_profile: RuntimePolicyProfile::Production,
+            npm_registry: Arc::new("https://registry.internal.example/npm/".to_string()),
+        }
+    }
+
+    pub fn with_policy_profile_and_registry(
+        &self,
+        policy_profile: RuntimePolicyProfile,
+        npm_registry: impl Into<String>,
+    ) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            permission_engine: self.permission_engine.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy_profile,
+            npm_registry: Arc::new(npm_registry.into()),
         }
     }
 
@@ -270,6 +361,8 @@ impl ToolExecutor {
             workspace_root: Arc::new(normalize_workspace_root(
                 workspace_root.as_ref().to_path_buf(),
             )),
+            policy_profile: self.policy_profile,
+            npm_registry: self.npm_registry.clone(),
         }
     }
 
@@ -305,7 +398,7 @@ impl ToolExecutor {
         let Some(run) = store.get_run(run_id).await else {
             return (Vec::new(), Vec::new());
         };
-        let ctx = ToolContext::new(store, run, (*self.workspace_root).clone());
+        let ctx = self.tool_context(store, run);
         let mut unique_tools = BTreeMap::new();
         for tool in self.tools.values() {
             unique_tools.insert(tool.name(), tool.clone());
@@ -345,12 +438,13 @@ impl ToolExecutor {
         tool_name: &str,
         input: Value,
     ) -> ToolExecution {
+        let input = normalize_tool_input(input);
         let Some(run) = store.get_run(run_id).await else {
             return ToolExecution {
                 result: ToolResult::error(format!("run not found: {run_id}")),
             };
         };
-        let ctx = ToolContext::new(store.clone(), run, (*self.workspace_root).clone());
+        let ctx = self.tool_context(store.clone(), run);
         let Some(tool) = self.get(tool_name) else {
             store
                 .append_audit_record(
@@ -371,6 +465,10 @@ impl ToolExecutor {
         let validated_input = match tool.validate_input(input, &ctx).await {
             Ok(input) => input,
             Err(error) => {
+                let error_kind = error
+                    .error_kind
+                    .clone()
+                    .unwrap_or_else(|| "tool.input_schema_invalid".to_string());
                 store
                     .append_audit_record(
                         &ctx.project_id,
@@ -378,11 +476,15 @@ impl ToolExecutor {
                         tool.name(),
                         summarize_input(&original_input),
                         "deny",
-                        format!("input validation failed: {}", error.message),
+                        format!("input validation failed ({error_kind}): {}", error.message),
                     )
                     .await;
+                let mut metadata = error.metadata.unwrap_or_else(|| json!({}));
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert("tool".to_string(), Value::String(tool.name().to_string()));
+                }
                 return ToolExecution {
-                    result: ToolResult::error(error.message),
+                    result: ToolResult::typed_error(error.message, error_kind, true, metadata),
                 };
             }
         };
@@ -444,10 +546,10 @@ impl ToolExecutor {
                         ),
                     },
                     Err(ToolError::Recoverable(message)) => ToolExecution {
-                        result: ToolResult::error(message),
+                        result: ToolResult::error_with_recoverable(message, true),
                     },
                     Err(ToolError::PermissionDenied(message)) => ToolExecution {
-                        result: ToolResult::error(message),
+                        result: ToolResult::error_with_recoverable(message, false),
                     },
                     Err(ToolError::Terminal(message)) => {
                         ctx.store
@@ -552,6 +654,13 @@ impl ToolExecutor {
         }
     }
 
+    fn tool_context(&self, store: RuntimeStore, run: AgentRun) -> ToolContext {
+        let mut ctx = ToolContext::new(store, run, (*self.workspace_root).clone());
+        ctx.policy_profile = self.policy_profile;
+        ctx.npm_registry = (*self.npm_registry).clone();
+        ctx
+    }
+
     async fn audit_decision(
         &self,
         store: &RuntimeStore,
@@ -575,6 +684,26 @@ impl ToolExecutor {
             )
             .await;
     }
+}
+
+fn normalize_tool_input(mut input: Value) -> Value {
+    for _ in 0..3 {
+        if !input.as_object().is_some_and(|object| object.len() == 1) {
+            return input;
+        };
+        let Some(arguments) = input.get("arguments") else {
+            return input;
+        };
+        match arguments {
+            Value::String(arguments) => match serde_json::from_str::<Value>(arguments) {
+                Ok(parsed) => input = parsed,
+                Err(_) => return input,
+            },
+            Value::Object(_) => input = arguments.clone(),
+            _ => return input,
+        };
+    }
+    input
 }
 
 fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {

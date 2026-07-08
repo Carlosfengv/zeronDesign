@@ -254,7 +254,7 @@ async fn shell_and_package_policies_are_enforced_on_real_sandbox_tools() {
     assert!(public_package.result.is_error);
     assert_eq!(
         store.get_run(&run_id).await.unwrap().status,
-        AgentRunStatus::NeedsUserInput
+        AgentRunStatus::Queued
     );
 
     let audits = store.audit_records().await;
@@ -262,7 +262,7 @@ async fn shell_and_package_policies_are_enforced_on_real_sandbox_tools() {
     assert_eq!(audits[0].decision, "deny");
     assert_eq!(audits[1].decision, "deny");
     assert_eq!(audits[2].decision, "allow");
-    assert_eq!(audits[3].decision, "ask");
+    assert_eq!(audits[3].decision, "deny");
     assert!(audits[0].input_summary.contains("argv=[sh -c pnpm build]"));
     assert!(audits[3].input_summary.contains("registry.npmjs.org"));
 }
@@ -439,6 +439,18 @@ fn setup_workspace() -> PathBuf {
     fs::create_dir_all(workspace.join("outputs/screenshots")).unwrap();
     fs::write(workspace.join("project").join("index.md"), "hello").unwrap();
     fs::write(workspace.join("outputs/build/build.log"), "Build ok").unwrap();
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "status": "success",
+            "success": true,
+            "cwd": "/workspace/project",
+            "argv": ["npm", "run", "build"],
+            "logPath": "/workspace/outputs/build/build.log"
+        })
+        .to_string(),
+    )
+    .unwrap();
     fs::write(
         workspace.join("outputs/reports/typescript.json"),
         json!({ "ok": true, "diagnostics": [] }).to_string(),

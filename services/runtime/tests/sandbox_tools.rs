@@ -1,4 +1,5 @@
 use anydesign_runtime::{
+    config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::ToolCall,
     tools::{
@@ -14,7 +15,7 @@ use anydesign_runtime::{
         },
         streaming::{tool_result_error_text, StreamingToolExecutor},
     },
-    types::{AgentPhase, AgentRunStatus, SandboxChannelProtocol},
+    types::{AgentEvent, AgentPhase, AgentRunStatus, SandboxChannelProtocol},
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -24,7 +25,10 @@ use std::{
     net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::{
     io::AsyncWriteExt, net::TcpListener, process::Command, task::JoinHandle, time::Duration,
@@ -263,7 +267,7 @@ async fn fs_read_and_write_execute_through_workspace_backend() {
 
     let results = executor
         .execute_calls(
-            store,
+            store.clone(),
             &run_id,
             vec![
                 ToolCall::new(
@@ -289,6 +293,653 @@ async fn fs_read_and_write_execute_through_workspace_backend() {
     assert!(writes[0].0.ends_with("project/generated.md"));
     assert_eq!(writes[0].1, "written through backend");
     assert!(!workspace.join("project/generated.md").exists());
+}
+
+#[tokio::test]
+async fn fs_write_accepts_direct_payloads_at_budget_limit() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+    let text_at_limit = "x".repeat(48_000);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-direct-write-limit",
+                "fs.write",
+                json!({ "path": "project/direct-limit.md", "text": text_at_limit }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/direct-limit.md"))
+            .unwrap()
+            .len(),
+        48_000
+    );
+}
+
+#[tokio::test]
+async fn fs_write_rejects_direct_payloads_over_budget() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+    let oversized_text = "x".repeat(48_001);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-large-write",
+                "fs.write",
+                json!({ "path": "project/large.md", "text": oversized_text }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    let result = &results[0].result;
+    assert!(result.is_error);
+    assert_eq!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("errorKind"))
+            .and_then(Value::as_str),
+        Some("tool.input_too_large")
+    );
+    assert_eq!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("recoverable"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(!workspace.join("project/large.md").exists());
+}
+
+#[tokio::test]
+async fn fs_write_rejects_serialized_arguments_over_budget_even_when_text_chars_fit() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+    let escaped_heavy_text = "\"".repeat(47_999);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-large-serialized-write",
+                "fs.write",
+                json!({ "path": "project/escaped.md", "text": escaped_heavy_text }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    let result = &results[0].result;
+    assert!(result.is_error);
+    let metadata = result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some("tool.input_too_large")
+    );
+    assert_eq!(
+        metadata.get("path").and_then(Value::as_str),
+        Some("project/escaped.md")
+    );
+    assert!(
+        metadata
+            .get("serializedBytes")
+            .and_then(Value::as_u64)
+            .unwrap()
+            > 96_000
+    );
+    assert!(!workspace.join("project/escaped.md").exists());
+}
+
+#[tokio::test]
+async fn fs_write_chunk_and_commit_chunks_create_large_file() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-chunk-0",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/chunked.md",
+                        "sessionId": "chunked-test",
+                        "index": 0,
+                        "total": 2,
+                        "text": "alpha\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-chunk-1",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/chunked.md",
+                        "sessionId": "chunked-test",
+                        "index": 1,
+                        "total": 2,
+                        "text": "beta\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-commit",
+                    "fs.commit_chunks",
+                    json!({
+                        "path": "project/chunked.md",
+                        "sessionId": "chunked-test",
+                        "total": 2,
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|result| !result.result.is_error));
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/chunked.md")).unwrap(),
+        "alpha\nbeta\n"
+    );
+    let events = store.events(&run_id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ChunkReceived { .. }))
+            .count(),
+        2
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ChunkCommitted {
+            path,
+            session_id,
+            total: 2,
+            ..
+        } if path == "/workspace/project/chunked.md" && session_id == "chunked-test"
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::MetricRecorded { name, .. }
+                    if name == "tool_chunk_write_started"
+            ))
+            .count(),
+        2
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded {
+            name,
+            metadata: Some(metadata),
+            ..
+        } if name == "tool_chunk_write_committed"
+            && metadata.get("path").and_then(Value::as_str)
+                == Some("/workspace/project/chunked.md")
+            && metadata.get("sessionId").and_then(Value::as_str) == Some("chunked-test")
+    )));
+    let health = serde_json::from_str::<Value>(
+        &fs::read_to_string(workspace.join("state/run-health.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        health["chunkWrites"][0]["path"],
+        "/workspace/project/chunked.md"
+    );
+    assert_eq!(health["chunkWrites"][0]["total"], 2);
+    assert_eq!(health["chunkWrites"][0]["bytes"], "alpha\nbeta\n".len());
+    assert_eq!(health["chunkWrites"][0]["status"], "committed");
+    assert!(!workspace
+        .join("outputs/staged-writes/chunked-test")
+        .exists());
+}
+
+#[tokio::test]
+async fn fs_write_chunk_rejects_duplicate_chunk_index() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-chunk-0",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/chunked.md",
+                        "sessionId": "duplicate-test",
+                        "index": 0,
+                        "total": 1,
+                        "text": "alpha\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-chunk-0-again",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/chunked.md",
+                        "sessionId": "duplicate-test",
+                        "index": 0,
+                        "total": 1,
+                        "text": "alpha again\n",
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert!(results[1].result.is_error);
+    assert!(tool_result_error_text(&results[1].result).contains("duplicate chunk"));
+}
+
+#[tokio::test]
+async fn fs_commit_chunks_rejects_missing_chunk_without_writing_target() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-chunk-0",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/missing-chunk.md",
+                        "sessionId": "missing-chunk-test",
+                        "index": 0,
+                        "total": 2,
+                        "text": "alpha\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-commit-missing",
+                    "fs.commit_chunks",
+                    json!({
+                        "path": "project/missing-chunk.md",
+                        "sessionId": "missing-chunk-test",
+                        "total": 2,
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(results[1].result.is_error);
+    assert!(tool_result_error_text(&results[1].result).contains("missing chunk 1/2"));
+    assert!(!workspace.join("project/missing-chunk.md").exists());
+}
+
+#[tokio::test]
+async fn fs_commit_chunks_rejects_nested_package_root() {
+    let workspace = setup_workspace();
+    let session_dir = workspace.join("outputs/staged-writes/nested-package-test");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("chunk-00000.txt"),
+        "{\"type\":\"module\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        session_dir.join("manifest.json"),
+        json!({
+            "sessionId": "nested-package-test",
+            "runId": "run-1",
+            "path": "/workspace/project/src/package.json",
+            "total": 1,
+            "chunks": [0],
+            "createdAt": "2026-07-07T00:00:00Z",
+            "updatedAt": "2026-07-07T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-commit-nested-package",
+                "fs.commit_chunks",
+                json!({
+                    "path": "project/src/package.json",
+                    "sessionId": "nested-package-test",
+                    "total": 1,
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("nested package root denied"));
+    assert!(!workspace.join("project/src/package.json").exists());
+}
+
+#[tokio::test]
+async fn fs_commit_chunks_supports_create_and_append_modes() {
+    let workspace = setup_workspace();
+    fs::write(workspace.join("project/existing.md"), "base\n").unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let create_refused = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-create-chunk",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/existing.md",
+                        "sessionId": "create-refused",
+                        "index": 0,
+                        "total": 1,
+                        "text": "new\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-create-commit",
+                    "fs.commit_chunks",
+                    json!({
+                        "path": "project/existing.md",
+                        "sessionId": "create-refused",
+                        "total": 1,
+                        "mode": "create",
+                    }),
+                ),
+            ],
+        )
+        .await;
+    assert!(!create_refused[0].result.is_error);
+    assert!(create_refused[1].result.is_error);
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/existing.md")).unwrap(),
+        "base\n"
+    );
+
+    let appended = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-append-chunk",
+                    "fs.write_chunk",
+                    json!({
+                        "path": "project/existing.md",
+                        "sessionId": "append-ok",
+                        "index": 0,
+                        "total": 1,
+                        "text": "tail\n",
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-append-commit",
+                    "fs.commit_chunks",
+                    json!({
+                        "path": "project/existing.md",
+                        "sessionId": "append-ok",
+                        "total": 1,
+                        "mode": "append",
+                    }),
+                ),
+            ],
+        )
+        .await;
+    assert!(appended.iter().all(|result| !result.result.is_error));
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/existing.md")).unwrap(),
+        "base\ntail\n"
+    );
+    assert_eq!(appended[1].result.content["mode"], "append");
+}
+
+#[tokio::test]
+async fn fs_write_chunk_cleans_expired_staged_sessions() {
+    let workspace = setup_workspace();
+    let expired_dir = workspace.join("outputs/staged-writes/expired-session");
+    fs::create_dir_all(&expired_dir).unwrap();
+    fs::write(expired_dir.join("chunk-00000.txt"), "stale").unwrap();
+    fs::write(
+        expired_dir.join("manifest.json"),
+        json!({
+            "sessionId": "expired-session",
+            "runId": "old-run",
+            "path": "/workspace/project/stale.md",
+            "total": 1,
+            "chunks": [0],
+            "createdAt": "2000-01-01T00:00:00Z",
+            "updatedAt": "2000-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-chunk",
+                "fs.write_chunk",
+                json!({
+                    "path": "project/fresh.md",
+                    "sessionId": "fresh-session",
+                    "index": 0,
+                    "total": 1,
+                    "text": "fresh\n",
+                }),
+            )],
+        )
+        .await;
+
+    assert!(!results[0].result.is_error);
+    assert!(!expired_dir.exists());
+    assert!(workspace
+        .join("outputs/staged-writes/fresh-session/manifest.json")
+        .exists());
+}
+
+#[tokio::test]
+async fn fs_write_chunk_rejects_chunk_payloads_over_budget() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+    let oversized_text = "x".repeat(24_001);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-large-chunk",
+                "fs.write_chunk",
+                json!({
+                    "path": "project/chunked.md",
+                    "sessionId": "chunked-test",
+                    "index": 0,
+                    "total": 1,
+                    "text": oversized_text,
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    let result = &results[0].result;
+    assert!(result.is_error);
+    assert_eq!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("errorKind"))
+            .and_then(Value::as_str),
+        Some("tool.input_too_large")
+    );
+    assert!(!workspace
+        .join("outputs/staged-writes/chunked-test")
+        .exists());
+}
+
+#[tokio::test]
+async fn project_write_page_renders_structured_sections_to_astro_route() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-page",
+                "project.write_page",
+                json!({
+                    "route": "/pricing",
+                    "title": "Runtime Plans",
+                    "styleProfile": "saas",
+                    "sections": [
+                        {
+                            "kind": "hero",
+                            "heading": "Launch sites with controlled runtime tools",
+                            "body": "Plan, generate, build, and promote previews without oversized tool-call payloads.",
+                            "visual": "Build pipeline"
+                        },
+                        {
+                            "kind": "proof",
+                            "heading": "Observable by default",
+                            "body": "Streams show chunk progress and input recovery guidance.",
+                            "visual": "SSE events"
+                        }
+                    ]
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert_eq!(
+        results[0].result.content["path"],
+        "/workspace/project/src/pages/pricing.astro"
+    );
+    let page = fs::read_to_string(workspace.join("project/src/pages/pricing.astro")).unwrap();
+    assert!(page.contains("Runtime Plans"));
+    assert!(page.contains("Launch sites with controlled runtime tools"));
+    assert!(page.contains("Observable by default"));
+    assert!(page.contains("class=\"saas\""));
+}
+
+#[tokio::test]
+async fn project_write_page_root_route_overwrites_existing_index_page() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/src/pages")).unwrap();
+    fs::write(
+        workspace.join("project/src/pages/index.astro"),
+        "<main>old page</main>\n",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-page-root",
+                "project.write_page",
+                json!({
+                    "route": "/",
+                    "title": "Root Runtime Page",
+                    "styleProfile": "saas",
+                    "sections": [
+                        {
+                            "kind": "hero",
+                            "heading": "Root route is writable",
+                            "body": "project.write_page must overwrite src/pages/index.astro for /.",
+                            "visual": "Index page"
+                        }
+                    ]
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert_eq!(
+        results[0].result.content["path"],
+        "/workspace/project/src/pages/index.astro"
+    );
+    let page_path = workspace.join("project/src/pages/index.astro");
+    assert!(page_path.is_file());
+    let page = fs::read_to_string(page_path).unwrap();
+    assert!(page.contains("Root Runtime Page"));
+    assert!(!page.contains("old page"));
 }
 
 #[tokio::test]
@@ -350,7 +1001,7 @@ async fn package_install_can_execute_over_json_workspace_channel() {
             vec![ToolCall::new(
                 "tool-1",
                 "package.install",
-                json!({ "packages": ["@internal/ui"], "registry": "https://registry.internal.local" }),
+                json!({ "mode": "add", "packages": ["@internal/ui"], "registry": "https://registry.internal.local" }),
             )],
         )
         .await;
@@ -378,12 +1029,176 @@ async fn package_install_can_execute_over_json_workspace_channel() {
     }));
     assert!(requests.iter().any(|request| {
         request.op == "fs.write"
-            && request.path == "/workspace/outputs/build/package-install.log"
+            && request
+                .path
+                .starts_with("/workspace/outputs/build/package-install-tool-1")
             && request.payload["text"]
                 .as_str()
                 .unwrap()
                 .contains("$ npm install")
     }));
+    assert!(requests.iter().any(|request| {
+        request.op == "fs.write"
+            && request.path == "/workspace/outputs/build/package-install-latest.log"
+    }));
+}
+
+#[tokio::test]
+async fn package_install_restore_uses_pnpm_install_and_emits_tool_output() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "dependencies": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(workspace_backend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-restore",
+                "package.install",
+                json!({
+                    "mode": "restore",
+                    "packageManager": "pnpm",
+                    "registry": "https://registry.internal.local"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(results[0].result.content["mode"], "restore");
+    assert_eq!(results[0].result.content["packageManager"], "pnpm");
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.payload["argv"]
+                .as_array()
+                .is_some_and(|argv| argv[0] == "pnpm" && argv[1] == "install")
+    }));
+    let events = store.events(&run_id).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolOutput {
+            tool,
+            tool_use_id,
+            stream,
+            text,
+            ..
+        } if tool == "package.install"
+            && tool_use_id == "tool-restore"
+            && stream == "stdout"
+            && text.contains("ran:pnpm@/workspace/project")
+    )));
+}
+
+#[tokio::test]
+async fn package_install_prefers_project_state_package_manager_over_lockfile() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "dependencies": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("project/pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({ "appRoot": "project", "packageManager": "npm" }).to_string(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(workspace_backend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-state-manager",
+                "package.install",
+                json!({ "mode": "restore", "registry": "https://registry.internal.local" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(results[0].result.content["packageManager"], "npm");
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.payload["argv"]
+                .as_array()
+                .is_some_and(|argv| argv[0] == "npm" && argv[1] == "install")
+    }));
+}
+
+#[tokio::test]
+async fn package_install_rejects_invalid_mode_package_combinations() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-add-empty",
+                    "package.install",
+                    json!({ "mode": "add", "packages": [] }),
+                ),
+                ToolCall::new(
+                    "tool-restore-packages",
+                    "package.install",
+                    json!({ "mode": "restore", "packages": ["astro"] }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("mode=add"));
+    assert!(results[1].result.is_error);
+    assert!(tool_result_error_text(&results[1].result).contains("mode=restore"));
 }
 
 #[tokio::test]
@@ -780,7 +1595,7 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
         .join("project/node_modules/@internal/channel-package/package.json")
         .exists());
     assert!(
-        fs::read_to_string(workspace.join("outputs/build/package-install.log"))
+        fs::read_to_string(workspace.join("outputs/build/package-install-latest.log"))
             .unwrap()
             .contains("file:../local-package")
     );
@@ -795,6 +1610,7 @@ async fn workspace_channel_server_script_serves_state_and_diagnostics_tools() {
         "Build failed\nError: missing import",
     )
     .unwrap();
+    write_successful_build_state(&workspace);
     fs::write(
         workspace.join("outputs/reports/typescript.json"),
         json!({ "ok": false, "diagnostics": [{ "message": "Type mismatch" }] }).to_string(),
@@ -923,6 +1739,19 @@ async fn fs_patch_is_atomic_when_old_string_is_ambiguous() {
     let run_id = create_run(&store).await;
     let executor = sandbox_executor(&workspace);
 
+    let read = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-read",
+                "fs.read",
+                json!({ "path": "project/copy.md" }),
+            )],
+        )
+        .await;
+    assert!(!read[0].result.is_error);
+
     let results = executor
         .execute_calls(
             store,
@@ -937,6 +1766,32 @@ async fn fs_patch_is_atomic_when_old_string_is_ambiguous() {
 
     assert!(results[0].result.is_error);
     assert_eq!(fs::read_to_string(&file).unwrap(), "same\nsame\n");
+}
+
+#[tokio::test]
+async fn fs_patch_requires_read_before_patch() {
+    let workspace = setup_workspace();
+    let file = workspace.join("project").join("copy.md");
+    fs::write(&file, "hello\nworld\n").unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-1",
+                "fs.patch",
+                json!({ "path": "project/copy.md", "oldStr": "hello", "newStr": "hi" }),
+            )],
+        )
+        .await;
+
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("requires reading"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello\nworld\n");
 }
 
 #[tokio::test]
@@ -1027,7 +1882,7 @@ async fn shell_run_non_zero_exit_is_error_and_cancels_later_sibling_tools() {
 }
 
 #[tokio::test]
-async fn package_install_public_registry_pauses_for_permission() {
+async fn package_install_public_registry_is_denied_in_production_profile() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
@@ -1048,13 +1903,83 @@ async fn package_install_public_registry_pauses_for_permission() {
     assert!(results[0].result.is_error);
     assert_eq!(
         store.get_run(&run_id).await.unwrap().status,
-        AgentRunStatus::NeedsUserInput
+        AgentRunStatus::Queued
     );
-    assert!(store
+    assert!(tool_result_error_text(&results[0].result).contains("public npm registry"));
+    assert!(!store
         .events(&run_id)
         .await
         .iter()
         .any(|event| serde_json::to_value(event).unwrap()["type"] == "permission.requested"));
+}
+
+#[tokio::test]
+async fn package_install_omitted_public_registry_is_denied_in_production_profile() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(sandbox_tools(), Default::default(), &workspace)
+            .with_policy_profile_and_registry(
+                RuntimePolicyProfile::Production,
+                "https://registry.npmjs.org",
+            ),
+    );
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-1",
+                "package.install",
+                json!({ "mode": "restore" }),
+            )],
+        )
+        .await;
+
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("public npm registry"));
+}
+
+#[tokio::test]
+async fn package_install_public_registry_is_allowed_only_for_local_e2e_profile() {
+    let workspace = setup_workspace();
+    let transport = RecordingChannelTransport::default();
+    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(
+            sandbox_tools_with_backends(Arc::new(workspace_backend), Arc::new(command_backend)),
+            Default::default(),
+            &workspace,
+        )
+        .with_policy_profile_and_registry(
+            RuntimePolicyProfile::LocalE2e,
+            "https://registry.npmjs.org",
+        ),
+    );
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-1",
+                "package.install",
+                json!({ "packages": ["left-pad"] }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(
+        results[0].result.content["registry"],
+        "https://registry.npmjs.org"
+    );
 }
 
 #[tokio::test]
@@ -1103,7 +2028,7 @@ async fn package_install_internal_registry_installs_workspace_local_package_and_
     assert_eq!(results[0].result.content["success"], true);
     assert_eq!(
         results[0].result.content["logPath"],
-        "/workspace/outputs/build/package-install.log"
+        "/workspace/outputs/build/package-install-tool-1.log"
     );
     assert!(workspace
         .join("project/node_modules/@internal/ui/package.json")
@@ -1112,7 +2037,12 @@ async fn package_install_internal_registry_installs_workspace_local_package_and_
         .unwrap()
         .contains("@internal/ui"));
     assert!(
-        fs::read_to_string(workspace.join("outputs/build/package-install.log"))
+        fs::read_to_string(workspace.join("outputs/build/package-install-tool-1.log"))
+            .unwrap()
+            .contains("file:../local-package")
+    );
+    assert!(
+        fs::read_to_string(workspace.join("outputs/build/package-install-latest.log"))
             .unwrap()
             .contains("file:../local-package")
     );
@@ -1122,6 +2052,7 @@ async fn package_install_internal_registry_installs_workspace_local_package_and_
 #[tokio::test]
 async fn preview_start_status_and_stop_use_workspace_state() {
     let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
     let (preview_url, _preview_server) = start_preview_server().await;
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
@@ -1152,8 +2083,48 @@ async fn preview_start_status_and_stop_use_workspace_state() {
 }
 
 #[tokio::test]
-async fn preview_start_requires_reachable_preview_url() {
+async fn preview_start_spawns_static_server_from_dist() {
     let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "<!doctype html><title>Preview</title><h1>Ready</h1>",
+    )
+    .unwrap();
+    let port = free_tcp_port();
+    let preview_url = format!("http://127.0.0.1:{port}");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-1",
+                    "preview.start",
+                    json!({ "url": preview_url, "port": port }),
+                ),
+                ToolCall::new("tool-2", "preview.stop", json!({})),
+            ],
+        )
+        .await;
+
+    assert!(results.iter().all(|result| !result.result.is_error));
+    assert_eq!(results[0].result.content["status"], "running");
+    assert_eq!(results[0].result.content["accessible"], true);
+    assert!(results[0].result.content["pid"].as_u64().is_some());
+    assert_eq!(results[1].result.content["status"], "stopped");
+    assert_eq!(results[1].result.content["pid"], Value::Null);
+}
+
+#[tokio::test]
+async fn preview_start_requires_dist_when_it_must_manage_server() {
+    let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
     let executor = sandbox_executor(&workspace);
@@ -1171,7 +2142,7 @@ async fn preview_start_requires_reachable_preview_url() {
         .await;
 
     assert!(results[0].result.is_error);
-    assert!(tool_result_error_text(&results[0].result).contains("could not reach"));
+    assert!(tool_result_error_text(&results[0].result).contains("missing dist"));
     assert!(!workspace.join("state/preview.json").exists());
 }
 
@@ -1281,9 +2252,28 @@ fn setup_workspace() -> PathBuf {
     workspace
 }
 
+fn write_successful_build_state(workspace: &Path) {
+    fs::create_dir_all(workspace.join("outputs/build")).unwrap();
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "status": "success",
+            "success": true,
+            "cwd": "/workspace/project",
+            "argv": ["npm", "run", "build"],
+            "logPath": "/workspace/outputs/build/build.log"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}",
+        "{prefix}-{}-{}-{}",
+        std::process::id(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
