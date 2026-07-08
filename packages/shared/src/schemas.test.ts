@@ -152,6 +152,15 @@ describe("shared schemas", () => {
         timestamp,
       },
       {
+        type: "tool.output",
+        runId: "run-1",
+        tool: "package.install",
+        toolUseId: "tool-install",
+        stream: "stdout",
+        text: "added 42 packages",
+        timestamp,
+      },
+      {
         type: "tool.failed",
         runId: "run-1",
         tool: "content.read_source",

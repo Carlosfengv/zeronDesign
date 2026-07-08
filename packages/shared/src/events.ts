@@ -31,6 +31,13 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
     metadata: z.unknown().nullish(),
   }),
   BaseEventSchema.extend({
+    type: z.literal("tool.output"),
+    tool: z.string().min(1),
+    toolUseId: z.string().min(1),
+    stream: z.enum(["stdout", "stderr"]),
+    text: z.string(),
+  }),
+  BaseEventSchema.extend({
     type: z.literal("tool.failed"),
     tool: z.string().min(1),
     error: z.string().min(1),

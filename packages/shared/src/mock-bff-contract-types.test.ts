@@ -229,6 +229,15 @@ describe("mock BFF shared runtime contract types", () => {
         timestamp: "2026-07-04T00:00:01.000Z",
       },
       {
+        type: "tool.output",
+        runId: "run-1",
+        tool: "package.install",
+        toolUseId: "tool-install",
+        stream: "stdout",
+        text: "added 42 packages",
+        timestamp: "2026-07-04T00:00:01.500Z",
+      },
+      {
         type: "run.completed",
         runId: "run-1",
         status: "completed",
@@ -240,6 +249,7 @@ describe("mock BFF shared runtime contract types", () => {
     expect(events.map((event) => AgentEventSchema.parse(event).type)).toEqual([
       "run.started",
       "preview.updated",
+      "tool.output",
       "run.completed",
     ]);
   });
