@@ -76,6 +76,7 @@ pub struct RuntimeConfig {
     pub sandbox_backend_mode: SandboxBackendMode,
     pub policy_profile: RuntimePolicyProfile,
     pub npm_registry: String,
+    pub enable_internal_template_build_api: bool,
     pub enable_internal_promote_api: bool,
     pub internal_admin_token: Option<String>,
     pub model_streaming: bool,
@@ -130,6 +131,7 @@ impl RuntimeConfig {
                 .unwrap_or(RuntimePolicyProfile::Production),
             npm_registry: env::var("RUNTIME_NPM_REGISTRY")
                 .unwrap_or_else(|_| "https://registry.internal.example/npm/".to_string()),
+            enable_internal_template_build_api: truthy_env("ENABLE_INTERNAL_TEMPLATE_BUILD_API"),
             enable_internal_promote_api: env::var("ENABLE_INTERNAL_PROMOTE_API")
                 .ok()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
@@ -154,6 +156,12 @@ impl RuntimeConfig {
 
 fn secret_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn truthy_env(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 fn agent_model_from_env(provider: ModelProvider) -> String {

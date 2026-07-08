@@ -339,6 +339,7 @@ async fn start_run(
     State(state): State<AppState>,
     Json(request): Json<StartRunRequest>,
 ) -> Result<Json<StartRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_start_run_request(&request)?;
     validate_sandbox_context(&state.store, &request).await?;
     let content_sources = merge_content_sources(
         inherited_build_content_sources(&state.store, &request).await,
@@ -641,6 +642,8 @@ async fn continue_run(
     Path(run_id): Path<String>,
     Json(request): Json<ContinueRunRequest>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("runId", &run_id)?;
+    validate_required_string("userMessage", &request.user_message)?;
     let run = state
         .store
         .get_run(&run_id)
@@ -781,6 +784,7 @@ async fn cancel_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("runId", &run_id)?;
     state
         .store
         .update_run_status(&run_id, AgentRunStatus::Cancelled)
@@ -812,6 +816,7 @@ async fn resolve_permission(
     Path(permission_id): Path<String>,
     Json(request): Json<ResolvePermissionRequest>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("permissionId", &permission_id)?;
     let pending_permission = state
         .store
         .pending_permission(&permission_id)
@@ -1191,8 +1196,34 @@ fn content_type_for_path(path: &FsPath) -> &'static str {
 
 async fn internal_template_build(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<InternalTemplateBuildRequest>,
 ) -> Result<Json<InternalTemplateBuildResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !state.config.enable_internal_template_build_api {
+        return Err(not_found(
+            "internal template build endpoint is disabled".to_string(),
+        ));
+    }
+    if !internal_admin_authorized(&state.config, &headers) {
+        state
+            .store
+            .append_audit_record(
+                &request.project_id,
+                "",
+                "internal.template_build",
+                format!("template={}", request.template),
+                "deny",
+                "missing or invalid internal template build authorization",
+            )
+            .await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "internal template build requires service authorization".to_string(),
+            }),
+        ));
+    }
+    validate_internal_template_build_request(&request)?;
     let project_id = request.project_id.clone();
     let workspace_root = project_workspace_root(&state.config, &project_id);
     let template = request.template.clone();
@@ -1305,6 +1336,7 @@ async fn internal_promote_preview(
     headers: HeaderMap,
     Json(request): Json<PromotePreviewRequest>,
 ) -> Result<Json<PreviewCurrentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_promote_preview_request(&request)?;
     if !state.config.enable_internal_promote_api {
         return Err(not_found(
             "internal preview promotion endpoint is disabled".to_string(),
@@ -1378,6 +1410,90 @@ fn internal_admin_authorized(config: &RuntimeConfig, headers: &HeaderMap) -> boo
     internal && token == Some(expected_token)
 }
 
+fn validate_start_run_request(
+    request: &StartRunRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("projectId", &request.project_id)?;
+    validate_required_string("agentProfile", &request.agent_profile)?;
+    for source in &request.input_context.content_sources {
+        validate_required_string("contentSources[].id", &source.id)?;
+        validate_required_string("contentSources[].kind", &source.kind)?;
+    }
+    validate_optional_string("briefId", request.input_context.brief_id.as_deref())?;
+    validate_optional_string(
+        "baseVersionId",
+        request.input_context.base_version_id.as_deref(),
+    )?;
+    validate_optional_string(
+        "sandboxBindingId",
+        request.input_context.sandbox_binding_id.as_deref(),
+    )?;
+    validate_optional_string(
+        "parentRunId",
+        request.input_context.parent_run_id.as_deref(),
+    )?;
+    validate_string_list("findingIds", &request.input_context.finding_ids)?;
+    Ok(())
+}
+
+fn validate_internal_template_build_request(
+    request: &InternalTemplateBuildRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("projectId", &request.project_id)?;
+    validate_required_string("template", &request.template)?;
+    validate_required_string("audience", &request.audience)?;
+    validate_required_string("visualDirection", &request.visual_direction)?;
+    validate_string_list("contentHierarchy", &request.content_hierarchy)?;
+    validate_string_list("assumptions", &request.assumptions)?;
+    validate_string_list("missingInformation", &request.missing_information)?;
+    validate_optional_string("model", request.model.as_deref())?;
+    validate_optional_string("publicBaseUrl", request.public_base_url.as_deref())?;
+    Ok(())
+}
+
+fn validate_promote_preview_request(
+    request: &PromotePreviewRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("projectId", &request.project_id)?;
+    validate_required_string("runId", &request.run_id)?;
+    validate_required_string("candidateVersionId", &request.candidate_version_id)?;
+    Ok(())
+}
+
+fn validate_optional_string(
+    field: &str,
+    value: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Some(value) = value {
+        validate_required_string(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_string_list(
+    field: &str,
+    values: &[String],
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    for value in values {
+        if value.trim().is_empty() {
+            return Err(bad_request(format!(
+                "{field} must not contain empty strings"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_string(
+    field: &str,
+    value: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if value.trim().is_empty() {
+        return Err(bad_request(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
 fn last_event_sequence(last_event_id: Option<&str>, run_id: &str) -> usize {
     let Some(last_event_id) = last_event_id else {
         return 0;
@@ -1404,6 +1520,10 @@ fn spawn_session(state: AppState, run_id: String) {
 
 fn not_found(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::NOT_FOUND, Json(ErrorResponse { error }))
+}
+
+fn bad_request(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
 }
 
 fn sandbox_binding_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {

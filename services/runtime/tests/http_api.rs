@@ -148,6 +148,75 @@ async fn start_run_and_stream_events() {
 }
 
 #[tokio::test]
+async fn start_run_rejects_empty_contract_identifiers() {
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: RuntimeStore::new(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": " ",
+                        "phase": "brief",
+                        "agentProfile": "brief"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "projectId must not be empty");
+}
+
+#[tokio::test]
+async fn continue_run_rejects_empty_user_message() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{}/continue", run.id))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "userMessage": " " }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "userMessage must not be empty");
+}
+
+#[tokio::test]
 async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments() {
     let store = RuntimeStore::new();
     let model = MockModelClient::new(vec![
@@ -2295,6 +2364,88 @@ async fn product_promote_http_route_is_not_exposed() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn internal_template_build_route_is_disabled_by_default() {
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: RuntimeStore::new(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/template-build")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "template": "astro-website",
+                        "audience": "Internal teams",
+                        "visualDirection": "Clear technical site"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"],
+        "internal template build endpoint is disabled"
+    );
+}
+
+#[tokio::test]
+async fn internal_template_build_route_requires_service_authorization_when_enabled() {
+    let store = RuntimeStore::new();
+    let mut config = RuntimeConfig::from_env();
+    config.enable_internal_template_build_api = true;
+    config.internal_admin_token = Some("test-token".to_string());
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/template-build")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "template": "astro-website",
+                        "audience": "Internal teams",
+                        "visualDirection": "Clear technical site"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"],
+        "internal template build requires service authorization"
+    );
+    let audit = store.audit_records().await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].tool, "internal.template_build");
+    assert_eq!(audit[0].decision, "deny");
 }
 
 #[tokio::test]

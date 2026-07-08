@@ -1,40 +1,37 @@
 ---
 date: 2026-07-08
-status: freeze-candidate
+status: frozen
 type: api-contract
 topic: phase-a-runtime-http-sse-freeze
 based_on_commit: d60e2f9
 ---
 
-# Phase A Runtime API Freeze Candidate
+# Phase A Runtime API Freeze
 
 ## Summary
 
 This document records the Phase A Runtime HTTP/SSE contract implemented by
 `services/runtime/src/http_api.rs` and the shared TypeScript schemas in
-`packages/shared/src`. It is the freeze candidate for Phase B BFF and product UI
+`packages/shared/src`. It is the frozen contract for Phase B BFF and product UI
 work.
 
 The Phase A freeze gate and real `deepseek-v4-pro` website generation regression
 passed on 2026-07-08. See `2026-07-08-phase-a-acceptance-report.md` for the
 test evidence.
 
-API review note: the runtime implementation currently emits a few SSE variants
-and `tool.failed.metadata` fields that are not yet represented in
-`packages/shared/src/events.ts`. Phase B should not treat the shared event schema
-as final until the "Phase B Freeze Blockers" section below is resolved.
+The Phase B freeze blockers from the API review have been resolved in code and
+covered by the verification suite listed below.
 
-## Phase B Freeze Blockers
+## Phase B Freeze Blockers Resolved
 
-These items must be resolved before this candidate becomes the final Phase B API
-freeze:
+These items were resolved before declaring the Phase B API contract frozen:
 
-| Priority | Area | Required action |
+| Priority | Area | Resolution |
 |---|---|---|
-| P1 | SSE event schema | Add `tool.recovery_suggested`, `chunk.received`, `chunk.committed`, and `metric.recorded` to `packages/shared/src/events.ts`, or filter those events out of the public `/runs/{runId}/events` stream. |
-| P1 | Typed tool failure metadata | Add optional `metadata` to the shared `tool.failed` event schema so Phase B can read `errorKind`, `guidance`, and retry diagnostics. |
-| P2 | Internal template build endpoint | Gate `/internal/template-build` behind internal authorization or remove it from non-test runtime routers before exposing the runtime outside trusted local/dev environments. |
-| P2 | Server-side request validation | Enforce the same non-empty string constraints in Rust request handlers that `packages/shared` currently enforces with Zod. |
+| P1 | SSE event schema | `packages/shared/src/events.ts` now includes `tool.recovery_suggested`, `chunk.received`, `chunk.committed`, and `metric.recorded`; mock BFF contract tests parse them. |
+| P1 | Typed tool failure metadata | The shared `tool.failed` schema now accepts optional `metadata` for `errorKind`, `guidance`, and retry diagnostics. |
+| P2 | Internal template build endpoint | `/internal/template-build` is gated behind `ENABLE_INTERNAL_TEMPLATE_BUILD_API` and internal service authorization. It is disabled by default. |
+| P2 | Server-side request validation | Rust request handlers now reject empty contract identifiers and user messages with schema-compatible `{ error }` responses. |
 
 ## Public Runtime API
 
@@ -259,16 +256,10 @@ through `POST /runs` and runtime-managed build/edit flows.
 
 ## Validation Boundary
 
-The shared Zod schemas currently enforce non-empty string constraints for
-identifiers and user messages. Rust request structs accept deserialized strings
-and rely mostly on later store and workflow validation. Before final API freeze,
-runtime handlers should reject empty `projectId`, `agentProfile`, `userMessage`,
-`briefId`, `sandboxBindingId`, `parentRunId`, `findingIds`, and permission ids
-with schema-compatible error responses.
-
-Until that server-side validation is added, Phase B BFF validation is required
-and direct runtime callers can exercise a looser request surface than the shared
-contract describes.
+The shared Zod schemas and Rust request handlers both enforce non-empty string
+constraints for public contract identifiers and user messages. Rust handlers
+return schema-compatible `{ error }` responses for invalid empty values before
+starting or mutating a run.
 
 ## Compatibility Rules
 
@@ -294,14 +285,16 @@ updates to `packages/shared` tests plus runtime mock BFF contract tests.
 
 ## Verification
 
-The candidate contract is covered by:
+The frozen contract is covered by:
 
 - `services/runtime/tests/http_api.rs`
 - `services/runtime/tests/mock_bff_contract.rs`
 - `packages/shared/src/mock-bff-contract-types.test.ts`
 - `packages/shared/src/schemas.test.ts`
 - `infra/phase-a/verify.sh`
+- Real `deepseek-v4-pro` website generation E2E:
+  `real_deepseek_design_md_website_generation_e2e`
 
-The freeze gate passed on 2026-07-08. Final Phase B freeze additionally requires
-the blocker items above to be either fixed in code/schema or explicitly moved
-behind a documented internal/debug boundary.
+The freeze gate and the real `deepseek-v4-pro` website generation E2E passed on
+2026-07-08 after the blocker fixes. Phase B may now consume this Runtime
+HTTP/SSE contract as frozen.
