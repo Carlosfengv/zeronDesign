@@ -4,7 +4,7 @@ use anydesign_runtime::{
     profiles::build::{
         run_astro_build, run_template_build, AstroBuildRequest, TemplateBuildRequest,
     },
-    types::{AgentPhase, Brief, ProjectVersionStatus},
+    types::{AgentPhase, Brief, ProjectVersionStatus, ReviewFindingSeverity, ReviewFindingStatus},
     RuntimeStore,
 };
 use serde_json::json;
@@ -377,6 +377,99 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
             .and_then(|result| result.screenshot_id.as_deref()),
         Some("shot-fumadocs-home")
     );
+}
+
+#[tokio::test]
+async fn incomplete_docs_brief_records_blocking_finding_without_promoting_preview() {
+    let workspace = unique_temp_dir("fumadocs-build-blocked");
+    let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
+    let brief_run = store
+        .create_run(
+            "docs-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let mut brief = docs_brief();
+    brief.content_hierarchy = vec!["AnyDesign Runtime Docs".to_string()];
+    brief.page_structure = json!([
+        {
+            "title": "Overview",
+            "purpose": "Homepage only",
+            "keyContent": ["homepage"]
+        }
+    ]);
+    brief.missing_information = vec!["Need sidebar coverage".to_string()];
+    let brief_id = store.write_brief(&brief_run.id, brief).await.unwrap();
+    let build_run = store
+        .create_run_with_context(
+            "docs-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+
+    let result = run_template_build(
+        &store,
+        TemplateBuildRequest {
+            project_id: "docs-project".to_string(),
+            run_id: build_run.id.clone(),
+            brief_id: build_run.brief_version.clone().unwrap(),
+            workspace_root: workspace.clone(),
+            preview_base_url: "http://preview.local".to_string(),
+        },
+    )
+    .await;
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("blocking review finding"));
+    assert!(workspace.join("project/content/docs/index.mdx").exists());
+    assert!(workspace.join("project/out").exists());
+
+    let events = store.events(&build_run.id).await;
+    let event_types = events
+        .iter()
+        .map(|event| {
+            serde_json::to_value(event).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        vec!["preview.rebuilding", "preview.candidate", "review.finding"]
+    );
+    assert!(
+        store
+            .current_project_version("docs-project")
+            .await
+            .is_none(),
+        "blocking docs structure findings must prevent promotion"
+    );
+
+    let finding_id = events
+        .iter()
+        .find_map(|event| {
+            let value = serde_json::to_value(event).unwrap();
+            (value["type"] == "review.finding")
+                .then(|| value["findingId"].as_str().unwrap().to_string())
+        })
+        .unwrap();
+    let finding = store.get_review_finding(&finding_id).await.unwrap();
+    assert_eq!(finding.severity, ReviewFindingSeverity::Blocking);
+    assert_eq!(finding.status, ReviewFindingStatus::Open);
+    assert!(finding
+        .summary
+        .contains("navigation with at least one content page"));
+    assert!(finding.summary.contains("content page coverage"));
+    assert!(finding.summary.contains("resolved docs requirements"));
 }
 
 #[test]

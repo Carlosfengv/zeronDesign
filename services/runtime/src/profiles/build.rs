@@ -1,6 +1,9 @@
 use crate::{
     preview::{promote_preview, PromotionGateReport},
-    types::{AgentEvent, Brief, ProjectVersion},
+    types::{
+        AgentEvent, Brief, ProjectVersion, ReviewFindingCategory, ReviewFindingEvidence,
+        ReviewFindingSeverity,
+    },
     RuntimeStore,
 };
 use anyhow::{anyhow, Context, Result};
@@ -114,6 +117,15 @@ async fn run_template_build_with_brief(
             timestamp: Utc::now(),
         })
         .await;
+    record_docs_structure_findings(
+        store,
+        &request,
+        &brief,
+        template,
+        &candidate.id,
+        &screenshot_id,
+    )
+    .await?;
 
     let promoted = promote_preview(
         store,
@@ -207,6 +219,84 @@ fn prepare_workspace(workspace_root: &Path, brief: &Brief, brief_id: &str) -> Re
     )?;
     fs::write(workspace_root.join("state/tasks.json"), "[]")?;
     Ok(())
+}
+
+async fn record_docs_structure_findings(
+    store: &RuntimeStore,
+    request: &TemplateBuildRequest,
+    brief: &Brief,
+    template: TemplateKind,
+    candidate_version_id: &str,
+    screenshot_id: &str,
+) -> Result<()> {
+    if template != TemplateKind::FumadocsDocs {
+        return Ok(());
+    }
+    let missing = missing_docs_structure_requirements(brief);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    store
+        .record_review_finding(
+            &request.project_id,
+            &request.run_id,
+            candidate_version_id,
+            ReviewFindingSeverity::Blocking,
+            ReviewFindingCategory::Content,
+            format!(
+                "Docs template is missing required structure: {}",
+                missing.join(", ")
+            ),
+            Some(ReviewFindingEvidence {
+                screenshot_id: Some(screenshot_id.to_string()),
+                file_path: Some("inputs/brief.md".to_string()),
+                log_excerpt: None,
+            }),
+            true,
+        )
+        .await?;
+    Ok(())
+}
+
+fn missing_docs_structure_requirements(brief: &Brief) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if brief.project_type != "docs" {
+        missing.push("projectType=docs");
+    }
+    if brief.content_hierarchy.len() < 2 {
+        missing.push("navigation with at least one content page");
+    }
+    let pages = brief.page_structure.as_array();
+    if pages.is_none_or(Vec::is_empty) {
+        missing.push("pageStructure");
+    }
+    if !pages.is_some_and(|pages| pages.iter().any(is_content_page)) {
+        missing.push("content page coverage");
+    }
+    if !brief.missing_information.is_empty() {
+        missing.push("resolved docs requirements");
+    }
+    missing
+}
+
+fn is_content_page(page: &Value) -> bool {
+    let title = page
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let purpose = page
+        .get("purpose")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let key_content_count = page
+        .get("keyContent")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    key_content_count > 0
+        && !matches!(title.as_str(), "home" | "homepage" | "overview" | "index")
+        && !purpose.contains("homepage")
 }
 
 fn write_astro_project(workspace_root: &Path, brief: &Brief) -> Result<()> {
