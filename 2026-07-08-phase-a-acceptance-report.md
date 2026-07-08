@@ -92,11 +92,11 @@ test k8s_sandbox_claim_workspace_channel_smoke ... ok
 - The default full Rust test suite still leaves real-provider checks ignored
   unless explicit API credentials are supplied. The DeepSeek website regression
   was run separately with `deepseek-v4-pro` and passed.
-- Phase A.5 can now start from the existing Fumadocs runtime loop. The freeze
-  decision should avoid breaking Runtime HTTP/SSE API shapes that Phase B BFF
-  tests already consume.
+- Phase A.5 can now start from the existing Fumadocs runtime loop. Before Phase
+  B consumes the Runtime HTTP/SSE API as final, resolve the API review blockers
+  documented in `2026-07-08-runtime-api-freeze.md`.
 
 ## Recommended Next Step
 
-Freeze the Phase A Runtime HTTP/SSE API contract, then start Phase A.5 Docs
-Template Loop work from the accepted runtime foundation.
+Resolve the Phase B API freeze blockers, then start Phase A.5 Docs Template Loop
+work from the accepted runtime foundation.
