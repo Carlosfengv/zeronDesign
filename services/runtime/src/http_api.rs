@@ -7,7 +7,10 @@ use crate::{
     profiles::edit::{self, EditIntent},
     query_session::QuerySession,
     recovery::{recover_interrupted_runs, RecoveryOutcome},
-    tools::control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
+    tools::{
+        control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
+        sandbox::cleanup_staged_writes_for_run,
+    },
     types::{
         AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource, ConversationItem,
     },
@@ -15,7 +18,10 @@ use crate::{
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::sse::{Event, Sse},
+    response::{
+        sse::{Event, Sse},
+        Html,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -75,6 +81,7 @@ pub fn router(config: RuntimeConfig) -> Router {
 
 pub fn router_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
         .route("/runs", post(start_run))
         .route("/runs/{run_id}/continue", post(continue_run))
@@ -105,6 +112,43 @@ pub fn router_with_state(state: AppState) -> Router {
             post(resolve_permission),
         )
         .with_state(state)
+}
+
+async fn root(State(state): State<AppState>) -> Html<String> {
+    let base = format!("http://{}:{}", state.config.host, state.config.port);
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AnyDesign Runtime</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; padding: 40px; background: #0f172a; color: #e5e7eb; }}
+    main {{ max-width: 880px; margin: 0 auto; }}
+    h1 {{ margin: 0 0 8px; font-size: 32px; }}
+    p {{ color: #a5b4fc; line-height: 1.6; }}
+    a {{ color: #67e8f9; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 24px; }}
+    .card {{ border: 1px solid #334155; border-radius: 8px; padding: 16px; background: #111827; }}
+    code {{ background: #1f2937; border-radius: 4px; padding: 2px 5px; color: #f8fafc; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AnyDesign Runtime</h1>
+    <p>Status: <code>ready</code>. This root page is a local runtime index for browser checks.</p>
+    <div class="grid">
+      <div class="card"><strong>Health</strong><p><a href="{base}/health">{base}/health</a></p></div>
+      <div class="card"><strong>Website artifact</strong><p><a href="{base}/artifacts/zeron-real-website-1783303319260/current">{base}/artifacts/zeron-real-website-1783303319260/current</a></p></div>
+      <div class="card"><strong>Docs artifact</strong><p><a href="{base}/artifacts/zeron-real-docs-1783303417188/current/docs">{base}/artifacts/zeron-real-docs-1783303417188/current/docs</a></p></div>
+      <div class="card"><strong>Run stream example</strong><p><code>{base}/runs/&lt;runId&gt;/events</code></p></div>
+    </div>
+  </main>
+</body>
+</html>"#
+    ))
 }
 
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
@@ -296,6 +340,10 @@ async fn start_run(
     Json(request): Json<StartRunRequest>,
 ) -> Result<Json<StartRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     validate_sandbox_context(&state.store, &request).await?;
+    let content_sources = merge_content_sources(
+        inherited_build_content_sources(&state.store, &request).await,
+        request.input_context.content_sources.clone(),
+    );
     let run = if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
         if request.phase == AgentPhase::Repair {
             state
@@ -305,7 +353,7 @@ async fn start_run(
                     &request.input_context.finding_ids,
                     None,
                     request.agent_profile,
-                    "internal-balanced".to_string(),
+                    state.config.agent_model.clone(),
                 )
                 .await
                 .map_err(repair_run_error)?
@@ -316,7 +364,7 @@ async fn start_run(
                     parent_run_id,
                     request.phase,
                     request.agent_profile,
-                    "internal-balanced".to_string(),
+                    state.config.agent_model.clone(),
                     None,
                     request.input_context.finding_ids,
                 )
@@ -330,8 +378,8 @@ async fn start_run(
                 request.project_id,
                 request.phase,
                 request.agent_profile,
-                "internal-balanced".to_string(),
-                request.input_context.content_sources,
+                state.config.agent_model.clone(),
+                content_sources,
                 request.input_context.brief_id,
                 request.input_context.base_version_id,
             )
@@ -371,6 +419,42 @@ async fn start_run(
         run_id: run.id,
         status: "queued",
     }))
+}
+
+async fn inherited_build_content_sources(
+    store: &RuntimeStore,
+    request: &StartRunRequest,
+) -> Vec<ContentSource> {
+    if request.phase != AgentPhase::Build {
+        return Vec::new();
+    }
+    let Some(brief_id) = request.input_context.brief_id.as_deref() else {
+        return Vec::new();
+    };
+    store
+        .content_sources_for_brief(brief_id)
+        .await
+        .into_iter()
+        .filter(|source| source.readable)
+        .collect()
+}
+
+fn merge_content_sources(
+    inherited: Vec<ContentSource>,
+    explicit: Vec<ContentSource>,
+) -> Vec<ContentSource> {
+    let mut merged: Vec<ContentSource> = Vec::new();
+    for source in inherited.into_iter().chain(explicit) {
+        if let Some(index) = merged
+            .iter()
+            .position(|existing| existing.id == source.id || existing.kind == source.kind)
+        {
+            merged[index] = source;
+        } else {
+            merged.push(source);
+        }
+    }
+    merged
 }
 
 async fn validate_sandbox_context(
@@ -453,7 +537,7 @@ async fn validate_build_confirmed_brief(
 
 fn is_brief_confirmation_message(message: &str) -> bool {
     let normalized = message.trim().to_ascii_lowercase();
-    matches!(
+    if matches!(
         normalized.as_str(),
         "confirm"
             | "confirmed"
@@ -467,7 +551,20 @@ fn is_brief_confirmation_message(message: &str) -> bool {
             | "同意"
             | "可以"
             | "开始生成"
-    )
+    ) {
+        return true;
+    }
+
+    let confirmation_prefixes = ["确认", "同意", "可以", "批准", "开始"];
+    confirmation_prefixes
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        || normalized.contains("开始生成")
+        || normalized.contains("开始构建")
+        || normalized.contains("开始创建")
+        || (normalized.contains("confirm") && normalized.contains("brief"))
+        || (normalized.contains("approve") && normalized.contains("brief"))
+        || (normalized.contains("start") && normalized.contains("build"))
 }
 
 async fn maybe_provision_build_sandbox(
@@ -689,6 +786,12 @@ async fn cancel_run(
         .update_run_status(&run_id, AgentRunStatus::Cancelled)
         .await
         .map_err(run_update_error)?;
+    if let Some(run) = state.store.get_run(&run_id).await {
+        cleanup_staged_writes_for_run(
+            &project_workspace_root(&state.config, &run.project_id),
+            &run_id,
+        );
+    }
     state
         .store
         .append_event(AgentEvent::RunCompleted {
@@ -965,16 +1068,11 @@ fn artifact_response(
     project_id: &str,
     artifact_path: &str,
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
-    let root = project_workspace_root(config, project_id);
-    let output_root = if root.join("project/dist").exists() {
-        root.join("project/dist")
-    } else if root.join("project/out").exists() {
-        root.join("project/out")
-    } else {
-        return Err(not_found(format!(
+    let output_root = artifact_output_root(config, project_id).ok_or_else(|| {
+        not_found(format!(
             "artifact output not found for project: {project_id}"
-        )));
-    };
+        ))
+    })?;
     let path = resolve_artifact_file(&output_root, artifact_path)?;
     let content_type = content_type_for_path(&path);
     let bytes =
@@ -989,6 +1087,16 @@ fn artifact_response(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok((headers, bytes))
+}
+
+fn artifact_output_root(config: &RuntimeConfig, project_id: &str) -> Option<PathBuf> {
+    [
+        project_workspace_root(config, project_id),
+        config.workspace_root.clone(),
+    ]
+    .into_iter()
+    .flat_map(|root| [root.join("project/dist"), root.join("project/out")])
+    .find(|path| path.exists())
 }
 
 fn resolve_artifact_file(
@@ -1054,9 +1162,16 @@ fn rewrite_artifact_html(html: &str, project_id: &str) -> String {
     let prefix = format!("/artifacts/{project_id}/current");
     html.replace("href=\"/_next/", &format!("href=\"{prefix}/_next/"))
         .replace("src=\"/_next/", &format!("src=\"{prefix}/_next/"))
+        .replace("href=\"/_astro/", &format!("href=\"{prefix}/_astro/"))
+        .replace("src=\"/_astro/", &format!("src=\"{prefix}/_astro/"))
+        .replace(
+            "href=\"/favicon.svg\"",
+            &format!("href=\"{prefix}/favicon.svg\""),
+        )
         .replace("href=\"/docs", &format!("href=\"{prefix}/docs"))
         .replace("href=\"/\"", &format!("href=\"{prefix}/\""))
         .replace("\\\"/_next/", &format!("\\\"{prefix}/_next/"))
+        .replace("\\\"/_astro/", &format!("\\\"{prefix}/_astro/"))
         .replace("\\\"/docs", &format!("\\\"{prefix}/docs"))
         .replace("\\\"/\\\"", &format!("\\\"{prefix}/\\\""))
 }

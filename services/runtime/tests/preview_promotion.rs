@@ -417,6 +417,18 @@ fn setup_passing_promotion_workspace(prefix: &str) -> PathBuf {
     fs::create_dir_all(workspace.join("state")).unwrap();
     fs::write(workspace.join("outputs/build/build.log"), "Build ok\n").unwrap();
     fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "status": "success",
+            "success": true,
+            "cwd": "/workspace/project",
+            "argv": ["npm", "run", "build"],
+            "logPath": "/workspace/outputs/build/build.log"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
         workspace.join("state/preview.json"),
         json!({ "accessible": true, "status": "running" }).to_string(),
     )

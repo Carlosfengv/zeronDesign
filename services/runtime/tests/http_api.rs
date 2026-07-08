@@ -1,7 +1,7 @@
 use anydesign_runtime::{
     config::SandboxBackendMode,
     http_api::{self, AppState},
-    model_gateway::{MockModelClient, ModelResponse, ToolCall},
+    model_gateway::{MockModelClient, ModelResponse, ToolCall, ToolInputParseFailure},
     preview::{promote_preview, PromotionGateReport},
     types::{
         AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
@@ -15,7 +15,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use tower::ServiceExt;
 
 fn phase_a_contract_config() -> RuntimeConfig {
@@ -41,6 +48,28 @@ fn website_brief() -> Brief {
         assumptions: vec![],
         missing_information: vec![],
     }
+}
+
+#[tokio::test]
+async fn root_route_returns_runtime_index_for_browser_access() {
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: RuntimeStore::new(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body =
+        String::from_utf8(to_bytes(response.into_body(), 8192).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("AnyDesign Runtime"));
+    assert!(body.contains("/health"));
+    assert!(body.contains("zeron-real-website-1783303319260"));
+    assert!(body.contains("zeron-real-docs-1783303417188"));
 }
 
 #[tokio::test]
@@ -116,6 +145,154 @@ async fn start_run_and_stream_events() {
     assert!(body.contains("run.completed"));
     assert!(body.contains("id:"));
     assert!(body.contains(&format!("id: {run_id}/1")));
+}
+
+#[tokio::test]
+async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments() {
+    let store = RuntimeStore::new();
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolInputParseFailed {
+            parsed_calls: vec![],
+            failures: vec![ToolInputParseFailure {
+                tool_call_id: "tool-bad-json".to_string(),
+                tool_name: "fs.write".to_string(),
+                raw_len: 54,
+                raw_sha256: "abc123".to_string(),
+                ends_with_json_close: false,
+                bracket_balance: 1,
+                quote_closed: false,
+                likely_truncated: true,
+            }],
+        },
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "tool-1",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Recovered after parse failure" }),
+        )]),
+    ]);
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let run_id = payload["runId"].as_str().unwrap().to_string();
+
+    for _ in 0..20 {
+        if store
+            .get_run(&run_id)
+            .await
+            .is_some_and(|run| run.status.is_terminal())
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{run_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("tool.failed"));
+    assert!(body.contains("tool.input_json_parse_failed"));
+    assert!(body.contains("tool_input_json_parse_failed"));
+    assert!(body.contains("rawSha256"));
+    assert!(!body.contains("rawArguments"));
+    assert!(!body.contains("<html"));
+    assert!(!body.contains("fs.write requires path"));
+}
+
+#[tokio::test]
+async fn start_run_uses_configured_agent_model_for_real_provider_runs() {
+    let store = RuntimeStore::new();
+    let mut config = RuntimeConfig::from_env();
+    config.agent_model = "deepseek-chat".to_string();
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "tool-1",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Brief ready" }),
+            ),
+        ])])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let run = store
+        .get_run(payload["runId"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(run.model, "deepseek-chat");
 }
 
 #[tokio::test]
@@ -280,13 +457,22 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
             AgentPhase::Brief,
             "brief".to_string(),
             "internal-balanced".to_string(),
-            vec![],
+            vec![ContentSource::readable(
+                "design-md",
+                "design_md",
+                "# Visual rules\nUse a polished product website style.",
+            )],
         )
         .await;
     let brief_id = store
         .write_brief_draft(&brief_run.id, website_brief())
         .await
         .unwrap();
+    assert!(store
+        .content_sources_for_brief(&brief_id)
+        .await
+        .iter()
+        .any(|source| source.id == "design-md" && source.kind == "design_md"));
     store
         .update_run_status(&brief_run.id, AgentRunStatus::NeedsUserInput)
         .await
@@ -335,7 +521,9 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
                 .method("POST")
                 .uri(format!("/runs/{}/continue", brief_run.id))
                 .header("content-type", "application/json")
-                .body(Body::from(json!({ "userMessage": "确认" }).to_string()))
+                .body(Body::from(
+                    json!({ "userMessage": "确认这个 brief，可以开始生成 website" }).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -348,6 +536,10 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
         store.brief_status(&brief_id).await,
         Some(BriefStatus::Confirmed)
     );
+    let inherited_sources = store.content_sources_for_brief(&brief_id).await;
+    assert!(inherited_sources
+        .iter()
+        .any(|source| source.id == "design-md" && source.kind == "design_md"));
     let checkpoint_id = store
         .get_run(&brief_run.id)
         .await
@@ -380,6 +572,13 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
         .await
         .unwrap();
     assert_eq!(accepted.status(), StatusCode::OK);
+    let body = to_bytes(accepted.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let build_run_id = payload["runId"].as_str().unwrap();
+    let build_sources = store.content_sources(build_run_id).await;
+    assert!(build_sources
+        .iter()
+        .any(|source| source.id == "design-md" && source.kind == "design_md"));
 }
 
 #[tokio::test]
@@ -1304,6 +1503,62 @@ async fn cancel_run_marks_terminal_cancelled() {
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["status"], "cancelled");
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn cancel_run_cleans_staged_chunk_sessions_for_run() {
+    let workspace_root = unique_temp_dir("http-cancel-staged-writes");
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let session_dir = workspace_root
+        .join("project-1")
+        .join("outputs/staged-writes/session-to-clean");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("manifest.json"),
+        json!({
+            "runId": run.id.clone(),
+            "path": "/workspace/project/large.astro",
+            "total": 1,
+            "chunks": [0]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(session_dir.join("chunk-0.txt"), "large page").unwrap();
+    let mut config = RuntimeConfig::from_env();
+    config.workspace_root = workspace_root;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{}/cancel", run.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!session_dir.exists());
     assert_eq!(
         store.get_run(&run.id).await.unwrap().status,
         AgentRunStatus::Cancelled
@@ -2275,9 +2530,64 @@ async fn artifact_serving_supports_next_export_routes_and_assets() {
     );
 }
 
+#[tokio::test]
+async fn artifact_serving_supports_phase_a_global_workspace_root() {
+    let workspace = unique_temp_dir("artifact-phase-a-global");
+    let project_root = workspace.join("project/dist");
+    fs::create_dir_all(project_root.join("_astro")).unwrap();
+    fs::write(
+        project_root.join("index.html"),
+        r#"<link rel="stylesheet" href="/_astro/app.css"><main>Phase A Artifact</main>"#,
+    )
+    .unwrap();
+    fs::write(project_root.join("_astro/app.css"), "body{color:white}").unwrap();
+
+    let mut config = RuntimeConfig::from_env();
+    config.workspace_root = workspace;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: RuntimeStore::new(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/artifacts/phase-a-project/current/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body =
+        String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("Phase A Artifact"));
+    assert!(body.contains(r#"href="/artifacts/phase-a-project/current/_astro/app.css""#));
+
+    let css = app
+        .oneshot(
+            Request::builder()
+                .uri("/artifacts/phase-a-project/current/_astro/app.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(css.status(), StatusCode::OK);
+    assert_eq!(
+        css.headers().get("content-type").unwrap(),
+        "text/css; charset=utf-8"
+    );
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}",
+        "{prefix}-{}-{}-{}",
+        std::process::id(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
