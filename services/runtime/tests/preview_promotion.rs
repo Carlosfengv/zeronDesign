@@ -9,7 +9,7 @@ use anydesign_runtime::{
     },
     types::{AgentPhase, AgentRunStatus, PermissionMode, ProjectVersionStatus, TranscriptMode},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
 
@@ -34,6 +34,18 @@ fn executor_with_workspace(workspace: &PathBuf) -> StreamingToolExecutor {
     StreamingToolExecutor::new(control_plane_executor().with_workspace_root(workspace))
 }
 
+fn assert_error_kind(result: &anydesign_runtime::tools::runtime::ToolResult, expected: &str) {
+    let metadata = result.metadata.as_ref().expect("error metadata");
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some(expected)
+    );
+    assert_eq!(
+        metadata.get("recoverable").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
 #[tokio::test]
 async fn preview_tools_emit_rebuilding_and_candidate_events() {
     let workspace = setup_passing_promotion_workspace("preview-promotion");
@@ -54,12 +66,12 @@ async fn preview_tools_emit_rebuilding_and_candidate_events() {
                 ToolCall::new(
                     "tool-2",
                     "preview.report_candidate",
-                    json!({
-                        "url": preview_url,
-                        "screenshotId": "shot-1",
-                        "sourceSnapshotUri": "file:///snapshot.tar"
-                    }),
-                ),
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1",
+                    "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
+                }),
+            ),
             ],
         )
         .await;
@@ -114,6 +126,69 @@ async fn preview_tools_emit_rebuilding_and_candidate_events() {
 }
 
 #[tokio::test]
+async fn preview_report_candidate_rejects_second_promotion_in_same_run() {
+    let workspace = setup_passing_promotion_workspace("preview-promotion-duplicate");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Edit).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let executor = executor_with_workspace(&workspace);
+
+    let first = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-first",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1",
+                    "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].result.is_error);
+    let first_version_id = first[0].result.content["versionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let second = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-second",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1",
+                    "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(second.len(), 1);
+    assert!(second[0].result.is_error);
+    assert_error_kind(&second[0].result, "preview.already_promoted");
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().output_version_id,
+        Some(first_version_id)
+    );
+    let candidate_events = store
+        .events(&run_id)
+        .await
+        .into_iter()
+        .filter(|event| serde_json::to_value(event).unwrap()["type"] == "preview.candidate")
+        .count();
+    assert_eq!(candidate_events, 1);
+}
+
+#[tokio::test]
 async fn preview_report_candidate_rejects_public_or_unreachable_urls() {
     let store = RuntimeStore::new();
     let run_id = create_run(&store, AgentPhase::Build).await;
@@ -150,6 +225,257 @@ async fn preview_report_candidate_rejects_public_or_unreachable_urls() {
         .await
         .iter()
         .all(|event| { serde_json::to_value(event).unwrap()["type"] != "preview.candidate" }));
+}
+
+#[tokio::test]
+async fn preview_report_candidate_requires_screenshot_before_creating_candidate() {
+    let workspace = setup_passing_promotion_workspace("preview-missing-screenshot");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-missing-shot",
+                "preview.report_candidate",
+                json!({ "url": preview_url }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("requires screenshotId"));
+    assert_error_kind(&results[0].result, "preview.screenshot_missing");
+    assert!(store
+        .events(&run_id)
+        .await
+        .iter()
+        .all(|event| { serde_json::to_value(event).unwrap()["type"] != "preview.candidate" }));
+}
+
+#[tokio::test]
+async fn preview_report_candidate_rejects_invalid_screenshot_id() {
+    let workspace = setup_passing_promotion_workspace("preview-invalid-screenshot");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-invalid-shot",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "../shot-1"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.screenshot_invalid");
+}
+
+#[tokio::test]
+async fn preview_report_candidate_rejects_blank_screenshot() {
+    let workspace = setup_passing_promotion_workspace("preview-blank-screenshot");
+    fs::write(
+        workspace.join("outputs/screenshots/blank-shot.json"),
+        json!({ "blank": true }).to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-blank-shot",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "blank-shot"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.screenshot_blank");
+}
+
+#[tokio::test]
+async fn preview_report_candidate_requires_build_evidence() {
+    let workspace = setup_passing_promotion_workspace("preview-build-missing");
+    fs::remove_file(workspace.join("outputs/build/latest.json")).unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build-missing",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.build_missing");
+}
+
+#[tokio::test]
+async fn preview_report_candidate_rejects_failed_latest_build() {
+    let workspace = setup_passing_promotion_workspace("preview-build-failed");
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "buildId": "build-test",
+            "status": "failed",
+            "success": false,
+            "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build-failed",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.build_failed");
+}
+
+#[tokio::test]
+async fn preview_report_candidate_requires_source_snapshot_evidence() {
+    let workspace = setup_passing_promotion_workspace("preview-source-missing");
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "buildId": "build-test",
+            "status": "success",
+            "success": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-source-missing",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.source_snapshot_missing");
+}
+
+#[tokio::test]
+async fn preview_report_candidate_requires_latest_build_source_snapshot() {
+    let workspace = setup_passing_promotion_workspace("preview-source-snapshot");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let (preview_url, _preview_server) = start_preview_server().await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-mismatch",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-1",
+                    "sourceSnapshotUri": "file:///workspace/outputs/build/old-source-snapshot.txt"
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert!(
+        tool_result_error_text(&results[0].result).contains("does not match latest project.build")
+    );
+    assert_error_kind(&results[0].result, "preview.source_snapshot_mismatch");
+    assert!(store
+        .events(&run_id)
+        .await
+        .iter()
+        .all(|event| { serde_json::to_value(event).unwrap()["type"] != "preview.candidate" }));
+}
+
+#[tokio::test]
+async fn preview_start_requires_built_dist_directory() {
+    let workspace = setup_passing_promotion_workspace("preview-dist-missing");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store, AgentPhase::Build).await;
+
+    let results = executor_with_workspace(&workspace)
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-preview-start",
+                "preview.start",
+                json!({ "url": "http://127.0.0.1:9" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "preview.dist_missing");
 }
 
 #[tokio::test]
@@ -417,13 +743,26 @@ fn setup_passing_promotion_workspace(prefix: &str) -> PathBuf {
     fs::create_dir_all(workspace.join("state")).unwrap();
     fs::write(workspace.join("outputs/build/build.log"), "Build ok\n").unwrap();
     fs::write(
+        workspace.join("outputs/build/source-snapshot.txt"),
+        "buildId: build-test\nstatus: success\n",
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("outputs/build/source-snapshots/build-test")).unwrap();
+    fs::write(
+        workspace.join("outputs/build/source-snapshots/build-test/package.json"),
+        "{}",
+    )
+    .unwrap();
+    fs::write(
         workspace.join("outputs/build/latest.json"),
         json!({
+            "buildId": "build-test",
             "status": "success",
             "success": true,
             "cwd": "/workspace/project",
             "argv": ["npm", "run", "build"],
-            "logPath": "/workspace/outputs/build/build.log"
+            "logPath": "/workspace/outputs/build/build.log",
+            "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
         })
         .to_string(),
     )

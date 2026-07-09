@@ -113,6 +113,18 @@ async function handleRequest(request) {
       await fs.promises.rm(dir, { recursive: true, force: false });
       return { deleted: true };
     }
+    case "fs.copyDir": {
+      if (typeof payload.to !== "string") {
+        throw new Error("fs.copyDir requires payload.to");
+      }
+      const source = resolveWorkspacePath(request.path, "existing");
+      const target = resolveWorkspacePath(payload.to, "create");
+      const skipDirNames = Array.isArray(payload.skipDirNames)
+        ? payload.skipDirNames.filter((item) => typeof item === "string")
+        : [];
+      await copyDir(source, target, skipDirNames);
+      return { copied: true };
+    }
     case "process.exec": {
       if (!Array.isArray(payload.argv) || payload.argv.length === 0) {
         throw new Error("process.exec requires payload.argv");
@@ -129,6 +141,27 @@ async function handleRequest(request) {
     }
     default:
       throw new Error(`unsupported workspace op: ${request.op}`);
+  }
+}
+
+async function copyDir(source, target, skipDirNames) {
+  const stat = await fs.promises.stat(source);
+  if (!stat.isDirectory()) {
+    throw new Error("fs.copyDir source must be a directory");
+  }
+  await fs.promises.mkdir(target, { recursive: true });
+  const entries = await fs.promises.readdir(source, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory() && skipDirNames.includes(entry.name)) {
+      continue;
+    }
+    const from = path.join(source, entry.name);
+    const to = path.join(target, entry.name);
+    if (entry.isDirectory()) {
+      await copyDir(from, to, skipDirNames);
+    } else if (entry.isFile()) {
+      await fs.promises.copyFile(from, to);
+    }
   }
 }
 

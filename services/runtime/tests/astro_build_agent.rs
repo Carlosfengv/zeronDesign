@@ -104,6 +104,17 @@ async fn confirmed_brief_generates_astro_project_candidate_and_promoted_preview(
     assert!(workspace.join("project/package.json").exists());
     assert!(workspace.join("project/astro.config.mjs").exists());
     assert!(workspace.join("project/src/pages/index.astro").exists());
+    assert!(workspace.join("project/src/styles/global.css").exists());
+    let package_json = fs::read_to_string(workspace.join("project/package.json")).unwrap();
+    assert!(package_json.contains("tailwindcss"));
+    let global_css = fs::read_to_string(workspace.join("project/src/styles/global.css")).unwrap();
+    assert!(global_css.contains("@import \"tailwindcss\""));
+    assert!(global_css.contains("--deco-obsidian: #0A0A0A"));
+    assert!(global_css.contains("--deco-champagne: #F2F0E4"));
+    assert!(global_css.contains("--deco-gold: #D4AF37"));
+    assert!(global_css.contains("repeating-linear-gradient(45deg"));
+    assert!(global_css.contains("repeating-conic-gradient"));
+    assert!(global_css.contains("clip-path: polygon"));
     assert!(
         fs::read_to_string(workspace.join("project/src/pages/index.astro"))
             .unwrap()
@@ -117,6 +128,13 @@ async fn confirmed_brief_generates_astro_project_candidate_and_promoted_preview(
     let built_index = fs::read_to_string(workspace.join("project/dist/index.html")).unwrap();
     assert!(built_index.contains("Design runtime"));
     assert!(built_index.contains("astro-website"));
+    assert!(built_index.contains("deco-hero"));
+    assert!(built_index.contains("fonts.googleapis.com"));
+    let compiled_css = read_compiled_css(&workspace.join("project/dist/_astro"));
+    assert!(compiled_css.contains("#0a0a0a") || compiled_css.contains("#0A0A0A"));
+    assert!(compiled_css.contains("#d4af37") || compiled_css.contains("#D4AF37"));
+    assert!(compiled_css.contains("repeating-linear-gradient"));
+    assert!(compiled_css.contains("clip-path"));
     let preview_json = fs::read_to_string(workspace.join("state/preview.json")).unwrap();
     assert!(preview_json.contains("\"accessible\": true"));
     assert!(fs::read_to_string(workspace.join("state/context.md"))
@@ -272,11 +290,10 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
         "project/next.config.mjs",
         "project/postcss.config.mjs",
         "project/source.config.ts",
-        "project/tsconfig.json",
-        "project/lib/source.ts",
-        "project/lib/layout.shared.tsx",
-        "project/components/mdx.tsx",
-        "project/mdx-components.tsx",
+        "project/lib/source.js",
+        "project/lib/layout.shared.jsx",
+        "project/components/mdx.jsx",
+        "project/mdx-components.jsx",
         "project/app/layout.jsx",
         "project/app/global.css",
         "project/app/docs/layout.jsx",
@@ -294,6 +311,7 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
     assert!(package_json.contains("fumadocs-ui"));
     assert!(package_json.contains("next"));
     assert!(package_json.contains("@tailwindcss/postcss"));
+    assert!(package_json.contains(r#""typescript": "5.9.3""#));
     let next_config = fs::read_to_string(workspace.join("project/next.config.mjs")).unwrap();
     assert!(next_config.contains("assetPrefix: '/artifacts/docs-project/current'"));
     let postcss_config = fs::read_to_string(workspace.join("project/postcss.config.mjs")).unwrap();
@@ -301,7 +319,7 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
     let source_config = fs::read_to_string(workspace.join("project/source.config.ts")).unwrap();
     assert!(source_config.contains("defineDocs"));
     assert!(source_config.contains("content/docs"));
-    let source_loader = fs::read_to_string(workspace.join("project/lib/source.ts")).unwrap();
+    let source_loader = fs::read_to_string(workspace.join("project/lib/source.js")).unwrap();
     assert!(source_loader.contains("docs.toFumadocsSource()"));
     assert!(
         workspace.join("project/.source").exists(),
@@ -333,7 +351,7 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
     let source_snapshot =
         fs::read_to_string(workspace.join("outputs/build/source-snapshot.txt")).unwrap();
     assert!(source_snapshot.contains("project/source.config.ts"));
-    assert!(source_snapshot.contains("project/lib/source.ts"));
+    assert!(source_snapshot.contains("project/lib/source.js"));
     assert!(source_snapshot.contains("project/content/docs/index.mdx"));
     assert!(source_snapshot.contains("project/app/docs/[[...slug]]/page.jsx"));
     let preview_json = fs::read_to_string(workspace.join("state/preview.json")).unwrap();

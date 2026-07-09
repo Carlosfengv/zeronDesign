@@ -1,4 +1,5 @@
 use crate::{
+    agent_hooks::{PreToolUseHook, PreToolUseObservation},
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::ModelToolDefinition,
@@ -67,6 +68,11 @@ impl ValidationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolError {
     Recoverable(String),
+    RecoverableWithMetadata {
+        message: String,
+        error_kind: String,
+        metadata: Value,
+    },
     Terminal(String),
     PermissionDenied(String),
     Aborted,
@@ -76,9 +82,22 @@ impl ToolError {
     pub fn message(&self) -> String {
         match self {
             Self::Recoverable(message)
+            | Self::RecoverableWithMetadata { message, .. }
             | Self::Terminal(message)
             | Self::PermissionDenied(message) => message.clone(),
             Self::Aborted => "tool aborted".to_string(),
+        }
+    }
+
+    pub fn typed_recoverable(
+        message: impl Into<String>,
+        error_kind: impl Into<String>,
+        metadata: Value,
+    ) -> Self {
+        Self::RecoverableWithMetadata {
+            message: message.into(),
+            error_kind: error_kind.into(),
+            metadata,
         }
     }
 }
@@ -460,6 +479,53 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("No such tool available: {tool_name}")),
             };
         };
+        if let Some(result) = reject_duplicate_promotion_after_run_output(&ctx, tool.name()) {
+            store
+                .append_audit_record(
+                    &ctx.project_id,
+                    &ctx.run.id,
+                    tool.name(),
+                    summarize_input(&input),
+                    "deny",
+                    "pre-tool lifecycle guard rejected duplicate promotion",
+                )
+                .await;
+            return ToolExecution { result };
+        }
+
+        let pre_tool_decision = PreToolUseHook::default().apply(PreToolUseObservation {
+            phase: ctx.run.phase,
+            tool_name: tool.name().to_string(),
+            input,
+            default_cwd: Some(default_tool_cwd(&ctx.workspace_root)),
+        });
+        let input = match pre_tool_decision.rejection {
+            Some(rejection) => {
+                store
+                    .append_audit_record(
+                        &ctx.project_id,
+                        &ctx.run.id,
+                        tool.name(),
+                        summarize_input(&pre_tool_decision.input),
+                        "deny",
+                        format!(
+                            "pre-tool hook rejected ({error_kind}): {message}",
+                            error_kind = rejection.error_kind,
+                            message = rejection.message
+                        ),
+                    )
+                    .await;
+                return ToolExecution {
+                    result: ToolResult::typed_error(
+                        rejection.message,
+                        rejection.error_kind,
+                        rejection.recoverable,
+                        rejection.metadata,
+                    ),
+                };
+            }
+            None => pre_tool_decision.input,
+        };
 
         let original_input = input.clone();
         let validated_input = match tool.validate_input(input, &ctx).await {
@@ -548,6 +614,13 @@ impl ToolExecutor {
                     Err(ToolError::Recoverable(message)) => ToolExecution {
                         result: ToolResult::error_with_recoverable(message, true),
                     },
+                    Err(ToolError::RecoverableWithMetadata {
+                        message,
+                        error_kind,
+                        metadata,
+                    }) => ToolExecution {
+                        result: ToolResult::typed_error(message, error_kind, true, metadata),
+                    },
                     Err(ToolError::PermissionDenied(message)) => ToolExecution {
                         result: ToolResult::error_with_recoverable(message, false),
                     },
@@ -623,11 +696,12 @@ impl ToolExecutor {
                 }
             }
             PermissionResult::Deny { message, reason } => {
+                let reason_summary = reason.summary();
                 ctx.store
                     .append_event(AgentEvent::PermissionDenied {
                         run_id: run_id.to_string(),
                         tool: tool.name().to_string(),
-                        reason: reason.summary(),
+                        reason: reason_summary.clone(),
                         timestamp: Utc::now(),
                     })
                     .await;
@@ -640,10 +714,17 @@ impl ToolExecutor {
                         format!("Permission denied for {}: {message}", tool.name()),
                         Some(json!({
                             "tool": tool.name(),
-                            "reason": reason.summary(),
+                            "reason": reason_summary,
                         })),
                     )
                     .await;
+                if let Some((error_kind, metadata)) =
+                    typed_permission_denial_metadata(tool.name(), &message, &validated_input)
+                {
+                    return ToolExecution {
+                        result: ToolResult::typed_error(message, error_kind, true, metadata),
+                    };
+                }
                 ToolExecution {
                     result: ToolResult::error(message),
                 }
@@ -684,6 +765,94 @@ impl ToolExecutor {
             )
             .await;
     }
+}
+
+fn reject_duplicate_promotion_after_run_output(
+    ctx: &ToolContext,
+    tool_name: &str,
+) -> Option<ToolResult> {
+    if tool_name != "preview.report_candidate" {
+        return None;
+    }
+    let version_id = ctx.run.output_version_id.as_ref()?;
+    Some(ToolResult::typed_error(
+        format!(
+            "{tool_name} cannot create another promoted candidate after this run already promoted {version_id}"
+        ),
+        "preview.already_promoted",
+        true,
+        json!({
+            "phase": format!("{:?}", ctx.run.phase),
+            "tool": tool_name,
+            "versionId": version_id,
+            "suggestedAction": "Do not manually report another candidate after this run already promoted. If the promoted artifact satisfies the user request, call run.complete. If it does not, edit the source first, then use preview.publish to rebuild, screenshot, and promote the new source snapshot."
+        }),
+    ))
+}
+
+fn typed_permission_denial_metadata(
+    tool_name: &str,
+    message: &str,
+    input: &Value,
+) -> Option<(String, Value)> {
+    if tool_name == "shell.run" {
+        return Some((
+            "shell.command_denied".to_string(),
+            json!({
+                "tool": tool_name,
+                "argv": input.get("argv").cloned().unwrap_or(Value::Null),
+                "suggestedAction": "Use the dedicated runtime tool for this operation instead of shell.run.",
+            }),
+        ));
+    }
+
+    if message.contains("SecretPath") {
+        return Some((
+            "path.secret".to_string(),
+            json!({
+                "tool": tool_name,
+                "receivedPath": input.get("path").and_then(Value::as_str).unwrap_or(""),
+                "suggestedAction": "Choose a non-secret project source path.",
+            }),
+        ));
+    }
+
+    if message.contains("nested package root denied") {
+        return Some((
+            "path.nested_package_root".to_string(),
+            json!({
+                "tool": tool_name,
+                "receivedPath": input.get("path").and_then(Value::as_str).unwrap_or(""),
+                "suggestedAction": "Use the app root package.json instead of creating or editing nested package.json files.",
+            }),
+        ));
+    }
+
+    None
+}
+
+fn default_tool_cwd(workspace_root: &Path) -> String {
+    fs::read_to_string(workspace_root.join("state/project.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|state| {
+            state
+                .get("appRoot")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .and_then(|app_root| {
+            let app_root = app_root
+                .strip_prefix("/workspace/")
+                .unwrap_or(app_root.as_str())
+                .trim_start_matches('/');
+            if app_root.is_empty() || app_root.contains("..") {
+                None
+            } else {
+                Some(app_root.to_string())
+            }
+        })
+        .unwrap_or_else(|| "project".to_string())
 }
 
 fn normalize_tool_input(mut input: Value) -> Value {

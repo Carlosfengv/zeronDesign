@@ -35,6 +35,18 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+fn assert_error_kind(result: &anydesign_runtime::tools::runtime::ToolResult, expected: &str) {
+    let metadata = result.metadata.as_ref().expect("error metadata");
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some(expected)
+    );
+    assert_eq!(
+        metadata.get("recoverable").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
 async fn create_run(store: &RuntimeStore) -> String {
     store
         .create_run(
@@ -56,6 +68,16 @@ fn sandbox_executor(workspace: &Path) -> StreamingToolExecutor {
     ))
 }
 
+fn sandbox_executor_local_e2e(workspace: &Path) -> StreamingToolExecutor {
+    StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(sandbox_tools(), Default::default(), workspace)
+            .with_policy_profile_and_registry(
+                RuntimePolicyProfile::LocalE2e,
+                "https://registry.npmjs.org/",
+            ),
+    )
+}
+
 #[derive(Debug, Clone)]
 struct RecordingWorkspaceBackend {
     read_text: String,
@@ -66,6 +88,32 @@ struct RecordingWorkspaceBackend {
 #[derive(Debug, Default, Clone)]
 struct RecordingChannelTransport {
     requests: Arc<Mutex<Vec<WorkspaceChannelRequest>>>,
+}
+
+#[derive(Debug, Clone)]
+enum ExecBehavior {
+    Error(io::ErrorKind),
+    Output {
+        status: i32,
+        success: bool,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ExecBehaviorTransport {
+    requests: Arc<Mutex<Vec<WorkspaceChannelRequest>>>,
+    behavior: ExecBehavior,
+}
+
+impl ExecBehaviorTransport {
+    fn new(behavior: ExecBehavior) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            behavior,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +151,7 @@ impl WorkspaceChannelTransport for RecordingChannelTransport {
                     json!({ "kind": "file" })
                 }
             }
+            "fs.copyDir" => json!({ "copied": true }),
             "fs.removeFile" | "fs.removeDirAll" => json!({ "deleted": true }),
             "process.exec" => json!({
                 "status": 0,
@@ -123,6 +172,33 @@ impl WorkspaceChannelTransport for RecordingChannelTransport {
         };
         self.requests.lock().unwrap().push(request);
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl WorkspaceChannelTransport for ExecBehaviorTransport {
+    async fn request(&self, request: WorkspaceChannelRequest) -> io::Result<Value> {
+        self.requests.lock().unwrap().push(request.clone());
+        if request.op != "process.exec" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unexpected op: {}", request.op),
+            ));
+        }
+        match &self.behavior {
+            ExecBehavior::Error(kind) => Err(io::Error::new(*kind, "synthetic exec failure")),
+            ExecBehavior::Output {
+                status,
+                success,
+                stdout,
+                stderr,
+            } => Ok(json!({
+                "status": status,
+                "success": success,
+                "stdout": stdout,
+                "stderr": stderr
+            })),
+        }
     }
 }
 
@@ -210,6 +286,37 @@ impl WorkspaceBackend for RecordingWorkspaceBackend {
     ) -> io::Result<()> {
         fs::remove_dir_all(path)
     }
+
+    async fn copy_dir_all(
+        &self,
+        _ctx: &anydesign_runtime::tools::runtime::ToolContext,
+        from: &Path,
+        to: &Path,
+        skip_dir_names: &[String],
+    ) -> io::Result<()> {
+        fn copy(from: &Path, to: &Path, skip_dir_names: &[String]) -> io::Result<()> {
+            fs::create_dir_all(to)?;
+            for entry in fs::read_dir(from)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if entry.path().is_dir()
+                    && skip_dir_names
+                        .iter()
+                        .any(|skip| name.to_string_lossy() == skip.as_str())
+                {
+                    continue;
+                }
+                let target = to.join(&name);
+                if entry.path().is_dir() {
+                    copy(&entry.path(), &target, skip_dir_names)?;
+                } else {
+                    fs::copy(entry.path(), target)?;
+                }
+            }
+            Ok(())
+        }
+        copy(from, to, skip_dir_names)
+    }
 }
 
 #[tokio::test]
@@ -217,7 +324,7 @@ async fn fs_read_write_list_and_search_are_workspace_bounded() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
-    let executor = sandbox_executor(&workspace);
+    let executor = sandbox_executor_local_e2e(&workspace);
 
     let results = executor
         .execute_calls(
@@ -250,6 +357,57 @@ async fn fs_read_write_list_and_search_are_workspace_bounded() {
         .any(|entry| entry["name"] == "new.md"));
     assert_eq!(results[3].result.content["matches"][0]["line"], 1);
     assert_eq!(store.audit_records().await.len(), 4);
+}
+
+#[tokio::test]
+async fn fs_read_directory_failure_has_structured_metadata() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/subdir")).unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-read-dir",
+                "fs.read",
+                json!({ "path": "project/subdir" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "fs.read_failed");
+    assert!(tool_result_error_text(&results[0].result).contains("/workspace/project/subdir"));
+}
+
+#[tokio::test]
+async fn fs_list_missing_directory_failure_has_structured_metadata() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor_local_e2e(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-list-missing-dir",
+                "fs.list",
+                json!({ "path": "project/missing-dir" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "fs.list_failed");
+    assert!(tool_result_error_text(&results[0].result).contains("/workspace/project/missing-dir"));
 }
 
 #[tokio::test]
@@ -885,7 +1043,8 @@ async fn project_write_page_renders_structured_sections_to_astro_route() {
     assert!(page.contains("Runtime Plans"));
     assert!(page.contains("Launch sites with controlled runtime tools"));
     assert!(page.contains("Observable by default"));
-    assert!(page.contains("class=\"saas\""));
+    assert!(page.contains("class=\"runtime-page saas\""));
+    assert!(page.contains("import '../styles/global.css';"));
 }
 
 #[tokio::test]
@@ -939,7 +1098,859 @@ async fn project_write_page_root_route_overwrites_existing_index_page() {
     assert!(page_path.is_file());
     let page = fs::read_to_string(page_path).unwrap();
     assert!(page.contains("Root Runtime Page"));
+    assert!(page.contains("import '../styles/global.css';"));
+    assert!(page.contains("class=\"runtime-section\""));
+    assert!(!page.contains("<style>"));
     assert!(!page.contains("old page"));
+}
+
+#[tokio::test]
+async fn project_init_astro_website_writes_style_contract_and_tokens() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-website",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert_eq!(results[0].result.content["template"], "astro-website");
+    assert_eq!(
+        results[0].result.content["styleContractPath"],
+        "/workspace/state/style-contract.json"
+    );
+
+    let package_json = fs::read_to_string(workspace.join("project/package.json")).unwrap();
+    assert!(package_json.contains("tailwindcss"));
+    let index = fs::read_to_string(workspace.join("project/src/pages/index.astro")).unwrap();
+    assert!(index.contains("import '../styles/global.css';"));
+    let button_component =
+        fs::read_to_string(workspace.join("project/src/components/ui/Button.astro")).unwrap();
+    assert!(button_component.contains("runtime-button"));
+    assert!(button_component.contains("Astro.props"));
+
+    let global_css = fs::read_to_string(workspace.join("project/src/styles/global.css")).unwrap();
+    assert!(global_css.contains("@import \"tailwindcss\""));
+    assert!(global_css.contains("@import \"./tokens.css\""));
+    assert!(global_css.contains("var(--runtime-primary)"));
+    assert!(global_css.contains("var(--runtime-radius-control)"));
+
+    let tokens = fs::read_to_string(workspace.join("project/src/styles/tokens.css")).unwrap();
+    assert!(tokens.contains("--runtime-primary: #2563eb"));
+    assert!(tokens.contains("--runtime-radius-card: 8px"));
+
+    let contract: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("state/style-contract.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(contract["template"], "astro-website");
+    assert_eq!(
+        contract["tokenFile"],
+        "/workspace/project/src/styles/tokens.css"
+    );
+    assert_eq!(
+        contract["globalCssFile"],
+        "/workspace/project/src/styles/global.css"
+    );
+    assert_eq!(
+        contract["componentRoot"],
+        "/workspace/project/src/components/ui"
+    );
+    assert_eq!(contract["tailwind"]["version"], "4");
+    assert_eq!(
+        contract["tailwind"]["entryImport"],
+        "@import \"tailwindcss\""
+    );
+    assert_eq!(contract["tailwind"]["themeSource"], "css-variables");
+    assert_eq!(contract["tokens"]["color.primary"], "--runtime-primary");
+
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join("state/project.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["templateVersion"], "astro-website@runtime-p2");
+}
+
+#[tokio::test]
+async fn style_update_tokens_updates_contract_backed_token_file() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-website",
+                    "project.init",
+                    json!({ "template": "astro-website" }),
+                ),
+                ToolCall::new(
+                    "tool-style-update",
+                    "style.update_tokens",
+                    json!({
+                        "tokens": {
+                            "color.primary": "#f37a0a",
+                            "color.primaryContrast": "#111827",
+                            "radius.card": "6px"
+                        }
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[1].result.is_error,
+        "{}",
+        tool_result_error_text(&results[1].result)
+    );
+    assert_eq!(
+        results[1].result.content["tokenFile"],
+        "/workspace/project/src/styles/tokens.css"
+    );
+    assert_eq!(
+        results[1].result.content["changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let tokens = fs::read_to_string(workspace.join("project/src/styles/tokens.css")).unwrap();
+    assert!(tokens.contains("--runtime-primary: #f37a0a;"));
+    assert!(tokens.contains("--runtime-primary-contrast: #111827;"));
+    assert!(tokens.contains("--runtime-radius-card: 6px;"));
+    assert!(!tokens.contains("--runtime-primary: #2563eb;"));
+}
+
+#[tokio::test]
+async fn style_update_tokens_rejects_unknown_contract_tokens() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-website",
+                    "project.init",
+                    json!({ "template": "astro-website" }),
+                ),
+                ToolCall::new(
+                    "tool-style-update",
+                    "style.update_tokens",
+                    json!({
+                        "tokens": {
+                            "color.unknown": "#f37a0a"
+                        }
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(results[1].result.is_error);
+    assert_error_kind(&results[1].result, "style.token_unknown");
+    let metadata = results[1].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("token").and_then(Value::as_str),
+        Some("color.unknown")
+    );
+    assert!(tool_result_error_text(&results[1].result).contains("unknown token color.unknown"));
+    let tokens = fs::read_to_string(workspace.join("project/src/styles/tokens.css")).unwrap();
+    assert!(tokens.contains("--runtime-primary: #2563eb;"));
+}
+
+#[tokio::test]
+async fn style_update_tokens_requires_runtime_style_contract_metadata() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-style-update",
+                "style.update_tokens",
+                json!({
+                    "tokens": {
+                        "color.primary": "#f37a0a"
+                    }
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "style.contract_missing");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("contractPath").and_then(Value::as_str),
+        Some("/workspace/state/style-contract.json")
+    );
+}
+
+#[tokio::test]
+async fn style_update_tokens_rejects_missing_css_variable_with_metadata() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let init = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-website",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!init[0].result.is_error);
+    let token_path = workspace.join("project/src/styles/tokens.css");
+    let mut tokens = fs::read_to_string(&token_path).unwrap();
+    tokens = tokens.replace("--runtime-primary:", "--runtime-primary-missing:");
+    fs::write(&token_path, tokens).unwrap();
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-style-update",
+                "style.update_tokens",
+                json!({
+                    "tokens": {
+                        "color.primary": "#f37a0a"
+                    }
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "style.token_variable_missing");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("cssVariable").and_then(Value::as_str),
+        Some("--runtime-primary")
+    );
+}
+
+#[tokio::test]
+async fn project_inspect_returns_lifecycle_style_and_dependency_state() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "buildId": "build-1",
+            "status": "success",
+            "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/dependency-state.json"),
+        json!({
+            "needsRestore": false,
+            "packageManager": "npm",
+            "success": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-website",
+                    "project.init",
+                    json!({ "template": "astro-website" }),
+                ),
+                ToolCall::new("tool-inspect", "project.inspect", json!({})),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[1].result.is_error,
+        "{}",
+        tool_result_error_text(&results[1].result)
+    );
+    let inspected = &results[1].result.content;
+    assert_eq!(inspected["appRoot"], "/workspace/project");
+    assert_eq!(inspected["packageManager"], "npm");
+    assert_eq!(inspected["framework"], "astro");
+    assert_eq!(
+        inspected["styleContractPath"],
+        "/workspace/state/style-contract.json"
+    );
+    assert_eq!(
+        inspected["latestBuild"]["sourceSnapshotUri"],
+        "file:///workspace/outputs/build/source-snapshots/build-1"
+    );
+    assert_eq!(inspected["dependencyState"]["needsRestore"], false);
+    assert!(inspected["keySourceFiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(
+            |file| file["path"] == "/workspace/project/src/styles/tokens.css"
+                && file["exists"] == true
+        ));
+}
+
+#[tokio::test]
+async fn project_init_fumadocs_docs_writes_docs_source_contract() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-docs",
+                "project.init",
+                json!({ "template": "fumadocs-docs" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(results[0].result.content["template"], "fumadocs-docs");
+    let package_json = fs::read_to_string(workspace.join("project/package.json")).unwrap();
+    assert!(package_json.contains("fumadocs-ui"));
+    assert!(package_json.contains(r#""typescript": "5.9.3""#));
+    assert!(workspace.join("project/source.config.ts").exists());
+    assert!(workspace.join("project/lib/source.js").exists());
+    assert!(workspace
+        .join("project/app/docs/[[...slug]]/page.jsx")
+        .exists());
+    let index_mdx = fs::read_to_string(workspace.join("project/content/docs/index.mdx")).unwrap();
+    assert!(index_mdx.contains("title: Overview"));
+    let meta: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("project/content/docs/meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(meta["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|page| page == "index"));
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join("state/project.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["templateKey"], "fumadocs-docs");
+    let global_css = fs::read_to_string(workspace.join("project/app/global.css")).unwrap();
+    assert!(global_css.contains("@import 'tailwindcss'"));
+    assert!(global_css.contains("@import './tokens.css'"));
+    assert!(global_css.contains("var(--runtime-primary)"));
+    assert!(workspace.join("project/app/tokens.css").exists());
+    let button_component =
+        fs::read_to_string(workspace.join("project/components/ui/button.jsx")).unwrap();
+    assert!(button_component.contains("runtime-button"));
+    assert!(button_component.contains("px-4 py-2"));
+    let contract: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("state/style-contract.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(contract["template"], "fumadocs-docs");
+    assert_eq!(contract["tokenFile"], "/workspace/project/app/tokens.css");
+    assert_eq!(
+        contract["globalCssFile"],
+        "/workspace/project/app/global.css"
+    );
+    assert_eq!(
+        contract["componentRoot"],
+        "/workspace/project/components/ui"
+    );
+    assert_eq!(contract["tailwind"]["version"], "4");
+    assert_eq!(
+        contract["tailwind"]["entryImport"],
+        "@import \"tailwindcss\""
+    );
+    assert_eq!(contract["tailwind"]["themeSource"], "css-variables");
+    assert_eq!(contract["tokens"]["color.primary"], "--runtime-primary");
+}
+
+#[tokio::test]
+#[ignore = "installs npm dependencies and runs a real Next/Fumadocs production build"]
+async fn fumadocs_docs_real_next_build_smoke() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-docs-smoke",
+                "project.init",
+                json!({ "template": "fumadocs-docs" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+
+    let docs_dir = workspace.join("project/content/docs");
+    fs::write(
+        docs_dir.join("runtime-flow.mdx"),
+        "---\ntitle: Runtime Flow\ndescription: Build and edit lifecycle\n---\n\n# Runtime Flow\n\nThe runtime creates, builds, previews, and promotes docs.\n",
+    )
+    .unwrap();
+    fs::write(
+        docs_dir.join("typed-errors.mdx"),
+        "---\ntitle: Typed Errors\ndescription: Recoverable error model\n---\n\n# Typed Errors\n\nTyped metadata keeps provider recovery observable.\n",
+    )
+    .unwrap();
+    fs::write(
+        docs_dir.join("meta.json"),
+        serde_json::to_string_pretty(&json!({
+            "title": "AnyDesign Runtime Docs",
+            "pages": ["index", "runtime-flow", "typed-errors"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let project_root = workspace.join("project");
+    let install = tokio::time::timeout(
+        Duration::from_secs(180),
+        Command::new("npm")
+            .args([
+                "install",
+                "--ignore-scripts",
+                "--audit=false",
+                "--fund=false",
+                "--registry",
+                "https://registry.npmjs.org/",
+            ])
+            .current_dir(&project_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .expect("npm install timed out")
+    .expect("failed to run npm install");
+    assert!(
+        install.status.success(),
+        "npm install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let build_results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build-docs-smoke",
+                "project.build",
+                json!({
+                    "cwd": "project",
+                    "timeoutMs": 180000
+                }),
+            )],
+        )
+        .await;
+
+    assert_eq!(build_results.len(), 1);
+    assert!(
+        !build_results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&build_results[0].result)
+    );
+    assert_eq!(build_results[0].result.content["success"], true);
+
+    let latest_build: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("outputs/build/latest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(latest_build["status"], "success");
+    assert_eq!(latest_build["packageManager"], "npm");
+    assert!(latest_build["sourceSnapshotUri"]
+        .as_str()
+        .unwrap()
+        .starts_with("file:///workspace/outputs/build/source-snapshots/build-"));
+
+    assert!(project_root.join("out/docs.html").exists());
+    assert!(project_root.join("out/docs/runtime-flow.html").exists());
+    assert!(project_root.join("out/docs/typed-errors.html").exists());
+}
+
+#[tokio::test]
+async fn project_init_cleans_conflicting_template_files_between_templates() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let website_results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-website",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert_eq!(website_results.len(), 1);
+    assert!(!website_results[0].result.is_error);
+    assert!(workspace.join("project/src/pages/index.astro").exists());
+    assert!(workspace.join("project/astro.config.mjs").exists());
+
+    let docs_results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-docs",
+                "project.init",
+                json!({ "template": "fumadocs-docs" }),
+            )],
+        )
+        .await;
+    assert_eq!(docs_results.len(), 1);
+    assert!(!docs_results[0].result.is_error);
+    assert!(!workspace.join("project/src/pages/index.astro").exists());
+    assert!(!workspace.join("project/astro.config.mjs").exists());
+    assert!(workspace
+        .join("project/app/docs/[[...slug]]/page.jsx")
+        .exists());
+    let docs_tsconfig = fs::read_to_string(workspace.join("project/tsconfig.json")).unwrap();
+    assert!(docs_tsconfig.contains("\"plugins\": [{ \"name\": \"next\" }]"));
+    assert!(!docs_tsconfig.contains("astro/tsconfigs/strict"));
+
+    let website_again_results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-website-again",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert_eq!(website_again_results.len(), 1);
+    assert!(!website_again_results[0].result.is_error);
+    assert!(workspace.join("project/src/pages/index.astro").exists());
+    assert!(workspace.join("project/astro.config.mjs").exists());
+    assert!(!workspace
+        .join("project/app/docs/[[...slug]]/page.jsx")
+        .exists());
+    assert!(!workspace.join("project/content/docs/index.mdx").exists());
+    assert!(!workspace.join("project/next.config.mjs").exists());
+    let website_tsconfig = fs::read_to_string(workspace.join("project/tsconfig.json")).unwrap();
+    assert!(website_tsconfig.contains("astro/tsconfigs/strict"));
+}
+
+#[tokio::test]
+async fn fumadocs_docs_rejects_pages_router_writes_with_structured_metadata() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-docs",
+                    "project.init",
+                    json!({ "template": "fumadocs-docs" }),
+                ),
+                ToolCall::new(
+                    "tool-write-pages-route",
+                    "fs.write",
+                    json!({
+                        "path": "project/pages/index.jsx",
+                        "text": "export default function Page() { return null; }"
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-write-src-pages-route",
+                    "fs.write",
+                    json!({
+                        "path": "project/src/pages/index.jsx",
+                        "text": "export default function Page() { return null; }"
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 3);
+    assert!(!results[0].result.is_error);
+    assert!(results[1].result.is_error);
+    assert_error_kind(&results[1].result, "docs.routing_root_forbidden");
+    assert!(results[2].result.is_error);
+    assert_error_kind(&results[2].result, "docs.routing_root_forbidden");
+    assert!(!workspace.join("project/pages/index.jsx").exists());
+    assert!(!workspace.join("project/src/pages/index.jsx").exists());
+}
+
+#[tokio::test]
+async fn project_build_accepts_valid_fumadocs_docs_source_contract() {
+    let workspace = setup_workspace();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-docs",
+                    "project.init",
+                    json!({ "template": "fumadocs-docs" }),
+                ),
+                ToolCall::new(
+                    "tool-build-docs",
+                    "project.build",
+                    json!({ "cwd": "project" }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(
+        !results[1].result.is_error,
+        "{}",
+        tool_result_error_text(&results[1].result)
+    );
+    assert_eq!(results[1].result.content["success"], true);
+    assert!(results[1].result.content["sourceSnapshotUri"]
+        .as_str()
+        .unwrap()
+        .contains("file:///workspace/outputs/build/source-snapshots/"));
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.path == "/workspace/project"
+            && request.payload["argv"]
+                .as_array()
+                .is_some_and(|argv| argv[0] == "npm" && argv[1] == "run" && argv[2] == "build")
+    }));
+}
+
+#[tokio::test]
+async fn project_build_rejects_fumadocs_docs_when_source_contract_is_missing() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "type": "module",
+            "scripts": { "build": "next build" },
+            "dependencies": { "fumadocs-ui": "^16.10.7" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({ "appRoot": "project", "templateKey": "fumadocs-docs" }).to_string(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build-docs",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    let error = tool_result_error_text(&results[0].result);
+    assert!(error.contains("Docs source contract invalid"));
+    assert!(error.contains("source.config.ts"));
+    assert!(error.contains("content/docs/meta.json"));
+    assert_error_kind(&results[0].result, "docs.source_contract_invalid");
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|request| request.op == "process.exec"));
+}
+
+#[tokio::test]
+async fn project_build_rejects_fumadocs_docs_with_pages_router_root() {
+    let workspace = setup_workspace();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let init_results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-docs",
+                "project.init",
+                json!({ "template": "fumadocs-docs" }),
+            )],
+        )
+        .await;
+    assert_eq!(init_results.len(), 1);
+    assert!(!init_results[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/pages")).unwrap();
+    fs::write(
+        workspace.join("project/pages/index.jsx"),
+        "export default function Page() { return null; }",
+    )
+    .unwrap();
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build-docs",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "docs.routing_root_forbidden");
+    assert!(tool_result_error_text(&results[0].result).contains("project/pages"));
+    assert!(tool_result_error_text(&results[0].result).contains("forbidden"));
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|request| request.op == "process.exec"));
+}
+
+#[tokio::test]
+async fn project_build_missing_command_failure_has_structured_metadata() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "scripts": { "build": "next build" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = ExecBehaviorTransport::new(ExecBehavior::Output {
+        status: 127,
+        success: false,
+        stdout: String::new(),
+        stderr: "sh: next: command not found".to_string(),
+    });
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "build.missing_dependency");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["exitCode"], 127);
+    assert!(metadata["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("next: command not found"));
 }
 
 #[tokio::test]
@@ -978,6 +1989,37 @@ async fn shell_run_can_execute_over_json_workspace_channel() {
     assert_eq!(requests[0].op, "process.exec");
     assert_eq!(requests[0].path, "/workspace/project");
     assert_eq!(requests[0].payload["argv"][0], "node");
+}
+
+#[tokio::test]
+async fn json_workspace_channel_backend_copy_dir_all_emits_copy_dir_request() {
+    let workspace = setup_workspace();
+    let transport = RecordingChannelTransport::default();
+    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let run = store.get_run(&run_id).await.unwrap();
+    let ctx = ToolContext::new(store, run, workspace.clone());
+
+    workspace_backend
+        .copy_dir_all(
+            &ctx,
+            &workspace.join("project"),
+            &workspace.join("outputs/build/source-snapshots/build-test"),
+            &["node_modules".to_string(), "dist".to_string()],
+        )
+        .await
+        .unwrap();
+
+    let requests = transport.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].op, "fs.copyDir");
+    assert_eq!(requests[0].path, "/workspace/project");
+    assert_eq!(
+        requests[0].payload["to"],
+        "/workspace/outputs/build/source-snapshots/build-test"
+    );
+    assert_eq!(requests[0].payload["skipDirNames"][0], "node_modules");
 }
 
 #[tokio::test]
@@ -1041,6 +2083,113 @@ async fn package_install_can_execute_over_json_workspace_channel() {
         request.op == "fs.write"
             && request.path == "/workspace/outputs/build/package-install-latest.log"
     }));
+}
+
+#[tokio::test]
+async fn project_ensure_dependencies_wraps_package_install_and_writes_dependency_state() {
+    let workspace = setup_workspace();
+    let transport = RecordingChannelTransport::default();
+    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(workspace_backend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-ensure-deps",
+                "project.ensure_dependencies",
+                json!({ "mode": "restore", "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert_eq!(results[0].result.content["ensured"], true);
+    assert_eq!(
+        results[0].result.content["dependencyState"]["packageManager"],
+        "npm"
+    );
+    assert_eq!(
+        results[0].result.content["dependencyState"]["mode"],
+        "restore"
+    );
+    assert_eq!(
+        results[0].result.content["dependencyState"]["success"],
+        true
+    );
+
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.path == "/workspace/project"
+            && request.payload["argv"][0] == "npm"
+            && request.payload["argv"][1] == "install"
+    }));
+    assert!(requests.iter().any(|request| {
+        request.op == "fs.write"
+            && request.path == "/workspace/state/dependency-state.json"
+            && request.payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"needsRestore\": false")
+    }));
+}
+
+#[tokio::test]
+async fn project_ensure_dependencies_timeout_has_structured_metadata() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "dependencies": { "next": "^15.5.7" },
+            "scripts": { "build": "next build" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = ExecBehaviorTransport::new(ExecBehavior::Error(io::ErrorKind::TimedOut));
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport, &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-ensure-deps",
+                "project.ensure_dependencies",
+                json!({ "mode": "restore", "cwd": "project", "timeoutMs": 1 }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "dependency.install_timeout");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["timeoutMs"], 1);
+    assert_eq!(metadata["packageManager"], "npm");
 }
 
 #[tokio::test]
@@ -1108,6 +2257,216 @@ async fn package_install_restore_uses_pnpm_install_and_emits_tool_output() {
             && stream == "stdout"
             && text.contains("ran:pnpm@/workspace/project")
     )));
+}
+
+#[tokio::test]
+async fn project_build_auto_restores_missing_dependencies_before_build() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "scripts": { "build": "astro build" },
+            "dependencies": { "astro": "^5.16.4" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(
+        results[0].result.content["dependencyRestoreAttempted"],
+        true
+    );
+    assert_eq!(
+        results[0].result.content["dependencyRestoreSucceeded"],
+        true
+    );
+    assert_eq!(
+        results[0].result.content["dependencyRestoreReason"],
+        "node_modules_missing"
+    );
+    let requests = transport.requests.lock().unwrap().clone();
+    let execs = requests
+        .iter()
+        .filter(|request| request.op == "process.exec")
+        .collect::<Vec<_>>();
+    assert_eq!(execs.len(), 2);
+    assert!(execs[0].payload["argv"]
+        .as_array()
+        .is_some_and(|argv| argv[0] == "npm" && argv[1] == "install"));
+    assert!(execs[1].payload["argv"]
+        .as_array()
+        .is_some_and(|argv| argv[0] == "npm" && argv[1] == "run" && argv[2] == "build"));
+    let events = store.events(&run_id).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolOutput { tool, text, .. }
+            if tool == "package.install"
+                && text.contains("runtime dependency restore before project.build")
+    )));
+}
+
+#[tokio::test]
+async fn project_build_dependency_restore_policy_denial_is_typed_recoverable() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "scripts": { "build": "astro build" },
+            "dependencies": { "astro": "^5.16.4" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(
+            sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+            Default::default(),
+            &workspace,
+        )
+        .with_policy_profile_and_registry(
+            RuntimePolicyProfile::Production,
+            "https://registry.npmjs.org",
+        ),
+    );
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "build.missing_dependency");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("registry").and_then(Value::as_str),
+        Some("https://registry.npmjs.org")
+    );
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|request| request.op == "process.exec"));
+}
+
+#[tokio::test]
+async fn project_build_uses_project_package_manager_for_build_command() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "scripts": { "build": "vite build" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({ "appRoot": "project", "packageManager": "pnpm" }).to_string(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(results[0].result.content["packageManager"], "pnpm");
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.payload["argv"]
+                .as_array()
+                .is_some_and(|argv| argv[0] == "pnpm" && argv[1] == "run" && argv[2] == "build")
+    }));
+}
+
+#[tokio::test]
+async fn fs_tools_accept_virtual_workspace_prefix_paths() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/virtual-path.txt"),
+        "from virtual path",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-read",
+                "fs.read",
+                json!({ "path": "/workspace/project/virtual-path.txt" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(results[0].result.content["text"], "from virtual path");
+    assert_eq!(
+        results[0].result.content["path"],
+        "/workspace/project/virtual-path.txt"
+    );
 }
 
 #[tokio::test]
@@ -1603,6 +2962,63 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
 }
 
 #[tokio::test]
+async fn workspace_channel_server_script_copies_directory_snapshots() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/src")).unwrap();
+    fs::create_dir_all(workspace.join("project/node_modules/ignored-package")).unwrap();
+    fs::create_dir_all(workspace.join("outputs/build/source-snapshots")).unwrap();
+    fs::write(workspace.join("project/src/index.md"), "copy me").unwrap();
+    fs::write(
+        workspace.join("project/node_modules/ignored-package/index.js"),
+        "ignored",
+    )
+    .unwrap();
+    let port = free_tcp_port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/agent-sandbox/base/workspace-channel-server.js");
+    let mut child = Command::new("node")
+        .arg(script)
+        .env("WORKSPACE_ROOT", &workspace)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node must start workspace-channel-server.js");
+
+    wait_for_tcp_port(port).await;
+
+    let backend = JsonWorkspaceChannelBackend::new(
+        WebSocketWorkspaceChannelTransport::new(format!("ws://127.0.0.1:{port}/workspace"))
+            .with_timeout(Duration::from_secs(2)),
+        &workspace,
+    );
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let run = store.get_run(&run_id).await.unwrap();
+    let ctx = ToolContext::new(store, run, workspace.clone());
+    let target = workspace.join("outputs/build/source-snapshots/channel-build");
+
+    backend
+        .copy_dir_all(
+            &ctx,
+            &workspace.join("project"),
+            &target,
+            &["node_modules".to_string()],
+        )
+        .await
+        .unwrap();
+
+    child.kill().await.ok();
+    assert_eq!(
+        fs::read_to_string(target.join("src/index.md")).unwrap(),
+        "copy me"
+    );
+    assert!(!target
+        .join("node_modules/ignored-package/index.js")
+        .exists());
+}
+
+#[tokio::test]
 async fn workspace_channel_server_script_serves_state_and_diagnostics_tools() {
     let workspace = setup_workspace();
     fs::write(
@@ -1723,11 +3139,144 @@ async fn fs_rejects_secret_and_external_paths() {
 
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|result| result.result.is_error));
+    assert_error_kind(&results[0].result, "path.secret");
+    assert_error_kind(&results[1].result, "path.external_directory");
     assert!(store
         .events(&run_id)
         .await
         .iter()
         .any(|event| serde_json::to_value(event).unwrap()["type"] == "permission.denied"));
+}
+
+#[tokio::test]
+async fn fs_external_path_returns_structured_recoverable_error() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-root",
+                "fs.read",
+                json!({ "path": "/" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some("path.external_directory")
+    );
+    assert_eq!(
+        metadata.get("receivedPath").and_then(Value::as_str),
+        Some("/")
+    );
+    assert_eq!(
+        metadata.get("suggestedPath").and_then(Value::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        metadata.get("recoverable").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn fs_invalid_path_component_returns_structured_recoverable_error() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-invalid",
+                "fs.write",
+                json!({ "path": "project/../escape.md", "text": "nope" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "path.invalid_component");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("receivedPath").and_then(Value::as_str),
+        Some("project/../escape.md")
+    );
+}
+
+#[tokio::test]
+async fn fs_patch_tools_reject_nested_package_root_with_structured_error() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/src")).unwrap();
+    fs::write(
+        workspace.join("project/src/package.json"),
+        "{\"name\":\"nested\"}\n",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-patch-nested-package",
+                    "fs.patch",
+                    json!({
+                        "path": "project/src/package.json",
+                        "oldStr": "nested",
+                        "newStr": "changed"
+                    }),
+                ),
+                ToolCall::new(
+                    "tool-multi-patch-nested-package",
+                    "fs.multi_patch",
+                    json!({
+                        "path": "project/src/package.json",
+                        "edits": [
+                            { "oldStr": "nested", "newStr": "changed" }
+                        ]
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].result.is_error);
+    assert!(results[1].result.is_error);
+    assert_error_kind(&results[0].result, "path.nested_package_root");
+    assert_error_kind(&results[1].result, "path.nested_package_root");
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/src/package.json")).unwrap(),
+        "{\"name\":\"nested\"}\n"
+    );
+    let audits = store.audit_records().await;
+    assert_eq!(audits.len(), 2);
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|record| record.decision == "deny"
+                && record.reason.contains("nested package root denied"))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -1766,6 +3315,195 @@ async fn fs_patch_is_atomic_when_old_string_is_ambiguous() {
 
     assert!(results[0].result.is_error);
     assert_eq!(fs::read_to_string(&file).unwrap(), "same\nsame\n");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some("patch.old_str_ambiguous")
+    );
+    assert_eq!(metadata.get("matchCount").and_then(Value::as_u64), Some(2));
+}
+
+#[tokio::test]
+async fn fs_patch_replace_all_updates_repeated_matches() {
+    let workspace = setup_workspace();
+    let file = workspace.join("project").join("tokens.css");
+    fs::write(
+        &file,
+        ":root { --color-primary: #16a34a; }\n.button { color: #16a34a; }\n",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-read",
+                    "fs.read",
+                    json!({ "path": "project/tokens.css" }),
+                ),
+                ToolCall::new(
+                    "tool-patch",
+                    "fs.patch",
+                    json!({
+                        "path": "project/tokens.css",
+                        "oldStr": "#16a34a",
+                        "newStr": "#7c3aed",
+                        "replaceAll": true
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(!results[1].result.is_error);
+    assert_eq!(results[1].result.content["replaceAll"], true);
+    assert_eq!(results[1].result.content["replacements"], 2);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        ":root { --color-primary: #7c3aed; }\n.button { color: #7c3aed; }\n"
+    );
+}
+
+#[tokio::test]
+async fn fs_patch_rejects_stale_read_after_file_changes() {
+    let workspace = setup_workspace();
+    let file = workspace.join("project").join("copy.md");
+    fs::write(&file, "hello\nworld\n").unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let read = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-read",
+                "fs.read",
+                json!({ "path": "project/copy.md" }),
+            )],
+        )
+        .await;
+    assert!(!read[0].result.is_error);
+
+    fs::write(&file, "hello\nexternal edit\n").unwrap();
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-patch",
+                "fs.patch",
+                json!({ "path": "project/copy.md", "oldStr": "hello", "newStr": "hi" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert!(tool_result_error_text(&results[0].result).contains("modified since fs.read"));
+    assert_error_kind(&results[0].result, "patch.stale_read");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello\nexternal edit\n");
+}
+
+#[tokio::test]
+async fn fs_multi_patch_applies_multiple_edits_atomically() {
+    let workspace = setup_workspace();
+    let file = workspace.join("project").join("page.astro");
+    fs::write(
+        &file,
+        "<h1>Old title</h1>\n<p>Old body</p>\n<span>#16a34a</span>\n",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-read",
+                    "fs.read",
+                    json!({ "path": "project/page.astro" }),
+                ),
+                ToolCall::new(
+                    "tool-multi-patch",
+                    "fs.multi_patch",
+                    json!({
+                        "path": "project/page.astro",
+                        "edits": [
+                            { "oldStr": "Old title", "newStr": "New title" },
+                            { "oldStr": "Old body", "newStr": "New body" },
+                            { "oldStr": "#16a34a", "newStr": "#7c3aed" }
+                        ]
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(!results[1].result.is_error);
+    assert_eq!(results[1].result.content["replacements"], 3);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "<h1>New title</h1>\n<p>New body</p>\n<span>#7c3aed</span>\n"
+    );
+}
+
+#[tokio::test]
+async fn fs_multi_patch_does_not_write_when_later_edit_fails() {
+    let workspace = setup_workspace();
+    let file = workspace.join("project").join("page.astro");
+    let original = "<h1>Old title</h1>\n<p>Old body</p>\n";
+    fs::write(&file, original).unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-read",
+                    "fs.read",
+                    json!({ "path": "project/page.astro" }),
+                ),
+                ToolCall::new(
+                    "tool-multi-patch",
+                    "fs.multi_patch",
+                    json!({
+                        "path": "project/page.astro",
+                        "edits": [
+                            { "oldStr": "Old title", "newStr": "New title" },
+                            { "oldStr": "Missing text", "newStr": "New body" }
+                        ]
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(results[1].result.is_error);
+    assert!(tool_result_error_text(&results[1].result).contains("edit 1 oldStr not found"));
+    assert_error_kind(&results[1].result, "patch.old_str_missing");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
 }
 
 #[tokio::test]
@@ -1791,7 +3529,34 @@ async fn fs_patch_requires_read_before_patch() {
 
     assert!(results[0].result.is_error);
     assert!(tool_result_error_text(&results[0].result).contains("requires reading"));
+    assert_error_kind(&results[0].result, "patch.read_required");
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello\nworld\n");
+}
+
+#[tokio::test]
+async fn shell_run_denied_command_returns_structured_recoverable_error() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-shell",
+                "shell.run",
+                json!({ "argv": ["sh", "-c", "echo nope"] }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "shell.command_denied");
+    let metadata = results[0].result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["argv"], json!(["sh", "-c", "echo nope"]));
 }
 
 #[tokio::test]
@@ -1852,6 +3617,39 @@ async fn shell_run_uses_argv_policy_without_shell_strings() {
 }
 
 #[tokio::test]
+async fn shell_run_local_backend_maps_virtual_workspace_argv_paths() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(workspace.join("project/dist/index.html"), "<h1>ok</h1>").unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-shell",
+                "shell.run",
+                json!({ "argv": ["ls", "/workspace/project/dist"], "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    assert!(results[0].result.content["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("index.html"));
+}
+
+#[tokio::test]
 async fn shell_run_non_zero_exit_is_error_and_cancels_later_sibling_tools() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();
@@ -1877,6 +3675,7 @@ async fn shell_run_non_zero_exit_is_error_and_cancels_later_sibling_tools() {
     assert!(results[0].result.is_error);
     assert!(tool_result_error_text(&results[0].result).contains("status Some(7)"));
     assert!(tool_result_error_text(&results[0].result).contains("boom"));
+    assert_error_kind(&results[0].result, "shell.non_zero_exit");
     assert!(results[1].synthetic);
     assert!(tool_result_error_text(&results[1].result).contains("shell.run failed"));
 }
@@ -2119,6 +3918,133 @@ async fn preview_start_spawns_static_server_from_dist() {
     assert!(results[0].result.content["pid"].as_u64().is_some());
     assert_eq!(results[1].result.content["status"], "stopped");
     assert_eq!(results[1].result.content["pid"], Value::Null);
+}
+
+#[tokio::test]
+async fn preview_start_spawns_static_server_from_fumadocs_out() {
+    let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({
+            "appRoot": "project",
+            "templateKey": "fumadocs-docs",
+            "template": "fumadocs-docs"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("project/out")).unwrap();
+    fs::write(
+        workspace.join("project/out/index.html"),
+        "<!doctype html><title>Docs</title><h1>Docs Ready</h1>",
+    )
+    .unwrap();
+    let port = free_tcp_port();
+    let preview_url = format!("http://127.0.0.1:{port}");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-1",
+                    "preview.start",
+                    json!({ "url": preview_url, "port": port }),
+                ),
+                ToolCall::new("tool-2", "preview.stop", json!({})),
+            ],
+        )
+        .await;
+
+    assert!(results.iter().all(|result| !result.result.is_error));
+    assert_eq!(results[0].result.content["status"], "running");
+    assert_eq!(results[0].result.content["accessible"], true);
+    assert_eq!(
+        results[0].result.content["staticOutputPath"],
+        "/workspace/project/out"
+    );
+    assert_eq!(results[1].result.content["status"], "stopped");
+}
+
+#[tokio::test]
+async fn preview_publish_builds_screenshots_and_promotes_candidate() {
+    let workspace = setup_workspace();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init",
+                    "project.init",
+                    json!({ "template": "astro-website" }),
+                ),
+                ToolCall::new(
+                    "tool-publish",
+                    "preview.publish",
+                    json!({
+                        "url": preview_url,
+                        "screenshotId": "publish-shot"
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[1].result.is_error,
+        "{}",
+        tool_result_error_text(&results[1].result)
+    );
+    assert_eq!(results[1].result.content["published"], true);
+    assert_eq!(results[1].result.content["build"]["success"], true);
+    assert_eq!(
+        results[1].result.content["screenshot"]["screenshotId"],
+        "publish-shot"
+    );
+    assert_eq!(results[1].result.content["promotion"]["status"], "promoted");
+    assert!(workspace
+        .join("outputs/screenshots/publish-shot.json")
+        .exists());
+
+    let requests = transport.requests.lock().unwrap().clone();
+    assert!(requests.iter().any(|request| {
+        request.op == "process.exec"
+            && request.path == "/workspace/project"
+            && request.payload["argv"]
+                .as_array()
+                .is_some_and(|argv| argv[0] == "npm" && argv[1] == "run" && argv[2] == "build")
+    }));
+    let event_types = store
+        .events(&run_id)
+        .await
+        .iter()
+        .map(|event| {
+            serde_json::to_value(event).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(event_types.contains(&"preview.candidate".to_string()));
+    assert!(event_types.contains(&"preview.updated".to_string()));
 }
 
 #[tokio::test]

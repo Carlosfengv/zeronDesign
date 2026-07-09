@@ -75,6 +75,49 @@ async fn control_plane_tool_calls_write_one_audit_record_each() {
 }
 
 #[tokio::test]
+async fn pre_tool_hook_rejects_brief_tools_during_build_before_validation() {
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = control_plane_executor();
+
+    let execution = executor
+        .execute(
+            store.clone(),
+            &run_id,
+            "tool-brief",
+            "brief.write_draft",
+            json!({}),
+        )
+        .await;
+
+    assert!(execution.result.is_error);
+    assert_eq!(
+        execution
+            .result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("errorKind"))
+            .and_then(Value::as_str),
+        Some("tool.phase_forbidden")
+    );
+    assert_eq!(
+        execution
+            .result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("recoverable"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let audits = store.audit_records().await;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].tool, "brief.write_draft");
+    assert_eq!(audits[0].decision, "deny");
+    assert!(audits[0].reason.contains("pre-tool hook rejected"));
+    assert!(audits[0].reason.contains("tool.phase_forbidden"));
+}
+
+#[tokio::test]
 async fn sandbox_tool_validation_runs_before_permission_but_writes_runtime_audit() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();
@@ -106,6 +149,44 @@ async fn sandbox_tool_validation_runs_before_permission_but_writes_runtime_audit
     assert_eq!(audits[0].tool, "shell.run");
     assert_eq!(audits[0].decision, "deny");
     assert!(audits[0].reason.contains("input validation failed"));
+}
+
+#[tokio::test]
+async fn pre_tool_hook_normalizes_cwd_before_permission_and_audit() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/custom-app")).unwrap();
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({ "appRoot": "project/custom-app" }).to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let execution = executor
+        .execute(
+            store.clone(),
+            &run_id,
+            "tool-1",
+            "shell.run",
+            json!({
+                "argv": ["node", "-e", "process.stdout.write(process.cwd())"],
+                "cwd": "/workspace/project/custom-app"
+            }),
+        )
+        .await;
+
+    assert!(!execution.result.is_error);
+    assert!(execution.result.content["stdout"]
+        .as_str()
+        .unwrap()
+        .ends_with("project/custom-app"));
+    let audits = store.audit_records().await;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].tool, "shell.run");
+    assert_eq!(audits[0].decision, "allow");
+    assert!(audits[0].input_summary.contains("cwd=project/custom-app"));
 }
 
 #[tokio::test]
@@ -248,7 +329,35 @@ async fn shell_and_package_policies_are_enforced_on_real_sandbox_tools() {
     assert!(pnpm_install.result.content["error"]
         .as_str()
         .unwrap()
-        .contains("package.install"));
+        .contains("runtime dependency tools"));
+    let metadata = pnpm_install.result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some("shell.command_denied")
+    );
+    assert_eq!(
+        metadata.get("suggestedTool").and_then(Value::as_str),
+        Some("project.ensure_dependencies")
+    );
+    let pnpm_dev = executor
+        .execute(
+            store.clone(),
+            &run_id,
+            "tool-preview-shell",
+            "shell.run",
+            json!({ "argv": ["pnpm", "run", "dev"], "cwd": "project" }),
+        )
+        .await;
+    assert!(pnpm_dev.result.is_error);
+    let metadata = pnpm_dev.result.metadata.as_ref().unwrap();
+    assert_eq!(
+        metadata.get("errorKind").and_then(Value::as_str),
+        Some("shell.command_denied")
+    );
+    assert_eq!(
+        metadata.get("suggestedTool").and_then(Value::as_str),
+        Some("preview.start")
+    );
     assert!(!node.result.is_error);
     assert_eq!(node.result.content["stdout"], "ok");
     assert!(public_package.result.is_error);
@@ -258,11 +367,12 @@ async fn shell_and_package_policies_are_enforced_on_real_sandbox_tools() {
     );
 
     let audits = store.audit_records().await;
-    assert_eq!(audits.len(), 4);
+    assert_eq!(audits.len(), 5);
     assert_eq!(audits[0].decision, "deny");
     assert_eq!(audits[1].decision, "deny");
     assert_eq!(audits[2].decision, "allow");
     assert_eq!(audits[3].decision, "deny");
+    assert_eq!(audits[4].decision, "deny");
     assert!(audits[0].input_summary.contains("argv=[sh -c pnpm build]"));
     assert!(audits[3].input_summary.contains("registry.npmjs.org"));
 }
@@ -356,7 +466,12 @@ async fn browser_open_denies_public_internet_and_allows_internal_preview_urls() 
 async fn each_sandbox_tool_decision_writes_one_audit_record() {
     let workspace = setup_workspace();
     let (preview_url, _preview_server) = start_preview_server().await;
-    let local_package = workspace.join("local-package");
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({ "appRoot": "project/custom-app" }).to_string(),
+    )
+    .unwrap();
+    let local_package = workspace.join("project/local-package");
     fs::create_dir_all(&local_package).unwrap();
     fs::write(
         local_package.join("package.json"),
@@ -378,15 +493,21 @@ async fn each_sandbox_tool_decision_writes_one_audit_record() {
     let executor = sandbox_executor(&workspace);
 
     let calls = vec![
-        ("fs.list", json!({ "path": "project" })),
-        ("fs.search", json!({ "path": "project", "query": "hello" })),
-        ("fs.write", json!({ "path": "project/a.txt", "text": "a" })),
-        ("fs.read", json!({ "path": "project/a.txt" })),
+        ("fs.list", json!({ "path": "project/custom-app" })),
+        (
+            "fs.search",
+            json!({ "path": "project/custom-app", "query": "hello" }),
+        ),
+        (
+            "fs.write",
+            json!({ "path": "project/custom-app/a.txt", "text": "a" }),
+        ),
+        ("fs.read", json!({ "path": "project/custom-app/a.txt" })),
         (
             "fs.patch",
-            json!({ "path": "project/a.txt", "oldStr": "a", "newStr": "b" }),
+            json!({ "path": "project/custom-app/a.txt", "oldStr": "a", "newStr": "b" }),
         ),
-        ("fs.delete", json!({ "path": "project/a.txt" })),
+        ("fs.delete", json!({ "path": "project/custom-app/a.txt" })),
         ("preview.rebuilding", json!({})),
         ("preview.start", json!({ "url": preview_url })),
         ("preview.status", json!({})),
@@ -432,12 +553,17 @@ async fn each_sandbox_tool_decision_writes_one_audit_record() {
 fn setup_workspace() -> PathBuf {
     let workspace = unique_temp_dir("tool-permissions");
     fs::create_dir_all(workspace.join("project")).unwrap();
+    fs::create_dir_all(workspace.join("project/custom-app")).unwrap();
     fs::create_dir_all(workspace.join("inputs")).unwrap();
     fs::create_dir_all(workspace.join("state")).unwrap();
     fs::create_dir_all(workspace.join("outputs/build")).unwrap();
     fs::create_dir_all(workspace.join("outputs/reports")).unwrap();
     fs::create_dir_all(workspace.join("outputs/screenshots")).unwrap();
-    fs::write(workspace.join("project").join("index.md"), "hello").unwrap();
+    fs::write(
+        workspace.join("project/custom-app").join("index.md"),
+        "hello",
+    )
+    .unwrap();
     fs::write(workspace.join("outputs/build/build.log"), "Build ok").unwrap();
     fs::write(
         workspace.join("outputs/build/latest.json"),
