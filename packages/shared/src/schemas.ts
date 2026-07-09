@@ -80,7 +80,10 @@ export const ConversationItemSchema = z.object({
   role: z.enum(["user", "assistant", "system"]).nullish(),
   text: z.string(),
   metadata: z.unknown().nullish(),
-  visibility: z.enum(["user", "debug"]).default("user"),
+  visibility: z
+    .enum(["user", "debug"])
+    .optional()
+    .transform((visibility) => visibility ?? "user"),
   createdAt: z.string().datetime(),
 });
 

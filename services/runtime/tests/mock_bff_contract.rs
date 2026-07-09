@@ -10,13 +10,16 @@ use anydesign_runtime::{
 };
 use axum::{
     body::{to_bytes, Body},
+    extract::{Path, Query, State},
     http::{Request, StatusCode},
+    response::Response,
+    routing::get,
     Router,
 };
 use chrono::Utc;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::time::{timeout, Duration};
 use tower::ServiceExt;
 
@@ -26,6 +29,33 @@ fn mock_bff_app(store: RuntimeStore, responses: Vec<ModelResponse>) -> Router {
         store,
         model: Arc::new(MockModelClient::new(responses)),
     })
+}
+
+#[derive(Clone)]
+struct MockBffProxyState {
+    runtime_app: Router,
+}
+
+fn mock_bff_proxy_app(runtime_app: Router) -> Router {
+    Router::new()
+        .route("/bff/runs/{run_id}/events", get(proxy_run_events))
+        .with_state(MockBffProxyState { runtime_app })
+}
+
+async fn proxy_run_events(
+    State(state): State<MockBffProxyState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut builder = Request::builder().uri(format!("/runs/{run_id}/events"));
+    if let Some(last_event_id) = query.get("lastEventId") {
+        builder = builder.header("last-event-id", last_event_id);
+    }
+    state
+        .runtime_app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
 }
 
 async fn post_json(app: Router, uri: impl AsRef<str>, body: Value) -> (StatusCode, Value) {
@@ -243,6 +273,91 @@ async fn brief_run_streams_and_reconnects_without_duplicate_events() {
     .await;
     assert!(!replay.contains("run.started"));
     assert!(replay.contains("run.completed"));
+}
+
+#[tokio::test]
+async fn bff_events_route_proxies_runtime_live_sse_with_last_event_id_query() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    for text in ["first", "second"] {
+        store
+            .append_event(AgentEvent::AgentMessage {
+                run_id: run.id.clone(),
+                text: text.to_string(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+    let runtime_app = mock_bff_app(store.clone(), vec![]);
+    let bff_app = mock_bff_proxy_app(runtime_app);
+    let response = bff_app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/bff/runs/{}/events?lastEventId={}%2F1",
+                    run.id, run.id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+
+    let replay = timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("expected replay frame")
+        .expect("expected replay body")
+        .expect("replay frame should be valid");
+    let replay = String::from_utf8(replay.to_vec()).unwrap();
+    assert!(!replay.contains("first"));
+    assert!(replay.contains("second"));
+    assert!(replay.contains(&format!("id: {}/2", run.id)));
+
+    store
+        .append_event(AgentEvent::AgentMessage {
+            run_id: run.id.clone(),
+            text: "third".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let live = timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("expected live frame")
+        .expect("expected live body")
+        .expect("live frame should be valid");
+    let live = String::from_utf8(live.to_vec()).unwrap();
+    assert!(live.contains("third"));
+    assert!(live.contains(&format!("id: {}/3", run.id)));
+
+    store
+        .append_event(AgentEvent::RunCompleted {
+            run_id: run.id.clone(),
+            status: "completed".to_string(),
+            summary: "done".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let terminal = timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("expected terminal frame")
+        .expect("expected terminal body")
+        .expect("terminal frame should be valid");
+    let terminal = String::from_utf8(terminal.to_vec()).unwrap();
+    assert!(terminal.contains("run.completed"));
+    assert!(terminal.contains(&format!("id: {}/4", run.id)));
 }
 
 #[tokio::test]
