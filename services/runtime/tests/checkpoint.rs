@@ -142,7 +142,8 @@ async fn agent_events_are_appended_to_run_log_jsonl() {
             text: "Starting".to_string(),
             timestamp: Utc::now(),
         })
-        .await;
+        .await
+        .unwrap();
     store
         .append_event(AgentEvent::RunCompleted {
             run_id: run_id.clone(),
@@ -150,7 +151,8 @@ async fn agent_events_are_appended_to_run_log_jsonl() {
             summary: "Done".to_string(),
             timestamp: Utc::now(),
         })
-        .await;
+        .await
+        .unwrap();
 
     let run_log_path = store.run_log_path(&run_id);
     assert!(run_log_path.ends_with(format!("{run_id}/run-log.jsonl")));

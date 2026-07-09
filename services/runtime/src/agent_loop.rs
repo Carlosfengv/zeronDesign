@@ -77,7 +77,8 @@ impl AgentLoop {
             .update_run_status(run_id, AgentRunStatus::Running)
             .await?;
         let project_id = run.project_id.clone();
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::RunStarted {
                 run_id: run_id.to_string(),
                 label: format!("{} Agent", run.agent_profile),
@@ -85,7 +86,8 @@ impl AgentLoop {
             })
             .await;
         let start_message = format!("{} agent is preparing the run.", run.agent_profile);
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::AgentMessage {
                 run_id: run_id.to_string(),
                 text: start_message.clone(),
@@ -463,7 +465,8 @@ impl AgentLoop {
                     let fallback_message = format!(
                         "Model fallback triggered: {reason}. Retrying with fallback model."
                     );
-                    self.store
+                    let _ = self
+                        .store
                         .append_event(AgentEvent::AgentMessage {
                             run_id: run_id.to_string(),
                             text: fallback_message.clone(),
@@ -482,7 +485,8 @@ impl AgentLoop {
                     continue;
                 }
                 Ok(ModelResponse::TextOnly(text)) => {
-                    self.store
+                    let _ = self
+                        .store
                         .append_event(AgentEvent::AgentMessage {
                             run_id: run_id.to_string(),
                             text: text.clone(),
@@ -691,7 +695,8 @@ impl AgentLoop {
 
     async fn record_tool_starts(&self, run_id: &str, calls: &[ToolCall]) {
         for call in calls {
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolStarted {
                     run_id: run_id.to_string(),
                     tool: call.name.clone(),
@@ -712,7 +717,8 @@ impl AgentLoop {
         let mut messages = Vec::new();
         for call in calls {
             let error = format!("Tool call did not complete: {reason}");
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolFailed {
                     run_id: run_id.to_string(),
                     tool: call.name.clone(),
@@ -773,7 +779,8 @@ impl AgentLoop {
                 "likelyTruncated": failure.likely_truncated,
                 "guidance": guidance,
             });
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolFailed {
                     run_id: run_id.to_string(),
                     tool: failure.tool_name.clone(),
@@ -872,7 +879,8 @@ impl AgentLoop {
                 "rawSha256": failure.raw_sha256,
                 "guidance": guidance,
             });
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolFailed {
                     run_id: run_id.to_string(),
                     tool: failure.tool_name.clone(),
@@ -1066,7 +1074,8 @@ impl AgentLoop {
                 .and_then(|metadata| metadata.get("recoverable"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolFailed {
                     run_id: run_id.to_string(),
                     tool: result.tool_name.clone(),
@@ -1148,7 +1157,8 @@ impl AgentLoop {
         });
         let metadata =
             merge_tool_metadata(result.result.metadata.clone(), success_decision.metadata);
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::ToolCompleted {
                 run_id: run_id.to_string(),
                 tool: result.tool_name.clone(),
@@ -1206,7 +1216,8 @@ impl AgentLoop {
             let error_kind = fingerprint.error_kind;
             let key = fingerprint.key;
             let normalized_path = fingerprint.normalized_path;
-            self.store
+            let _ = self
+                .store
                 .append_event(AgentEvent::ToolRecoverySuggested {
                     run_id: run_id.to_string(),
                     tool: tool.clone(),
@@ -1265,7 +1276,8 @@ impl AgentLoop {
     }
 
     async fn emit_metric(&self, run_id: &str, name: &str, metadata: Value) {
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::MetricRecorded {
                 run_id: run_id.to_string(),
                 name: name.to_string(),
@@ -1300,7 +1312,8 @@ impl AgentLoop {
             );
         }
         self.store.update_run_status(run_id, status).await?;
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::RunCompleted {
                 run_id: run_id.to_string(),
                 status: status_string(status).to_string(),

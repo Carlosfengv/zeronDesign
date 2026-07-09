@@ -1,6 +1,6 @@
 use crate::{
     config::{RuntimeConfig, SandboxBackendMode},
-    conversation::RuntimeStore,
+    conversation::{RuntimeStore, SequencedAgentEvent},
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
@@ -23,7 +23,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
         Html,
     },
     routing::{get, post},
@@ -34,11 +34,13 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
+use tokio::sync::broadcast;
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -861,7 +863,8 @@ async fn continue_run(
                 summary: "Brief confirmed.".to_string(),
                 timestamp: Utc::now(),
             })
-            .await;
+            .await
+            .map_err(internal_error)?;
         state
             .store
             .append_conversation_item(
@@ -887,7 +890,8 @@ async fn continue_run(
                 state: "running:continue_queued".to_string(),
                 timestamp: Utc::now(),
             })
-            .await;
+            .await
+            .map_err(internal_error)?;
         return Ok(Json(RunStatusResponse {
             run_id,
             status: "running".to_string(),
@@ -923,7 +927,8 @@ async fn continue_run(
                         state: "needs_user_input:brief_conflict".to_string(),
                         timestamp: Utc::now(),
                     })
-                    .await;
+                    .await
+                    .map_err(internal_error)?;
                 return Ok(Json(RunStatusResponse {
                     run_id,
                     status: "needs_user_input".to_string(),
@@ -943,7 +948,8 @@ async fn continue_run(
             state: "running".to_string(),
             timestamp: Utc::now(),
         })
-        .await;
+        .await
+        .map_err(internal_error)?;
     spawn_session(state, run_id.clone());
     Ok(Json(RunStatusResponse {
         run_id,
@@ -975,7 +981,8 @@ async fn cancel_run(
             summary: "Run cancelled.".to_string(),
             timestamp: Utc::now(),
         })
-        .await;
+        .await
+        .map_err(internal_error)?;
     Ok(Json(RunStatusResponse {
         run_id,
         status: "cancelled".to_string(),
@@ -1030,7 +1037,8 @@ async fn resolve_permission(
                     state: "running".to_string(),
                     timestamp: Utc::now(),
                 })
-                .await;
+                .await
+                .map_err(internal_error)?;
             state
                 .store
                 .append_audit_record(
@@ -1062,7 +1070,8 @@ async fn resolve_permission(
                     state: "needs_user_input:permission_ask".to_string(),
                     timestamp: Utc::now(),
                 })
-                .await;
+                .await
+                .map_err(internal_error)?;
             state
                 .store
                 .append_audit_record(
@@ -1094,7 +1103,8 @@ async fn resolve_permission(
                     reason: "permission denied by API".to_string(),
                     timestamp: Utc::now(),
                 })
-                .await;
+                .await
+                .map_err(internal_error)?;
             state
                 .store
                 .append_conversation_item(
@@ -1142,29 +1152,84 @@ async fn stream_run_events(
         .get_run(&run_id)
         .await
         .ok_or_else(|| not_found(format!("run not found: {run_id}")))?;
-    let events = state.store.events(&run_id).await;
     let start_after = last_event_sequence(
         headers
             .get("last-event-id")
             .and_then(|value| value.to_str().ok()),
         &run_id,
     );
-    let stream = stream::iter(
-        events
-            .into_iter()
-            .enumerate()
-            .filter_map(move |(index, event)| {
-                let sequence = index + 1;
-                if sequence <= start_after {
-                    return None;
-                }
-                let json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                Some(Ok(Event::default()
-                    .id(format!("{run_id}/{sequence}"))
-                    .data(json)))
-            }),
+    let live_events = state.store.subscribe_events(&run_id).await;
+    let events = state.store.events(&run_id).await;
+    let history_len = events.len();
+    let replay_events = events
+        .into_iter()
+        .enumerate()
+        .filter_map(move |(index, event)| {
+            let sequence = index + 1;
+            (sequence > start_after).then_some(SequencedAgentEvent { sequence, event })
+        })
+        .collect::<VecDeque<_>>();
+    let stream = stream::unfold(
+        RunEventsSseState {
+            run_id,
+            replay_events,
+            live_events,
+            min_live_sequence: history_len.max(start_after),
+            finished: false,
+        },
+        next_run_event_sse,
     );
-    Ok(Sse::new(stream))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default().text("heartbeat")))
+}
+
+struct RunEventsSseState {
+    run_id: String,
+    replay_events: VecDeque<SequencedAgentEvent>,
+    live_events: Option<broadcast::Receiver<SequencedAgentEvent>>,
+    min_live_sequence: usize,
+    finished: bool,
+}
+
+async fn next_run_event_sse(
+    mut state: RunEventsSseState,
+) -> Option<(Result<Event, Infallible>, RunEventsSseState)> {
+    loop {
+        if state.finished {
+            return None;
+        }
+        if let Some(sequenced) = state.replay_events.pop_front() {
+            let is_terminal = sequenced.event.is_run_completed();
+            let event = encode_run_event_sse(&state.run_id, sequenced.sequence, &sequenced.event);
+            if is_terminal {
+                state.finished = true;
+                state.live_events = None;
+            }
+            return Some((Ok(event), state));
+        }
+        let receiver = state.live_events.as_mut()?;
+        let sequenced = match receiver.recv().await {
+            Ok(sequenced) => sequenced,
+            Err(broadcast::error::RecvError::Lagged(_))
+            | Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        if sequenced.sequence <= state.min_live_sequence {
+            continue;
+        }
+        state.min_live_sequence = sequenced.sequence;
+        let is_terminal = sequenced.event.is_run_completed();
+        let event = encode_run_event_sse(&state.run_id, sequenced.sequence, &sequenced.event);
+        if is_terminal {
+            state.finished = true;
+            state.live_events = None;
+        }
+        return Some((Ok(event), state));
+    }
+}
+
+fn encode_run_event_sse(run_id: &str, sequence: usize, event: &AgentEvent) -> Event {
+    Event::default()
+        .id(format!("{run_id}/{sequence}"))
+        .data(serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string()))
 }
 
 async fn project_conversation(

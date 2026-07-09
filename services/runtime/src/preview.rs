@@ -101,7 +101,7 @@ pub async fn promote_preview(
     let version = store
         .promote_project_version(project_id, run_id, candidate_version_id)
         .await?;
-    store
+    let _ = store
         .append_event(AgentEvent::PreviewUpdated {
             run_id: run_id.to_string(),
             url: version.preview_url.clone(),

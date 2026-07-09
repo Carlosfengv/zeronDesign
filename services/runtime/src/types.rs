@@ -448,6 +448,10 @@ impl AgentEvent {
             | Self::RunCompleted { run_id, .. } => run_id,
         }
     }
+
+    pub fn is_run_completed(&self) -> bool {
+        matches!(self, Self::RunCompleted { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

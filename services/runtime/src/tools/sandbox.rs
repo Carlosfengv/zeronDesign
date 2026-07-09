@@ -1237,7 +1237,8 @@ impl Tool for FsWriteChunkTool {
                 ))
             })?;
         let display_path = display_workspace_path(&final_path, &ctx);
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::ChunkReceived {
                 run_id: ctx.run.id.clone(),
                 path: display_path.clone(),
@@ -1249,7 +1250,8 @@ impl Tool for FsWriteChunkTool {
                 timestamp: Utc::now(),
             })
             .await;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::MetricRecorded {
                 run_id: ctx.run.id.clone(),
                 name: "tool_chunk_write_started".to_string(),
@@ -1421,7 +1423,8 @@ impl Tool for FsCommitChunksTool {
             .remove_dir_all(&ctx, &staged_session_dir(&ctx, &session_id))
             .await;
         let display_path = display_workspace_path(&final_path, &ctx);
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::ChunkCommitted {
                 run_id: ctx.run.id.clone(),
                 path: display_path.clone(),
@@ -1433,7 +1436,8 @@ impl Tool for FsCommitChunksTool {
                 timestamp: Utc::now(),
             })
             .await;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::MetricRecorded {
                 run_id: ctx.run.id.clone(),
                 name: "tool_chunk_write_committed".to_string(),
@@ -3051,7 +3055,8 @@ impl Tool for PreviewRebuildingTool {
             .get("previousVersionId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::PreviewRebuilding {
                 run_id: ctx.run.id.clone(),
                 previous_version_id,
@@ -3353,7 +3358,8 @@ async fn report_preview_candidate(
             Some(source_snapshot_uri.to_string()),
         )
         .await;
-    ctx.store
+    let _ = ctx
+        .store
         .append_event(AgentEvent::PreviewCandidate {
             run_id: ctx.run.id.clone(),
             url,

@@ -514,7 +514,8 @@ impl Tool for BriefRequestConfirmationTool {
         let value = brief::request_confirmation(&ctx.store, &ctx.run.id, &ctx.project_id, message)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::StateChanged {
                 run_id: ctx.run.id.clone(),
                 state: "needs_user_input".to_string(),
@@ -638,7 +639,8 @@ impl Tool for SandboxClaimTool {
             .bind_run_to_sandbox(&ctx.run.id, &binding.id)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::StateChanged {
                 run_id: ctx.run.id.clone(),
                 state: "sandbox.claiming".to_string(),
@@ -843,7 +845,8 @@ impl Tool for SandboxWaitReadyTool {
             .mark_sandbox_binding_busy(&ready.id)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::StateChanged {
                 run_id: ctx.run.id.clone(),
                 state: "sandbox.ready".to_string(),
@@ -1027,7 +1030,8 @@ impl Tool for SandboxReleaseTool {
             .release(&ctx.store, binding_id)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        ctx.store
+        let _ = ctx
+            .store
             .append_event(AgentEvent::StateChanged {
                 run_id: ctx.run.id.clone(),
                 state: "sandbox.released".to_string(),

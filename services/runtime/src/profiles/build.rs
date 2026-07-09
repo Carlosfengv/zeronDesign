@@ -69,7 +69,7 @@ async fn run_template_build_with_brief(
     brief: Brief,
 ) -> Result<TemplateBuildOutput> {
     prepare_workspace(&request.workspace_root, &brief, &request.brief_id)?;
-    store
+    let _ = store
         .append_event(AgentEvent::PreviewRebuilding {
             run_id: request.run_id.clone(),
             previous_version_id: store
@@ -108,7 +108,7 @@ async fn run_template_build_with_brief(
             Some(source_snapshot_uri.clone()),
         )
         .await;
-    store
+    let _ = store
         .append_event(AgentEvent::PreviewCandidate {
             run_id: request.run_id.clone(),
             url: preview_url,

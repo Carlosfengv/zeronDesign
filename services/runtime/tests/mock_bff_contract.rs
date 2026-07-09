@@ -14,8 +14,10 @@ use axum::{
     Router,
 };
 use chrono::Utc;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::time::{timeout, Duration};
 use tower::ServiceExt;
 
 fn mock_bff_app(store: RuntimeStore, responses: Vec<ModelResponse>) -> Router {
@@ -80,6 +82,34 @@ async fn get_sse(app: Router, uri: impl AsRef<str>, last_event_id: Option<String
             .to_vec(),
     )
     .unwrap()
+}
+
+async fn get_sse_frames(
+    app: Router,
+    uri: impl AsRef<str>,
+    last_event_id: Option<String>,
+    frame_count: usize,
+) -> String {
+    let mut builder = Request::builder().uri(uri.as_ref());
+    if let Some(last_event_id) = last_event_id {
+        builder = builder.header("last-event-id", last_event_id);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut frames = String::new();
+    for _ in 0..frame_count {
+        let frame = timeout(Duration::from_secs(1), body.next())
+            .await
+            .expect("expected SSE frame")
+            .expect("expected body frame")
+            .expect("SSE frame should be valid");
+        frames.push_str(&String::from_utf8(frame.to_vec()).unwrap());
+    }
+    frames
 }
 
 async fn start_run(
@@ -534,7 +564,7 @@ async fn permission_decision_resumes_the_same_run() {
             && record.tool == "package.install"
             && record.decision == "allow"));
 
-    let events = get_sse(app, format!("/runs/{}/events", run.id), None).await;
+    let events = get_sse_frames(app, format!("/runs/{}/events", run.id), None, 1).await;
     assert!(events.contains("state.changed"));
     assert!(events.contains("running"));
 }
@@ -557,7 +587,8 @@ async fn cancel_run_is_terminal_and_replayable() {
             text: "Started build".to_string(),
             timestamp: Utc::now(),
         })
-        .await;
+        .await
+        .unwrap();
     let app = mock_bff_app(store.clone(), vec![]);
 
     let (status, payload) =

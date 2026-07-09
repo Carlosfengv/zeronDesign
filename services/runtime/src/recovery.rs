@@ -56,7 +56,7 @@ pub async fn recover_run(store: &RuntimeStore, run_id: &str) -> Result<RecoveryO
         store
             .update_run_status(run_id, AgentRunStatus::Running)
             .await?;
-        store
+        let _ = store
             .append_event(AgentEvent::StateChanged {
                 run_id: run_id.to_string(),
                 state: format!("recovered_from_checkpoint:{}", checkpoint.id),
@@ -91,7 +91,7 @@ async fn fail_recovery_with_checkpoint(
     store
         .update_run_status(&run.id, AgentRunStatus::Failed)
         .await?;
-    store
+    let _ = store
         .append_event(AgentEvent::RunCompleted {
             run_id: run.id.clone(),
             status: "failed".to_string(),

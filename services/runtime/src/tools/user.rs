@@ -26,14 +26,14 @@ pub async fn ask(
             None,
         )
         .await;
-    store
+    let _ = store
         .append_event(AgentEvent::StateChanged {
             run_id: run_id.to_string(),
             state: "needs_user_input".to_string(),
             timestamp: Utc::now(),
         })
         .await;
-    store
+    let _ = store
         .append_event(AgentEvent::AgentMessage {
             run_id: run_id.to_string(),
             text: text.to_string(),

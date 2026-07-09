@@ -23,7 +23,7 @@ pub async fn report_progress(
             None,
         )
         .await;
-    store
+    let _ = store
         .append_event(AgentEvent::AgentMessage {
             run_id: run_id.to_string(),
             text: text.to_string(),

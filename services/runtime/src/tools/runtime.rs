@@ -208,7 +208,8 @@ impl ProgressSink {
     }
 
     pub async fn emit(&self, summary: impl Into<String>) {
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::ToolStarted {
                 run_id: self.run_id.clone(),
                 tool: "progress".to_string(),
@@ -233,7 +234,8 @@ impl ProgressSink {
         if text.is_empty() {
             return;
         }
-        self.store
+        let _ = self
+            .store
             .append_event(AgentEvent::ToolOutput {
                 run_id: self.run_id.clone(),
                 tool: tool.into(),
@@ -565,7 +567,8 @@ impl ToolExecutor {
             };
             self.audit_decision(&store, &ctx, tool.name(), &validated_input, &permission)
                 .await;
-            ctx.store
+            let _ = ctx
+                .store
                 .append_event(AgentEvent::PermissionDenied {
                     run_id: run_id.to_string(),
                     tool: tool.name().to_string(),
@@ -650,7 +653,8 @@ impl ToolExecutor {
                     .store
                     .create_permission_request(&ctx.project_id, run_id, tool.name())
                     .await;
-                ctx.store
+                let _ = ctx
+                    .store
                     .append_event(AgentEvent::PermissionRequested {
                         run_id: run_id.to_string(),
                         permission_id: permission.id.clone(),
@@ -659,7 +663,8 @@ impl ToolExecutor {
                         timestamp: Utc::now(),
                     })
                     .await;
-                ctx.store
+                let _ = ctx
+                    .store
                     .append_event(AgentEvent::AgentMessage {
                         run_id: run_id.to_string(),
                         text: permission_message.clone(),
@@ -680,7 +685,8 @@ impl ToolExecutor {
                         })),
                     )
                     .await;
-                ctx.store
+                let _ = ctx
+                    .store
                     .append_event(AgentEvent::StateChanged {
                         run_id: run_id.to_string(),
                         state: "needs_user_input".to_string(),
@@ -697,7 +703,8 @@ impl ToolExecutor {
             }
             PermissionResult::Deny { message, reason } => {
                 let reason_summary = reason.summary();
-                ctx.store
+                let _ = ctx
+                    .store
                     .append_event(AgentEvent::PermissionDenied {
                         run_id: run_id.to_string(),
                         tool: tool.name().to_string(),

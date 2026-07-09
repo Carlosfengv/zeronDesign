@@ -180,7 +180,7 @@ async fn apply_stop_decision(
         }
     };
     for run_id in [parent_run_id, repair_run_id] {
-        store
+        let _ = store
             .append_event(AgentEvent::StateChanged {
                 run_id: run_id.to_string(),
                 state: state.to_string(),

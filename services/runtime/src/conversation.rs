@@ -23,9 +23,16 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 static DEFAULT_STORAGE_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const RUN_EVENT_BROADCAST_CAPACITY: usize = 512;
+
+#[derive(Debug, Clone)]
+pub struct SequencedAgentEvent {
+    pub sequence: usize,
+    pub event: AgentEvent,
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
@@ -49,6 +56,7 @@ pub struct RuntimeStore {
 struct RuntimeStoreInner {
     runs: HashMap<String, AgentRun>,
     events: HashMap<String, Vec<AgentEvent>>,
+    event_broadcasters: HashMap<String, broadcast::Sender<SequencedAgentEvent>>,
     conversation_items: HashMap<String, Vec<ConversationItem>>,
     content_sources: HashMap<String, Vec<ContentSource>>,
     briefs: HashMap<String, Brief>,
@@ -1152,13 +1160,31 @@ impl RuntimeStore {
         self.brief_status(brief_id).await == Some(BriefStatus::Confirmed)
     }
 
-    pub async fn append_event(&self, event: AgentEvent) {
+    pub async fn append_event(&self, event: AgentEvent) -> Result<()> {
         let run_id = event.run_id().to_string();
-        if let Err(error) = self.append_run_log_event(&run_id, &event) {
-            eprintln!("failed to append run log for {run_id}: {error}");
-        }
+        self.append_run_log_event(&run_id, &event)?;
+        let event_is_terminal = event.is_run_completed();
         let mut inner = self.inner.write().await;
-        inner.events.entry(run_id).or_default().push(event);
+        let sequence = if inner.events.contains_key(&run_id) {
+            let events = inner.events.get_mut(&run_id).expect("events checked");
+            events.push(event.clone());
+            events.len()
+        } else {
+            let events = self.read_run_log_events(&run_id)?;
+            let sequence = events.len();
+            inner.events.insert(run_id.clone(), events);
+            sequence
+        };
+        let broadcaster = if event_is_terminal {
+            inner.event_broadcasters.remove(&run_id)
+        } else {
+            inner.event_broadcasters.get(&run_id).cloned()
+        };
+        drop(inner);
+        if let Some(broadcaster) = broadcaster {
+            let _ = broadcaster.send(SequencedAgentEvent { sequence, event });
+        }
+        Ok(())
     }
 
     fn append_run_log_event(&self, run_id: &str, event: &AgentEvent) -> Result<()> {
@@ -1175,6 +1201,40 @@ impl RuntimeStore {
             Some(events) if !events.is_empty() => events,
             _ => self.read_run_log_events(run_id).unwrap_or_default(),
         }
+    }
+
+    pub async fn subscribe_events(
+        &self,
+        run_id: &str,
+    ) -> Option<broadcast::Receiver<SequencedAgentEvent>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner).ok()?;
+        if !inner.runs.contains_key(run_id) {
+            if let Some(run) = self.read_run(run_id).ok().flatten() {
+                inner.runs.insert(run.id.clone(), run);
+            }
+        }
+        let run = inner.runs.get(run_id)?;
+        if run.status.is_terminal() {
+            let has_terminal_event = match inner.events.get(run_id) {
+                Some(events) => events.iter().any(AgentEvent::is_run_completed),
+                None => {
+                    let events = self.read_run_log_events(run_id).ok()?;
+                    let has_terminal_event = events.iter().any(AgentEvent::is_run_completed);
+                    inner.events.insert(run_id.to_string(), events);
+                    has_terminal_event
+                }
+            };
+            if has_terminal_event {
+                return None;
+            }
+        }
+        let sender = inner
+            .event_broadcasters
+            .entry(run_id.to_string())
+            .or_insert_with(|| broadcast::channel(RUN_EVENT_BROADCAST_CAPACITY).0)
+            .clone();
+        Some(sender.subscribe())
     }
 
     fn read_run_log_events(&self, run_id: &str) -> Result<Vec<AgentEvent>> {
@@ -1789,14 +1849,15 @@ impl RuntimeStore {
                 .insert(finding.id.clone(), finding.clone());
         }
         self.append_review_finding_snapshot(&finding)?;
-        self.append_event(AgentEvent::ReviewFinding {
-            run_id: run_id.to_string(),
-            finding_id: finding.id.clone(),
-            severity: severity.as_str().to_string(),
-            summary,
-            timestamp: Utc::now(),
-        })
-        .await;
+        let _ = self
+            .append_event(AgentEvent::ReviewFinding {
+                run_id: run_id.to_string(),
+                finding_id: finding.id.clone(),
+                severity: severity.as_str().to_string(),
+                summary,
+                timestamp: Utc::now(),
+            })
+            .await;
         self.append_conversation_item(
             project_id,
             Some(run_id),
