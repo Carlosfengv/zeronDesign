@@ -20,12 +20,25 @@ import {
   PromotePreviewRequestSchema,
   PromotePreviewResponseSchema,
   PreviewCurrentResponseSchema,
+  ProjectRuntimeStateResponseSchema,
   ResolvePermissionResponseSchema,
   StartRunRequestSchema,
   StartRunResponseSchema,
 } from "./api-types.js";
 
 const timestamp = "2026-07-04T00:00:00.000Z";
+
+const runtimeStyleContract = () => ({
+  tokenFile: "project/src/styles/tokens.css",
+  globalCssFile: "project/src/styles/global.css",
+  componentRoot: "project/src/components/ui",
+  tailwind: {
+    version: "4",
+    entryImport: '@import "tailwindcss"',
+    themeSource: "css-variables",
+  },
+  tokens: { "color.primary": "--runtime-primary" },
+});
 
 describe("shared schemas", () => {
   it("accepts every AgentRun status including partial", () => {
@@ -167,6 +180,9 @@ describe("shared schemas", () => {
         error: "Missing source",
         toolUseId: "tool-1",
         recoverable: true,
+        metadata: {
+          errorKind: "content.source_missing",
+        },
         timestamp,
       },
       {
@@ -222,6 +238,28 @@ describe("shared schemas", () => {
     for (const event of events) {
       expect(() => AgentEventSchema.parse(event)).not.toThrow();
     }
+    expect(() =>
+      AgentEventSchema.parse({
+        type: "tool.failed",
+        runId: "run-1",
+        tool: "fs.patch",
+        error: "oldStr not found",
+        toolUseId: "tool-1",
+        recoverable: true,
+        timestamp,
+      }),
+    ).toThrow();
+    expect(() =>
+      AgentEventSchema.parse({
+        type: "tool.failed",
+        runId: "run-1",
+        tool: "shell.run",
+        error: "process exited 1",
+        toolUseId: "tool-1",
+        recoverable: false,
+        timestamp,
+      }),
+    ).not.toThrow();
   });
 
   it("validates durable conversation and finding records", () => {
@@ -328,6 +366,64 @@ describe("shared schemas", () => {
         agentProfile: "brief",
       }).inputContext,
     ).toEqual({});
+    expect(
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "build",
+        agentProfile: "build",
+        inputContext: {
+          briefId: "brief-1",
+        },
+      }).inputContext.briefId,
+    ).toBe("brief-1");
+    expect(() =>
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "build",
+        agentProfile: "build",
+      }),
+    ).toThrow();
+    expect(
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "build",
+        agentProfile: "build",
+        inputContext: {
+          parentRunId: "run-parent-1",
+        },
+      }).inputContext.parentRunId,
+    ).toBe("run-parent-1");
+    expect(
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "edit",
+        agentProfile: "edit",
+        inputContext: {
+          baseVersionId: "version-1",
+          sandboxBindingId: "sandbox-binding-1",
+        },
+      }).inputContext.baseVersionId,
+    ).toBe("version-1");
+    expect(() =>
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "edit",
+        agentProfile: "edit",
+        inputContext: {
+          sandboxBindingId: "sandbox-binding-1",
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "edit",
+        agentProfile: "edit",
+        inputContext: {
+          baseVersionId: "version-1",
+        },
+      }),
+    ).toThrow();
 
     expect(StartRunResponseSchema.parse({ runId: "run-1", status: "queued" }).status).toBe(
       "queued",
@@ -348,6 +444,117 @@ describe("shared schemas", () => {
     expect(
       ResolvePermissionResponseSchema.parse({ runId: "run-1", status: "blocked" }).status,
     ).toBe("blocked");
+    expect(
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        styleContractPath: "/workspace/state/style-contract.json",
+        styleContract: runtimeStyleContract(),
+        latestBuild: {
+          status: "success",
+          sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        },
+        dependencyState: { needsRestore: false },
+        preview: { status: "running", url: "http://127.0.0.1:4321" },
+      }).sandboxBindingId,
+    ).toBe("sandbox-binding-1");
+    expect(() =>
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        styleContractPath: "/workspace/state/style-contract.json",
+        styleContract: runtimeStyleContract(),
+        latestBuild: {
+          status: "success",
+          sourceSnapshotUri: "runtime://snapshots/project-1/stale-version",
+        },
+        dependencyState: { needsRestore: false },
+        preview: { status: "running", url: "http://127.0.0.1:4321" },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        styleContractPath: "/workspace/state/style-contract.json",
+        styleContract: {
+          tokens: { "color.primary": "--runtime-primary" },
+        },
+        latestBuild: {
+          status: "success",
+          sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        },
+        dependencyState: { needsRestore: false },
+        preview: { status: "running" },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        styleContractPath: "/workspace/state/style-contract.json",
+        styleContract: {
+          ...runtimeStyleContract(),
+          tokens: {},
+        },
+        latestBuild: {
+          status: "success",
+          sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        },
+        dependencyState: { needsRestore: false },
+        preview: { status: "running" },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        styleContractPath: "/workspace/state/style-contract.json",
+        styleContract: {
+          ...runtimeStyleContract(),
+          tailwind: undefined,
+        },
+        latestBuild: {
+          status: "success",
+          sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        },
+        dependencyState: { needsRestore: false },
+        preview: { status: "running" },
+      }),
+    ).toThrow();
+    expect(() =>
+      ProjectRuntimeStateResponseSchema.parse({
+        projectId: "project-1",
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-binding-1",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+        appRoot: "project",
+        templateKey: "astro-website",
+        latestBuild: {},
+        dependencyState: { needsRestore: false },
+        preview: { status: "running" },
+      }),
+    ).toThrow();
     expect(
       PreviewCurrentResponseSchema.parse({
         projectId: "project-1",

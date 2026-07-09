@@ -1,5 +1,5 @@
 use crate::{
-    config::RuntimeConfig,
+    config::{RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
@@ -9,7 +9,11 @@ use crate::{
     recovery::{recover_interrupted_runs, RecoveryOutcome},
     tools::{
         control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
-        sandbox::cleanup_staged_writes_for_run,
+        runtime::ToolContext,
+        sandbox::{
+            cleanup_staged_writes_for_run, LocalWorkspaceBackend, SandboxChannelWorkspaceBackend,
+            WorkspaceBackend,
+        },
     },
     types::{
         AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource, ConversationItem,
@@ -28,7 +32,7 @@ use axum::{
 use chrono::Utc;
 use futures::stream;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     convert::Infallible,
     fs,
@@ -90,6 +94,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route(
             "/projects/{project_id}/conversation",
             get(project_conversation),
+        )
+        .route(
+            "/projects/{project_id}/runtime-state",
+            get(project_runtime_state),
         )
         .route("/preview/{project_id}/current", get(preview_current))
         .route("/preview/{project_id}/{version_id}", get(preview_version))
@@ -260,6 +268,22 @@ pub struct ConversationListResponse {
     pub items: Vec<ConversationItem>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRuntimeStateResponse {
+    pub project_id: String,
+    pub current_version_id: String,
+    pub sandbox_binding_id: String,
+    pub source_snapshot_uri: String,
+    pub app_root: String,
+    pub template_key: String,
+    pub style_contract_path: Option<String>,
+    pub style_contract: Option<Value>,
+    pub latest_build: Option<Value>,
+    pub dependency_state: Option<Value>,
+    pub preview: Option<Value>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromotePreviewRequest {
@@ -341,6 +365,7 @@ async fn start_run(
 ) -> Result<Json<StartRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     validate_start_run_request(&request)?;
     validate_sandbox_context(&state.store, &request).await?;
+    validate_project_lifecycle_context(&state.store, &request).await?;
     let content_sources = merge_content_sources(
         inherited_build_content_sources(&state.store, &request).await,
         request.input_context.content_sources.clone(),
@@ -413,13 +438,100 @@ async fn start_run(
             }
         }
     }
+    if run.phase == AgentPhase::Edit {
+        if let Err(error) = restore_edit_workspace_from_base_version(&state, &run).await {
+            let _ = state
+                .store
+                .update_run_status(&run.id, AgentRunStatus::Cancelled)
+                .await;
+            return Err(conflict_error(error));
+        }
+    }
     let run_id = run.id.clone();
-    spawn_session(state, run_id.clone());
+    if run.phase != AgentPhase::Edit {
+        spawn_session(state, run_id.clone());
+    }
 
     Ok(Json(StartRunResponse {
         run_id: run.id,
         status: "queued",
     }))
+}
+
+async fn restore_edit_workspace_from_base_version(
+    state: &AppState,
+    run: &AgentRun,
+) -> anyhow::Result<()> {
+    let base_version_id = run
+        .base_version_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("edit run missing baseVersionId"))?;
+    let version = state
+        .store
+        .get_project_version(base_version_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("base version not found: {base_version_id}"))?;
+    let source_snapshot_uri = version.source_snapshot_uri.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("base version {base_version_id} is missing sourceSnapshotUri")
+    })?;
+    restore_project_source_snapshot(&state.store, &state.config, run, source_snapshot_uri).await
+}
+
+async fn restore_project_source_snapshot(
+    store: &RuntimeStore,
+    config: &RuntimeConfig,
+    run: &AgentRun,
+    source_snapshot_uri: &str,
+) -> anyhow::Result<()> {
+    let workspace_root = effective_workspace_root(config, &run.project_id);
+    let snapshot_root = workspace_file_uri_to_workspace_path(&workspace_root, source_snapshot_uri)?;
+    let project_root = workspace_root.join("project");
+    let ctx = ToolContext::new(store.clone(), run.clone(), workspace_root.clone());
+    let backend: Box<dyn WorkspaceBackend> = match config.sandbox_backend_mode {
+        SandboxBackendMode::Kubernetes => Box::new(SandboxChannelWorkspaceBackend::new()),
+        SandboxBackendMode::PhaseAContract => Box::new(LocalWorkspaceBackend),
+    };
+    if let Err(error) = backend.remove_dir_all(&ctx, &project_root).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(anyhow::anyhow!(error));
+        }
+    }
+    backend
+        .copy_dir_all(&ctx, &snapshot_root, &project_root, &[])
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let dependency_state = serde_json::to_string_pretty(&json!({
+        "needsRestore": true,
+        "reason": "source_snapshot_restored_without_node_modules",
+        "sourceSnapshotUri": source_snapshot_uri,
+        "markedAt": Utc::now().to_rfc3339(),
+    }))?;
+    backend
+        .write_string(
+            &ctx,
+            &workspace_root.join("state/dependency-state.json"),
+            &dependency_state,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(())
+}
+
+fn workspace_file_uri_to_workspace_path(
+    workspace_root: &FsPath,
+    uri: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = uri
+        .strip_prefix("file:///workspace/")
+        .ok_or_else(|| anyhow::anyhow!("unsupported source snapshot URI: {uri}"))?;
+    let relative = FsPath::new(path);
+    if relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow::anyhow!("source snapshot escapes workspace: {uri}"));
+    }
+    Ok(workspace_root.join(relative))
 }
 
 async fn inherited_build_content_sources(
@@ -534,6 +646,65 @@ async fn validate_build_confirmed_brief(
         )));
     }
     Ok(())
+}
+
+async fn validate_project_lifecycle_context(
+    store: &RuntimeStore,
+    request: &StartRunRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if is_mutable_phase(request.phase) && request.input_context.parent_run_id.is_none() {
+        if let Some(active) = store
+            .active_mutable_run_for_project(&request.project_id)
+            .await
+        {
+            return Err(conflict_error(anyhow::anyhow!(
+                "project {} already has active mutable run {}",
+                request.project_id,
+                active.id
+            )));
+        }
+    }
+
+    if request.phase == AgentPhase::Edit {
+        let base_version_id = request
+            .input_context
+            .base_version_id
+            .as_deref()
+            .ok_or_else(|| {
+                conflict_error(anyhow::anyhow!(
+                    "Edit run requires baseVersionId for lifecycle snapshot verification"
+                ))
+            })?;
+        let current = store
+            .current_project_version(&request.project_id)
+            .await
+            .ok_or_else(|| {
+                conflict_error(anyhow::anyhow!(
+                    "Edit run requires a promoted current version for project {}",
+                    request.project_id
+                ))
+            })?;
+        if current.id != base_version_id {
+            return Err(conflict_error(anyhow::anyhow!(
+                "Edit run baseVersionId {base_version_id} is stale; currentVersionId is {}",
+                current.id
+            )));
+        }
+        if current.source_snapshot_uri.is_none() {
+            return Err(conflict_error(anyhow::anyhow!(
+                "Edit run requires sourceSnapshotUri for baseVersionId {base_version_id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_mutable_phase(phase: AgentPhase) -> bool {
+    matches!(
+        phase,
+        AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair | AgentPhase::Export
+    )
 }
 
 fn is_brief_confirmation_message(message: &str) -> bool {
@@ -792,7 +963,7 @@ async fn cancel_run(
         .map_err(run_update_error)?;
     if let Some(run) = state.store.get_run(&run_id).await {
         cleanup_staged_writes_for_run(
-            &project_workspace_root(&state.config, &run.project_id),
+            &effective_workspace_root(&state.config, &run.project_id),
             &run_id,
         );
     }
@@ -1006,6 +1177,99 @@ async fn project_conversation(
         items.retain(|item| item.visibility == "user");
     }
     Json(ConversationListResponse { project_id, items })
+}
+
+async fn project_runtime_state(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectRuntimeStateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let current = state
+        .store
+        .current_project_version(&project_id)
+        .await
+        .ok_or_else(|| {
+            not_found(format!(
+                "current version not found for project: {project_id}"
+            ))
+        })?;
+    let binding = state
+        .store
+        .current_project_sandbox_binding(&project_id)
+        .await
+        .ok_or_else(|| {
+            conflict_error(anyhow::anyhow!(
+                "editable sandbox binding not found for project: {project_id}"
+            ))
+        })?;
+    let source_snapshot_uri = current.source_snapshot_uri.clone().ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "source snapshot not found for current version: {}",
+            current.id
+        ))
+    })?;
+    let current_run = state.store.get_run(&current.created_by_run_id).await;
+    let template_key = if let Some(run) = current_run.as_ref() {
+        if let Some(brief_id) = &run.brief_version {
+            state
+                .store
+                .get_brief(brief_id)
+                .await
+                .map(|brief| brief.recommended_template)
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            "unknown".to_string()
+        }
+    } else {
+        "unknown".to_string()
+    };
+    let style_contract = read_runtime_state_json(
+        &state,
+        &project_id,
+        current_run.as_ref(),
+        Some(&binding.id),
+        "state/style-contract.json",
+    )
+    .await;
+    let latest_build = read_runtime_state_json(
+        &state,
+        &project_id,
+        current_run.as_ref(),
+        Some(&binding.id),
+        "outputs/build/latest.json",
+    )
+    .await;
+    let dependency_state = read_runtime_state_json(
+        &state,
+        &project_id,
+        current_run.as_ref(),
+        Some(&binding.id),
+        "state/dependency-state.json",
+    )
+    .await;
+    let preview = read_runtime_state_json(
+        &state,
+        &project_id,
+        current_run.as_ref(),
+        Some(&binding.id),
+        "state/preview.json",
+    )
+    .await;
+
+    Ok(Json(ProjectRuntimeStateResponse {
+        project_id,
+        current_version_id: current.id,
+        sandbox_binding_id: binding.id,
+        source_snapshot_uri,
+        app_root: "project".to_string(),
+        template_key,
+        style_contract_path: style_contract
+            .as_ref()
+            .map(|_| "/workspace/state/style-contract.json".to_string()),
+        style_contract,
+        latest_build,
+        dependency_state,
+        preview,
+    }))
 }
 
 async fn preview_current(
@@ -1331,6 +1595,64 @@ fn project_workspace_root(config: &RuntimeConfig, project_id: &str) -> PathBuf {
     config.workspace_root.join(safe)
 }
 
+fn effective_workspace_root(config: &RuntimeConfig, project_id: &str) -> PathBuf {
+    match config.sandbox_backend_mode {
+        SandboxBackendMode::PhaseAContract => project_workspace_root(config, project_id),
+        SandboxBackendMode::Kubernetes => config.workspace_root.clone(),
+    }
+}
+
+fn project_state_roots(config: &RuntimeConfig, project_id: &str) -> Vec<PathBuf> {
+    vec![
+        project_workspace_root(config, project_id),
+        config.workspace_root.clone(),
+    ]
+}
+
+fn read_first_json_file(roots: &[PathBuf], relative: &str) -> Option<Value> {
+    roots
+        .iter()
+        .find_map(|root| read_json_file(&root.join(relative)))
+}
+
+fn read_json_file(path: &FsPath) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+async fn read_runtime_state_json(
+    state: &AppState,
+    project_id: &str,
+    run: Option<&AgentRun>,
+    sandbox_binding_id: Option<&str>,
+    relative: &str,
+) -> Option<Value> {
+    if state.config.sandbox_backend_mode == SandboxBackendMode::Kubernetes {
+        if let (Some(run), Some(sandbox_binding_id)) = (run, sandbox_binding_id) {
+            let mut run = run.clone();
+            run.sandbox_id = Some(sandbox_binding_id.to_string());
+            let ctx = ToolContext::new(
+                state.store.clone(),
+                run,
+                state.config.workspace_root.clone(),
+            );
+            let backend = SandboxChannelWorkspaceBackend::new();
+            if let Ok(text) = backend
+                .read_to_string(&ctx, &state.config.workspace_root.join(relative))
+                .await
+            {
+                if let Ok(value) = serde_json::from_str(&text) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    let state_roots = project_state_roots(&state.config, project_id);
+    read_first_json_file(&state_roots, relative)
+}
+
 async fn internal_promote_preview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1508,12 +1830,19 @@ fn last_event_sequence(last_event_id: Option<&str>, run_id: &str) -> usize {
 }
 
 fn spawn_session(state: AppState, run_id: String) {
-    let session = QuerySession::with_tool_executor(
-        state.store.clone(),
-        state.model.clone(),
-        control_plane_executor_for_config(&state.config),
-    );
     tokio::spawn(async move {
+        let tool_executor = if let Some(run) = state.store.get_run(&run_id).await {
+            let workspace_root = effective_workspace_root(&state.config, &run.project_id);
+            let _ = fs::create_dir_all(&workspace_root);
+            control_plane_executor_for_config(&state.config).with_workspace_root(workspace_root)
+        } else {
+            control_plane_executor_for_config(&state.config)
+        };
+        let session = QuerySession::with_tool_executor(
+            state.store.clone(),
+            state.model.clone(),
+            tool_executor,
+        );
         let _ = session.submit_run(&run_id).await;
     });
 }

@@ -1,7 +1,10 @@
 use anydesign_runtime::{
-    config::SandboxBackendMode,
+    config::{RuntimePolicyProfile, SandboxBackendMode},
     http_api::{self, AppState},
-    model_gateway::{MockModelClient, ModelResponse, ToolCall, ToolInputParseFailure},
+    model_gateway::{
+        MockModelClient, ModelResponse, OpenAiCompatibleModelClient, ToolCall,
+        ToolInputParseFailure,
+    },
     preview::{promote_preview, PromotionGateReport},
     types::{
         AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
@@ -14,16 +17,44 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
+use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tower::ServiceExt;
+
+static SANDBOX_CHANNEL_ENV_LOCK: Mutex<()> = Mutex::new(());
+const REAL_PROVIDER_STAGE_TIMEOUT_SECS: u64 = 420;
+
+struct SandboxChannelEnvOverride;
+
+impl SandboxChannelEnvOverride {
+    fn set(host: String, port: u16) -> Self {
+        unsafe {
+            std::env::set_var("SANDBOX_CHANNEL_HOST_OVERRIDE", host);
+            std::env::set_var("SANDBOX_CHANNEL_PORT_OVERRIDE", port.to_string());
+        }
+        Self
+    }
+}
+
+impl Drop for SandboxChannelEnvOverride {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("SANDBOX_CHANNEL_HOST_OVERRIDE");
+            std::env::remove_var("SANDBOX_CHANNEL_PORT_OVERRIDE");
+        }
+    }
+}
 
 fn phase_a_contract_config() -> RuntimeConfig {
     let mut config = RuntimeConfig::from_env();
@@ -48,6 +79,46 @@ fn website_brief() -> Brief {
         assumptions: vec![],
         missing_information: vec![],
     }
+}
+
+fn docs_brief() -> Brief {
+    Brief {
+        project_type: "docs".to_string(),
+        audience: "developer operators".to_string(),
+        content_hierarchy: vec!["overview".to_string(), "lifecycle".to_string()],
+        page_structure: json!([
+            {
+                "title": "Overview",
+                "level": 1,
+                "content": "Explain the runtime lifecycle"
+            }
+        ]),
+        visual_direction: "clear technical documentation".to_string(),
+        recommended_template: "fumadocs-docs".to_string(),
+        assumptions: vec![],
+        missing_information: vec![],
+    }
+}
+
+fn runtime_style_contract_json(
+    token_file: &str,
+    global_css_file: &str,
+    component_root: &str,
+) -> Value {
+    json!({
+        "version": "runtime-style-contract@p2",
+        "tokenFile": token_file,
+        "globalCssFile": global_css_file,
+        "componentRoot": component_root,
+        "tailwind": {
+            "version": "4",
+            "entryImport": "@import \"tailwindcss\"",
+            "themeSource": "css-variables"
+        },
+        "tokens": {
+            "color.primary": "--runtime-primary"
+        }
+    })
 }
 
 #[tokio::test]
@@ -111,8 +182,14 @@ async fn start_run_and_stream_events() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected start run response: {}",
+        String::from_utf8_lossy(&body)
+    );
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
 
@@ -270,8 +347,14 @@ async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_a
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected start run response: {}",
+        String::from_utf8_lossy(&body)
+    );
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
 
@@ -354,8 +437,14 @@ async fn start_run_uses_configured_agent_model_for_real_provider_runs() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    if status != StatusCode::OK {
+        panic!(
+            "unexpected start run response {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let run = store
         .get_run(payload["runId"].as_str().unwrap())
@@ -1607,7 +1696,7 @@ async fn cancel_run_cleans_staged_chunk_sessions_for_run() {
     )
     .unwrap();
     fs::write(session_dir.join("chunk-0.txt"), "large page").unwrap();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = phase_a_contract_config();
     config.workspace_root = workspace_root;
     let app = http_api::router_with_state(AppState {
         config,
@@ -2242,6 +2331,1853 @@ async fn preview_current_returns_promoted_version_contract() {
 }
 
 #[tokio::test]
+async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
+    let workspace = unique_temp_dir("runtime-state-lifecycle");
+    let project_workspace = workspace.join("project-1");
+    fs::create_dir_all(project_workspace.join("state")).unwrap();
+    fs::create_dir_all(project_workspace.join("outputs/build")).unwrap();
+    fs::write(
+        project_workspace.join("state/style-contract.json"),
+        runtime_style_contract_json(
+            "project/src/styles/tokens.css",
+            "project/src/styles/global.css",
+            "project/src/components/ui",
+        )
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        project_workspace.join("state/dependency-state.json"),
+        json!({
+            "needsRestore": false,
+            "packageManager": "npm",
+            "success": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        project_workspace.join("state/preview.json"),
+        json!({
+            "url": "http://127.0.0.1:4321",
+            "status": "running"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        project_workspace.join("outputs/build/latest.json"),
+        json!({
+            "status": "success",
+            "buildId": "build-1",
+            "sourceSnapshotUri": "runtime://snapshots/project-1/version-1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    let run = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let binding = store
+        .create_sandbox_binding(
+            "project-1",
+            "sandbox-1".to_string(),
+            "sandbox-claim-1".to_string(),
+            "workspace-sandbox-claim-1".to_string(),
+            "anydesign-astro-website-pool".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    let candidate = store
+        .create_project_version_candidate(
+            "project-1",
+            &run.id,
+            "http://preview.local/project-1/current".to_string(),
+            Some("shot-1".to_string()),
+            Some("runtime://snapshots/project-1/version-1".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &run.id,
+        &candidate.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    let mut config = RuntimeConfig::from_env();
+    config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+    config.workspace_root = workspace;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-1/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["projectId"], "project-1");
+    assert_eq!(payload["currentVersionId"], candidate.id);
+    assert_eq!(payload["sandboxBindingId"], binding.id);
+    assert_eq!(
+        payload["sourceSnapshotUri"],
+        "runtime://snapshots/project-1/version-1"
+    );
+    assert_eq!(payload["appRoot"], "project");
+    assert_eq!(payload["templateKey"], "astro-website");
+    assert_eq!(
+        payload["styleContractPath"],
+        "/workspace/state/style-contract.json"
+    );
+    assert_eq!(
+        payload["styleContract"]["tokens"]["color.primary"],
+        "--runtime-primary"
+    );
+    assert_eq!(
+        payload["styleContract"]["globalCssFile"],
+        "project/src/styles/global.css"
+    );
+    assert_eq!(
+        payload["styleContract"]["componentRoot"],
+        "project/src/components/ui"
+    );
+    assert_eq!(payload["styleContract"]["tailwind"]["version"], "4");
+    assert_eq!(
+        payload["styleContract"]["tailwind"]["entryImport"],
+        "@import \"tailwindcss\""
+    );
+    assert_eq!(
+        payload["styleContract"]["tailwind"]["themeSource"],
+        "css-variables"
+    );
+    assert_eq!(payload["dependencyState"]["needsRestore"], false);
+    assert_eq!(payload["latestBuild"]["status"], "success");
+    assert_eq!(
+        payload["latestBuild"]["sourceSnapshotUri"],
+        payload["sourceSnapshotUri"]
+    );
+    assert_eq!(payload["preview"]["status"], "running");
+}
+
+#[tokio::test]
+async fn project_runtime_state_reads_phase_a_global_workspace_lifecycle_state() {
+    let workspace = unique_temp_dir("runtime-state-phase-a-global");
+    fs::create_dir_all(workspace.join("state")).unwrap();
+    fs::create_dir_all(workspace.join("outputs/build")).unwrap();
+    fs::write(
+        workspace.join("state/style-contract.json"),
+        runtime_style_contract_json(
+            "project/src/styles/tokens.css",
+            "project/src/styles/global.css",
+            "project/src/components/ui",
+        )
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/dependency-state.json"),
+        json!({ "needsRestore": true }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/preview.json"),
+        json!({ "status": "running" }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        json!({
+            "status": "success",
+            "sourceSnapshotUri": "runtime://snapshots/phase-a-project/version-1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "phase-a-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    let run = store
+        .create_run_with_context(
+            "phase-a-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let binding = store
+        .create_sandbox_binding(
+            "phase-a-project",
+            "sandbox-1".to_string(),
+            "sandbox-claim-1".to_string(),
+            "workspace-sandbox-claim-1".to_string(),
+            "anydesign-astro-website-pool".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    let candidate = store
+        .create_project_version_candidate(
+            "phase-a-project",
+            &run.id,
+            "http://preview.local/phase-a-project/current".to_string(),
+            Some("shot-1".to_string()),
+            Some("runtime://snapshots/phase-a-project/version-1".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "phase-a-project",
+        &run.id,
+        &candidate.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    let mut config = RuntimeConfig::from_env();
+    config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+    config.workspace_root = workspace;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/projects/phase-a-project/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["styleContract"]["tokens"]["color.primary"],
+        "--runtime-primary"
+    );
+    assert_eq!(
+        payload["styleContract"]["componentRoot"],
+        "project/src/components/ui"
+    );
+    assert_eq!(
+        payload["styleContract"]["tailwind"]["themeSource"],
+        "css-variables"
+    );
+    assert_eq!(payload["dependencyState"]["needsRestore"], true);
+    assert_eq!(payload["latestBuild"]["status"], "success");
+    assert_eq!(
+        payload["latestBuild"]["sourceSnapshotUri"],
+        payload["sourceSnapshotUri"]
+    );
+    assert_eq!(payload["preview"]["status"], "running");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn project_runtime_state_reads_kubernetes_workspace_channel_lifecycle_state() {
+    let _env_guard = SANDBOX_CHANNEL_ENV_LOCK.lock().unwrap();
+    let mut files = HashMap::new();
+    files.insert(
+        "/workspace/state/style-contract.json".to_string(),
+        runtime_style_contract_json(
+            "project/src/styles/tokens.css",
+            "project/src/styles/global.css",
+            "project/src/components/ui",
+        ),
+    );
+    files.insert(
+        "/workspace/state/dependency-state.json".to_string(),
+        json!({ "needsRestore": false }),
+    );
+    files.insert(
+        "/workspace/state/preview.json".to_string(),
+        json!({ "status": "running" }),
+    );
+    files.insert(
+        "/workspace/outputs/build/latest.json".to_string(),
+        json!({
+            "status": "success",
+            "sourceSnapshotUri": "runtime://snapshots/k8s-project/version-1"
+        }),
+    );
+    let (host, port, _requests, server) = start_runtime_state_workspace_channel_server(files).await;
+    let _channel_env = SandboxChannelEnvOverride::set(host, port);
+
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "k8s-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    let run = store
+        .create_run_with_context(
+            "k8s-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let binding = store
+        .create_sandbox_binding(
+            "k8s-project",
+            "sandbox-1".to_string(),
+            "sandbox-claim-1".to_string(),
+            "workspace-sandbox-claim-1".to_string(),
+            "anydesign-astro-website-pool".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    let candidate = store
+        .create_project_version_candidate(
+            "k8s-project",
+            &run.id,
+            "http://preview.local/k8s-project/current".to_string(),
+            Some("shot-1".to_string()),
+            Some("runtime://snapshots/k8s-project/version-1".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "k8s-project",
+        &run.id,
+        &candidate.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    let mut config = RuntimeConfig::from_env();
+    config.sandbox_backend_mode = SandboxBackendMode::Kubernetes;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/projects/k8s-project/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    server.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["styleContract"]["tokens"]["color.primary"],
+        "--runtime-primary"
+    );
+    assert_eq!(
+        payload["styleContract"]["globalCssFile"],
+        "project/src/styles/global.css"
+    );
+    assert_eq!(payload["styleContract"]["tailwind"]["version"], "4");
+    assert_eq!(payload["dependencyState"]["needsRestore"], false);
+    assert_eq!(payload["latestBuild"]["status"], "success");
+    assert_eq!(
+        payload["latestBuild"]["sourceSnapshotUri"],
+        payload["sourceSnapshotUri"]
+    );
+    assert_eq!(payload["preview"]["status"], "running");
+    assert_eq!(_requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn start_edit_rejects_stale_base_version() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let binding = store
+        .create_sandbox_binding(
+            "project-1",
+            "sandbox-1".to_string(),
+            "sandbox-claim-1".to_string(),
+            "workspace-sandbox-claim-1".to_string(),
+            "anydesign-astro-website-pool".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    let candidate = store
+        .create_project_version_candidate(
+            "project-1",
+            &run.id,
+            "http://preview.local/project-1/current".to_string(),
+            Some("shot-1".to_string()),
+            Some("runtime://snapshots/project-1/current".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &run.id,
+        &candidate.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    store
+        .update_run_status(&run.id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "edit",
+                        "agentProfile": "edit",
+                        "inputContext": {
+                            "sandboxBindingId": binding.id,
+                            "baseVersionId": "version-stale"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("baseVersionId version-stale is stale"));
+}
+
+#[tokio::test]
+async fn start_edit_waits_for_continue_before_spawning_agent() {
+    let workspace = unique_temp_dir("http-edit-waits-restore");
+    fs::create_dir_all(
+        workspace
+            .join("project-1")
+            .join("outputs/build/source-snapshots/current"),
+    )
+    .unwrap();
+    fs::write(
+        workspace
+            .join("project-1")
+            .join("outputs/build/source-snapshots/current/package.json"),
+        "{}",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let binding = store
+        .create_sandbox_binding(
+            "project-1",
+            "sandbox-1".to_string(),
+            "sandbox-claim-1".to_string(),
+            "workspace-sandbox-claim-1".to_string(),
+            "anydesign-astro-website-pool".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    let candidate = store
+        .create_project_version_candidate(
+            "project-1",
+            &run.id,
+            "http://preview.local/project-1/current".to_string(),
+            Some("shot-1".to_string()),
+            Some("file:///workspace/outputs/build/source-snapshots/current".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &run.id,
+        &candidate.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    store
+        .update_run_status(&run.id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+    let model = MockModelClient::new(vec![ModelResponse::Error(
+        "edit agent should wait for continue".to_string(),
+    )]);
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace;
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(model.clone()),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "edit",
+                        "agentProfile": "edit",
+                        "inputContext": {
+                            "sandboxBindingId": binding.id,
+                            "baseVersionId": candidate.id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    if status != StatusCode::OK {
+        panic!(
+            "unexpected start edit response {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let edit_run_id = payload["runId"].as_str().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        store.get_run(edit_run_id).await.unwrap().status,
+        AgentRunStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn start_mutable_run_rejects_existing_project_mutation() {
+    let store = RuntimeStore::new();
+    let active = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    assert_eq!(active.status, AgentRunStatus::Queued);
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "build",
+                        "agentProfile": "build",
+                        "inputContext": {
+                            "briefId": brief_id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["error"],
+        format!(
+            "project project-1 already has active mutable run {}",
+            active.id
+        )
+    );
+}
+
+#[tokio::test]
+async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
+    let workspace = unique_temp_dir("http-lifecycle-edit");
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let build_script = r#"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); const html=fs.readFileSync('src/pages/index.astro','utf8'); const tokens=fs.existsSync('src/styles/tokens.css')?fs.readFileSync('src/styles/tokens.css','utf8'):''; fs.writeFileSync('dist/index.html', `${html}\n<style>${tokens}</style>`);"#;
+    let style_contract = serde_json::to_string_pretty(&runtime_style_contract_json(
+        "/workspace/project/src/styles/tokens.css",
+        "/workspace/project/src/styles/global.css",
+        "/workspace/project/src/components/ui",
+    ))
+    .unwrap();
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "build-package",
+                "fs.write",
+                json!({
+                    "path": "project/package.json",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "scripts": { "build": "node build.cjs" }
+                    })).unwrap()
+                }),
+            ),
+            ToolCall::new(
+                "build-script",
+                "fs.write",
+                json!({ "path": "project/build.cjs", "text": build_script }),
+            ),
+            ToolCall::new(
+                "build-tokens",
+                "fs.write",
+                json!({
+                    "path": "project/src/styles/tokens.css",
+                    "text": ":root {\n  --runtime-primary: #2563eb;\n}\n"
+                }),
+            ),
+            ToolCall::new(
+                "build-style-contract",
+                "fs.write",
+                json!({
+                    "path": "state/style-contract.json",
+                    "text": style_contract
+                }),
+            ),
+            ToolCall::new(
+                "build-page",
+                "fs.write",
+                json!({ "path": "project/src/pages/index.astro", "text": "<main><h1>Initial hero</h1></main>" }),
+            ),
+            ToolCall::new("build-run", "project.build", json!({ "cwd": "project" })),
+            ToolCall::new(
+                "build-preview",
+                "preview.start",
+                json!({ "url": preview_url, "port": 4321 }),
+            ),
+            ToolCall::new(
+                "build-browser",
+                "browser.open",
+                json!({ "url": preview_url }),
+            ),
+            ToolCall::new(
+                "build-shot",
+                "browser.screenshot",
+                json!({ "screenshotId": "shot-build", "blank": false }),
+            ),
+            ToolCall::new(
+                "build-candidate",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-build"
+                }),
+            ),
+            ToolCall::new(
+                "build-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Initial preview promoted" }),
+            ),
+        ]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "edit-read",
+                "fs.read",
+                json!({ "path": "project/src/pages/index.astro" }),
+            ),
+            ToolCall::new(
+                "edit-patch",
+                "fs.patch",
+                json!({
+                    "path": "project/src/pages/index.astro",
+                    "oldStr": "Initial hero",
+                    "newStr": "Edited hero"
+                }),
+            ),
+            ToolCall::new("edit-build", "project.build", json!({ "cwd": "project" })),
+            ToolCall::new(
+                "edit-preview",
+                "preview.start",
+                json!({ "url": preview_url, "port": 4321 }),
+            ),
+            ToolCall::new(
+                "edit-browser",
+                "browser.open",
+                json!({ "url": preview_url }),
+            ),
+            ToolCall::new(
+                "edit-shot",
+                "browser.screenshot",
+                json!({ "screenshotId": "shot-edit", "blank": false }),
+            ),
+            ToolCall::new(
+                "edit-candidate",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-edit"
+                }),
+            ),
+            ToolCall::new(
+                "edit-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Edited preview promoted" }),
+            ),
+        ]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "theme-style-update",
+                "style.update_tokens",
+                json!({
+                    "tokens": {
+                        "color.primary": "#f97316"
+                    }
+                }),
+            ),
+            ToolCall::new("theme-build", "project.build", json!({ "cwd": "project" })),
+            ToolCall::new(
+                "theme-preview",
+                "preview.start",
+                json!({ "url": preview_url, "port": 4321 }),
+            ),
+            ToolCall::new(
+                "theme-browser",
+                "browser.open",
+                json!({ "url": preview_url }),
+            ),
+            ToolCall::new(
+                "theme-shot",
+                "browser.screenshot",
+                json!({ "screenshotId": "shot-theme-edit", "blank": false }),
+            ),
+            ToolCall::new(
+                "theme-candidate",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-theme-edit"
+                }),
+            ),
+            ToolCall::new(
+                "theme-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Theme preview promoted" }),
+            ),
+        ]),
+    ]);
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace.clone();
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+
+    let build_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "build",
+                        "agentProfile": "build",
+                        "inputContext": {
+                            "briefId": brief_id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(build_response.status(), StatusCode::OK);
+    let body = to_bytes(build_response.into_body(), 4096).await.unwrap();
+    let build_payload: Value = serde_json::from_slice(&body).unwrap();
+    let build_run_id = build_payload["runId"].as_str().unwrap().to_string();
+    wait_for_terminal(&store, &build_run_id).await;
+    let build_run = store.get_run(&build_run_id).await.unwrap();
+    assert_eq!(build_run.status, AgentRunStatus::Completed);
+    let initial_version_id = build_run.output_version_id.clone().unwrap();
+
+    let runtime_state = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-1/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime_state.status(), StatusCode::OK);
+    let body = to_bytes(runtime_state.into_body(), 4096).await.unwrap();
+    let runtime_state: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(runtime_state["currentVersionId"], initial_version_id);
+    assert_eq!(runtime_state["templateKey"], "astro-website");
+    fs::write(
+        workspace.join("project-1/project/src/pages/index.astro"),
+        "<main><h1>Corrupted workspace</h1></main>",
+    )
+    .unwrap();
+
+    let edit_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "edit",
+                        "agentProfile": "edit",
+                        "inputContext": {
+                            "briefId": brief_id,
+                            "baseVersionId": runtime_state["currentVersionId"],
+                            "sandboxBindingId": runtime_state["sandboxBindingId"]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_response.status(), StatusCode::OK);
+    let body = to_bytes(edit_response.into_body(), 4096).await.unwrap();
+    let edit_payload: Value = serde_json::from_slice(&body).unwrap();
+    let edit_run_id = edit_payload["runId"].as_str().unwrap().to_string();
+    assert_eq!(
+        store.get_run(&edit_run_id).await.unwrap().status,
+        AgentRunStatus::Queued
+    );
+
+    let continue_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{edit_run_id}/continue"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": "Change the hero title to Edited hero" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continue_response.status(), StatusCode::OK);
+    wait_for_terminal(&store, &edit_run_id).await;
+    let edit_run = store.get_run(&edit_run_id).await.unwrap();
+    assert_eq!(edit_run.status, AgentRunStatus::Completed);
+    let edited_version_id = edit_run.output_version_id.clone().unwrap();
+    assert_ne!(edited_version_id, initial_version_id);
+    assert_eq!(
+        store.current_project_version("project-1").await.unwrap().id,
+        edited_version_id
+    );
+    let html = fs::read_to_string(workspace.join("project-1/project/dist/index.html")).unwrap();
+    assert!(html.contains("Edited hero"));
+    assert!(!html.contains("Initial hero"));
+    assert!(store
+        .events(&edit_run_id)
+        .await
+        .iter()
+        .any(|event| serde_json::to_value(event).unwrap()["type"] == "preview.updated"));
+
+    let hero_runtime_state = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-1/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hero_runtime_state.status(), StatusCode::OK);
+    let body = to_bytes(hero_runtime_state.into_body(), 4096)
+        .await
+        .unwrap();
+    let hero_runtime_state: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(hero_runtime_state["currentVersionId"], edited_version_id);
+    assert_eq!(
+        hero_runtime_state["styleContract"]["tokens"]["color.primary"],
+        "--runtime-primary"
+    );
+
+    let theme_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "edit",
+                        "agentProfile": "edit",
+                        "inputContext": {
+                            "briefId": brief_id,
+                            "baseVersionId": hero_runtime_state["currentVersionId"],
+                            "sandboxBindingId": hero_runtime_state["sandboxBindingId"]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(theme_response.status(), StatusCode::OK);
+    let body = to_bytes(theme_response.into_body(), 4096).await.unwrap();
+    let theme_payload: Value = serde_json::from_slice(&body).unwrap();
+    let theme_run_id = theme_payload["runId"].as_str().unwrap().to_string();
+    assert_eq!(
+        store.get_run(&theme_run_id).await.unwrap().status,
+        AgentRunStatus::Queued
+    );
+
+    let continue_theme_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{theme_run_id}/continue"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": "Change the primary theme color token to #f97316" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continue_theme_response.status(), StatusCode::OK);
+    wait_for_terminal(&store, &theme_run_id).await;
+    let theme_run = store.get_run(&theme_run_id).await.unwrap();
+    assert_eq!(theme_run.status, AgentRunStatus::Completed);
+    let theme_version_id = theme_run.output_version_id.clone().unwrap();
+    assert_ne!(theme_version_id, edited_version_id);
+    assert_eq!(
+        store.current_project_version("project-1").await.unwrap().id,
+        theme_version_id
+    );
+    let tokens =
+        fs::read_to_string(workspace.join("project-1/project/src/styles/tokens.css")).unwrap();
+    assert!(tokens.contains("--runtime-primary: #f97316;"));
+    assert!(!tokens.contains("--runtime-primary: #2563eb;"));
+    let themed_html =
+        fs::read_to_string(workspace.join("project-1/project/dist/index.html")).unwrap();
+    assert!(themed_html.contains("Edited hero"));
+    assert!(themed_html.contains("--runtime-primary: #f97316;"));
+    assert!(store
+        .events(&theme_run_id)
+        .await
+        .iter()
+        .any(|event| serde_json::to_value(event).unwrap()["type"] == "preview.updated"));
+}
+
+#[tokio::test]
+async fn phase_a_public_run_uses_project_scoped_workspace_root() {
+    let workspace = unique_temp_dir("http-project-workspace-isolation");
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-a".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let model = MockModelClient::new(
+        (0..8)
+            .map(|index| {
+                ModelResponse::ToolCalls(vec![
+                    ToolCall::new(
+                        format!("init-website-{index}"),
+                        "project.init",
+                        json!({ "template": "astro-website" }),
+                    ),
+                    ToolCall::new(
+                        format!("complete-website-{index}"),
+                        "run.complete",
+                        json!({ "status": "completed", "summary": "website initialized" }),
+                    ),
+                ])
+            })
+            .collect(),
+    );
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace.clone();
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+
+    let website_run_id = start_public_run(
+        app.clone(),
+        "project-a",
+        "build",
+        json!({ "briefId": brief_id }),
+    )
+    .await;
+    assert!(
+        wait_for_terminal_with_timeout(&store, &website_run_id, 5).await,
+        "website run should finish"
+    );
+
+    assert!(workspace
+        .join("project-a/project/src/pages/index.astro")
+        .exists());
+    assert!(!workspace.join("project").exists());
+    assert!(!workspace.join("project-a/project/app").exists());
+}
+
+#[tokio::test]
+async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
+    let workspace = unique_temp_dir("http-docs-lifecycle-edit");
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "docs-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, docs_brief())
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); fs.writeFileSync('out/docs.html', `<main>${mdx}</main>`); fs.writeFileSync('out/index.html', '<a href=\"/docs\">Docs</a>');";
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "docs-package",
+                "fs.write",
+                json!({
+                    "path": "project/package.json",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "scripts": { "build": "node build.cjs" }
+                    })).unwrap()
+                }),
+            ),
+            ToolCall::new(
+                "docs-script",
+                "fs.write",
+                json!({ "path": "project/build.cjs", "text": build_script }),
+            ),
+            ToolCall::new(
+                "docs-mdx",
+                "fs.write",
+                json!({
+                    "path": "project/content/docs/index.mdx",
+                    "text": "# Initial docs title\n\nInitial lifecycle section"
+                }),
+            ),
+            ToolCall::new("docs-build", "project.build", json!({ "cwd": "project" })),
+            ToolCall::new(
+                "docs-preview",
+                "preview.start",
+                json!({ "url": preview_url, "port": 4321 }),
+            ),
+            ToolCall::new(
+                "docs-browser",
+                "browser.open",
+                json!({ "url": preview_url }),
+            ),
+            ToolCall::new(
+                "docs-shot",
+                "browser.screenshot",
+                json!({ "screenshotId": "shot-docs-build", "blank": false }),
+            ),
+            ToolCall::new(
+                "docs-candidate",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-docs-build"
+                }),
+            ),
+            ToolCall::new(
+                "docs-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Docs preview promoted" }),
+            ),
+        ]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "docs-edit-read",
+                "fs.read",
+                json!({ "path": "project/content/docs/index.mdx" }),
+            ),
+            ToolCall::new(
+                "docs-edit-patch",
+                "fs.patch",
+                json!({
+                    "path": "project/content/docs/index.mdx",
+                    "oldStr": "Initial docs title",
+                    "newStr": "Edited docs title"
+                }),
+            ),
+            ToolCall::new(
+                "docs-edit-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            ),
+            ToolCall::new(
+                "docs-edit-preview",
+                "preview.start",
+                json!({ "url": preview_url, "port": 4321 }),
+            ),
+            ToolCall::new(
+                "docs-edit-browser",
+                "browser.open",
+                json!({ "url": preview_url }),
+            ),
+            ToolCall::new(
+                "docs-edit-shot",
+                "browser.screenshot",
+                json!({ "screenshotId": "shot-docs-edit", "blank": false }),
+            ),
+            ToolCall::new(
+                "docs-edit-candidate",
+                "preview.report_candidate",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "shot-docs-edit"
+                }),
+            ),
+            ToolCall::new(
+                "docs-edit-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Edited docs preview promoted" }),
+            ),
+        ]),
+    ]);
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace.clone();
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+
+    let build_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "docs-project",
+                        "phase": "build",
+                        "agentProfile": "build",
+                        "inputContext": {
+                            "briefId": brief_id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(build_response.status(), StatusCode::OK);
+    let body = to_bytes(build_response.into_body(), 4096).await.unwrap();
+    let build_payload: Value = serde_json::from_slice(&body).unwrap();
+    let build_run_id = build_payload["runId"].as_str().unwrap().to_string();
+    wait_for_terminal(&store, &build_run_id).await;
+    let build_run = store.get_run(&build_run_id).await.unwrap();
+    assert_eq!(build_run.status, AgentRunStatus::Completed);
+    let initial_version_id = build_run.output_version_id.clone().unwrap();
+
+    let runtime_state = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/projects/docs-project/runtime-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime_state.status(), StatusCode::OK);
+    let body = to_bytes(runtime_state.into_body(), 4096).await.unwrap();
+    let runtime_state: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(runtime_state["currentVersionId"], initial_version_id);
+    assert_eq!(runtime_state["templateKey"], "fumadocs-docs");
+    fs::write(
+        workspace.join("docs-project/project/content/docs/index.mdx"),
+        "# Corrupted docs title\n\nCorrupted content",
+    )
+    .unwrap();
+
+    let edit_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "docs-project",
+                        "phase": "edit",
+                        "agentProfile": "edit",
+                        "inputContext": {
+                            "briefId": brief_id,
+                            "baseVersionId": runtime_state["currentVersionId"],
+                            "sandboxBindingId": runtime_state["sandboxBindingId"]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit_response.status(), StatusCode::OK);
+    let body = to_bytes(edit_response.into_body(), 4096).await.unwrap();
+    let edit_payload: Value = serde_json::from_slice(&body).unwrap();
+    let edit_run_id = edit_payload["runId"].as_str().unwrap().to_string();
+    let continue_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{edit_run_id}/continue"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": "Rename the overview page to Edited docs title" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continue_response.status(), StatusCode::OK);
+    wait_for_terminal(&store, &edit_run_id).await;
+    let edit_run = store.get_run(&edit_run_id).await.unwrap();
+    assert_eq!(edit_run.status, AgentRunStatus::Completed);
+    let edited_version_id = edit_run.output_version_id.clone().unwrap();
+    assert_ne!(edited_version_id, initial_version_id);
+    assert_eq!(
+        store
+            .current_project_version("docs-project")
+            .await
+            .unwrap()
+            .id,
+        edited_version_id
+    );
+    let mdx =
+        fs::read_to_string(workspace.join("docs-project/project/content/docs/index.mdx")).unwrap();
+    assert!(mdx.contains("Edited docs title"));
+    assert!(!mdx.contains("Initial docs title"));
+    let html = fs::read_to_string(workspace.join("docs-project/project/out/docs.html")).unwrap();
+    assert!(html.contains("Edited docs title"));
+}
+
+#[tokio::test]
+#[ignore = "requires a real DEEPSEEK_API_KEY, network access, and npm registry access"]
+async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
+    let api_key =
+        std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set for this test");
+    let base_url =
+        std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".into());
+    let model_name = std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+    let workspace = unique_temp_dir("real-provider-http-lifecycle");
+    let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace.clone();
+    config.agent_model = model_name;
+    config.policy_profile = RuntimePolicyProfile::LocalE2e;
+    config.npm_registry = std::env::var("RUNTIME_E2E_NPM_REGISTRY")
+        .unwrap_or_else(|_| "https://registry.npmjs.org/".to_string());
+    let model = OpenAiCompatibleModelClient::new(base_url, api_key, Some("deepseek"))
+        .with_streaming(env_flag("MODEL_STREAMING"))
+        .with_strict_tools(env_flag("MODEL_STRICT_TOOLS"));
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+
+    run_real_provider_lifecycle_project(
+        app.clone(),
+        &store,
+        &workspace,
+        "real-http-website",
+        website_brief(),
+        vec![
+            ContentSource::readable(
+                "website-design",
+                "design_md",
+                "# Website design\n- Build a compact operational SaaS website for runtime harness engineers.\n- Use Tailwind/token styling and local UI primitives from the runtime template.\n- Hero title should initially include Runtime Harness.\n- Include sections for lifecycle, typed recovery, preview promotion, and evidence.\n",
+            ),
+            ContentSource::readable(
+                "website-instructions",
+                "prompt",
+                "Use project.init with astro-website if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Prefer style.update_tokens for color edits. Do not use raw npm/pnpm install commands through shell.run.",
+            ),
+        ],
+        "Acceptance criteria: the promoted website artifact must contain the literal text TESTXXX in the hero title. Change the hero title to TESTXXX 标题内容, set the primary theme color token to #f97316 using style.update_tokens when possible, then rebuild and promote with preview.publish exactly once. Do not call run.complete until the served artifact contains TESTXXX.",
+        "/artifacts/real-http-website/current/",
+        "project/dist/index.html",
+        "TESTXXX",
+    )
+    .await;
+
+    run_real_provider_lifecycle_project(
+        app,
+        &store,
+        &workspace,
+        "real-http-docs",
+        docs_brief(),
+        vec![
+            ContentSource::readable(
+                "docs-design",
+                "design_md",
+                "# Docs design\n- Build a Fumadocs documentation portal for runtime lifecycle operations.\n- The overview page should explain create, generate, edit, build, screenshot, and promote.\n- Include a section on typed recoverable errors and preview evidence.\n",
+            ),
+            ContentSource::readable(
+                "docs-instructions",
+                "prompt",
+                "Use project.init with fumadocs-docs if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Keep Docs source editable and tokenized.",
+            ),
+        ],
+        "Rename the overview page to Edited docs title and add one short section about browser computed-style verification. Rebuild and promote with preview.publish.",
+        "/artifacts/real-http-docs/current/docs",
+        "project/out/docs.html",
+        "Edited docs title",
+    )
+    .await;
+}
+
+async fn run_real_provider_lifecycle_project(
+    app: axum::Router,
+    store: &RuntimeStore,
+    workspace_root: &Path,
+    project_id: &str,
+    brief: Brief,
+    content_sources: Vec<ContentSource>,
+    edit_prompt: &str,
+    artifact_path: &str,
+    local_artifact_relative: &str,
+    expected_artifact_text: &str,
+) {
+    let brief_run = store
+        .create_run(
+            project_id.to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store.write_brief(&brief_run.id, brief).await.unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+
+    let build_run_id = start_public_run(
+        app.clone(),
+        project_id,
+        "build",
+        json!({
+            "briefId": brief_id,
+            "contentSources": content_sources
+        }),
+    )
+    .await;
+    if !wait_for_terminal_with_timeout(store, &build_run_id, REAL_PROVIDER_STAGE_TIMEOUT_SECS).await
+    {
+        emit_real_provider_run_stream(store, &build_run_id, project_id, "build").await;
+        panic!(
+            "run {build_run_id} did not reach terminal status within {REAL_PROVIDER_STAGE_TIMEOUT_SECS}s"
+        );
+    }
+    emit_real_provider_run_stream(store, &build_run_id, project_id, "build").await;
+    let build_run = store.get_run(&build_run_id).await.unwrap();
+    assert_eq!(
+        build_run.status,
+        AgentRunStatus::Completed,
+        "real provider build run {build_run_id} should complete; events={}",
+        serde_json::to_string(&store.events(&build_run_id).await).unwrap()
+    );
+    assert_preview_updated_before_completed(store, &build_run_id).await;
+    let initial_version_id = build_run.output_version_id.clone().unwrap();
+
+    let runtime_state = get_json(
+        app.clone(),
+        &format!("/projects/{project_id}/runtime-state"),
+        8192,
+    )
+    .await;
+    assert_eq!(runtime_state["currentVersionId"], initial_version_id);
+    let initial_snapshot = runtime_state["sourceSnapshotUri"]
+        .as_str()
+        .expect("runtime state should include source snapshot")
+        .to_string();
+    assert_eq!(
+        runtime_state["latestBuild"]["sourceSnapshotUri"], initial_snapshot,
+        "build runtime-state latestBuild sourceSnapshotUri should match promoted sourceSnapshotUri"
+    );
+    let build_current_preview =
+        get_json(app.clone(), &format!("/preview/{project_id}/current"), 8192).await;
+    assert_eq!(build_current_preview["versionId"], initial_version_id);
+    assert_eq!(build_current_preview["status"], "promoted");
+    let build_artifact = get_text(app.clone(), artifact_path, 256_000).await;
+    let build_artifact_byte_length = build_artifact.len();
+    assert!(
+        build_artifact_byte_length > 0,
+        "build artifact {artifact_path} should be non-empty"
+    );
+    let build_local_artifact_url =
+        local_artifact_url(workspace_root, project_id, local_artifact_relative);
+    emit_real_provider_evidence(
+        project_id,
+        "build",
+        &build_run_id,
+        json!({
+            "runtimeState": runtime_state.clone(),
+            "currentPreview": build_current_preview,
+            "sourceSnapshotUri": initial_snapshot,
+            "artifactPath": artifact_path,
+            "localArtifactUrl": build_local_artifact_url,
+            "artifactServed": true,
+            "artifactByteLength": build_artifact_byte_length,
+            "previewUpdatedBeforeCompleted": true
+        }),
+    );
+
+    let edit_run_id = start_public_run(
+        app.clone(),
+        project_id,
+        "edit",
+        json!({
+            "briefId": brief_id,
+            "baseVersionId": runtime_state["currentVersionId"],
+            "sandboxBindingId": runtime_state["sandboxBindingId"]
+        }),
+    )
+    .await;
+    post_continue(app.clone(), &edit_run_id, edit_prompt).await;
+    if !wait_for_terminal_with_timeout(store, &edit_run_id, REAL_PROVIDER_STAGE_TIMEOUT_SECS).await
+    {
+        emit_real_provider_run_stream(store, &edit_run_id, project_id, "edit").await;
+        panic!(
+            "run {edit_run_id} did not reach terminal status within {REAL_PROVIDER_STAGE_TIMEOUT_SECS}s"
+        );
+    }
+    emit_real_provider_run_stream(store, &edit_run_id, project_id, "edit").await;
+    let edit_run = store.get_run(&edit_run_id).await.unwrap();
+    assert_eq!(
+        edit_run.status,
+        AgentRunStatus::Completed,
+        "real provider edit run {edit_run_id} should complete; events={}",
+        serde_json::to_string(&store.events(&edit_run_id).await).unwrap()
+    );
+    assert_preview_updated_before_completed(store, &edit_run_id).await;
+    let edited_version_id = edit_run.output_version_id.clone().unwrap();
+    assert_ne!(edited_version_id, initial_version_id);
+
+    let edited_state = get_json(
+        app.clone(),
+        &format!("/projects/{project_id}/runtime-state"),
+        8192,
+    )
+    .await;
+    assert_eq!(edited_state["currentVersionId"], edited_version_id);
+    let edited_snapshot = edited_state["sourceSnapshotUri"]
+        .as_str()
+        .expect("edited runtime state should include source snapshot")
+        .to_string();
+    assert_eq!(
+        edited_state["latestBuild"]["sourceSnapshotUri"], edited_snapshot,
+        "edit runtime-state latestBuild sourceSnapshotUri should match promoted sourceSnapshotUri"
+    );
+    let source_snapshot_changed = edited_snapshot != initial_snapshot;
+    assert!(source_snapshot_changed);
+
+    let current_preview =
+        get_json(app.clone(), &format!("/preview/{project_id}/current"), 8192).await;
+    assert_eq!(current_preview["versionId"], edited_version_id);
+    assert_eq!(current_preview["status"], "promoted");
+
+    let artifact = get_text(app, artifact_path, 256_000).await;
+    let artifact_byte_length = artifact.len();
+    let artifact_contains_expected = artifact.contains(expected_artifact_text);
+    let edited_local_artifact_url =
+        local_artifact_url(workspace_root, project_id, local_artifact_relative);
+    emit_real_provider_evidence(
+        project_id,
+        "edit",
+        &edit_run_id,
+        json!({
+            "runtimeState": edited_state,
+            "currentPreview": current_preview,
+            "initialVersionId": initial_version_id,
+            "editedVersionId": edited_version_id,
+            "sourceSnapshotUri": edited_snapshot,
+            "initialSourceSnapshotUri": initial_snapshot,
+            "editedSourceSnapshotUri": edited_snapshot,
+            "sourceSnapshotChanged": source_snapshot_changed,
+            "artifactPath": artifact_path,
+            "localArtifactUrl": edited_local_artifact_url,
+            "artifactServed": true,
+            "artifactByteLength": artifact_byte_length,
+            "artifactContainsExpectedText": artifact_contains_expected,
+            "artifactContainsEditMarker": artifact_contains_expected,
+            "expectedArtifactText": expected_artifact_text,
+            "previewUpdatedBeforeCompleted": true
+        }),
+    );
+    assert!(
+        artifact_contains_expected,
+        "artifact {artifact_path} should include edited text {expected_artifact_text:?}; body preview={}",
+        artifact.chars().take(1000).collect::<String>()
+    );
+}
+
+fn local_artifact_url(workspace_root: &Path, project_id: &str, relative: &str) -> String {
+    let path = workspace_root.join(project_id).join(relative);
+    assert!(
+        path.exists(),
+        "local artifact file should exist for provider evidence: {}",
+        path.display()
+    );
+    format!("file://{}", path.display())
+}
+
+fn emit_real_provider_evidence(project_id: &str, stage: &str, run_id: &str, evidence: Value) {
+    eprintln!(
+        "REAL_PROVIDER_EVIDENCE {}",
+        serde_json::to_string(&json!({
+            "project": project_id,
+            "stage": stage,
+            "runId": run_id,
+            "evidence": evidence
+        }))
+        .unwrap()
+    );
+}
+
+async fn emit_real_provider_run_stream(
+    store: &RuntimeStore,
+    run_id: &str,
+    project_id: &str,
+    stage: &str,
+) {
+    let run = store.get_run(run_id).await;
+    eprintln!(
+        "REAL_PROVIDER_STREAM_BEGIN project={} stage={} run={} status={:?} outputVersion={:?}",
+        project_id,
+        stage,
+        run_id,
+        run.as_ref().map(|run| &run.status),
+        run.as_ref()
+            .and_then(|run| run.output_version_id.as_deref())
+    );
+    for event in store.events(run_id).await {
+        eprintln!(
+            "REAL_PROVIDER_EVENT {}",
+            serde_json::to_string(&event).unwrap()
+        );
+    }
+    eprintln!(
+        "REAL_PROVIDER_STREAM_END project={} stage={} run={}",
+        project_id, stage, run_id
+    );
+}
+
+async fn start_public_run(
+    app: axum::Router,
+    project_id: &str,
+    phase: &str,
+    input_context: Value,
+) -> String {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": project_id,
+                        "phase": phase,
+                        "agentProfile": phase,
+                        "inputContext": input_context
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    payload["runId"].as_str().unwrap().to_string()
+}
+
+async fn post_continue(app: axum::Router, run_id: &str, user_message: &str) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{run_id}/continue"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": user_message }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn get_json(app: axum::Router, uri: &str, limit: usize) -> Value {
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), limit).await.unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn get_text(app: axum::Router, uri: &str, limit: usize) -> String {
+    let response = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), limit)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+async fn assert_preview_updated_before_completed(store: &RuntimeStore, run_id: &str) {
+    let event_types = store
+        .events(run_id)
+        .await
+        .into_iter()
+        .map(|event| {
+            serde_json::to_value(event).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let updated_index = event_types
+        .iter()
+        .position(|event| event == "preview.updated")
+        .expect("preview.updated should be emitted");
+    let completed_index = event_types
+        .iter()
+        .position(|event| event == "run.completed")
+        .expect("run.completed should be emitted");
+    assert!(
+        updated_index < completed_index,
+        "preview.updated must be emitted before run.completed: {event_types:?}"
+    );
+}
+
+#[tokio::test]
 async fn preview_version_returns_pinned_project_version_contract() {
     let store = RuntimeStore::new();
     let run = store
@@ -2731,6 +4667,106 @@ async fn artifact_serving_supports_phase_a_global_workspace_root() {
         css.headers().get("content-type").unwrap(),
         "text/css; charset=utf-8"
     );
+}
+
+async fn wait_for_terminal(store: &RuntimeStore, run_id: &str) {
+    for _ in 0..100 {
+        if store
+            .get_run(run_id)
+            .await
+            .is_some_and(|run| run.status.is_terminal())
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("run {run_id} did not reach terminal status");
+}
+
+async fn wait_for_terminal_with_timeout(store: &RuntimeStore, run_id: &str, seconds: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if store
+            .get_run(run_id)
+            .await
+            .is_some_and(|run| run.status.is_terminal())
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    false
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+async fn start_preview_server() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+    (format!("http://{addr}/candidate"), handle)
+}
+
+async fn start_runtime_state_workspace_channel_server(
+    files: HashMap<String, Value>,
+) -> (String, u16, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = requests.clone();
+    let files = Arc::new(files);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let requests = server_requests.clone();
+            let files = files.clone();
+            tokio::spawn(async move {
+                let Ok(mut socket) = accept_async(stream).await else {
+                    return;
+                };
+                let Some(Ok(message)) = socket.next().await else {
+                    return;
+                };
+                let text = match message {
+                    Message::Text(text) => text.to_string(),
+                    Message::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| "{}".to_string())
+                    }
+                    _ => "{}".to_string(),
+                };
+                let request: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+                requests.lock().unwrap().push(request.clone());
+                let path = request["path"].as_str().unwrap_or("");
+                let response = if request["op"].as_str() == Some("fs.read") {
+                    files
+                        .get(path)
+                        .map(|value| json!({ "ok": true, "result": { "text": value.to_string() } }))
+                        .unwrap_or_else(|| json!({ "ok": false, "error": "not found" }))
+                } else {
+                    json!({ "ok": false, "error": "unsupported op" })
+                };
+                let _ = socket
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
+            });
+        }
+    });
+    ("127.0.0.1".to_string(), addr.port(), requests, handle)
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -8,6 +8,7 @@ import type {
   ErrorResponse,
   PreviewCurrentResponse,
   PreviewVersionResponse,
+  ProjectRuntimeStateResponse,
   PromotePreviewRequest,
   PromotePreviewResponse,
   ResolvePermissionRequest,
@@ -24,6 +25,7 @@ import {
   ErrorResponseSchema,
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
+  ProjectRuntimeStateResponseSchema,
   PromotePreviewRequestSchema,
   PromotePreviewResponseSchema,
   ResolvePermissionRequestSchema,
@@ -78,6 +80,15 @@ describe("mock BFF shared runtime contract types", () => {
       agentProfile: "build",
       inputContext: {
         briefId: "brief-1",
+        sandboxBindingId: "sandbox-binding-1",
+      },
+    } satisfies StartRunRequest;
+    const startEditRun = {
+      projectId: "project-1",
+      phase: "edit",
+      agentProfile: "edit",
+      inputContext: {
+        baseVersionId: "version-1",
         sandboxBindingId: "sandbox-binding-1",
       },
     } satisfies StartRunRequest;
@@ -156,6 +167,39 @@ describe("mock BFF shared runtime contract types", () => {
       previewUrl: "http://preview.local/preview/project-1/version-1",
       status: "candidate",
     } satisfies PreviewVersionResponse;
+    const runtimeState = {
+      projectId: "project-1",
+      currentVersionId: "version-1",
+      sandboxBindingId: "sandbox-binding-1",
+      sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+      appRoot: "project",
+      templateKey: "astro-website",
+      styleContractPath: "/workspace/state/style-contract.json",
+      styleContract: {
+        tokenFile: "project/src/styles/tokens.css",
+        globalCssFile: "project/src/styles/global.css",
+        componentRoot: "project/src/components/ui",
+        tailwind: {
+          version: "4",
+          entryImport: '@import "tailwindcss"',
+          themeSource: "css-variables",
+        },
+        tokens: {
+          "color.primary": "--runtime-primary",
+        },
+      },
+      latestBuild: {
+        status: "success",
+        sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+      },
+      dependencyState: {
+        needsRestore: false,
+      },
+      preview: {
+        status: "running",
+        url: "http://127.0.0.1:4321",
+      },
+    } satisfies ProjectRuntimeStateResponse;
     const promotePreview = {
       projectId: "project-1",
       runId: "run-1",
@@ -178,6 +222,9 @@ describe("mock BFF shared runtime contract types", () => {
     expect(StartRunRequestSchema.parse(startRun).phase).toBe("brief");
     expect(StartRunRequestSchema.parse(startBuildRun).inputContext.sandboxBindingId).toBe(
       "sandbox-binding-1",
+    );
+    expect(StartRunRequestSchema.parse(startEditRun).inputContext.baseVersionId).toBe(
+      "version-1",
     );
     expect(StartRunRequestSchema.parse(startRepairRun).inputContext.findingIds).toEqual([
       "finding-1",
@@ -205,6 +252,11 @@ describe("mock BFF shared runtime contract types", () => {
       "/preview/project-1/current",
     );
     expect(PreviewVersionResponseSchema.parse(previewVersion).status).toBe("candidate");
+    expect(
+      ProjectRuntimeStateResponseSchema.parse(runtimeState).styleContract?.tokens[
+        "color.primary"
+      ],
+    ).toBe("--runtime-primary");
     expect(PromotePreviewRequestSchema.parse(promotePreview).gateReport.previewAccessible).toBe(
       true,
     );

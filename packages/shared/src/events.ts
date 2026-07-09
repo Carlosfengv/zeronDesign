@@ -8,7 +8,7 @@ const BaseEventSchema = z.object({
   timestamp: z.string().datetime(),
 });
 
-export const AgentEventSchema = z.discriminatedUnion("type", [
+const AgentEventBaseSchema = z.discriminatedUnion("type", [
   BaseEventSchema.extend({
     type: z.literal("run.started"),
     label: z.string().min(1),
@@ -121,5 +121,25 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
     summary: z.string(),
   }),
 ]);
+
+export const AgentEventSchema = AgentEventBaseSchema.superRefine((event, ctx) => {
+  if (event.type !== "tool.failed" || !event.recoverable) {
+    return;
+  }
+  const metadata = event.metadata;
+  if (
+    !metadata ||
+    typeof metadata !== "object" ||
+    !("errorKind" in metadata) ||
+    typeof metadata.errorKind !== "string" ||
+    metadata.errorKind.trim() === ""
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["metadata", "errorKind"],
+      message: "recoverable tool.failed events require metadata.errorKind",
+    });
+  }
+});
 
 export type AgentEvent = z.infer<typeof AgentEventSchema>;

@@ -2228,6 +2228,50 @@ impl RuntimeStore {
         Some(version)
     }
 
+    pub async fn current_project_sandbox_binding(
+        &self,
+        project_id: &str,
+    ) -> Option<SandboxBinding> {
+        if let Some(version) = self.current_project_version(project_id).await {
+            if let Some(run) = self.get_run(&version.created_by_run_id).await {
+                if let Some(binding_id) = run.sandbox_id.as_deref() {
+                    if let Some(binding) = self.get_sandbox_binding(binding_id).await {
+                        return Some(binding);
+                    }
+                }
+            }
+        }
+        let mut bindings = self
+            .read_sandbox_bindings()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|binding| {
+                binding.project_id == project_id
+                    && !matches!(
+                        binding.status,
+                        SandboxBindingStatus::Failed | SandboxBindingStatus::Deleted
+                    )
+            })
+            .collect::<Vec<_>>();
+        bindings.sort_by_key(|binding| binding.last_seen_at);
+        bindings.pop()
+    }
+
+    pub async fn active_mutable_run_for_project(&self, project_id: &str) -> Option<AgentRun> {
+        let mut runs_by_id = self
+            .read_runs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| (run.id.clone(), run))
+            .collect::<HashMap<_, _>>();
+        for run in self.inner.read().await.runs.values().cloned() {
+            runs_by_id.insert(run.id.clone(), run);
+        }
+        runs_by_id.into_values().find(|run| {
+            run.project_id == project_id && is_mutable_phase(run.phase) && !run.status.is_terminal()
+        })
+    }
+
     pub async fn create_sandbox_binding(
         &self,
         project_id: &str,
@@ -2490,6 +2534,13 @@ fn allowed_workspace_holder_ids(
             .and_then(|run| run.parent_run_id.as_deref());
     }
     ids
+}
+
+fn is_mutable_phase(phase: AgentPhase) -> bool {
+    matches!(
+        phase,
+        AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair | AgentPhase::Export
+    )
 }
 
 fn run_is_candidate_review_descendant(

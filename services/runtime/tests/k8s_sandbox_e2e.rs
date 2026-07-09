@@ -145,6 +145,60 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     assert!(output.success, "command stderr: {}", output.stderr);
     assert_eq!(output.stdout, "sandbox command ok");
 
+    let mkdir_output = command_backend
+        .run(
+            &ctx,
+            &[
+                "node".to_string(),
+                "-e".to_string(),
+                "const fs=require('fs'); fs.mkdirSync('src',{recursive:true}); fs.mkdirSync('node_modules/ignored',{recursive:true}); fs.mkdirSync('../outputs/build/source-snapshots',{recursive:true});".to_string(),
+            ],
+            &workspace.join("project"),
+            5_000,
+        )
+        .await
+        .expect("create copyDir fixture directories over sandbox channel");
+    assert!(
+        mkdir_output.success,
+        "mkdir stderr: {}",
+        mkdir_output.stderr
+    );
+
+    workspace_backend
+        .write_string(&ctx, &workspace.join("project/src/index.md"), "copy me")
+        .await
+        .expect("write source file over sandbox channel");
+    workspace_backend
+        .write_string(
+            &ctx,
+            &workspace.join("project/node_modules/ignored/index.js"),
+            "ignored",
+        )
+        .await
+        .expect("write skipped dependency over sandbox channel");
+    let snapshot_root = workspace.join("outputs/build/source-snapshots/k8s-copy");
+    workspace_backend
+        .copy_dir_all(
+            &ctx,
+            &workspace.join("project"),
+            &snapshot_root,
+            &["node_modules".to_string()],
+        )
+        .await
+        .expect("fs.copyDir over sandbox channel");
+    let copied = workspace_backend
+        .read_to_string(&ctx, &snapshot_root.join("src/index.md"))
+        .await
+        .expect("read copied snapshot source over sandbox channel");
+    assert_eq!(copied, "copy me");
+    let skipped = workspace_backend
+        .read_to_string(&ctx, &snapshot_root.join("node_modules/ignored/index.js"))
+        .await;
+    assert!(
+        skipped.is_err(),
+        "copy_dir_all must skip node_modules in sandbox snapshot"
+    );
+
     port_forward.kill().await.ok();
     drop(cleanup);
 }
