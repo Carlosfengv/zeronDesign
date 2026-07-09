@@ -420,9 +420,8 @@ async fn model_error_after_tool_use_emits_missing_tool_result_before_failure() {
 
     let run = store.get_run(&run.id).await.unwrap();
     assert_eq!(run.status, AgentRunStatus::Failed);
-    let event_types = store
-        .events(&run.id)
-        .await
+    let events = store.events(&run.id).await;
+    let event_types = events
         .into_iter()
         .map(|event| {
             serde_json::to_value(event).unwrap()["type"]
@@ -852,6 +851,109 @@ async fn repeated_recoverable_large_write_failure_stops_run_as_partial() {
 }
 
 #[tokio::test]
+async fn repeated_typed_patch_failure_stops_run_as_partial() {
+    let workspace = unique_temp_dir("agent-loop-patch-guard");
+    fs::create_dir_all(workspace.join("project")).unwrap();
+    fs::write(workspace.join("project/copy.md"), "same\nsame\n").unwrap();
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let repeated_call = |id: &str| {
+        ToolCall::new(
+            id,
+            "fs.patch",
+            json!({
+                "path": "project/copy.md",
+                "oldStr": "same",
+                "newStr": "changed"
+            }),
+        )
+    };
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![repeated_call("tool-patch-1")]),
+        ModelResponse::ToolCalls(vec![repeated_call("tool-patch-2")]),
+        ModelResponse::ToolCalls(vec![repeated_call("tool-patch-3")]),
+        ModelResponse::Error("guard should stop before this response".to_string()),
+    ]);
+    let executor = ToolExecutor::new_with_workspace_root(
+        sandbox_tools(),
+        PermissionRules::default(),
+        &workspace,
+    );
+    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
+
+    let results = loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|result| result.is_error));
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/copy.md")).unwrap(),
+        "same\nsame\n"
+    );
+    let run = store.get_run(&run.id).await.unwrap();
+    assert_eq!(run.status, AgentRunStatus::Partial);
+    let events = store.events(&run.id).await;
+    let recovery_attempts = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolRecoverySuggested {
+                tool,
+                error_kind,
+                attempt,
+                metadata,
+                guidance,
+                ..
+            } => Some((tool, error_kind, *attempt, metadata, guidance)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovery_attempts.len(), 2);
+    assert_eq!(recovery_attempts[0].0, "fs.patch");
+    assert_eq!(recovery_attempts[0].1, "patch.read_required");
+    assert_eq!(recovery_attempts[0].2, 2);
+    assert!(recovery_attempts[0].4.contains("fs.read"));
+    assert_eq!(
+        recovery_attempts[0]
+            .3
+            .as_ref()
+            .and_then(|metadata| metadata.get("normalizedPath"))
+            .and_then(Value::as_str),
+        Some("project/copy.md")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::MetricRecorded { name, .. }
+                    if name == "tool_recoverable_retry_same_error"
+            ))
+            .count(),
+        2
+    );
+    let partial_summary = events
+        .iter()
+        .find_map(|event| {
+            let value = serde_json::to_value(event).unwrap();
+            if value["type"] == "run.completed" && value["status"] == "partial" {
+                value["summary"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .expect("partial run.completed event should include a summary");
+    assert!(partial_summary.contains("patch.read_required"));
+    assert!(partial_summary.contains("fs.read"));
+}
+
+#[tokio::test]
 async fn failed_run_cleans_its_staged_chunk_sessions() {
     let workspace = unique_temp_dir("agent-loop-chunk-cleanup");
     fs::create_dir_all(workspace.join("project")).unwrap();
@@ -1084,6 +1186,50 @@ async fn agent_loop_sends_messages_and_tool_snapshot_to_model_gateway() {
         message["role"] == "tool"
             && message["toolUseId"] == "tool-list"
             && message["toolName"] == "content.list_sources"
+    }));
+}
+
+#[tokio::test]
+async fn agent_loop_includes_run_user_messages_in_model_context() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_conversation_item(
+            "project-1",
+            Some(&run.id),
+            "user_message",
+            Some("user"),
+            "Change the hero title to TESTXXX 标题内容",
+            None,
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::ToolCalls(vec![ToolCall::new(
+            "tool-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "User request received" }),
+        )])],
+        captured_requests.clone(),
+    );
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model));
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["kind"] == "user_message"
+            && message["text"] == "Change the hero title to TESTXXX 标题内容"
     }));
 }
 
@@ -1330,8 +1476,7 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>ok</title>');";
             "preview.report_candidate",
             json!({
                 "url": preview_url,
-                "screenshotId": "shot-tool-build",
-                "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshot.txt"
+                "screenshotId": "shot-tool-build"
             }),
         ),
         ToolCall::new(
@@ -1351,9 +1496,22 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>ok</title>');";
     assert!(run.output_version_id.is_some());
     assert!(workspace.join("project/dist/index.html").exists());
 
-    let event_types = store
-        .events(&run.id)
-        .await
+    let events = store.events(&run.id).await;
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ToolCompleted { tool, metadata, .. }
+                if tool == "project.build"
+                    && metadata.as_ref().is_some_and(|metadata| {
+                        metadata
+                            .get("postToolUseSuccess")
+                            .and_then(|hook| hook.get("effect"))
+                            .and_then(Value::as_str)
+                            == Some("build_state_updated")
+                    })
+        )
+    }));
+    let event_types = events
         .into_iter()
         .map(|event| {
             serde_json::to_value(event).unwrap()["type"]
@@ -1474,8 +1632,7 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>chunked</title>'+sourc
             "preview.report_candidate",
             json!({
                 "url": preview_url,
-                "screenshotId": "shot-chunked-build",
-                "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshot.txt"
+                "screenshotId": "shot-chunked-build"
             }),
         ),
         ToolCall::new(

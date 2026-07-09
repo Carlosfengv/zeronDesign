@@ -389,7 +389,17 @@ impl Tool for ContentReadSourceTool {
         content::read_source(&ctx.store, &ctx.run.id, &input)
             .await
             .map(ToolResult::ok)
-            .map_err(|error| ToolError::Recoverable(error.to_string()))
+            .map_err(|error| {
+                let id = input.get("id").and_then(Value::as_str).unwrap_or("");
+                ToolError::RecoverableWithMetadata {
+                    message: error.to_string(),
+                    error_kind: "content.source_missing".to_string(),
+                    metadata: json!({
+                        "sourceId": id,
+                        "suggestedAction": "Call content.list_sources and read one of the returned source ids, or use inputs/*.md files that were bootstrapped into the workspace."
+                    }),
+                }
+            })
     }
 }
 

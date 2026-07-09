@@ -4,7 +4,7 @@ use anydesign_runtime::{
     model_gateway::{MockModelClient, ModelResponse, ToolCall},
     types::{AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 fn valid_brief() -> serde_json::Value {
@@ -212,7 +212,18 @@ async fn unreadable_content_source_blocks_run_when_agent_completes_blocked() {
     let results = loop_runner.run(&run.id).await.unwrap();
 
     model.assert_all_consumed().await;
-    assert!(results.iter().any(|result| result.is_error));
+    let failed = results
+        .iter()
+        .find(|result| result.is_error)
+        .expect("content.read_source should fail for unreadable source");
+    assert_eq!(
+        failed
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("errorKind"))
+            .and_then(Value::as_str),
+        Some("content.source_missing")
+    );
     let blocked = store.get_run(&run.id).await.unwrap();
     assert_eq!(blocked.status, AgentRunStatus::Blocked);
 }

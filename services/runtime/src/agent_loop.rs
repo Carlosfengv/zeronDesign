@@ -1,4 +1,8 @@
 use crate::{
+    agent_hooks::{
+        PostToolUseFailureHook, PostToolUseSuccessHook, RecoverableErrorState,
+        ToolFailureObservation, ToolSuccessObservation,
+    },
     conversation::RuntimeStore,
     model_gateway::{
         ModelClient, ModelRequest, ModelResponse, ToolCall, ToolInputParseFailure,
@@ -23,8 +27,6 @@ const EMPTY_TURN_LIMIT: u32 = 3;
 const MAX_TURNS: u32 = 80;
 const COMPACT_MESSAGE_THRESHOLD: usize = 32;
 const COMPACT_KEEP_RECENT: usize = 16;
-const RECOVERABLE_ERROR_STRONG_GUIDANCE_ATTEMPT: u32 = 2;
-const RECOVERABLE_ERROR_PARTIAL_ATTEMPT: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ToolResultMessage {
@@ -35,26 +37,13 @@ pub struct ToolResultMessage {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecoverableErrorState {
-    fingerprint: String,
-    attempts: u32,
-}
-
-#[derive(Debug, Clone)]
-struct RecoverableErrorFingerprint {
-    key: String,
-    tool: String,
-    error_kind: String,
-    normalized_path: String,
-    guidance: String,
-}
-
 #[derive(Clone)]
 pub struct AgentLoop {
     store: RuntimeStore,
     model: Arc<dyn ModelClient>,
     tool_executor: ToolExecutor,
+    post_tool_failure_hook: PostToolUseFailureHook,
+    post_tool_success_hook: PostToolUseSuccessHook,
 }
 
 impl AgentLoop {
@@ -63,6 +52,8 @@ impl AgentLoop {
             store,
             model,
             tool_executor: tools::control_plane::control_plane_executor(),
+            post_tool_failure_hook: PostToolUseFailureHook::default(),
+            post_tool_success_hook: PostToolUseSuccessHook::default(),
         }
     }
 
@@ -75,6 +66,8 @@ impl AgentLoop {
             store,
             model,
             tool_executor,
+            post_tool_failure_hook: PostToolUseFailureHook::default(),
+            post_tool_success_hook: PostToolUseSuccessHook::default(),
         }
     }
 
@@ -127,6 +120,8 @@ impl AgentLoop {
         let mut recoverable_error_state: Option<RecoverableErrorState> = None;
 
         for turn in 1..=MAX_TURNS {
+            self.append_run_user_messages_to_window(&project_id, run_id, &mut message_window)
+                .await;
             self.save_checkpoint(
                 run_id,
                 &message_window,
@@ -1146,7 +1141,13 @@ impl AgentLoop {
         }
 
         let summary = tool_summary(&result.tool_name, false);
-        let metadata = result.result.metadata.clone();
+        let success_decision = self.post_tool_success_hook.apply(ToolSuccessObservation {
+            tool_name: result.tool_name.clone(),
+            content: result.result.content.clone(),
+            metadata: result.result.metadata.clone(),
+        });
+        let metadata =
+            merge_tool_metadata(result.result.metadata.clone(), success_decision.metadata);
         self.store
             .append_event(AgentEvent::ToolCompleted {
                 run_id: run_id.to_string(),
@@ -1164,6 +1165,7 @@ impl AgentLoop {
             json!({
                 "tool": result.tool_name.clone(),
                 "toolUseId": result.tool_use_id.clone(),
+                "metadata": metadata.clone(),
             }),
         )
         .await;
@@ -1185,87 +1187,81 @@ impl AgentLoop {
         message_window: &mut Vec<Value>,
         state: &mut Option<RecoverableErrorState>,
     ) -> Result<Option<String>> {
-        let Some(fingerprint) = tool_results
+        let observations = tool_results
             .iter()
-            .filter_map(|result| recoverable_error_fingerprint(phase, result))
-            .next()
-        else {
-            *state = None;
-            return Ok(None);
-        };
+            .map(|result| ToolFailureObservation {
+                tool_name: result.tool_name.clone(),
+                is_error: result.is_error,
+                content: result.content.clone(),
+                metadata: result.metadata.clone(),
+            })
+            .collect::<Vec<_>>();
+        let decision = self
+            .post_tool_failure_hook
+            .apply(phase, &observations, state);
 
-        let attempts = match state {
-            Some(existing) if existing.fingerprint == fingerprint.key => {
-                existing.attempts += 1;
-                existing.attempts
-            }
-            _ => {
-                *state = Some(RecoverableErrorState {
-                    fingerprint: fingerprint.key.clone(),
-                    attempts: 1,
-                });
-                1
-            }
-        };
-
-        if attempts >= RECOVERABLE_ERROR_STRONG_GUIDANCE_ATTEMPT {
-            let guidance = format!(
-                "检测到同一类可恢复工具输入失败已连续出现 {attempts} 次：tool={tool}, errorKind={error_kind}, path={path}。{base_guidance} 请立即切换策略：已有文件用 fs.patch 的小片段修改，新建大文件用 fs.write_chunk 后接 fs.commit_chunks；不要再次提交相同的大段工具输入。",
-                error_kind = fingerprint.error_kind,
-                tool = fingerprint.tool,
-                path = fingerprint.normalized_path,
-                base_guidance = fingerprint.guidance,
-            );
+        if let Some(suggestion) = decision.suggestion {
+            let fingerprint = suggestion.fingerprint;
+            let tool = fingerprint.tool;
+            let error_kind = fingerprint.error_kind;
+            let key = fingerprint.key;
+            let normalized_path = fingerprint.normalized_path;
             self.store
                 .append_event(AgentEvent::ToolRecoverySuggested {
                     run_id: run_id.to_string(),
-                    tool: fingerprint.tool.clone(),
-                    error_kind: fingerprint.error_kind.clone(),
-                    fingerprint: fingerprint.key.clone(),
-                    attempt: attempts,
-                    guidance: guidance.clone(),
+                    tool: tool.clone(),
+                    error_kind: error_kind.clone(),
+                    fingerprint: key.clone(),
+                    attempt: suggestion.attempts,
+                    guidance: suggestion.guidance.clone(),
                     metadata: Some(json!({
                         "phase": format!("{phase:?}"),
-                        "normalizedPath": fingerprint.normalized_path,
+                        "normalizedPath": normalized_path.clone(),
                     })),
                     timestamp: Utc::now(),
                 })
                 .await;
             self.emit_metric(
                 run_id,
-                "tool_input_retry_same_large_write",
+                "tool_recoverable_retry_same_error",
                 json!({
-                    "tool": fingerprint.tool,
-                    "errorKind": fingerprint.error_kind,
-                    "fingerprint": fingerprint.key,
-                    "attempt": attempts,
-                    "normalizedPath": fingerprint.normalized_path,
+                    "tool": tool.clone(),
+                    "errorKind": error_kind.clone(),
+                    "fingerprint": key.clone(),
+                    "attempt": suggestion.attempts,
+                    "normalizedPath": normalized_path.clone(),
                 }),
             )
             .await;
+            if suggestion.emit_large_write_metric {
+                self.emit_metric(
+                    run_id,
+                    "tool_input_retry_same_large_write",
+                    json!({
+                        "tool": tool.clone(),
+                        "errorKind": error_kind.clone(),
+                        "fingerprint": key.clone(),
+                        "attempt": suggestion.attempts,
+                        "normalizedPath": normalized_path.clone(),
+                    }),
+                )
+                .await;
+            }
             message_window.push(json!({
                 "role": "system",
                 "turn": turn,
                 "kind": "tool_recovery_suggested",
-                "text": guidance,
+                "text": suggestion.guidance,
                 "metadata": {
-                    "fingerprint": fingerprint.key,
-                    "attempt": attempts,
-                    "errorKind": fingerprint.error_kind,
-                    "tool": fingerprint.tool,
+                    "fingerprint": key.clone(),
+                    "attempt": suggestion.attempts,
+                    "errorKind": error_kind.clone(),
+                    "tool": tool.clone(),
                 }
             }));
         }
 
-        if attempts >= RECOVERABLE_ERROR_PARTIAL_ATTEMPT {
-            return Ok(Some(format!(
-                "已停止自动重试：同一类可恢复工具输入失败连续出现 {attempts} 次，tool={tool}, errorKind={error_kind}。请改用可恢复写入策略：已有文件先 fs.read 再用 fs.patch 小片段修改；新建或较大的页面用 fs.write_chunk 分块写入，再调用 fs.commit_chunks 提交。当前 run 已以 partial 结束，最近成功的预览会保留。",
-                tool = fingerprint.tool,
-                error_kind = fingerprint.error_kind,
-            )));
-        }
-
-        Ok(None)
+        Ok(decision.partial_summary)
     }
 
     async fn emit_metric(&self, run_id: &str, name: &str, metadata: Value) {
@@ -1401,6 +1397,38 @@ impl AgentLoop {
             .await
             .map(|checkpoint| checkpoint.message_window)
             .unwrap_or_default()
+    }
+
+    async fn append_run_user_messages_to_window(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        message_window: &mut Vec<Value>,
+    ) {
+        let conversation_items = self.store.conversation_items(project_id).await;
+        let mut existing_user_texts = message_window
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["text"].as_str())
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>();
+        let pending_user_messages = conversation_items
+            .into_iter()
+            .filter(|item| item.run_id.as_deref() == Some(run_id))
+            .filter(|item| item.kind == "user_message")
+            .filter(|item| item.role.as_deref() == Some("user"))
+            .filter(|item| item.visibility == "user")
+            .filter(|item| existing_user_texts.insert(item.text.clone()))
+            .collect::<Vec<_>>();
+        for item in pending_user_messages {
+            message_window.push(json!({
+                "role": "user",
+                "kind": item.kind,
+                "conversationItemId": item.id,
+                "text": item.text,
+                "createdAt": item.created_at,
+            }));
+        }
     }
 
     async fn save_turn_checkpoint(
@@ -1544,6 +1572,27 @@ fn truncate_conversation_text(text: &str) -> String {
     }
 }
 
+fn merge_tool_metadata(base: Option<Value>, hook: Option<Value>) -> Option<Value> {
+    match (base, hook) {
+        (None, None) => None,
+        (Some(metadata), None) | (None, Some(metadata)) => Some(metadata),
+        (Some(mut base), Some(hook)) => {
+            if let (Some(base_object), Some(hook_object)) = (base.as_object_mut(), hook.as_object())
+            {
+                for (key, value) in hook_object {
+                    base_object.insert(key.clone(), value.clone());
+                }
+                Some(base)
+            } else {
+                Some(json!({
+                    "toolMetadata": base,
+                    "hookMetadata": hook,
+                }))
+            }
+        }
+    }
+}
+
 pub fn status_string(status: AgentRunStatus) -> &'static str {
     match status {
         AgentRunStatus::Queued => "queued",
@@ -1565,82 +1614,6 @@ fn status_from_value(content: &Value) -> AgentRunStatus {
         Some("cancelled") => AgentRunStatus::Cancelled,
         Some("completed" | "success") | None => AgentRunStatus::Completed,
         Some(_) => AgentRunStatus::Completed,
-    }
-}
-
-fn recoverable_error_fingerprint(
-    phase: AgentPhase,
-    result: &ToolResultMessage,
-) -> Option<RecoverableErrorFingerprint> {
-    if !result.is_error {
-        return None;
-    }
-    let metadata = result.metadata.as_ref()?;
-    let recoverable = metadata
-        .get("recoverable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !recoverable {
-        return None;
-    }
-    let error_kind = metadata
-        .get("errorKind")
-        .and_then(Value::as_str)
-        .unwrap_or("tool.error")
-        .to_string();
-    if !matches!(
-        error_kind.as_str(),
-        "tool.input_json_parse_failed" | "tool.input_too_large"
-    ) {
-        return None;
-    }
-    let normalized_path = metadata
-        .get("path")
-        .or_else(|| metadata.get("normalizedPath"))
-        .or_else(|| result.content.get("path"))
-        .and_then(Value::as_str)
-        .map(normalize_fingerprint_path)
-        .unwrap_or_else(|| "unknown".to_string());
-    let guidance = metadata
-        .get("guidance")
-        .and_then(Value::as_str)
-        .unwrap_or(
-            "Use fs.patch for existing files or fs.write_chunk/fs.commit_chunks for large files.",
-        )
-        .to_string();
-    let key = format!(
-        "{phase:?}|{}|{}|{}",
-        result.tool_name, error_kind, normalized_path
-    );
-    Some(RecoverableErrorFingerprint {
-        key,
-        tool: result.tool_name.clone(),
-        error_kind,
-        normalized_path,
-        guidance,
-    })
-}
-
-fn normalize_fingerprint_path(path: &str) -> String {
-    let path = path
-        .trim()
-        .trim_start_matches("/workspace/")
-        .trim_start_matches("./")
-        .replace('\\', "/");
-    let mut parts = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            part => parts.push(part),
-        }
-    }
-    if parts.is_empty() {
-        "unknown".to_string()
-    } else {
-        parts.join("/")
     }
 }
 
@@ -1681,10 +1654,10 @@ fn system_prompt_for_run(run: &AgentRun) -> String {
             "Create a structured Brief draft from the provided content sources only. Use content.list_sources and content.read_source to inspect user inputs. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to astro-website for website projects or fumadocs-docs for docs projects. Call brief.write_draft with the complete Brief, then call brief.request_confirmation and wait for user confirmation before completing."
         }
         AgentPhase::Build => {
-            "Use the runtime project workflow. Read inputs/brief.md, inputs/content-sources.json, and inputs/design.md when present. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; treat state/project.json appRoot as the only app root after initialization. Use package.install for dependencies; it runs the real npm/pnpm package manager under runtime policy control. Use package.install({\"mode\":\"restore\"}) to install package.json dependencies and package.install({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. Edit app source with fs.* under the appRoot, run project.build, then call preview.start only after project.build succeeds. Report a preview candidate and only complete after preview promotion. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns tool.input_json_parse_failed or tool.input_too_large, switch strategy immediately and do not retry the same full fs.write payload."
+            "Use the runtime project workflow. Read inputs/brief.md, inputs/content-sources.json, and inputs/design.md when present. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. Edit app source with fs.* under the appRoot, then use preview.publish for the normal build, preview, screenshot, candidate, and promotion path. Only use project.build, preview.start, browser.screenshot, and preview.report_candidate separately when debugging a failed publish. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Edit => {
-            "Use the runtime project workflow. Use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read new user content sources such as design.md or docs markdown, apply focused code/content/style changes under appRoot with fs.* tools, use package.install for dependency changes; it runs the real npm/pnpm package manager under runtime policy control. Use package.install({\"mode\":\"restore\"}) to install package.json dependencies and package.install({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. Run project.build, call preview.start only after project.build succeeds, report a preview candidate, and only complete after preview promotion. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns tool.input_json_parse_failed or tool.input_too_large, switch strategy immediately and do not retry the same full fs.write payload."
+            "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the promoted artifact contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read new user content sources such as design.md or docs markdown, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. Use preview.publish for the normal rebuild, preview, screenshot, candidate, and promotion path after source edits are complete. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the promoted artifact. If it satisfies the latest user request, call run.complete. If it does not, edit the source again and then use preview.publish for the new source snapshot. Only use project.build, preview.start, browser.screenshot, and preview.report_candidate separately when debugging a failed publish. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Review => {
             "Review the candidate preview using read-only tools and report actionable findings."
