@@ -5,7 +5,7 @@ use crate::{
     model_gateway::ModelToolDefinition,
     permission::{PermissionEngine, PermissionResult, PermissionRules},
     profiles::policy,
-    types::{AgentEvent, AgentRun, AgentRunStatus, TranscriptMode},
+    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, TranscriptMode},
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -494,6 +494,25 @@ impl ToolExecutor {
                 .await;
             return ToolExecution { result };
         }
+        if !tool_use_id.starts_with("bootstrap:") {
+            if let Some((message, error_kind, metadata)) =
+                design_context_read_gate(&ctx.run, tool.name(), &input)
+            {
+                store
+                    .append_audit_record(
+                        &ctx.project_id,
+                        &ctx.run.id,
+                        tool.name(),
+                        summarize_input(&input),
+                        "deny",
+                        format!("design context read gate rejected ({error_kind}): {message}"),
+                    )
+                    .await;
+                return ToolExecution {
+                    result: ToolResult::typed_error(message, error_kind, true, metadata),
+                };
+            }
+        }
 
         let pre_tool_decision = PreToolUseHook::default().apply(PreToolUseObservation {
             phase: ctx.run.phase,
@@ -604,8 +623,9 @@ impl ToolExecutor {
 
         match audited_permission {
             PermissionResult::Allow { updated_input, .. } => {
-                let progress = ProgressSink::new(run_id, tool_use_id, store);
-                match tool.call(updated_input, ctx.clone(), progress).await {
+                let progress = ProgressSink::new(run_id, tool_use_id, store.clone());
+                let tracked_input = updated_input.clone();
+                let execution = match tool.call(updated_input, ctx.clone(), progress).await {
                     Ok(result) => ToolExecution {
                         result: truncate_large_result_if_needed(
                             result,
@@ -643,7 +663,18 @@ impl ToolExecutor {
                     Err(ToolError::Aborted) => ToolExecution {
                         result: ToolResult::error("tool aborted"),
                     },
+                };
+                if !execution.result.is_error {
+                    record_design_context_read(
+                        &store,
+                        &ctx.run,
+                        tool.name(),
+                        &tracked_input,
+                        &execution.result,
+                    )
+                    .await;
                 }
+                execution
             }
             PermissionResult::Ask {
                 message, reason, ..
@@ -880,6 +911,194 @@ fn normalize_tool_input(mut input: Value) -> Value {
         };
     }
     input
+}
+
+fn design_context_read_gate(
+    run: &AgentRun,
+    tool_name: &str,
+    input: &Value,
+) -> Option<(String, String, Value)> {
+    if run.design_profile_id.is_none() {
+        return None;
+    }
+    if tool_name == "fs.read" {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(normalize_design_context_path)
+            .unwrap_or_default();
+        if path == "inputs/design-source.md" {
+            if run.design_fidelity_mode.as_deref() != Some("source_fallback") {
+                return Some((
+                    "raw design source is not exposed in profile_only mode".to_string(),
+                    "design_source.mode_forbidden".to_string(),
+                    json!({ "requiredMode": "source_fallback" }),
+                ));
+            }
+            if run.design_source_size_bytes.unwrap_or(0) > 32 * 1024 {
+                return Some((
+                    "large design source must be read through its index and design_source.read_sections"
+                        .to_string(),
+                    "design_source.index_required".to_string(),
+                    json!({ "indexPath": "inputs/design-source-index.json" }),
+                ));
+            }
+        }
+    }
+    if !design_context_gate_mutation(tool_name, input) {
+        return None;
+    }
+
+    let mut required_files = match run.phase {
+        AgentPhase::Build => vec![
+            "inputs/brief.md".to_string(),
+            "inputs/design.md".to_string(),
+            "inputs/design-profile.json".to_string(),
+        ],
+        AgentPhase::Edit => vec!["inputs/design.md".to_string()],
+        AgentPhase::Repair => vec!["inputs/design.md".to_string()],
+        _ => Vec::new(),
+    };
+    if run.design_fidelity_mode.as_deref() == Some("source_fallback") {
+        if run.phase != AgentPhase::Edit {
+            required_files.push("inputs/design-profile.json".to_string());
+        }
+        if run.design_source_size_bytes.unwrap_or(0) <= 32 * 1024 {
+            required_files.push("inputs/design-source.md".to_string());
+        } else {
+            required_files.push("inputs/design-source-index.json".to_string());
+        }
+    }
+    required_files.sort();
+    required_files.dedup();
+    let missing_files = required_files
+        .into_iter()
+        .filter(|path| {
+            !run.design_context_read_files
+                .iter()
+                .any(|read| read == path)
+        })
+        .collect::<Vec<_>>();
+    let missing_sections = if run.design_fidelity_mode.as_deref() == Some("source_fallback")
+        && run.design_source_size_bytes.unwrap_or(0) > 32 * 1024
+    {
+        run.design_source_required_section_ids
+            .iter()
+            .filter(|section_id| {
+                run.design_source_sections
+                    .iter()
+                    .find(|section| &section.id == *section_id)
+                    .is_none_or(|section| {
+                        !run.design_source_read_section_hashes
+                            .iter()
+                            .any(|hash| hash == &section.sha256)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if missing_files.is_empty() && missing_sections.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "read required design context before calling {tool_name}: missing files [{}], missing source sections [{}]",
+            missing_files.join(", "),
+            missing_sections.join(", ")
+        ),
+        "design_context.read_required".to_string(),
+        json!({
+            "missingFiles": missing_files,
+            "missingSectionIds": missing_sections,
+            "fidelityMode": run.design_fidelity_mode.as_deref(),
+        }),
+    ))
+}
+
+fn design_context_gate_mutation(tool_name: &str, input: &Value) -> bool {
+    match tool_name {
+        "project.init"
+        | "style.update_tokens"
+        | "project.ensure_dependencies"
+        | "project.build"
+        | "preview.publish"
+        | "shell.run" => true,
+        "fs.write" | "fs.write_chunk" | "fs.commit_chunks" | "fs.patch" | "fs.multi_patch"
+        | "fs.delete" => input
+            .get("path")
+            .or_else(|| input.get("targetPath"))
+            .and_then(Value::as_str)
+            .map(normalize_design_context_path)
+            .is_some_and(|path| {
+                path == "state/style-contract.json"
+                    || path == "project"
+                    || path.starts_with("project/")
+            }),
+        _ => false,
+    }
+}
+
+async fn record_design_context_read(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    _input: &Value,
+    result: &ToolResult,
+) {
+    if tool_name != "fs.read" || run.design_profile_id.is_none() {
+        return;
+    }
+    let Some(path) = result.content.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    let path = normalize_design_context_path(path);
+    if !matches!(
+        path.as_str(),
+        "inputs/brief.md"
+            | "inputs/design.md"
+            | "inputs/design-profile.json"
+            | "inputs/design-source.md"
+            | "inputs/design-source-index.json"
+    ) {
+        return;
+    }
+    if let Err(error) = store.record_design_context_file_read(&run.id, &path).await {
+        eprintln!(
+            "failed to record design context read for {}: {error}",
+            run.id
+        );
+        return;
+    }
+    if path == "inputs/design-source.md"
+        && run.design_fidelity_mode.as_deref() == Some("source_fallback")
+    {
+        let hashes = run
+            .design_source_sections
+            .iter()
+            .map(|section| section.sha256.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = store
+            .record_design_source_sections_read(
+                &run.id,
+                &hashes,
+                run.design_source_size_bytes.unwrap_or(0),
+            )
+            .await
+        {
+            eprintln!(
+                "failed to record full design source read for {}: {error}",
+                run.id
+            );
+        }
+    }
+}
+
+fn normalize_design_context_path(path: &str) -> String {
+    path.trim_start_matches("/workspace/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {

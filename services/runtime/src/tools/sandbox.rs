@@ -10,11 +10,16 @@ use crate::{
         runtime::{ProgressSink, Tool, ToolContext, ToolError, ToolResult, ValidationError},
         schema::{object_schema, string_schema},
     },
-    types::{AgentEvent, AgentPhase, AgentRunStatus},
+    types::{
+        AgentEvent, AgentPhase, AgentRunStatus, ReviewFindingCategory, ReviewFindingEvidence,
+        ReviewFindingSeverity,
+    },
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
+use regex::Regex;
+use scraper::{Html as ParsedHtml, Selector};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     process::{Child, Command as TokioCommand},
     sync::Mutex,
@@ -60,6 +65,7 @@ pub fn sandbox_tools_with_backends(
         Arc::new(FsReadTool {
             workspace: workspace_backend.clone(),
         }),
+        Arc::new(DesignSourceReadSectionsTool),
         Arc::new(FsListTool {
             workspace: workspace_backend.clone(),
         }),
@@ -907,6 +913,217 @@ impl WorkspaceBackend for LocalWorkspaceBackend {
 
 struct FsReadTool {
     workspace: Arc<dyn WorkspaceBackend>,
+}
+
+struct DesignSourceReadSectionsTool;
+
+#[async_trait]
+impl Tool for DesignSourceReadSectionsTool {
+    fn name(&self) -> &'static str {
+        "design_source.read_sections"
+    }
+
+    fn input_schema(&self) -> Value {
+        object_schema(
+            json!({
+                "sourceArtifactId": string_schema("Design source artifact bound to this run"),
+                "sectionIds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "uniqueItems": true
+                },
+                "expectedSourceHash": string_schema("SHA-256 hash from the run snapshot")
+            }),
+            &["sourceArtifactId", "sectionIds", "expectedSourceHash"],
+        )
+    }
+
+    fn is_enabled(&self, ctx: &ToolContext) -> bool {
+        ctx.run.design_fidelity_mode.as_deref() == Some("source_fallback")
+            && ctx.run.design_source_artifact_id.is_some()
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: Value,
+        ctx: &ToolContext,
+    ) -> Result<Value, ValidationError> {
+        require_string(&input, "sourceArtifactId", self.name())?;
+        require_string(&input, "expectedSourceHash", self.name())?;
+        let artifact_id = input["sourceArtifactId"].as_str().unwrap_or_default();
+        let expected_hash = input["expectedSourceHash"].as_str().unwrap_or_default();
+        if ctx.run.design_source_artifact_id.as_deref() != Some(artifact_id)
+            || ctx.run.design_source_hash.as_deref() != Some(expected_hash)
+        {
+            return Err(ValidationError::with_kind(
+                "design source artifact or hash does not match the current run snapshot",
+                "design_source.snapshot_mismatch",
+            ));
+        }
+        let section_ids = input
+            .get("sectionIds")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ValidationError::with_kind(
+                    "design_source.read_sections requires sectionIds",
+                    "tool.input_schema_invalid",
+                )
+            })?;
+        if section_ids.is_empty() {
+            return Err(ValidationError::with_kind(
+                "design_source.read_sections requires at least one sectionId",
+                "tool.input_schema_invalid",
+            ));
+        }
+        let mut selected_bytes = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        for section_id in section_ids {
+            let section_id = section_id.as_str().ok_or_else(|| {
+                ValidationError::with_kind(
+                    "sectionIds must contain strings",
+                    "tool.input_schema_invalid",
+                )
+            })?;
+            if !seen.insert(section_id) {
+                return Err(ValidationError::with_kind(
+                    "sectionIds must not contain duplicates",
+                    "tool.input_schema_invalid",
+                ));
+            }
+            let section = ctx
+                .run
+                .design_source_sections
+                .iter()
+                .find(|section| section.id == section_id)
+                .ok_or_else(|| {
+                    ValidationError::with_kind(
+                        format!("unknown source section for current run: {section_id}"),
+                        "design_source.section_not_found",
+                    )
+                })?;
+            selected_bytes += (section.end_byte - section.start_byte) as u64;
+        }
+        if selected_bytes > 16 * 1024 {
+            return Err(ValidationError::with_kind(
+                "design_source.read_sections may return at most 16 KiB per call",
+                "design_source.read_limit_exceeded",
+            ));
+        }
+        let budget = ctx.run.design_source_budget_bytes.unwrap_or(48 * 1024);
+        if ctx
+            .run
+            .design_source_bytes_read
+            .saturating_add(selected_bytes)
+            > budget
+        {
+            ctx.store
+                .update_run_status(&ctx.run.id, AgentRunStatus::NeedsUserInput)
+                .await
+                .ok();
+            ctx.store
+                .append_event(AgentEvent::StateChanged {
+                    run_id: ctx.run.id.clone(),
+                    state: "needs_user_input:design_profile_source_budget_exceeded".to_string(),
+                    timestamp: Utc::now(),
+                })
+                .await
+                .ok();
+            return Err(ValidationError::with_kind(
+                "design profile source budget exceeded",
+                "design_source.budget_exceeded",
+            ));
+        }
+        Ok(input)
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "read-only source sections bound to the current run".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        let artifact_id = input["sourceArtifactId"].as_str().unwrap_or_default();
+        let source = ctx
+            .store
+            .read_design_source_artifact_content(artifact_id)
+            .await
+            .map_err(|error| ToolError::Terminal(error.to_string()))?;
+        let section_ids = input["sectionIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let mut sections = Vec::new();
+        let mut hashes = Vec::new();
+        let mut bytes_read = 0u64;
+        for section_id in section_ids {
+            let section = ctx
+                .run
+                .design_source_sections
+                .iter()
+                .find(|section| section.id == section_id)
+                .ok_or_else(|| {
+                    ToolError::Terminal(format!("source section disappeared: {section_id}"))
+                })?;
+            let bytes = source
+                .get(section.start_byte..section.end_byte)
+                .ok_or_else(|| {
+                    ToolError::Terminal(format!("source section range is invalid: {section_id}"))
+                })?;
+            if crate::types::sha256_hex(bytes) != section.sha256 {
+                return Err(ToolError::Terminal(format!(
+                    "source section integrity check failed: {section_id}"
+                )));
+            }
+            bytes_read += bytes.len() as u64;
+            hashes.push(section.sha256.clone());
+            sections.push(json!({
+                "id": section.id,
+                "heading": section.heading,
+                "startByte": section.start_byte,
+                "endByte": section.end_byte,
+                "sha256": section.sha256,
+                "text": std::str::from_utf8(bytes).map_err(|_| ToolError::Terminal("source section is not UTF-8".to_string()))?,
+            }));
+        }
+        ctx.store
+            .record_design_source_sections_read(&ctx.run.id, &hashes, bytes_read)
+            .await
+            .map_err(|error| {
+                ToolError::typed_recoverable(
+                    error.to_string(),
+                    "design_source.budget_exceeded",
+                    json!({ "state": "needs_user_input:design_profile_source_budget_exceeded" }),
+                )
+            })?;
+        Ok(ToolResult::ok(json!({
+            "trustLabel": "untrusted_design_reference",
+            "sourceArtifactId": artifact_id,
+            "sourceHash": ctx.run.design_source_hash,
+            "sections": sections,
+            "bytesRead": bytes_read,
+            "remainingBudgetBytes": ctx.run.design_source_budget_bytes.unwrap_or(48 * 1024).saturating_sub(ctx.run.design_source_bytes_read + bytes_read),
+        })))
+    }
 }
 
 #[async_trait]
@@ -2451,18 +2668,21 @@ impl Tool for ProjectInitTool {
 
         cleanup_conflicting_template_files(&*self.workspace, &ctx, &app_root, &template).await?;
         write_project_template_files(&*self.workspace, &ctx, &app_root, &template).await?;
+        let style_contract = runtime_style_contract(&template, &app_root_relative);
+        let initial_token_changes =
+            apply_design_profile_initial_tokens(&*self.workspace, &ctx, &style_contract).await?;
         write_workspace_json(
             &*self.workspace,
             &ctx,
             "state/style-contract.json",
-            &runtime_style_contract(&template, &app_root_relative),
+            &style_contract,
         )
         .await?;
         let state = json!({
             "appRoot": app_root_relative,
             "template": template,
             "templateKey": template,
-            "templateVersion": format!("{template}@runtime-p2"),
+            "templateVersion": format!("{template}@runtime-p3"),
             "framework": if template == "fumadocs-docs" { "fumadocs" } else { "astro" },
             "packageManager": "npm",
             "lockfile": "package-lock.json",
@@ -2476,6 +2696,7 @@ impl Tool for ProjectInitTool {
             "template": template,
             "packageManager": "npm",
             "styleContractPath": "/workspace/state/style-contract.json",
+            "designProfileTokenChanges": initial_token_changes,
         })))
     }
 }
@@ -2793,6 +3014,7 @@ impl Tool for ProjectBuildTool {
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         let build_id = format!("build-{}", finished_at.timestamp_millis());
+        let source_fingerprint = project_source_fingerprint(&*self.workspace, &ctx, &cwd).await?;
         let source_snapshot_path = format!("outputs/build/source-snapshots/{build_id}");
         let source_snapshot_uri = format!("file:///workspace/{source_snapshot_path}");
         snapshot_project_source(&*self.workspace, &ctx, &cwd, &source_snapshot_path).await?;
@@ -2840,6 +3062,7 @@ impl Tool for ProjectBuildTool {
             "exitCode": output.as_ref().and_then(|output| output.status),
             "logPath": format!("/workspace/{log_path}"),
             "sourceSnapshotUri": source_snapshot_uri,
+            "sourceFingerprint": source_fingerprint,
             "staticOutputPath": static_output_path,
             "staticOutputName": static_output_name,
             "error": error_message,
@@ -3221,14 +3444,17 @@ impl Tool for PreviewPublishTool {
             .call(build_input, ctx.clone(), progress.clone())
             .await?
             .content;
+        reject_unchanged_fidelity_republish(&ctx, &build).await?;
 
         let preview_tool = PreviewStartTool {
             workspace: self.workspace.clone(),
         };
         let mut preview_input = json!({});
-        for key in ["url", "port", "command", "mode"] {
-            if let Some(value) = input.get(key).cloned() {
-                preview_input[key] = value;
+        if ctx.policy_profile != RuntimePolicyProfile::LocalE2e {
+            for key in ["url", "port", "command", "mode"] {
+                if let Some(value) = input.get(key).cloned() {
+                    preview_input[key] = value;
+                }
             }
         }
         let preview = preview_tool
@@ -3276,13 +3502,770 @@ impl Tool for PreviewPublishTool {
 
         let published =
             report_preview_candidate(&*self.workspace, &ctx, url, screenshot_id, None).await?;
+        let fidelity = evaluate_design_profile_fidelity(
+            &*self.workspace,
+            &ctx,
+            preview
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            screenshot
+                .get("screenshotId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            &published,
+        )
+        .await?;
         Ok(ToolResult::ok(json!({
             "published": true,
             "build": build,
             "preview": preview,
             "screenshot": screenshot,
             "promotion": published,
+            "designProfileFidelity": fidelity,
         })))
+    }
+}
+
+async fn reject_unchanged_fidelity_republish(
+    ctx: &ToolContext,
+    build: &Value,
+) -> Result<(), ToolError> {
+    let current_fingerprint = build
+        .get("sourceFingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if current_fingerprint.is_empty() {
+        return Ok(());
+    }
+    let previous_failed_report = ctx
+        .store
+        .conversation_items(&ctx.project_id)
+        .await
+        .into_iter()
+        .rev()
+        .filter(|item| {
+            item.run_id.as_deref() == Some(&ctx.run.id)
+                && item.kind == "design_profile_fidelity_checked"
+        })
+        .filter_map(|item| item.metadata)
+        .find(|report| {
+            report
+                .get("requiredFailedRuleIds")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| !ids.is_empty())
+        });
+    let Some(previous_failed_report) = previous_failed_report else {
+        return Ok(());
+    };
+    if previous_failed_report
+        .get("sourceFingerprint")
+        .and_then(Value::as_str)
+        != Some(current_fingerprint)
+    {
+        return Ok(());
+    }
+    Err(ToolError::typed_recoverable(
+        "preview.publish blocked because project source is unchanged since the failed DesignProfile fidelity check",
+        "design_profile.no_source_change_after_fidelity_failure",
+        json!({
+            "sourceFingerprint": current_fingerprint,
+            "requiredFailedRuleIds": previous_failed_report["requiredFailedRuleIds"],
+            "suggestedAction": "Read state/design-profile-fidelity.json, edit project source to address the reported selector/property failures, then call preview.publish again. Inspecting or rebuilding unchanged source does not count as a repair."
+        }),
+    ))
+}
+
+async fn evaluate_design_profile_fidelity(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    preview_url: &str,
+    screenshot_id: &str,
+    published: &Value,
+) -> Result<Value, ToolError> {
+    let Some(profile) = read_workspace_json(workspace, ctx, "inputs/design-profile.json").await
+    else {
+        return Ok(json!({
+            "status": "not_applicable",
+            "assertions": [],
+            "requiredFailedRuleIds": []
+        }));
+    };
+    let rules = profile
+        .get("signatureRules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let surface = ctx
+        .run
+        .design_profile_surface
+        .as_deref()
+        .unwrap_or("website");
+    let rules = rules
+        .into_iter()
+        .filter(|rule| fidelity_rule_applies(rule, surface))
+        .collect::<Vec<_>>();
+    let needs_dom = rules.iter().any(|rule| {
+        matches!(
+            rule.get("verification")
+                .and_then(|verification| verification.get("kind"))
+                .and_then(Value::as_str),
+            Some("dom" | "computed-style")
+        )
+    });
+    let html = if needs_dom && !preview_url.is_empty() {
+        match reqwest::get(preview_url).await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response.text().await.ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let contract = read_workspace_json(workspace, ctx, "state/style-contract.json").await;
+    let token_file_content = if let Some(token_file) = contract
+        .as_ref()
+        .and_then(|contract| contract.get("tokenFile"))
+        .and_then(Value::as_str)
+    {
+        let path = resolve_path(token_file, &ctx.workspace_root);
+        workspace.read_to_string(ctx, &path).await.ok()
+    } else {
+        None
+    };
+    let computed_style_evidence = if rules.iter().any(|rule| {
+        rule.get("verification")
+            .and_then(|verification| verification.get("kind"))
+            .and_then(Value::as_str)
+            == Some("computed-style")
+    }) {
+        collect_computed_style_evidence(preview_url, &rules).await
+    } else {
+        json!({ "ok": true, "results": {} })
+    };
+
+    let mut assertions = Vec::new();
+    let mut required_failed_rule_ids = Vec::new();
+    for rule in rules {
+        let rule_id = rule
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown-rule")
+            .to_string();
+        let required = rule.get("priority").and_then(Value::as_str) == Some("required");
+        let category = rule
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("component");
+        let verification = rule
+            .get("verification")
+            .cloned()
+            .unwrap_or_else(|| json!({ "kind": "missing" }));
+        let kind = verification
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let expected = verification
+            .get("expected")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let comparator = verification
+            .get("comparator")
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("exact");
+        let (actual, normalized_actual, passed, reason) = match kind {
+            "token" => {
+                let token = verification
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let css_variable = contract
+                    .as_ref()
+                    .and_then(|contract| contract.get("tokens"))
+                    .and_then(|tokens| tokens.get(token))
+                    .and_then(Value::as_str);
+                let actual = css_variable
+                    .and_then(|variable| {
+                        token_file_content
+                            .as_deref()
+                            .and_then(|content| read_css_variable_value(content, variable))
+                    })
+                    .unwrap_or_default();
+                let (passed, normalized, reason) = compare_fidelity_value(
+                    actual,
+                    expected,
+                    comparator,
+                    verification.get("comparator"),
+                );
+                (actual.to_string(), normalized, passed, reason)
+            }
+            "dom" => {
+                let selector = verification
+                    .get("selector")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let min_matches = verification
+                    .get("minMatches")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let count = html
+                    .as_deref()
+                    .and_then(|html| {
+                        Selector::parse(selector).ok().map(|selector| {
+                            ParsedHtml::parse_document(html).select(&selector).count() as u64
+                        })
+                    })
+                    .unwrap_or(0);
+                (
+                    count.to_string(),
+                    count.to_string(),
+                    count >= min_matches,
+                    format!("matched {count}, required {min_matches}"),
+                )
+            }
+            "source-pattern" => {
+                let pattern = verification
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let regex = Regex::new(pattern).ok();
+                let mut matches = 0usize;
+                for path in verification
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    let path = resolve_path(path, &ctx.workspace_root);
+                    if let Ok(content) = workspace.read_to_string(ctx, &path).await {
+                        if regex.as_ref().is_some_and(|regex| regex.is_match(&content)) {
+                            matches += 1;
+                        }
+                    }
+                }
+                let visual_only = required
+                    && matches!(
+                        category,
+                        "color"
+                            | "typography"
+                            | "spacing"
+                            | "component"
+                            | "composition"
+                            | "imagery"
+                    );
+                (
+                    matches.to_string(),
+                    matches.to_string(),
+                    matches > 0 && !visual_only,
+                    if visual_only {
+                        "source-pattern cannot alone satisfy a required visual rule".to_string()
+                    } else {
+                        format!("pattern matched {matches} path(s)")
+                    },
+                )
+            }
+            "computed-style" => {
+                let values = computed_style_evidence
+                    .get("results")
+                    .and_then(|results| results.get(&rule_id))
+                    .and_then(|result| result.get("values"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>();
+                let min_matches = verification
+                    .get("minMatches")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as usize;
+                let reference_values = computed_style_evidence
+                    .get("results")
+                    .and_then(|results| results.get(&rule_id))
+                    .and_then(|result| result.get("referenceValues"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>();
+                let browser_error = computed_style_evidence.get("error").and_then(Value::as_str);
+                let comparisons = values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if comparator == "numeric-ratio" {
+                            compare_fidelity_ratio(
+                                value,
+                                reference_values
+                                    .get(index)
+                                    .map(String::as_str)
+                                    .unwrap_or_default(),
+                                verification.get("comparator"),
+                            )
+                        } else {
+                            compare_fidelity_value(
+                                value,
+                                expected,
+                                comparator,
+                                verification.get("comparator"),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let enough_matches = if comparator == "forbidden-anywhere" {
+                    true
+                } else {
+                    values.len() >= min_matches
+                };
+                let match_policy = verification
+                    .get("matchPolicy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("all");
+                let comparisons_pass = if match_policy == "any" {
+                    comparisons.iter().any(|(passed, _, _)| *passed)
+                } else {
+                    comparisons.iter().all(|(passed, _, _)| *passed)
+                };
+                let passed = browser_error.is_none() && enough_matches && comparisons_pass;
+                let normalized = comparisons
+                    .iter()
+                    .map(|(_, normalized, _)| normalized.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let reason = if let Some(error) = browser_error {
+                    format!("browser-computed evidence unavailable: {error}")
+                } else if !enough_matches {
+                    format!("matched {}, required {min_matches}", values.len())
+                } else if passed {
+                    format!(
+                        "browser-computed comparison passed for {} match(es)",
+                        values.len()
+                    )
+                } else {
+                    format!(
+                        "browser-computed comparison failed for {} match(es)",
+                        values.len()
+                    )
+                };
+                (values.join(" | "), normalized, passed, reason)
+            }
+            "visual-review" => (
+                screenshot_id.to_string(),
+                screenshot_id.to_string(),
+                false,
+                "visual-review rubric requires a Review finding".to_string(),
+            ),
+            _ => (
+                String::new(),
+                String::new(),
+                false,
+                "unsupported or missing verification kind".to_string(),
+            ),
+        };
+        if required && !passed {
+            required_failed_rule_ids.push(rule_id.clone());
+        }
+        let assertion = json!({
+            "ruleId": rule_id,
+            "priority": if required { "required" } else { "preferred" },
+            "kind": kind,
+            "route": verification.get("route").cloned().unwrap_or(json!("/")),
+            "selector": verification.get("selector").cloned().unwrap_or(Value::Null),
+            "property": verification.get("property").cloned().unwrap_or(Value::Null),
+            "rawActual": actual,
+            "normalizedActual": normalized_actual,
+            "expected": expected,
+            "comparator": comparator,
+            "passed": passed,
+            "reason": reason,
+        });
+        ctx.store
+            .append_audit_record(
+                &ctx.project_id,
+                &ctx.run.id,
+                "design_profile.fidelity_assertion",
+                assertion.to_string(),
+                if passed { "allow" } else { "deny" },
+                format!("ruleId={rule_id}"),
+            )
+            .await;
+        assertions.push(assertion);
+    }
+    required_failed_rule_ids.sort();
+    let output_version_id = published
+        .get("versionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let style_contract = read_workspace_json(workspace, ctx, "state/style-contract.json")
+        .await
+        .unwrap_or_else(|| json!({}));
+    let report = json!({
+        "version": "design-profile-fidelity@1",
+        "runId": ctx.run.id,
+        "designProfileId": ctx.run.design_profile_id,
+        "designProfileVersion": ctx.run.design_profile_version,
+        "effectiveProfileHash": ctx.run.design_profile_effective_hash,
+        "surface": ctx.run.design_profile_surface,
+        "template": ctx.run.design_profile_template,
+        "outputVersionId": output_version_id,
+        "sourceFingerprint": read_workspace_json(workspace, ctx, "outputs/build/latest.json")
+            .await
+            .and_then(|build| build.get("sourceFingerprint").cloned()),
+        "repairContext": {
+            "styleContractPath": "/workspace/state/style-contract.json",
+            "tokenFile": style_contract.get("tokenFile").cloned(),
+            "globalCssFile": style_contract.get("globalCssFile").cloned(),
+            "componentRoot": style_contract.get("componentRoot").cloned(),
+            "instructions": [
+                "Edit source that is imported by the current page; do not create a standalone CSS file unless the page imports it.",
+                "Prefer the declared globalCssFile for selector and computed-style repairs.",
+                "Use only tokens declared by the Style Contract."
+            ]
+        },
+        "previewUrl": preview_url,
+        "screenshotId": screenshot_id,
+        "assertions": assertions,
+        "requiredFailedRuleIds": required_failed_rule_ids,
+        "checkedAt": Utc::now(),
+    });
+    write_workspace_json(
+        workspace,
+        ctx,
+        "state/design-profile-fidelity.json",
+        &report,
+    )
+    .await?;
+    ctx.store
+        .append_conversation_item(
+            &ctx.project_id,
+            Some(&ctx.run.id),
+            "design_profile_fidelity_checked",
+            Some("assistant"),
+            format!(
+                "DesignProfile fidelity checked: {} required failure(s).",
+                required_failed_rule_ids.len()
+            ),
+            Some(report.clone()),
+        )
+        .await;
+    for assertion in report["assertions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|assertion| {
+            assertion.get("priority").and_then(Value::as_str) == Some("required")
+                && assertion.get("passed").and_then(Value::as_bool) == Some(false)
+        })
+    {
+        let rule_id = assertion
+            .get("ruleId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown-rule");
+        let reason = assertion
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("fidelity assertion failed");
+        let _ = ctx
+            .store
+            .record_review_finding(
+                &ctx.project_id,
+                &ctx.run.id,
+                output_version_id,
+                ReviewFindingSeverity::Blocking,
+                ReviewFindingCategory::Visual,
+                format!("DesignProfile rule {rule_id} failed: {reason}"),
+                Some(ReviewFindingEvidence {
+                    screenshot_id: (!screenshot_id.is_empty()).then(|| screenshot_id.to_string()),
+                    file_path: Some("state/design-profile-fidelity.json".to_string()),
+                    log_excerpt: Some(assertion.to_string()),
+                }),
+                true,
+            )
+            .await;
+    }
+    Ok(report)
+}
+
+async fn collect_computed_style_evidence(preview_url: &str, rules: &[Value]) -> Value {
+    if preview_url.trim().is_empty() {
+        return json!({
+            "ok": false,
+            "error": "preview URL is missing",
+            "results": {}
+        });
+    }
+    let assertions = rules
+        .iter()
+        .filter_map(|rule| {
+            let verification = rule.get("verification")?;
+            (verification.get("kind").and_then(Value::as_str) == Some("computed-style"))
+                .then(|| {
+                    json!({
+                        "ruleId": rule.get("id").and_then(Value::as_str).unwrap_or("unknown-rule"),
+                        "route": verification.get("route").and_then(Value::as_str).unwrap_or("/"),
+                        "selector": verification.get("selector").and_then(Value::as_str).unwrap_or_default(),
+                        "property": verification.get("property").and_then(Value::as_str).unwrap_or_default(),
+                        "referenceProperty": verification.get("referenceProperty").and_then(Value::as_str),
+                        "excludeWithin": verification.get("excludeWithin").and_then(Value::as_str),
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    if assertions.is_empty() {
+        return json!({ "ok": true, "results": {} });
+    }
+
+    let input = json!({
+        "url": preview_url,
+        "assertions": assertions,
+    });
+    let mut command = TokioCommand::new("node");
+    command
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(include_str!("../../scripts/collect-computed-styles.mjs"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": format!("failed to start browser evidence collector: {error}"),
+                "results": {}
+            });
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(input.to_string().as_bytes()).await {
+            return json!({
+                "ok": false,
+                "error": format!("failed to write browser evidence input: {error}"),
+                "results": {}
+            });
+        }
+    }
+    let output = match time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return json!({
+                "ok": false,
+                "error": format!("browser evidence collector failed: {error}"),
+                "results": {}
+            });
+        }
+        Err(_) => {
+            return json!({
+                "ok": false,
+                "error": "browser evidence collector timed out",
+                "results": {}
+            });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(value) if output.status.success() => value,
+        Ok(value) => json!({
+            "ok": false,
+            "error": value.get("error").and_then(Value::as_str).map(ToString::to_string).unwrap_or_else(|| {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if stderr.is_empty() {
+                    "browser evidence collector exited unsuccessfully".to_string()
+                } else {
+                    format!("browser evidence collector exited unsuccessfully: {stderr}")
+                }
+            }),
+            "results": value.get("results").cloned().unwrap_or_else(|| json!({}))
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": format!("invalid browser evidence output: {error}"),
+            "results": {}
+        }),
+    }
+}
+
+fn fidelity_rule_applies(rule: &Value, surface: &str) -> bool {
+    match rule.get("appliesTo") {
+        Some(Value::String(value)) => value == "all",
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(surface)),
+        _ => false,
+    }
+}
+
+fn read_css_variable_value<'a>(content: &'a str, css_variable: &str) -> Option<&'a str> {
+    let marker = format!("{css_variable}:");
+    let start = content.find(&marker)? + marker.len();
+    let end = start + content[start..].find(';')?;
+    Some(content[start..end].trim())
+}
+
+fn compare_fidelity_value(
+    actual: &str,
+    expected: &str,
+    comparator: &str,
+    comparator_value: Option<&Value>,
+) -> (bool, String, String) {
+    let normalized_actual = normalize_fidelity_value(actual);
+    let normalized_expected = normalize_fidelity_value(expected);
+    let passed = match comparator {
+        "contains" => normalized_actual.contains(&normalized_expected),
+        "color-equivalent" => normalize_css_color(actual) == normalize_css_color(expected),
+        "numeric-tolerance" => {
+            let tolerance = comparator_value
+                .and_then(|value| value.get("tolerance"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            match (parse_css_number(actual), parse_css_number(expected)) {
+                (Some(actual), Some(expected)) => (actual - expected).abs() <= tolerance,
+                _ => false,
+            }
+        }
+        "forbidden-anywhere" => {
+            !normalized_actual.contains(&normalized_expected)
+                && normalize_css_color(actual) != normalize_css_color(expected)
+        }
+        _ => normalized_actual == normalized_expected,
+    };
+    (
+        passed,
+        normalized_actual,
+        if passed {
+            "comparison passed".to_string()
+        } else {
+            format!("comparison failed against normalized expected {normalized_expected}")
+        },
+    )
+}
+
+fn compare_fidelity_ratio(
+    actual: &str,
+    reference: &str,
+    comparator_value: Option<&Value>,
+) -> (bool, String, String) {
+    let expected_ratio = comparator_value
+        .and_then(|value| value.get("ratio"))
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let tolerance = comparator_value
+        .and_then(|value| value.get("tolerance"))
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let ratio = match (parse_css_number(actual), parse_css_number(reference)) {
+        (Some(actual), Some(reference)) if reference.abs() > f64::EPSILON => {
+            Some(actual / reference)
+        }
+        _ => None,
+    };
+    let passed = ratio.is_some_and(|ratio| (ratio - expected_ratio).abs() <= tolerance);
+    let normalized = ratio
+        .map(|ratio| format!("{ratio:.4}"))
+        .unwrap_or_else(|| "invalid-ratio".to_string());
+    let reason = if passed {
+        "ratio comparison passed".to_string()
+    } else {
+        format!(
+            "ratio comparison failed for {actual} / {reference}; expected {expected_ratio} +/- {tolerance}"
+        )
+    };
+    (passed, normalized, reason)
+}
+
+fn normalize_fidelity_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(['\'', '"'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn normalize_css_color(value: &str) -> String {
+    let value = normalize_fidelity_value(value);
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 3 {
+            return format!("#{0}{0}{1}{1}{2}{2}", &hex[0..1], &hex[1..2], &hex[2..3]);
+        }
+        if hex.len() == 6 {
+            return value;
+        }
+    }
+    if let Some(captures) = Regex::new(
+        r"^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.]+))?\s*\)$",
+    )
+    .expect("valid CSS color regex")
+    .captures(&value)
+    {
+        let channels = [1, 2, 3]
+            .into_iter()
+            .filter_map(|index| captures.get(index)?.as_str().parse::<f64>().ok())
+            .map(|channel| channel.round().clamp(0.0, 255.0) as u8)
+            .collect::<Vec<_>>();
+        if channels.len() == 3 {
+            let alpha = captures
+                .get(4)
+                .and_then(|value| value.as_str().parse::<f64>().ok())
+                .unwrap_or(1.0);
+            if (alpha - 1.0).abs() < 0.001 {
+                return format!("#{:02x}{:02x}{:02x}", channels[0], channels[1], channels[2]);
+            }
+            return format!(
+                "rgba({},{},{},{alpha:.3})",
+                channels[0], channels[1], channels[2]
+            );
+        }
+    }
+    value
+}
+
+fn parse_css_number(value: &str) -> Option<f64> {
+    let number = value
+        .trim()
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || matches!(character, '.' | '-'))
+        .collect::<String>();
+    number.parse().ok()
+}
+
+#[cfg(test)]
+mod fidelity_comparator_tests {
+    use super::{compare_fidelity_ratio, compare_fidelity_value};
+
+    #[test]
+    fn color_equivalent_matches_browser_rgb_with_hex() {
+        assert!(
+            compare_fidelity_value("rgb(102, 58, 243)", "#663af3", "color-equivalent", None,).0
+        );
+    }
+
+    #[test]
+    fn forbidden_anywhere_rejects_equivalent_browser_color() {
+        assert!(
+            !compare_fidelity_value("rgb(102, 58, 243)", "#663af3", "forbidden-anywhere", None,).0
+        );
+        assert!(
+            compare_fidelity_value("rgba(0, 0, 0, 0)", "#663af3", "forbidden-anywhere", None,).0
+        );
+    }
+
+    #[test]
+    fn numeric_ratio_compares_css_length_roles_across_font_sizes() {
+        let comparator = serde_json::json!({
+            "kind": "numeric-ratio",
+            "ratio": 0.10,
+            "tolerance": 0.01
+        });
+        assert!(compare_fidelity_ratio("1.5px", "15px", Some(&comparator)).0);
+        assert!(compare_fidelity_ratio("1.7px", "17px", Some(&comparator)).0);
+        assert!(!compare_fidelity_ratio("normal", "17px", Some(&comparator)).0);
     }
 }
 
@@ -3478,19 +4461,23 @@ impl Tool for PreviewStartTool {
             ));
         }
         let cwd = default_project_dir(&ctx);
+        let explicit_url = input.get("url").and_then(Value::as_str);
         let port = input
             .get("port")
             .and_then(Value::as_u64)
             .and_then(|port| u16::try_from(port).ok())
-            .or_else(|| input.get("url").and_then(Value::as_str).and_then(url_port))
-            .unwrap_or(4321);
-        let url = input
-            .get("url")
-            .and_then(Value::as_str)
+            .or_else(|| explicit_url.and_then(url_port))
+            .map(Ok)
+            .unwrap_or_else(allocate_preview_port)?;
+        let url = explicit_url
             .map(str::to_string)
             .unwrap_or_else(|| format!("http://127.0.0.1:{port}"))
             .to_string();
-        let static_output_dir = if verify_preview_accessible(&url).await.is_err() {
+        let static_output_dir = if explicit_url.is_none() {
+            let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
+            wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
+            Some(static_output)
+        } else if verify_preview_accessible(&url).await.is_err() {
             let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
             wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
             Some(static_output)
@@ -3508,10 +4495,27 @@ impl Tool for PreviewStartTool {
             "pid": read_preview_pid(&ctx),
             "build": build,
             "accessible": true,
+            "managed": explicit_url.is_none(),
         });
         write_workspace_json(&*self.workspace, &ctx, "state/preview.json", &state).await?;
         Ok(ToolResult::ok(state))
     }
+}
+
+fn allocate_preview_port() -> Result<u16, ToolError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+        ToolError::Recoverable(format!(
+            "preview.start failed to allocate a local port: {error}"
+        ))
+    })?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| {
+            ToolError::Recoverable(format!(
+                "preview.start failed to read allocated port: {error}"
+            ))
+        })
 }
 
 fn static_preview_output_candidates(ctx: &ToolContext) -> [&'static str; 2] {
@@ -5438,6 +6442,54 @@ async fn snapshot_project_source(
     Ok(())
 }
 
+async fn project_source_fingerprint(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    source_root: &Path,
+) -> Result<String, ToolError> {
+    let skip_dir_names = source_snapshot_skip_dir_names();
+    let mut pending = vec![source_root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let mut entries = workspace
+            .list_dir(ctx, &directory)
+            .await
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        for entry in entries {
+            match entry.kind {
+                WorkspaceEntryKind::Dir => {
+                    if !skip_dir_names.contains(&entry.name) {
+                        pending.push(entry.path);
+                    }
+                }
+                WorkspaceEntryKind::File => {
+                    let relative_path = entry
+                        .path
+                        .strip_prefix(source_root)
+                        .unwrap_or(&entry.path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let content = workspace
+                        .read_to_string(ctx, &entry.path)
+                        .await
+                        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+                    files.push((relative_path, content));
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (path, content) in files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update((content.len() as u64).to_be_bytes());
+        digest.update(content.as_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn source_snapshot_skip_dir_names() -> Vec<String> {
     ["node_modules", "dist", "out", ".next", ".astro", ".source"]
         .into_iter()
@@ -5795,6 +6847,81 @@ async fn write_project_template_files(
     Ok(())
 }
 
+async fn apply_design_profile_initial_tokens(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    contract: &Value,
+) -> Result<Vec<Value>, ToolError> {
+    let Some(profile) = read_workspace_json(workspace, ctx, "inputs/design-profile.json").await
+    else {
+        return Ok(Vec::new());
+    };
+    let mut requested = Vec::new();
+    for field in ["runtimeTokenMapping", "extendedTokenMapping"] {
+        if let Some(tokens) = profile.get(field).and_then(Value::as_object) {
+            requested.extend(tokens.iter());
+        }
+    }
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let token_file = contract
+        .get("tokenFile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Recoverable("style contract missing tokenFile".to_string()))?;
+    let token_path = check_existing_path(
+        &resolve_path(token_file, &ctx.workspace_root),
+        &ctx.workspace_root,
+    )
+    .map_err(|error| {
+        ToolError::Recoverable(format!(
+            "design profile token initialization cannot read tokenFile: {error:?}"
+        ))
+    })?;
+    let contract_tokens = contract
+        .get("tokens")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ToolError::Recoverable("style contract missing tokens map".to_string()))?;
+    let mut content = workspace
+        .read_to_string(ctx, &token_path)
+        .await
+        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+    let mut changes = Vec::new();
+    for (token_name, value) in requested {
+        let Some(css_variable) = contract_tokens.get(token_name).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(new_value) = value.as_str() else {
+            return Err(ToolError::Recoverable(format!(
+                "design profile runtimeTokenMapping.{token_name} must be a string"
+            )));
+        };
+        validate_style_token_value(new_value).map_err(|message| {
+            ToolError::Recoverable(format!(
+                "design profile runtimeTokenMapping.{token_name} {message}"
+            ))
+        })?;
+        let (updated, old_value) =
+            replace_css_variable_value(&content, css_variable, new_value, ctx, &token_path)?;
+        content = updated;
+        changes.push(json!({
+            "token": token_name,
+            "cssVariable": css_variable,
+            "before": old_value,
+            "after": new_value,
+            "reason": "initial_build",
+        }));
+    }
+    if !changes.is_empty() {
+        workspace
+            .write_string(ctx, &token_path, &content)
+            .await
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        record_read_path(ctx, &token_path, &content)?;
+    }
+    Ok(changes)
+}
+
 async fn cleanup_conflicting_template_files(
     workspace: &dyn WorkspaceBackend,
     ctx: &ToolContext,
@@ -6117,8 +7244,71 @@ fn runtime_style_contract(template: &str, app_root_relative: &Path) -> Value {
             format!("{app_root}/src/components/ui"),
         )
     };
+    let mut tokens = json!({
+        "color.background": "--runtime-bg",
+        "color.surface": "--runtime-surface",
+        "color.surfaceStrong": "--runtime-surface-strong",
+        "color.text": "--runtime-text",
+        "color.muted": "--runtime-muted",
+        "color.primary": "--runtime-primary",
+        "color.primaryContrast": "--runtime-primary-contrast",
+        "color.action": "--runtime-action",
+        "color.actionContrast": "--runtime-action-contrast",
+        "color.authSubmit": "--runtime-auth-submit",
+        "color.border": "--runtime-border",
+        "radius.card": "--runtime-radius-card",
+        "radius.control": "--runtime-radius-control",
+        "font.sans": "--runtime-font-sans",
+        "shadow.soft": "--runtime-shadow-soft"
+    });
+    let extended = if template == "fumadocs-docs" {
+        vec![
+            ("font.display", "--runtime-font-display"),
+            ("font.mono", "--runtime-font-mono"),
+            (
+                "type.display.letterSpacing",
+                "--runtime-type-display-tracking",
+            ),
+            ("type.body.letterSpacing", "--runtime-type-body-tracking"),
+            ("spacing.pageGutter", "--runtime-spacing-page-gutter"),
+            ("spacing.section", "--runtime-spacing-section"),
+            ("radius.input", "--runtime-radius-input"),
+            ("radius.badge", "--runtime-radius-badge"),
+            ("gradient.display", "--runtime-gradient-display"),
+        ]
+    } else {
+        vec![
+            ("font.display", "--runtime-font-display"),
+            ("font.mono", "--runtime-font-mono"),
+            ("type.display.size", "--runtime-type-display-size"),
+            (
+                "type.display.lineHeight",
+                "--runtime-type-display-line-height",
+            ),
+            (
+                "type.display.letterSpacing",
+                "--runtime-type-display-tracking",
+            ),
+            ("type.body.letterSpacing", "--runtime-type-body-tracking"),
+            ("spacing.pageGutter", "--runtime-spacing-page-gutter"),
+            ("spacing.section", "--runtime-spacing-section"),
+            ("spacing.cardPadding", "--runtime-spacing-card-padding"),
+            ("spacing.gridCell", "--runtime-spacing-grid-cell"),
+            ("radius.input", "--runtime-radius-input"),
+            ("radius.badge", "--runtime-radius-badge"),
+            ("radius.largeCard", "--runtime-radius-large-card"),
+            ("gradient.display", "--runtime-gradient-display"),
+            ("gradient.ambient", "--runtime-gradient-ambient"),
+            ("shadow.cardStrong", "--runtime-shadow-card-strong"),
+        ]
+    };
+    let token_object = tokens.as_object_mut().expect("style contract token map");
+    for (name, variable) in extended {
+        token_object.insert(name.to_string(), Value::String(variable.to_string()));
+    }
+    let editable_tokens = token_object.keys().cloned().collect::<Vec<_>>();
     json!({
-        "version": "runtime-style-contract@p2",
+        "version": "runtime-style-contract@p3",
         "template": template,
         "tokenFile": token_file,
         "globalCssFile": global_css_file,
@@ -6128,34 +7318,8 @@ fn runtime_style_contract(template: &str, app_root_relative: &Path) -> Value {
             "entryImport": "@import \"tailwindcss\"",
             "themeSource": "css-variables"
         },
-        "tokens": {
-            "color.background": "--runtime-bg",
-            "color.surface": "--runtime-surface",
-            "color.surfaceStrong": "--runtime-surface-strong",
-            "color.text": "--runtime-text",
-            "color.muted": "--runtime-muted",
-            "color.primary": "--runtime-primary",
-            "color.primaryContrast": "--runtime-primary-contrast",
-            "color.border": "--runtime-border",
-            "radius.card": "--runtime-radius-card",
-            "radius.control": "--runtime-radius-control",
-            "font.sans": "--runtime-font-sans",
-            "shadow.soft": "--runtime-shadow-soft"
-        },
-        "editableTokens": [
-            "color.background",
-            "color.surface",
-            "color.surfaceStrong",
-            "color.text",
-            "color.muted",
-            "color.primary",
-            "color.primaryContrast",
-            "color.border",
-            "radius.card",
-            "radius.control",
-            "font.sans",
-            "shadow.soft"
-        ]
+        "tokens": tokens,
+        "editableTokens": editable_tokens
     })
 }
 
@@ -6168,10 +7332,29 @@ fn runtime_website_tokens_css() -> &'static str {
   --runtime-muted: #526173;
   --runtime-primary: #2563eb;
   --runtime-primary-contrast: #ffffff;
+  --runtime-action: var(--runtime-primary);
+  --runtime-action-contrast: var(--runtime-primary-contrast);
+  --runtime-auth-submit: var(--runtime-primary);
   --runtime-border: #d7deea;
   --runtime-radius-card: 8px;
   --runtime-radius-control: 8px;
   --runtime-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --runtime-font-display: var(--runtime-font-sans);
+  --runtime-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --runtime-type-display-size: 76px;
+  --runtime-type-display-line-height: 0.95;
+  --runtime-type-display-tracking: 0;
+  --runtime-type-body-tracking: 0;
+  --runtime-spacing-page-gutter: 32px;
+  --runtime-spacing-section: 96px;
+  --runtime-spacing-card-padding: 24px;
+  --runtime-spacing-grid-cell: 96px;
+  --runtime-radius-input: var(--runtime-radius-control);
+  --runtime-radius-badge: 999px;
+  --runtime-radius-large-card: var(--runtime-radius-card);
+  --runtime-gradient-display: linear-gradient(135deg, var(--runtime-text), var(--runtime-primary));
+  --runtime-gradient-ambient: radial-gradient(circle, color-mix(in srgb, var(--runtime-primary) 18%, transparent), transparent 70%);
+  --runtime-shadow-card-strong: 0 24px 70px rgba(23, 32, 47, 0.18);
   --runtime-shadow-soft: 0 18px 48px rgba(23, 32, 47, 0.12);
 }
 "#
@@ -6217,9 +7400,9 @@ a {
 }
 
 .runtime-shell {
-  width: min(1120px, calc(100% - 32px));
+  width: min(1120px, calc(100% - (var(--runtime-spacing-page-gutter) * 2)));
   margin: 0 auto;
-  padding: 64px 0;
+  padding: var(--runtime-spacing-section) 0;
 }
 
 .runtime-hero,
@@ -6245,9 +7428,10 @@ a {
 .runtime-hero h1 {
   margin: 0;
   max-width: 780px;
-  font-size: clamp(38px, 6vw, 76px);
-  line-height: 0.95;
-  letter-spacing: 0;
+  font-family: var(--runtime-font-display);
+  font-size: clamp(38px, 6vw, var(--runtime-type-display-size));
+  line-height: var(--runtime-type-display-line-height);
+  letter-spacing: var(--runtime-type-display-tracking);
 }
 
 .runtime-lede,
@@ -6257,6 +7441,7 @@ a {
   color: var(--runtime-muted);
   font-size: 16px;
   line-height: 1.65;
+  letter-spacing: var(--runtime-type-body-tracking);
 }
 
 .runtime-sections {
@@ -6295,12 +7480,19 @@ a {
   align-items: center;
   justify-content: center;
   min-height: 40px;
-  border: 1px solid var(--runtime-primary);
+  border: 1px solid var(--runtime-action);
   border-radius: var(--runtime-radius-control);
-  background: var(--runtime-primary);
-  color: var(--runtime-primary-contrast);
+  background: var(--runtime-action);
+  color: var(--runtime-action-contrast);
   font-weight: 700;
   text-decoration: none;
+}
+
+[data-auth-submit],
+.auth-submit {
+  border-color: var(--runtime-auth-submit);
+  background: var(--runtime-auth-submit);
+  color: var(--runtime-action-contrast);
 }
 
 @media (max-width: 760px) {
@@ -6333,10 +7525,22 @@ fn runtime_fumadocs_tokens_css() -> &'static str {
   --runtime-muted: #5b6472;
   --runtime-primary: #2563eb;
   --runtime-primary-contrast: #ffffff;
+  --runtime-action: var(--runtime-primary);
+  --runtime-action-contrast: var(--runtime-primary-contrast);
+  --runtime-auth-submit: var(--runtime-primary);
   --runtime-border: #d8dee9;
   --runtime-radius-card: 8px;
   --runtime-radius-control: 8px;
   --runtime-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --runtime-font-display: var(--runtime-font-sans);
+  --runtime-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --runtime-type-display-tracking: 0;
+  --runtime-type-body-tracking: 0;
+  --runtime-spacing-page-gutter: 32px;
+  --runtime-spacing-section: 96px;
+  --runtime-radius-input: var(--runtime-radius-control);
+  --runtime-radius-badge: 999px;
+  --runtime-gradient-display: linear-gradient(135deg, var(--runtime-text), var(--runtime-primary));
   --runtime-shadow-soft: 0 16px 44px rgba(17, 24, 39, 0.10);
 }
 "#
@@ -6352,6 +7556,14 @@ body {
   background: var(--runtime-bg);
   color: var(--runtime-text);
   font-family: var(--runtime-font-sans);
+  letter-spacing: var(--runtime-type-body-tracking);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--runtime-font-display);
+  letter-spacing: var(--runtime-type-display-tracking);
 }
 
 :root {
@@ -6364,8 +7576,8 @@ body {
 
 .runtime-button {
   border-radius: var(--runtime-radius-control);
-  background: var(--runtime-primary);
-  color: var(--runtime-primary-contrast);
+  background: var(--runtime-action);
+  color: var(--runtime-action-contrast);
 }
 "#
 }

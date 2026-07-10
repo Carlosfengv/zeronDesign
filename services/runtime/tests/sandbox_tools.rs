@@ -3,6 +3,7 @@ use anydesign_runtime::{
     conversation::RuntimeStore,
     model_gateway::ToolCall,
     tools::{
+        control_plane::control_plane_executor,
         runtime::ToolContext,
         runtime::ToolExecutor,
         sandbox::{
@@ -15,9 +16,13 @@ use anydesign_runtime::{
         },
         streaming::{tool_result_error_text, StreamingToolExecutor},
     },
-    types::{AgentEvent, AgentPhase, AgentRunStatus, SandboxChannelProtocol},
+    types::{
+        sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, DesignProfile, DesignSourceIndex,
+        DesignSourceIndexSection, SandboxChannelProtocol,
+    },
 };
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -58,6 +63,60 @@ async fn create_run(store: &RuntimeStore) -> String {
         )
         .await
         .id
+}
+
+fn imported_design_profile(source_artifact_id: &str, source_hash: &str) -> DesignProfile {
+    let now = Utc::now();
+    DesignProfile {
+        id: "design-profile-source-gate".to_string(),
+        schema_version: "design-profile@2".to_string(),
+        name: "Source Gate".to_string(),
+        status: "active".to_string(),
+        version: 2,
+        scope: json!({ "projectId": "project-1" }),
+        source: json!({
+            "kind": "imported",
+            "sourceArtifactIds": [source_artifact_id],
+            "primarySourceArtifactId": source_artifact_id,
+            "sourceHash": source_hash,
+            "converterVersion": "test@1",
+            "integrity": "verified"
+        }),
+        product: json!({ "name": "Source Gate", "category": "test" }),
+        brand: json!({}),
+        visual: json!({ "direction": "test direction" }),
+        tokens: json!({}),
+        runtime_token_mapping: json!({
+            "color.background": "#ffffff",
+            "color.surface": "#f8fafc",
+            "color.surfaceStrong": "#e2e8f0",
+            "color.text": "#0f172a",
+            "color.muted": "#475569",
+            "color.primary": "#663af3",
+            "color.primaryContrast": "#ffffff",
+            "color.border": "#cbd5e1",
+            "radius.card": "8px",
+            "radius.control": "6px",
+            "font.sans": "Inter, sans-serif",
+            "shadow.soft": "none"
+        }),
+        extended_token_mapping: json!({}),
+        components: json!({}),
+        content: json!({}),
+        accessibility: json!({}),
+        technical: json!({ "allowedTemplates": ["astro-website"] }),
+        governance: json!({ "conflictBehavior": "ask" }),
+        signature_rules: vec![json!({
+            "id": "required-source",
+            "statement": "Read the required source section.",
+            "priority": "required",
+            "appliesTo": ["website"],
+            "verification": { "kind": "visual-review", "rubric": "Check it." }
+        })],
+        overrides: json!({}),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn sandbox_executor(workspace: &Path) -> StreamingToolExecutor {
@@ -357,6 +416,191 @@ async fn fs_read_write_list_and_search_are_workspace_bounded() {
         .any(|entry| entry["name"] == "new.md"));
     assert_eq!(results[3].result.content["matches"][0]["line"], 1);
     assert_eq!(store.audit_records().await.len(), 4);
+}
+
+#[tokio::test]
+async fn design_context_gate_requires_indexed_source_reads_before_mutation() {
+    let workspace = setup_workspace();
+    let inputs = workspace.join("inputs");
+    fs::create_dir_all(&inputs).unwrap();
+    for (name, content) in [
+        ("brief.md", "# Brief\n"),
+        ("design.md", "# Design Capsule\n"),
+        ("design-profile.json", "{}\n"),
+        ("design-source-index.json", "{}\n"),
+    ] {
+        fs::write(inputs.join(name), content).unwrap();
+    }
+
+    let mut source = b"# Required\nUse violet.\n## Optional\n".to_vec();
+    source.extend(vec![b'x'; 40 * 1024]);
+    let store = RuntimeStore::new();
+    let artifact = store
+        .create_design_source_artifact(
+            json!({ "projectId": "project-1" }),
+            "DESIGN.md".to_string(),
+            "text/markdown".to_string(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+    let profile = imported_design_profile(&artifact.id, &artifact.sha256);
+    store.create_design_profile(profile.clone()).await.unwrap();
+    let run_id = create_run(&store).await;
+    store
+        .attach_run_effective_design_profile(
+            &run_id,
+            &profile,
+            Some("website"),
+            Some("astro-website"),
+        )
+        .await
+        .unwrap();
+    store
+        .configure_run_design_fidelity(&run_id, &profile, Some("source_fallback"))
+        .await
+        .unwrap();
+    let optional_start = source
+        .windows("## Optional".len())
+        .position(|window| window == b"## Optional")
+        .unwrap();
+    let required = DesignSourceIndexSection {
+        id: "section-1-required".to_string(),
+        heading: "Required".to_string(),
+        start_byte: 0,
+        end_byte: optional_start,
+        sha256: sha256_hex(&source[..optional_start]),
+        required_by_rule_ids: vec!["required-source".to_string()],
+    };
+    let optional = DesignSourceIndexSection {
+        id: "section-2-optional".to_string(),
+        heading: "Optional".to_string(),
+        start_byte: optional_start,
+        end_byte: source.len(),
+        sha256: sha256_hex(&source[optional_start..]),
+        required_by_rule_ids: Vec::new(),
+    };
+    store
+        .set_run_design_source_index(
+            &run_id,
+            &DesignSourceIndex {
+                source_artifact_id: artifact.id.clone(),
+                source_hash: artifact.sha256.clone(),
+                size_bytes: source.len() as u64,
+                profile_hash: profile.stable_hash(),
+                capsule_hash: "b".repeat(64),
+                sections: vec![required.clone(), optional],
+            },
+            vec![required.id.clone()],
+        )
+        .await
+        .unwrap();
+    let executor = sandbox_executor_local_e2e(&workspace);
+
+    let blocked = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "gate-blocked",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert_error_kind(&blocked[0].result, "design_context.read_required");
+
+    for (index, path) in [
+        "inputs/brief.md",
+        "inputs/design.md",
+        "inputs/design-profile.json",
+        "inputs/design-source-index.json",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let read = executor
+            .execute_calls(
+                store.clone(),
+                &run_id,
+                vec![ToolCall::new(
+                    format!("read-{index}"),
+                    "fs.read",
+                    json!({ "path": path }),
+                )],
+            )
+            .await;
+        assert!(!read[0].result.is_error, "failed to read {path}");
+    }
+
+    let wrong_hash = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "source-wrong-hash",
+                "design_source.read_sections",
+                json!({
+                    "sourceArtifactId": artifact.id,
+                    "sectionIds": [required.id],
+                    "expectedSourceHash": "0".repeat(64)
+                }),
+            )],
+        )
+        .await;
+    assert_error_kind(&wrong_hash[0].result, "design_source.snapshot_mismatch");
+
+    let source_read = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "source-read",
+                "design_source.read_sections",
+                json!({
+                    "sourceArtifactId": artifact.id,
+                    "sectionIds": [required.id],
+                    "expectedSourceHash": artifact.sha256
+                }),
+            )],
+        )
+        .await;
+    assert!(!source_read[0].result.is_error);
+    assert_eq!(
+        source_read[0].result.content["trustLabel"],
+        "untrusted_design_reference"
+    );
+    assert_eq!(
+        source_read[0].result.content["sections"][0]["text"],
+        "# Required\nUse violet.\n"
+    );
+
+    let allowed = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "gate-allowed",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert_ne!(
+        allowed[0]
+            .result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("errorKind"))
+            .and_then(Value::as_str),
+        Some("design_context.read_required")
+    );
+    let run = store.get_run(&run_id).await.unwrap();
+    assert!(run
+        .design_source_read_section_hashes
+        .contains(&required.sha256));
+
+    fs::remove_dir_all(workspace).unwrap();
 }
 
 #[tokio::test]
@@ -1149,6 +1393,8 @@ async fn project_init_astro_website_writes_style_contract_and_tokens() {
     assert!(global_css.contains("@import \"./tokens.css\""));
     assert!(global_css.contains("var(--runtime-primary)"));
     assert!(global_css.contains("var(--runtime-radius-control)"));
+    assert!(global_css.contains("[data-auth-submit]"));
+    assert!(global_css.contains("var(--runtime-auth-submit)"));
 
     let tokens = fs::read_to_string(workspace.join("project/src/styles/tokens.css")).unwrap();
     assert!(tokens.contains("--runtime-primary: #2563eb"));
@@ -1177,12 +1423,97 @@ async fn project_init_astro_website_writes_style_contract_and_tokens() {
         "@import \"tailwindcss\""
     );
     assert_eq!(contract["tailwind"]["themeSource"], "css-variables");
+    assert_eq!(contract["version"], "runtime-style-contract@p3");
     assert_eq!(contract["tokens"]["color.primary"], "--runtime-primary");
+    assert_eq!(contract["tokens"]["color.action"], "--runtime-action");
+    assert_eq!(
+        contract["tokens"]["color.authSubmit"],
+        "--runtime-auth-submit"
+    );
+    assert_eq!(contract["tokens"]["font.display"], "--runtime-font-display");
+    assert_eq!(
+        contract["tokens"]["spacing.cardPadding"],
+        "--runtime-spacing-card-padding"
+    );
+    assert_eq!(
+        contract["tokens"]["spacing.gridCell"],
+        "--runtime-spacing-grid-cell"
+    );
 
     let state: Value =
         serde_json::from_str(&fs::read_to_string(workspace.join("state/project.json")).unwrap())
             .unwrap();
-    assert_eq!(state["templateVersion"], "astro-website@runtime-p2");
+    assert_eq!(state["templateVersion"], "astro-website@runtime-p3");
+}
+
+#[tokio::test]
+async fn project_init_applies_design_profile_runtime_token_mapping_on_first_build() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("inputs")).unwrap();
+    fs::write(
+        workspace.join("inputs/design-profile.json"),
+        serde_json::to_string_pretty(&json!({
+            "id": "design-profile-1",
+            "version": 1,
+            "runtimeTokenMapping": {
+                "color.background": "#101820",
+                "color.surface": "#ffffff",
+                "color.surfaceStrong": "#eef2ff",
+                "color.text": "#f8fafc",
+                "color.muted": "#94a3b8",
+                "color.primary": "#f37a0a",
+                "color.primaryContrast": "#111827",
+                "color.border": "#334155",
+                "radius.card": "6px",
+                "radius.control": "4px",
+                "font.sans": "Inter, sans-serif",
+                "shadow.soft": "0 8px 24px rgba(15, 23, 42, 0.18)"
+            },
+            "extendedTokenMapping": {
+                "font.display": "Space Grotesk, sans-serif",
+                "spacing.pageGutter": "48px",
+                "gradient.display": "linear-gradient(90deg, #d8ecf8, #98c0ef)"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init-website",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
+    let tokens = fs::read_to_string(workspace.join("project/src/styles/tokens.css")).unwrap();
+    assert!(tokens.contains("--runtime-bg: #101820"));
+    assert!(tokens.contains("--runtime-primary: #f37a0a"));
+    assert!(tokens.contains("--runtime-radius-card: 6px"));
+    assert!(tokens.contains("--runtime-font-display: Space Grotesk, sans-serif"));
+    assert!(tokens.contains("--runtime-spacing-page-gutter: 48px"));
+    assert!(tokens.contains("--runtime-gradient-display: linear-gradient(90deg, #d8ecf8, #98c0ef)"));
+    assert_eq!(
+        results[0].result.content["designProfileTokenChanges"]
+            .as_array()
+            .unwrap()
+            .len(),
+        15
+    );
 }
 
 #[tokio::test]
@@ -1514,7 +1845,14 @@ async fn project_init_fumadocs_docs_writes_docs_source_contract() {
         "@import \"tailwindcss\""
     );
     assert_eq!(contract["tailwind"]["themeSource"], "css-variables");
+    assert_eq!(contract["version"], "runtime-style-contract@p3");
     assert_eq!(contract["tokens"]["color.primary"], "--runtime-primary");
+    assert_eq!(contract["tokens"]["color.action"], "--runtime-action");
+    assert_eq!(
+        contract["tokens"]["gradient.display"],
+        "--runtime-gradient-display"
+    );
+    assert!(contract["tokens"].get("spacing.cardPadding").is_none());
 }
 
 #[tokio::test]
@@ -3921,6 +4259,69 @@ async fn preview_start_spawns_static_server_from_dist() {
 }
 
 #[tokio::test]
+async fn managed_preview_restart_uses_fresh_port_and_latest_static_output() {
+    let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(workspace.join("project/dist/index.html"), "first build").unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let first = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new("preview-first", "preview.start", json!({}))],
+        )
+        .await;
+    assert!(!first[0].result.is_error);
+    let first_url = first[0].result.content["url"].as_str().unwrap().to_string();
+    assert_eq!(
+        reqwest::get(&first_url)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "first build"
+    );
+
+    fs::write(workspace.join("project/dist/index.html"), "second build").unwrap();
+    let second = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new("preview-second", "preview.start", json!({}))],
+        )
+        .await;
+    assert!(!second[0].result.is_error);
+    let second_url = second[0].result.content["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_url, second_url);
+    assert_eq!(
+        reqwest::get(&second_url)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "second build"
+    );
+
+    let stopped = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new("preview-stop", "preview.stop", json!({}))],
+        )
+        .await;
+    assert!(!stopped[0].result.is_error);
+}
+
+#[tokio::test]
 async fn preview_start_spawns_static_server_from_fumadocs_out() {
     let workspace = setup_workspace();
     write_successful_build_state(&workspace);
@@ -4045,6 +4446,368 @@ async fn preview_publish_builds_screenshots_and_promotes_candidate() {
         .collect::<Vec<_>>();
     assert!(event_types.contains(&"preview.candidate".to_string()));
     assert!(event_types.contains(&"preview.updated".to_string()));
+}
+
+#[tokio::test]
+async fn local_e2e_preview_publish_ignores_model_selected_endpoint() {
+    let workspace = setup_workspace();
+    let command_backend =
+        JsonWorkspaceChannelCommandBackend::new(RecordingChannelTransport::default(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(
+            sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+            Default::default(),
+            &workspace,
+        )
+        .with_policy_profile_and_registry(
+            RuntimePolicyProfile::LocalE2e,
+            "https://registry.npmjs.org/",
+        ),
+    );
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "managed-publish-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "<!doctype html><title>Managed publish</title>",
+    )
+    .unwrap();
+
+    let published = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "managed-publish",
+                "preview.publish",
+                json!({
+                    "url": "http://localhost:4321",
+                    "port": 4321,
+                    "screenshotId": "managed-publish-shot"
+                }),
+            )],
+        )
+        .await;
+    assert!(
+        !published[0].result.is_error,
+        "{}",
+        tool_result_error_text(&published[0].result)
+    );
+    let managed_url = published[0].result.content["preview"]["url"]
+        .as_str()
+        .expect("managed preview url");
+    assert_ne!(managed_url, "http://localhost:4321");
+    assert!(managed_url.starts_with("http://127.0.0.1:"));
+
+    let stopped = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "managed-publish-stop",
+                "preview.stop",
+                json!({}),
+            )],
+        )
+        .await;
+    assert!(!stopped[0].result.is_error);
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn preview_publish_records_passing_token_fidelity_before_run_complete() {
+    let workspace = setup_workspace();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport, &workspace);
+    let store = RuntimeStore::new();
+    let artifact = store
+        .create_design_source_artifact(
+            json!({ "projectId": "project-1" }),
+            "DESIGN.md".to_string(),
+            "text/markdown".to_string(),
+            b"# Design\n".to_vec(),
+        )
+        .await
+        .unwrap();
+    let mut profile = imported_design_profile(&artifact.id, &artifact.sha256);
+    profile.signature_rules[0]["category"] = json!("color");
+    profile.signature_rules[0]["verification"] = json!({
+        "kind": "token",
+        "token": "color.primary",
+        "expected": "#663af3",
+        "comparator": { "kind": "color-equivalent" }
+    });
+    let profile = store.create_design_profile(profile).await.unwrap();
+    let run_id = create_run(&store).await;
+    store
+        .attach_run_effective_design_profile(
+            &run_id,
+            &profile,
+            Some("website"),
+            Some("astro-website"),
+        )
+        .await
+        .unwrap();
+    store
+        .configure_run_design_fidelity(&run_id, &profile, Some("profile_only"))
+        .await
+        .unwrap();
+    fs::create_dir_all(workspace.join("inputs")).unwrap();
+    fs::write(workspace.join("inputs/brief.md"), "# Brief\n").unwrap();
+    fs::write(workspace.join("inputs/design.md"), "# Design Capsule\n").unwrap();
+    fs::write(
+        workspace.join("inputs/design-profile.json"),
+        serde_json::to_string_pretty(&profile).unwrap(),
+    )
+    .unwrap();
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+    for (index, path) in [
+        "inputs/brief.md",
+        "inputs/design.md",
+        "inputs/design-profile.json",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let read = executor
+            .execute_calls(
+                store.clone(),
+                &run_id,
+                vec![ToolCall::new(
+                    format!("fidelity-read-{index}"),
+                    "fs.read",
+                    json!({ "path": path }),
+                )],
+            )
+            .await;
+        assert!(!read[0].result.is_error);
+    }
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    let published = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-publish",
+                "preview.publish",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "fidelity-shot"
+                }),
+            )],
+        )
+        .await;
+    assert!(
+        !published[0].result.is_error,
+        "{}",
+        tool_result_error_text(&published[0].result)
+    );
+    assert_eq!(
+        published[0].result.content["designProfileFidelity"]["requiredFailedRuleIds"],
+        json!([])
+    );
+    assert_eq!(
+        published[0].result.content["designProfileFidelity"]["assertions"][0]["passed"],
+        true
+    );
+    assert!(workspace
+        .join("state/design-profile-fidelity.json")
+        .exists());
+
+    let complete_executor =
+        StreamingToolExecutor::new(control_plane_executor().with_workspace_root(&workspace));
+    let completed = complete_executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-complete",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Fidelity passed." }),
+            )],
+        )
+        .await;
+    assert!(
+        !completed[0].result.is_error,
+        "{}",
+        tool_result_error_text(&completed[0].result)
+    );
+    assert_eq!(completed[0].result.content["status"], "completed");
+
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn preview_publish_rejects_unchanged_source_after_failed_fidelity_check() {
+    let workspace = setup_workspace();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let command_backend =
+        JsonWorkspaceChannelCommandBackend::new(RecordingChannelTransport::default(), &workspace);
+    let store = RuntimeStore::new();
+    let artifact = store
+        .create_design_source_artifact(
+            json!({ "projectId": "project-1" }),
+            "DESIGN.md".to_string(),
+            "text/markdown".to_string(),
+            b"# Design\n".to_vec(),
+        )
+        .await
+        .unwrap();
+    let mut profile = imported_design_profile(&artifact.id, &artifact.sha256);
+    profile.signature_rules[0]["category"] = json!("color");
+    profile.signature_rules[0]["verification"] = json!({
+        "kind": "token",
+        "token": "color.primary",
+        "expected": "#000000",
+        "comparator": { "kind": "color-equivalent" }
+    });
+    let profile = store.create_design_profile(profile).await.unwrap();
+    let run_id = create_run(&store).await;
+    store
+        .attach_run_effective_design_profile(
+            &run_id,
+            &profile,
+            Some("website"),
+            Some("astro-website"),
+        )
+        .await
+        .unwrap();
+    store
+        .configure_run_design_fidelity(&run_id, &profile, Some("profile_only"))
+        .await
+        .unwrap();
+    fs::create_dir_all(workspace.join("inputs")).unwrap();
+    fs::write(workspace.join("inputs/brief.md"), "# Brief\n").unwrap();
+    fs::write(workspace.join("inputs/design.md"), "# Design Capsule\n").unwrap();
+    fs::write(
+        workspace.join("inputs/design-profile.json"),
+        serde_json::to_string_pretty(&profile).unwrap(),
+    )
+    .unwrap();
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+    for (index, path) in [
+        "inputs/brief.md",
+        "inputs/design.md",
+        "inputs/design-profile.json",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let read = executor
+            .execute_calls(
+                store.clone(),
+                &run_id,
+                vec![ToolCall::new(
+                    format!("fidelity-noop-read-{index}"),
+                    "fs.read",
+                    json!({ "path": path }),
+                )],
+            )
+            .await;
+        assert!(!read[0].result.is_error);
+    }
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-noop-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+
+    let first_publish = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-noop-first-publish",
+                "preview.publish",
+                json!({ "url": preview_url, "screenshotId": "fidelity-noop-first" }),
+            )],
+        )
+        .await;
+    assert!(!first_publish[0].result.is_error);
+    assert_eq!(
+        first_publish[0].result.content["designProfileFidelity"]["requiredFailedRuleIds"],
+        json!(["required-source"])
+    );
+
+    let unchanged_publish = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-noop-second-publish",
+                "preview.publish",
+                json!({ "url": preview_url, "screenshotId": "fidelity-noop-second" }),
+            )],
+        )
+        .await;
+    assert!(unchanged_publish[0].result.is_error);
+    assert_error_kind(
+        &unchanged_publish[0].result,
+        "design_profile.no_source_change_after_fidelity_failure",
+    );
+
+    fs::write(
+        workspace.join("project/src/styles/global.css"),
+        "/* fidelity repair mutation */\n",
+    )
+    .unwrap();
+    let changed_publish = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "fidelity-noop-third-publish",
+                "preview.publish",
+                json!({ "url": preview_url, "screenshotId": "fidelity-noop-third" }),
+            )],
+        )
+        .await;
+    assert!(
+        !changed_publish[0].result.is_error,
+        "{}",
+        tool_result_error_text(&changed_publish[0].result)
+    );
+
+    fs::remove_dir_all(workspace).unwrap();
 }
 
 #[tokio::test]

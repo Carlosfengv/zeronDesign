@@ -13,13 +13,106 @@ use anydesign_runtime::{
             InterruptBehavior, ProgressSink, Tool, ToolContext, ToolError, ToolExecutor, ToolResult,
         },
     },
-    types::{AgentEvent, AgentPhase, AgentRunStatus, Brief, ContentSource},
+    types::{AgentEvent, AgentPhase, AgentRunStatus, Brief, ContentSource, DesignProfile},
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::{collections::VecDeque, fs, path::PathBuf, sync::Arc};
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Mutex, task::JoinHandle};
+
+fn design_profile_fixture(project_id: &str) -> DesignProfile {
+    let now = Utc::now();
+    DesignProfile {
+        id: "design-profile-1".to_string(),
+        schema_version: "design-profile@1".to_string(),
+        name: "Harness Calm Ops".to_string(),
+        status: "active".to_string(),
+        version: 1,
+        scope: json!({ "projectId": project_id }),
+        source: json!({ "kind": "manual" }),
+        product: json!({
+            "name": "AnyDesign Runtime",
+            "category": "agent harness",
+            "audience": ["internal builders"],
+            "primaryUseCases": ["generate websites"],
+            "productQualities": ["reliable", "inspectable"]
+        }),
+        brand: json!({
+            "voice": {
+                "tone": ["clear"],
+                "sentenceStyle": "technical",
+                "vocabulary": { "prefer": ["runtime"], "avoid": ["magic"] },
+                "writingRules": ["Use concrete status text."]
+            },
+            "messaging": {
+                "headlineStyle": "specific",
+                "bodyStyle": "concise",
+                "ctaStyle": "verb first",
+                "proofStyle": "evidence based",
+                "forbiddenClaims": ["guaranteed"]
+            }
+        }),
+        visual: json!({
+            "direction": "quiet operational interface",
+            "principles": ["scan friendly"],
+            "moodKeywords": ["calm"],
+            "avoidKeywords": ["flashy"],
+            "composition": {},
+            "imagery": {},
+            "motion": {}
+        }),
+        tokens: json!({
+            "color": {},
+            "typography": {},
+            "radius": {},
+            "shadow": {},
+            "spacing": {}
+        }),
+        runtime_token_mapping: json!({
+            "color.background": "#ffffff",
+            "color.surface": "#f8fafc",
+            "color.surfaceStrong": "#e2e8f0",
+            "color.text": "#0f172a",
+            "color.muted": "#475569",
+            "color.primary": "#2563eb",
+            "color.primaryContrast": "#ffffff",
+            "color.border": "#cbd5e1",
+            "radius.card": "8px",
+            "radius.control": "6px",
+            "font.sans": "Inter, sans-serif",
+            "shadow.soft": "0 1px 2px rgba(15, 23, 42, 0.12)"
+        }),
+        extended_token_mapping: json!({}),
+        components: json!({
+            "primitives": {
+                "button": { "intent": "clear action", "usage": ["primary actions"], "avoid": ["overuse"] },
+                "input": { "intent": "precise entry", "usage": ["forms"], "avoid": ["placeholder-only labels"] },
+                "card": { "intent": "group repeated items", "usage": ["lists"], "avoid": ["nested cards"] },
+                "badge": { "intent": "show status", "usage": ["statuses"], "avoid": ["decorative noise"] }
+            }
+        }),
+        content: json!({}),
+        accessibility: json!({}),
+        technical: json!({
+            "allowedTemplates": ["astro-website", "fumadocs-docs"],
+            "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+            "cssStrategy": "runtime-style-contract",
+            "dependencyPolicy": {},
+            "filePolicy": {
+                "designProfilePath": "/workspace/inputs/design-profile.json",
+                "designMarkdownPath": "/workspace/inputs/design.md",
+                "styleContractPath": "/workspace/state/style-contract.json"
+            }
+        }),
+        governance: json!({ "conflictBehavior": "ask" }),
+        signature_rules: Vec::new(),
+        overrides: json!({}),
+        created_at: now,
+        updated_at: now,
+    }
+}
 
 #[tokio::test]
 async fn brief_run_prompt_stays_on_content_sources_without_workspace_exploration() {
@@ -208,6 +301,488 @@ async fn build_run_bootstraps_confirmed_brief_into_workspace_before_model_turn()
     assert!(started.contains(&"bootstrap:inputs/design.md".to_string()));
     assert!(started.contains(&"bootstrap:state/tasks.json".to_string()));
     assert!(started.contains(&"bootstrap:state/preview.json".to_string()));
+}
+
+#[tokio::test]
+async fn build_run_bootstraps_design_profile_json_and_markdown() {
+    let workspace = unique_temp_dir("agent-loop-design-profile");
+    let store = RuntimeStore::new();
+    let profile = store
+        .create_design_profile(design_profile_fixture("project-1"))
+        .await
+        .unwrap();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "internal design teams".to_string(),
+                content_hierarchy: vec!["Runtime reliability".to_string()],
+                page_structure: json!([
+                    {
+                        "title": "Home",
+                        "purpose": "Explain runtime scope",
+                        "keyContent": ["hero"]
+                    }
+                ]),
+                visual_direction: "precise and calm".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let build_run = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![ContentSource::readable(
+                "source-2",
+                "design_md",
+                "# Per-run visual addendum",
+            )],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let build_run = store
+        .attach_run_design_profile(&build_run.id, &profile)
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after design profile bootstrap assertion".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+    let executor = control_plane_executor().with_workspace_root(&workspace);
+    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
+
+    loop_runner.run(&build_run.id).await.unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .system_prompt
+        .contains("inputs/design-profile.json"));
+
+    let design_profile_json =
+        fs::read_to_string(workspace.join("inputs/design-profile.json")).unwrap();
+    assert!(design_profile_json.contains("\"id\": \"design-profile-1\""));
+    assert!(design_profile_json.contains("\"runtimeTokenMapping\""));
+    let design_md = fs::read_to_string(workspace.join("inputs/design.md")).unwrap();
+    assert!(design_md.contains("# Design Capsule"));
+    assert!(design_md.contains("- ID: design-profile-1"));
+    assert!(design_md.contains("quiet operational interface"));
+    assert!(design_md.contains("runtimeTokenMapping.color.primary"));
+    assert!(design_md.contains("#2563eb"));
+    assert!(design_md.contains("# Per-run visual addendum"));
+    let context_md = fs::read_to_string(workspace.join("state/context.md")).unwrap();
+    assert!(context_md.contains("## DesignProfile Decision"));
+    assert!(context_md.contains("- Decision: adopted"));
+    assert!(context_md.contains("- DesignProfile ID: design-profile-1"));
+    assert!(context_md.contains("- Version: 1"));
+    assert!(context_md.contains("- Base hash: "));
+    assert!(context_md.contains("Initial build may initialize runtime style-contract tokens"));
+
+    let run = store.get_run(&build_run.id).await.unwrap();
+    assert_eq!(run.design_profile_id.as_deref(), Some("design-profile-1"));
+    assert_eq!(run.design_profile_version, Some(1));
+    let profile_hash = profile.stable_hash();
+    assert_eq!(
+        run.design_profile_hash.as_deref(),
+        Some(profile_hash.as_str())
+    );
+    let events = store.events(&build_run.id).await;
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ToolStarted { tool_use_id, .. }
+                if tool_use_id == "bootstrap:inputs/design-profile.json"
+        )
+    }));
+}
+
+#[tokio::test]
+async fn imported_profile_bootstrap_preserves_source_bytes_and_writes_index() {
+    let workspace = unique_temp_dir("agent-loop-imported-design-source");
+    let store = RuntimeStore::new();
+    let source = b"# AuthKit\r\nFrosted glass.\r\n## Tokens\r\n--primary: #663af3;\r\n";
+    let artifact = store
+        .create_design_source_artifact(
+            json!({ "projectId": "project-1" }),
+            "DESIGN.md".to_string(),
+            "text/markdown".to_string(),
+            source.to_vec(),
+        )
+        .await
+        .unwrap();
+    let mut profile = design_profile_fixture("project-1");
+    profile.schema_version = "design-profile@2".to_string();
+    profile.source = json!({
+        "kind": "imported",
+        "sourceArtifactIds": [artifact.id],
+        "primarySourceArtifactId": artifact.id,
+        "sourceHash": artifact.sha256,
+        "converterVersion": "test@1",
+        "integrity": "verified"
+    });
+    profile.signature_rules = vec![json!({
+        "id": "authkit-token",
+        "category": "color",
+        "statement": "AuthKit violet is required.",
+        "priority": "required",
+        "appliesTo": ["website"],
+        "sourceSectionIds": ["section-2-tokens"],
+        "verification": {
+            "kind": "token",
+            "token": "color.primary",
+            "expected": "#663af3",
+            "comparator": { "kind": "color-equivalent" }
+        }
+    })];
+    let profile = store.create_design_profile(profile).await.unwrap();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "builders".to_string(),
+                content_hierarchy: vec!["AuthKit".to_string()],
+                page_structure: json!([]),
+                visual_direction: "frosted glass".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let build_run = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let build_run = store
+        .attach_run_effective_design_profile(
+            &build_run.id,
+            &profile,
+            Some("website"),
+            Some("astro-website"),
+        )
+        .await
+        .unwrap();
+    let build_run = store
+        .configure_run_design_fidelity(&build_run.id, &profile, None)
+        .await
+        .unwrap();
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after imported source bootstrap".to_string(),
+        )],
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let executor = control_plane_executor().with_workspace_root(&workspace);
+    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
+
+    loop_runner.run(&build_run.id).await.unwrap();
+
+    assert_eq!(
+        fs::read(workspace.join("inputs/design-source.md")).unwrap(),
+        source
+    );
+    let index: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("inputs/design-source-index.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(index["sourceHash"], artifact.sha256);
+    assert_eq!(index["sections"][1]["id"], "section-2-tokens");
+    assert_eq!(
+        index["sections"][1]["requiredByRuleIds"][0],
+        "authkit-token"
+    );
+    let run = store.get_run(&build_run.id).await.unwrap();
+    assert_eq!(run.design_fidelity_mode.as_deref(), Some("source_fallback"));
+    assert_eq!(run.design_source_sections.len(), 2);
+    assert_eq!(
+        run.design_source_required_section_ids,
+        vec!["section-2-tokens"]
+    );
+}
+
+#[tokio::test]
+async fn docs_build_run_bootstraps_design_profile_json_and_markdown() {
+    let workspace = unique_temp_dir("agent-loop-docs-design-profile");
+    let store = RuntimeStore::new();
+    let profile = store
+        .create_design_profile(design_profile_fixture("docs-project"))
+        .await
+        .unwrap();
+    let brief_run = store
+        .create_run(
+            "docs-project".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(
+            &brief_run.id,
+            Brief {
+                project_type: "docs".to_string(),
+                audience: "platform engineers".to_string(),
+                content_hierarchy: vec!["Overview".to_string(), "Quickstart".to_string()],
+                page_structure: json!([
+                    {
+                        "title": "Overview",
+                        "purpose": "Explain the runtime docs",
+                        "keyContent": ["navigation", "quickstart"]
+                    }
+                ]),
+                visual_direction: "precise docs workspace".to_string(),
+                recommended_template: "fumadocs-docs".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let build_run = store
+        .create_run_with_context(
+            "docs-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let build_run = store
+        .attach_run_design_profile(&build_run.id, &profile)
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after docs design profile bootstrap assertion".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+    let executor = control_plane_executor().with_workspace_root(&workspace);
+    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
+
+    loop_runner.run(&build_run.id).await.unwrap();
+
+    let design_profile_json =
+        fs::read_to_string(workspace.join("inputs/design-profile.json")).unwrap();
+    assert!(design_profile_json.contains("\"id\": \"design-profile-1\""));
+    let design_md = fs::read_to_string(workspace.join("inputs/design.md")).unwrap();
+    assert!(design_md.contains("# Design Capsule"));
+    assert!(design_md.contains("- ID: design-profile-1"));
+    assert!(design_md.contains("quiet operational interface"));
+    let brief_md = fs::read_to_string(workspace.join("inputs/brief.md")).unwrap();
+    assert!(brief_md.contains("Project type: docs"));
+    assert!(brief_md.contains("Template: fumadocs-docs"));
+    let context_md = fs::read_to_string(workspace.join("state/context.md")).unwrap();
+    assert!(context_md.contains("## DesignProfile Decision"));
+    assert!(context_md.contains("- DesignProfile ID: design-profile-1"));
+    assert!(context_md.contains("Initial build may initialize runtime style-contract tokens"));
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .system_prompt
+        .contains("inputs/design-profile.json"));
+}
+
+#[tokio::test]
+async fn edit_run_bootstraps_design_profile_json_and_markdown() {
+    let workspace = unique_temp_dir("agent-loop-edit-design-profile");
+    let store = RuntimeStore::new();
+    let profile = store
+        .create_design_profile(design_profile_fixture("project-1"))
+        .await
+        .unwrap();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "internal design teams".to_string(),
+                content_hierarchy: vec!["Runtime reliability".to_string()],
+                page_structure: json!([
+                    {
+                        "title": "Home",
+                        "purpose": "Explain runtime scope",
+                        "keyContent": ["hero"]
+                    }
+                ]),
+                visual_direction: "precise and calm".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let edit_run = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            Some("version-1".to_string()),
+        )
+        .await;
+    let edit_run = store
+        .attach_run_design_profile(&edit_run.id, &profile)
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after edit design profile bootstrap assertion".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+    let executor = control_plane_executor().with_workspace_root(&workspace);
+    fs::create_dir_all(workspace.join("state")).unwrap();
+    fs::write(
+        workspace.join("state/context.md"),
+        "# Runtime Context\n\nExisting project decision.",
+    )
+    .unwrap();
+    store
+        .append_conversation_item(
+            "project-1",
+            Some(&edit_run.id),
+            "design_profile_override",
+            Some("user"),
+            "DesignProfile override accepted for this run.",
+            Some(json!({
+                "designProfileId": "design-profile-1",
+                "decision": "override",
+                "state": "accepted",
+                "userMessage": "临时覆盖 DesignProfile，继续执行"
+            })),
+        )
+        .await;
+    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
+
+    loop_runner.run(&edit_run.id).await.unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .system_prompt
+        .contains("inputs/design-profile.json"));
+    let design_profile_json =
+        fs::read_to_string(workspace.join("inputs/design-profile.json")).unwrap();
+    assert!(design_profile_json.contains("\"id\": \"design-profile-1\""));
+    let design_md = fs::read_to_string(workspace.join("inputs/design.md")).unwrap();
+    assert!(design_md.contains("# Design Capsule"));
+    assert!(design_md.contains("runtimeTokenMapping.color.primary"));
+    assert!(design_md.contains("#2563eb"));
+    let context_md = fs::read_to_string(workspace.join("state/context.md")).unwrap();
+    assert!(context_md.contains("Existing project decision."));
+    assert!(context_md.contains("## DesignProfile Decision"));
+    assert!(context_md.contains("- Phase: Edit"));
+    assert!(context_md.contains("Edit run must not reset tokens automatically"));
+    assert!(context_md.contains("## DesignProfile Override"));
+    assert!(context_md.contains("- Decision: override"));
+    assert!(context_md.contains("临时覆盖 DesignProfile，继续执行"));
+}
+
+#[tokio::test]
+async fn review_run_prompt_uses_design_profile_for_drift_findings() {
+    let store = RuntimeStore::new();
+    let profile = store
+        .create_design_profile(design_profile_fixture("project-1"))
+        .await
+        .unwrap();
+    let review_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Review,
+            "visual-review".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let review_run = store
+        .attach_run_design_profile(&review_run.id, &profile)
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after review prompt assertion".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+    let loop_runner = AgentLoop::new(store, Arc::new(model));
+
+    loop_runner.run(&review_run.id).await.unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .system_prompt
+        .contains("DesignProfile: id=design-profile-1, version=1"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("Read inputs/design-profile.json and inputs/design.md"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("compare the preview, source, style tokens, content voice"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("call review.report_finding with category visual, content, or safety"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("Do not mutate files during Review runs"));
 }
 
 #[tokio::test]

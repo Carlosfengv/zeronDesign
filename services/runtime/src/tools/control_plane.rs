@@ -1105,6 +1105,66 @@ impl Tool for RunCompleteTool {
                 ));
             }
         }
+        if matches!(ctx.run.phase, AgentPhase::Build | AgentPhase::Edit)
+            && ctx.run.design_profile_id.is_some()
+        {
+            let fidelity_reports = ctx
+                .store
+                .conversation_items(&ctx.project_id)
+                .await
+                .into_iter()
+                .filter(|item| {
+                    item.run_id.as_deref() == Some(&ctx.run.id)
+                        && item.kind == "design_profile_fidelity_checked"
+                })
+                .filter_map(|item| item.metadata)
+                .collect::<Vec<_>>();
+            let Some(latest_report) = fidelity_reports.last() else {
+                return Ok(ToolResult::error(
+                    "DesignProfile fidelity gate has not run. Use preview.publish before run.complete.",
+                ));
+            };
+            let failed_rule_ids = latest_report
+                .get("requiredFailedRuleIds")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !failed_rule_ids.is_empty() {
+                let failed_report_count = fidelity_reports
+                    .iter()
+                    .filter(|report| {
+                        report
+                            .get("requiredFailedRuleIds")
+                            .and_then(Value::as_array)
+                            .is_some_and(|ids| !ids.is_empty())
+                    })
+                    .count();
+                if failed_report_count >= 2 {
+                    return run::complete(&json!({
+                        "status": "partial",
+                        "summary": format!(
+                            "DesignProfile fidelity still failed after one repair attempt: {}",
+                            failed_rule_ids
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }))
+                    .await
+                    .map(ToolResult::ok)
+                    .map_err(|error| ToolError::Terminal(error.to_string()));
+                }
+                return Ok(ToolResult::error(format!(
+                    "DesignProfile fidelity gate failed for required rules: {}. Apply one repair and publish again.",
+                    failed_rule_ids
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
         let value = run::complete(&input)
             .await
             .map_err(|error| ToolError::Terminal(error.to_string()))?;
