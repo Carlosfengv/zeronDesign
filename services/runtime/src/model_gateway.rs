@@ -312,7 +312,15 @@ impl ModelClient for OpenAiCompatibleModelClient {
         if self.streaming {
             return openai_streaming_model_response(response, &tool_name_map).await;
         }
-        let response = response.json::<OpenAiChatCompletionResponse>().await?;
+        let response_body = response.text().await?;
+        let response = serde_json::from_str::<OpenAiChatCompletionResponse>(&response_body)
+            .map_err(|error| {
+                anyhow!(
+                    "{} model response decode failed: {error}; body={}",
+                    self.provider_id,
+                    response_body.chars().take(2_000).collect::<String>()
+                )
+            })?;
         Ok(response.into_model_response(&tool_name_map))
     }
 }
@@ -361,19 +369,20 @@ struct OpenAiChatMessage {
     #[serde(default)]
     content: Option<Value>,
     #[serde(default)]
-    tool_calls: Vec<OpenAiToolCall>,
+    tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiToolCall {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     function: OpenAiToolCallFunction,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiToolCallFunction {
     name: String,
-    arguments: String,
+    arguments: Value,
 }
 
 impl OpenAiChatCompletionResponse {
@@ -381,13 +390,20 @@ impl OpenAiChatCompletionResponse {
         let Some(choice) = self.choices.into_iter().next() else {
             return ModelResponse::Error("model returned no choices".to_string());
         };
-        if !choice.message.tool_calls.is_empty() {
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
+        if !tool_calls.is_empty() {
             return openai_tool_calls_to_model_response(
-                choice
-                    .message
-                    .tool_calls
-                    .into_iter()
-                    .map(|call| (call.id, call.function.name, call.function.arguments)),
+                tool_calls.into_iter().enumerate().map(|(index, call)| {
+                    let arguments = match call.function.arguments {
+                        Value::String(arguments) => arguments,
+                        arguments => arguments.to_string(),
+                    };
+                    (
+                        call.id.unwrap_or_else(|| format!("tool-call-{index}")),
+                        call.function.name,
+                        arguments,
+                    )
+                }),
                 tool_name_map,
             );
         }

@@ -535,6 +535,74 @@ async fn openai_compatible_client_unwraps_object_arguments_wrapper() {
 }
 
 #[tokio::test]
+async fn openai_compatible_client_accepts_object_arguments_and_missing_call_id() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(capture_object_arguments_without_id_completion),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 2,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "You are a runtime agent.".to_string(),
+            messages: vec![],
+            tools: vec![ModelToolDefinition {
+                name: "run.complete".to_string(),
+                input_schema: json!({ "type": "object" }),
+                input_json_schema: None,
+                output_schema: None,
+                loading_policy: ToolLoadingPolicy::Eager,
+                mcp_info: None,
+            }],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
+            "tool-call-0",
+            "run.complete",
+            json!({ "status": "completed", "summary": "done" }),
+        )])
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_client_accepts_null_tool_calls_for_text_response() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(capture_null_tool_calls_completion),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None);
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-1".to_string(),
+            turn: 1,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Brief,
+            agent_profile: "brief".to_string(),
+            system_prompt: "Reply briefly.".to_string(),
+            messages: vec![],
+            tools: vec![],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response, ModelResponse::TextOnly("OK".to_string()));
+}
+
+#[tokio::test]
 async fn openai_compatible_client_reports_invalid_tool_arguments_without_wrapping_raw_text() {
     let app = Router::new().route(
         "/v1/chat/completions",
@@ -608,6 +676,53 @@ async fn capture_wrapped_object_arguments_completion(Json(_body): Json<Value>) -
                     ]
                 },
                 "finish_reason": "tool_calls"
+            }
+        ]
+    }))
+}
+
+async fn capture_object_arguments_without_id_completion(Json(_body): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-object-arguments",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "run_complete",
+                                "arguments": {
+                                    "status": "completed",
+                                    "summary": "done"
+                                }
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ]
+    }))
+}
+
+async fn capture_null_tool_calls_completion(Json(_body): Json<Value>) -> Json<Value> {
+    Json(json!({
+        "id": "chatcmpl-null-tool-calls",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "OK",
+                    "tool_calls": null
+                },
+                "finish_reason": "stop"
             }
         ]
     }))
