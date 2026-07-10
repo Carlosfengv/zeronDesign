@@ -195,6 +195,85 @@ type ConversationListResponse = {
 By default, debug conversation items are filtered out. Phase B may opt in with
 `includeDebug=true` for internal diagnostics views only.
 
+## DesignProfile Fidelity Addendum (2026-07-10)
+
+The following additive routes extend the frozen Runtime contract. They do not
+change existing run, preview, conversation, or SSE route semantics.
+
+| Method | Path | Authorization | Purpose |
+|---|---|---|---|
+| `POST` | `/design-source-artifacts` | trusted BFF/service | Create an immutable UTF-8 source artifact, maximum 256 KiB |
+| `GET` | `/design-source-artifacts/{artifactId}` | trusted BFF/service | Read source metadata without source body |
+| `GET` | `/design-source-artifacts/{artifactId}/content` | trusted BFF/service | Read hash-verified source bytes |
+| `POST` | `/design-profiles/import` | trusted BFF/service | Deterministically import a source artifact into a V2 draft and conversion report |
+| `GET` | `/design-profiles/{id}/conversion-report` | trusted BFF/service | Read the latest draft conversion report |
+| `GET` | `/design-profiles/{id}/versions/{version}/conversion-report` | trusted BFF/service | Read a versioned conversion report |
+| `POST` | `/design-profiles/{id}/activate` | trusted BFF/service | Validate and append a strict active revision |
+| `GET` | `/design-profiles/{id}/versions/{version}/fidelity-report?surface=...&template=...` | normal Profile visibility | Read a side-effect-free, versioned capability report |
+
+Trusted source routes require both headers:
+
+```http
+x-anydesign-internal: true
+x-runtime-admin-token: <RUNTIME_INTERNAL_ADMIN_TOKEN>
+```
+
+`DesignSourceArtifact` bytes are immutable. Runtime calculates the canonical
+SHA-256 digest, validates an optional `clientSha256`, requires exactly one
+scope key, and revalidates size and digest before every content response.
+Profile/source scope must match exactly in this contract revision.
+
+`schemaVersion` describes the Profile payload contract and is independent from
+the append-only numeric revision `version`. Historical Profile JSON without
+`schemaVersion` is normalized at read time to `design-profile@1`; persisted
+historical bytes are not rewritten.
+
+Imported source creates `DesignProfileDraft` only. Drafts cannot bind to a
+project or enter run context. Draft updates require `expectedVersion`; a stale
+revision returns `409`. Activation also requires `expectedVersion`, returns
+`409` with blocking validation issues when incomplete, and creates a new strict
+active revision on success.
+
+V2 run snapshots add the resolved surface/template, base and effective Profile
+hashes, source artifact/hash, fidelity mode, source budget, indexed source
+sections, and read hashes. `profile_only` denies raw source reads.
+`source_fallback` enforces the 32 KiB full-read threshold, 16 KiB per-section
+limit, and 48 KiB per-run budget before allowing sandbox mutation.
+
+Built-in `astro-website` and `fumadocs-docs` templates now declare
+`runtime-style-contract@p3`; p2 remains parse-compatible. Post-publish fidelity
+assertions are written to `state/design-profile-fidelity.json` and recorded as
+`design_profile_fidelity_checked` conversation evidence before `run.complete`.
+
+p3 distinguishes semantic action roles: `color.primary` remains the Profile
+primary color, generic controls consume `color.action` and
+`color.actionContrast`, and auth-submit controls consume `color.authSubmit`.
+This prevents a brand accent that is intentionally scoped to one component
+from leaking into every `.runtime-button`.
+
+Required `computed-style` assertions are collected from the promoted preview
+with an isolated headless Chrome/Chromium CDP session. Browser launch,
+navigation, selector/property evaluation, timeout, or collector-exit failures
+are explicit assertion failures. Evidence is never reused from a previous
+publish. Comparators support equivalent browser color forms, forbidden scope,
+all/any matching, and relative numeric ratios such as
+`letter-spacing / font-size = 0.10`.
+
+Every successful build records a deterministic `sourceFingerprint`. The
+post-publish fidelity report binds that fingerprint and exposes a
+`repairContext` containing the Style Contract path, token file, global CSS
+file, component root, and repair constraints. If required rules failed and the
+next publish has the same fingerprint, Runtime returns the recoverable error
+`design_profile.no_source_change_after_fidelity_failure`; an unchanged rebuild
+does not consume the repair opportunity.
+
+Under the `local-e2e` policy, `preview.publish` owns the preview lifecycle and
+ignores model-provided `url`, `port`, `command`, and `mode` values. It allocates
+a fresh managed loopback port for each publish so an old `localhost:4321`
+server cannot satisfy browser checks for a newer source snapshot. Production
+sandbox endpoint selection remains Runtime-controlled by its deployment
+adapter.
+
 ## SSE Contract
 
 `GET /runs/{runId}/events` emits SSE records whose `data` field is one
