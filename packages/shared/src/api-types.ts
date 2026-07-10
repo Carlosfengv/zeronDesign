@@ -2,6 +2,14 @@ import { z } from "zod";
 import {
   AgentPhaseSchema,
   ConversationItemSchema,
+  DesignProfileBaseSchema,
+  DesignProfileDraftSchema,
+  DesignProfileRecordSchema,
+  DesignProfileScopeSchema,
+  DesignProfileSchema,
+  DesignSourceArtifactSchema,
+  DesignSourceFileNameSchema,
+  DesignSourceScopeSchema,
   ProjectVersionStatusSchema,
 } from "./schemas.js";
 
@@ -24,6 +32,10 @@ export const StartRunRequestSchema = z
         baseVersionId: z.string().min(1).optional(),
         sandboxBindingId: z.string().min(1).optional(),
         parentRunId: z.string().min(1).optional(),
+        designProfileId: z.string().min(1).optional(),
+        designFidelityMode: z.enum(["profile_only", "source_fallback"]).optional(),
+        workspaceId: z.string().min(1).optional(),
+        organizationId: z.string().min(1).optional(),
         findingIds: z.array(z.string().min(1)).optional(),
       })
       .default({}),
@@ -61,7 +73,7 @@ export const StartRunRequestSchema = z
 
 export const StartRunResponseSchema = z.object({
   runId: z.string().min(1),
-  status: z.literal("queued"),
+  status: z.enum(["queued", "needs_user_input"]),
 });
 
 export const ContinueRunRequestSchema = z.object({
@@ -76,6 +88,142 @@ export const ContinueRunResponseSchema = z.object({
 export const CancelRunResponseSchema = z.object({
   runId: z.string().min(1),
   status: z.literal("cancelled"),
+});
+
+export const CreateDesignSourceArtifactRequestSchema = z.object({
+  scope: DesignSourceScopeSchema,
+  fileName: DesignSourceFileNameSchema,
+  mediaType: z.enum(["text/markdown", "text/plain"]),
+  contentBase64: z.string().min(1).max(Math.ceil((256 * 1024) / 3) * 4),
+  clientSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
+});
+
+export const DesignSourceArtifactResponseSchema = z.object({
+  artifact: DesignSourceArtifactSchema,
+});
+
+export const DesignProfileConversionReportSchema = z.object({
+  id: z.string().min(1),
+  designProfileId: z.string().min(1),
+  profileVersion: z.number().int().positive(),
+  converterVersion: z.string().min(1),
+  deterministicParserVersion: z.string().min(1),
+  sourceArtifactId: z.string().min(1),
+  sourceHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  extractedSections: z.array(z.string().min(1)),
+  extractedTokenCount: z.number().int().nonnegative(),
+  extractedComponentCount: z.number().int().nonnegative(),
+  requiredSignatureRuleCount: z.number().int().nonnegative(),
+  unmappedItems: z.array(z.object({
+    sourceSection: z.string(),
+    startByte: z.number().int().nonnegative(),
+    endByte: z.number().int().nonnegative(),
+    excerpt: z.string().max(500),
+    excerptHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    reason: z.enum(["unsupported-field", "ambiguous", "duplicate", "invalid-value"]),
+  })),
+  warnings: z.array(z.string()),
+  createdAt: z.string().datetime(),
+});
+
+export const ImportDesignProfileRequestSchema = z.object({
+  name: z.string().min(1),
+  scope: DesignSourceScopeSchema,
+  sourceArtifactId: z.string().min(1),
+});
+
+export const ImportDesignProfileResponseSchema = z.object({
+  designProfileDraft: DesignProfileDraftSchema,
+  conversionReport: DesignProfileConversionReportSchema,
+  requiresReview: z.literal(true),
+});
+
+export const DesignProfileCreatePayloadSchema = DesignProfileBaseSchema.omit({
+  id: true,
+  name: true,
+  version: true,
+  createdAt: true,
+  updatedAt: true,
+}).extend({
+  name: z.string().min(1).optional(),
+});
+
+export const CreateDesignProfileRequestSchema = z.object({
+  projectId: z.string().min(1).optional(),
+  name: z.string().min(1),
+  profile: DesignProfileCreatePayloadSchema,
+});
+
+export const DesignProfileResponseSchema = z.object({
+  designProfile: DesignProfileRecordSchema,
+  profile: DesignProfileRecordSchema.optional(),
+});
+
+export const ListDesignProfilesResponseSchema = z.object({
+  designProfiles: z.array(DesignProfileRecordSchema),
+});
+
+export const DesignProfileVersionsResponseSchema = z.object({
+  designProfileId: z.string().min(1),
+  versions: z.array(DesignProfileRecordSchema),
+});
+
+export const DesignProfileDiffChangeSchema = z.object({
+  path: z.string().min(1),
+  before: z.unknown().optional(),
+  after: z.unknown().optional(),
+});
+
+export const DesignProfileDiffResponseSchema = z.object({
+  designProfileId: z.string().min(1),
+  fromVersion: z.number().int().positive(),
+  toVersion: z.number().int().positive(),
+  changes: z.array(DesignProfileDiffChangeSchema),
+});
+
+export const DesignProfileFidelityReportSchema = z.object({
+  designProfileId: z.string().min(1),
+  version: z.number().int().positive(),
+  schemaVersion: z.enum(["design-profile@1", "design-profile@2"]),
+  surface: z.enum(["website", "docs"]),
+  template: z.string().min(1),
+  styleContractVersion: z.enum([
+    "runtime-style-contract@p2",
+    "runtime-style-contract@p3",
+  ]),
+  effectiveProfileHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  sourceIntegrity: z.enum(["verified", "unverified", "missing"]),
+  sourceHashMatches: z.boolean().nullable(),
+  requiredSignatureRuleIds: z.array(z.string().min(1)),
+  capsuleIncludedRuleIds: z.array(z.string().min(1)),
+  capsuleMissingRuleIds: z.array(z.string().min(1)),
+  unsupportedExtendedTokens: z.array(z.string().min(1)),
+  warnings: z.array(z.string()),
+});
+
+export const UpdateDesignProfileRequestSchema = z.object({
+  expectedVersion: z.number().int().positive().optional(),
+  name: z.string().min(1),
+  profile: z.union([DesignProfileCreatePayloadSchema, z.object({}).passthrough()]),
+});
+
+export const ActivateDesignProfileRequestSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+});
+
+export const ActivateDesignProfileResponseSchema = z.object({
+  designProfile: DesignProfileSchema,
+  profile: DesignProfileSchema.optional(),
+});
+
+export const BindProjectDesignProfileRequestSchema = z.object({
+  designProfileId: z.string().min(1),
+});
+
+export const ProjectDesignProfileResponseSchema = z.object({
+  projectId: z.string().min(1),
+  designProfile: DesignProfileSchema.nullable(),
+  profile: DesignProfileSchema.nullish(),
 });
 
 export const ResolvePermissionRequestSchema = z.object({
@@ -109,6 +257,10 @@ export const ConversationListResponseSchema = z.object({
 
 export const RuntimeStyleContractSchema = z
   .object({
+    version: z
+      .enum(["runtime-style-contract@p2", "runtime-style-contract@p3"])
+      .default("runtime-style-contract@p2"),
+    template: z.string().min(1).optional(),
     tokenFile: z.string().min(1),
     globalCssFile: z.string().min(1),
     componentRoot: z.string().min(1),
@@ -122,6 +274,7 @@ export const RuntimeStyleContractSchema = z
     tokens: z
       .record(z.string().min(1), z.string().min(1))
       .refine((tokens) => Object.keys(tokens).length > 0, "style contract tokens required"),
+    editableTokens: z.array(z.string().min(1)).optional(),
   })
   .passthrough();
 
@@ -202,6 +355,32 @@ export type StartRunResponse = z.infer<typeof StartRunResponseSchema>;
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
 export type ContinueRunResponse = z.infer<typeof ContinueRunResponseSchema>;
 export type CancelRunResponse = z.infer<typeof CancelRunResponseSchema>;
+export type CreateDesignSourceArtifactRequest = z.infer<
+  typeof CreateDesignSourceArtifactRequestSchema
+>;
+export type DesignSourceArtifactResponse = z.infer<typeof DesignSourceArtifactResponseSchema>;
+export type DesignProfileConversionReport = z.infer<
+  typeof DesignProfileConversionReportSchema
+>;
+export type ImportDesignProfileRequest = z.infer<typeof ImportDesignProfileRequestSchema>;
+export type ImportDesignProfileResponse = z.infer<typeof ImportDesignProfileResponseSchema>;
+export type CreateDesignProfileRequest = z.input<typeof CreateDesignProfileRequestSchema>;
+export type DesignProfileCreatePayload = z.infer<typeof DesignProfileCreatePayloadSchema>;
+export type DesignProfileResponse = z.infer<typeof DesignProfileResponseSchema>;
+export type ListDesignProfilesResponse = z.infer<typeof ListDesignProfilesResponseSchema>;
+export type DesignProfileVersionsResponse = z.infer<typeof DesignProfileVersionsResponseSchema>;
+export type DesignProfileDiffChange = z.infer<typeof DesignProfileDiffChangeSchema>;
+export type DesignProfileDiffResponse = z.infer<typeof DesignProfileDiffResponseSchema>;
+export type DesignProfileFidelityReport = z.infer<
+  typeof DesignProfileFidelityReportSchema
+>;
+export type UpdateDesignProfileRequest = z.input<typeof UpdateDesignProfileRequestSchema>;
+export type ActivateDesignProfileRequest = z.infer<typeof ActivateDesignProfileRequestSchema>;
+export type ActivateDesignProfileResponse = z.infer<typeof ActivateDesignProfileResponseSchema>;
+export type BindProjectDesignProfileRequest = z.infer<
+  typeof BindProjectDesignProfileRequestSchema
+>;
+export type ProjectDesignProfileResponse = z.infer<typeof ProjectDesignProfileResponseSchema>;
 export type ResolvePermissionRequest = z.infer<typeof ResolvePermissionRequestSchema>;
 export type ResolvePermissionResponse = z.infer<typeof ResolvePermissionResponseSchema>;
 export type PreviewCurrentResponse = z.infer<typeof PreviewCurrentResponseSchema>;

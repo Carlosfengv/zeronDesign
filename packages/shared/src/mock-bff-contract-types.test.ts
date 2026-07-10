@@ -5,7 +5,10 @@ import type {
   ContinueRunRequest,
   ContinueRunResponse,
   ContentSource,
+  CreateDesignSourceArtifactRequest,
+  DesignSourceArtifactResponse,
   ErrorResponse,
+  ImportDesignProfileRequest,
   PreviewCurrentResponse,
   PreviewVersionResponse,
   ProjectRuntimeStateResponse,
@@ -22,7 +25,10 @@ import {
   ContinueRunRequestSchema,
   ContinueRunResponseSchema,
   ContentSourceSchema,
+  CreateDesignSourceArtifactRequestSchema,
+  DesignSourceArtifactResponseSchema,
   ErrorResponseSchema,
+  ImportDesignProfileRequestSchema,
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
   ProjectRuntimeStateResponseSchema,
@@ -51,6 +57,30 @@ describe("mock BFF shared runtime contract types", () => {
       kind: "markdown",
       text: "# Product notes",
     };
+    const createDesignSourceArtifact = {
+      scope: { projectId: "project-1" },
+      fileName: "DESIGN.md",
+      mediaType: "text/markdown",
+      contentBase64: "IyBEZXNpZ24K",
+      clientSha256: "a".repeat(64),
+    } satisfies CreateDesignSourceArtifactRequest;
+    const designSourceArtifactResponse = {
+      artifact: {
+        id: "design-source-1",
+        scope: { projectId: "project-1" },
+        fileName: "DESIGN.md",
+        mediaType: "text/markdown",
+        contentEncoding: "identity",
+        sizeBytes: 9,
+        sha256: "a".repeat(64),
+        createdAt: "2026-07-04T00:00:00.000Z",
+      },
+    } satisfies DesignSourceArtifactResponse;
+    const importDesignProfile = {
+      name: "Imported Design",
+      scope: { projectId: "project-1" },
+      sourceArtifactId: "design-source-1",
+    } satisfies ImportDesignProfileRequest;
     const sandboxBinding = {
       id: "sandbox-binding-1",
       projectId: "project-1",
@@ -176,6 +206,7 @@ describe("mock BFF shared runtime contract types", () => {
       templateKey: "astro-website",
       styleContractPath: "/workspace/state/style-contract.json",
       styleContract: {
+        version: "runtime-style-contract@p3",
         tokenFile: "project/src/styles/tokens.css",
         globalCssFile: "project/src/styles/global.css",
         componentRoot: "project/src/components/ui",
@@ -216,6 +247,15 @@ describe("mock BFF shared runtime contract types", () => {
 
     expect(ContentSourceSchema.parse(contentSource).readable).toBe(true);
     expect(ContentSourceSchema.parse(contentSourceWithRuntimeDefault).readable).toBe(true);
+    expect(
+      CreateDesignSourceArtifactRequestSchema.parse(createDesignSourceArtifact).fileName,
+    ).toBe("DESIGN.md");
+    expect(
+      DesignSourceArtifactResponseSchema.parse(designSourceArtifactResponse).artifact.id,
+    ).toBe("design-source-1");
+    expect(ImportDesignProfileRequestSchema.parse(importDesignProfile).sourceArtifactId).toBe(
+      "design-source-1",
+    );
     expect(SandboxBindingSchema.parse(sandboxBinding).workspacePvcName).toBe(
       "workspace-project-project-1-sandbox-1",
     );

@@ -1,0 +1,165 @@
+{
+  "id": "design-profile-elevenlabs-warm-editorial-v2",
+  "schemaVersion": "design-profile@2",
+  "name": "ElevenLabs Warm Editorial V2",
+  "status": "active",
+  "version": 2,
+  "scope": { "projectId": "elevenlabs-style-reference" },
+  "source": {
+    "kind": "imported",
+    "sourceArtifactIds": ["fixture-elevenlabs-design-source"],
+    "primarySourceArtifactId": "fixture-elevenlabs-design-source",
+    "sourceHash": "1f11478756c066ad859c3517912cb300bef78fc284aff859a02308ad8ac3753c",
+    "converterVersion": "design-profile-import@1",
+    "importedAt": "2026-07-10T00:00:00Z",
+    "integrity": "verified",
+    "notes": "Fixture source is /Users/carlos/Downloads/DESIGN (2).md; replace the fixture artifact id when importing into a RuntimeStore."
+  },
+  "product": {
+    "name": "ElevenLabs Style Reference",
+    "category": "AI voice product website",
+    "audience": ["AI product teams", "developers", "creative professionals"],
+    "primaryUseCases": ["voice platform website", "AI agent product story"],
+    "productQualities": ["editorial", "restrained", "warm", "credible"]
+  },
+  "brand": {
+    "voice": {
+      "tone": ["confident", "editorial", "clear", "human"],
+      "sentenceStyle": "editorial",
+      "vocabulary": { "prefer": ["voice", "audio", "agent", "studio"], "avoid": ["magic", "revolutionary", "neon"] },
+      "writingRules": ["Use clear editorial headlines.", "Support claims with product evidence."]
+    },
+    "messaging": {
+      "headlineStyle": "large restrained editorial statement",
+      "bodyStyle": "short readable product narrative",
+      "ctaStyle": "black filled pill",
+      "proofStyle": "audio and voice product evidence",
+      "forbiddenClaims": ["indistinguishable in every context"]
+    }
+  },
+  "visual": {
+    "direction": "Warm editorial paper with graphite type, taupe cards, black actions, and violet/orange restricted to voice product visuals.",
+    "principles": ["Use warm #fdfcfc canvas.", "Create authority through light display typography.", "Keep accents inside product visuals."],
+    "moodKeywords": ["warm", "editorial", "human", "precise"],
+    "avoidKeywords": ["pure white canvas", "violet CTA", "heavy shadows", "neon gradient"],
+    "composition": { "rhythm": "96-125px sections with 64px desktop gutter" },
+    "imagery": { "productSignal": "audio sphere, waveform, or voice interface" },
+    "motion": { "level": "subtle" }
+  },
+  "tokens": {
+    "color": {
+      "background": "#fdfcfc",
+      "surface": "#f5f3f1",
+      "text": "#000000",
+      "graphite": "#1f1f1f",
+      "smoke": "#66625f",
+      "ash": "#9b9691",
+      "border": "#ebe8e4",
+      "violetProduct": "#0447ff",
+      "orangeProduct": "#ff4704"
+    },
+    "typography": {
+      "families": {
+        "body": "Inter, sans-serif",
+        "display": "Waldenburg, Inter, sans-serif",
+        "mono": "Geist Mono, monospace"
+      },
+      "scale": {
+        "display": { "fontSize": "72px", "lineHeight": "1.02", "fontWeight": "300", "letterSpacing": "-0.02em" },
+        "heading": { "fontSize": "36px", "lineHeight": "1.1", "fontWeight": "300", "letterSpacing": "-0.02em" },
+        "body": { "fontSize": "16px", "lineHeight": "1.55", "fontWeight": "400", "letterSpacing": "0.01em" }
+      }
+    },
+    "gradients": { "display": "linear-gradient(135deg, #0447ff 0%, #ff4704 100%)" },
+    "radius": {
+      "scale": { "input": "12px", "badge": "999px", "button": "999px", "card": "24px" },
+      "byComponent": { "featureCard": "24px", "audioSphere": "999px" }
+    },
+    "elevation": { "featureCard": "none", "whiteCard": "0 1px 2px rgba(0,0,0,0.04)" },
+    "spacing": { "baseUnit": "4px", "layout": { "pageGutter": "64px", "section": "112px", "cardPadding": "28px" } },
+    "shadow": { "soft": "0 1px 2px rgba(0,0,0,0.04)" }
+  },
+  "runtimeTokenMapping": {
+    "color.background": "#fdfcfc",
+    "color.surface": "#f5f3f1",
+    "color.surfaceStrong": "#ebe8e4",
+    "color.text": "#000000",
+    "color.muted": "#66625f",
+    "color.primary": "#000000",
+    "color.primaryContrast": "#ffffff",
+    "color.border": "#ebe8e4",
+    "radius.card": "24px",
+    "radius.control": "999px",
+    "font.sans": "Inter, sans-serif",
+    "shadow.soft": "0 1px 2px rgba(0,0,0,0.04)"
+  },
+  "extendedTokenMapping": {
+    "color.action": "#000000",
+    "color.actionContrast": "#ffffff",
+    "color.authSubmit": "#000000",
+    "font.display": "Waldenburg, Inter, sans-serif",
+    "font.mono": "Geist Mono, monospace",
+    "type.display.size": "72px",
+    "type.display.lineHeight": "1.02",
+    "type.display.letterSpacing": "-0.02em",
+    "type.body.letterSpacing": "0.01em",
+    "spacing.pageGutter": "64px",
+    "spacing.section": "112px",
+    "spacing.cardPadding": "28px",
+    "radius.input": "12px",
+    "radius.badge": "999px",
+    "radius.largeCard": "24px",
+    "gradient.display": "linear-gradient(135deg, #0447ff 0%, #ff4704 100%)",
+    "gradient.ambient": "radial-gradient(circle, rgba(4,71,255,0.18), rgba(255,71,4,0.08) 52%, transparent 72%)",
+    "shadow.cardStrong": "0 1px 2px rgba(0,0,0,0.04)"
+  },
+  "components": {
+    "primitives": {
+      "button": { "role": "black filled or outlined pill action", "usage": ["Use black filled pill for primary CTA."], "avoid": ["violet or orange CTA"] },
+      "input": { "role": "quiet product input", "usage": ["Use 12px radius and hairline border."], "avoid": ["glowing focus treatment"] },
+      "card": { "role": "warm taupe feature surface", "usage": ["Use #f5f3f1 and 20-24px radius."], "avoid": ["heavy shadow"] },
+      "badge": { "role": "compact editorial label", "usage": ["Use neutral pill treatment."], "avoid": ["bright accent fill"] }
+    },
+    "patterns": {
+      "audioVisual": { "role": "voice product evidence", "requiredElements": ["audio sphere or waveform", "voice controls"] }
+    }
+  },
+  "content": {
+    "website": { "requiredSections": ["hero", "voice product evidence", "feature cards", "trust proof"] },
+    "docs": { "pageRules": ["Use editorial type sparingly and keep technical content dense."] }
+  },
+  "accessibility": { "wcag": "AA", "contrast": "Graphite text must remain legible on taupe surfaces.", "motion": ["Audio motion respects reduced motion."] },
+  "technical": {
+    "allowedTemplates": ["astro-website", "fumadocs-docs"],
+    "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+    "cssStrategy": "runtime-style-contract",
+    "dependencyPolicy": { "preferExisting": true },
+    "filePolicy": {
+      "designProfilePath": "/workspace/inputs/design-profile.json",
+      "designMarkdownPath": "/workspace/inputs/design.md",
+      "styleContractPath": "/workspace/state/style-contract.json"
+    }
+  },
+  "governance": { "conflictBehavior": "ask", "review": { "requireVisualReview": true } },
+  "signatureRules": [
+    { "id": "elevenlabs-canvas", "category": "color", "statement": "The page canvas is #fdfcfc and never pure white.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Tokens — Colors"], "verification": { "kind": "token", "token": "color.background", "expected": "#fdfcfc", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "elevenlabs-display-font", "category": "typography", "statement": "Display typography uses Waldenburg or Inter at weight 300.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Waldenburg — Display and heading type only. Used at 48/36/32px with weight 300 — the ultra-light weight is anti-convention; most sites use 600-700, this whisper-weight creates authority through restraint. Tight -0.02em tracking pulls letters closer at large sizes. Substitute: \"Inter\" weight 300, or \"Söhne\" light as a premium alternative. · `--font-waldenburg`"], "verification": { "kind": "token", "token": "font.display", "expected": "Waldenburg", "comparator": { "kind": "contains" } } },
+    { "id": "elevenlabs-display-weight", "category": "typography", "statement": "The largest heading uses an editorial weight of 300.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Type Scale"], "verification": { "kind": "computed-style", "route": "/", "selector": "h1", "property": "font-weight", "expected": "300", "comparator": { "kind": "numeric-tolerance", "tolerance": 50 }, "minMatches": 1 } },
+    { "id": "elevenlabs-display-tracking", "category": "typography", "statement": "Headings at 32px and above use -0.02em tracking.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Type Scale"], "verification": { "kind": "computed-style", "route": "/", "selector": "h1", "property": "letter-spacing", "referenceProperty": "font-size", "expected": "-0.02", "comparator": { "kind": "numeric-ratio", "ratio": -0.02, "tolerance": 0.005 }, "minMatches": 1 } },
+    { "id": "elevenlabs-primary-action", "category": "component", "statement": "The primary CTA is a black filled pill, never violet or orange.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Filled Pill Button"], "verification": { "kind": "token", "token": "color.primary", "expected": "#000000", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "elevenlabs-primary-action-visible", "category": "component", "statement": "At least one visible interactive CTA uses the black primary fill.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Filled Pill Button"], "verification": { "kind": "computed-style", "route": "/", "selector": "a, button, [role=button]", "property": "background-color", "expected": "#000000", "comparator": { "kind": "color-equivalent" }, "minMatches": 1, "matchPolicy": "any" } },
+    { "id": "elevenlabs-product-accents", "category": "imagery", "statement": "#0447ff and #ff4704 appear only inside product visuals.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Audio Sphere Visual"], "verification": { "kind": "dom", "route": "/", "selector": ".audio-visual, [data-product-visual]", "minMatches": 1 } },
+    { "id": "elevenlabs-feature-card", "category": "component", "statement": "Feature cards use the #f5f3f1 warm taupe surface.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Feature Card (Taupe)"], "verification": { "kind": "computed-style", "route": "/", "selector": ".runtime-feature-card, .feature-card, [data-feature-card]", "property": "background-color", "expected": "#f5f3f1", "comparator": { "kind": "color-equivalent" }, "minMatches": 1 } },
+    { "id": "elevenlabs-feature-card-radius", "category": "component", "statement": "Feature cards use a 24px large-card radius.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Feature Card (Taupe)"], "verification": { "kind": "computed-style", "route": "/", "selector": ".runtime-feature-card, .feature-card, [data-feature-card]", "property": "border-radius", "expected": "24px", "comparator": { "kind": "exact" }, "minMatches": 1 } },
+    { "id": "elevenlabs-voice-evidence", "category": "composition", "statement": "The Website includes concrete audio or voice product evidence.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Audio Sphere Visual"], "verification": { "kind": "dom", "route": "/", "selector": "audio, .waveform, .audio-sphere, [data-voice-product]", "minMatches": 1 } },
+    { "id": "elevenlabs-divider", "category": "spacing", "statement": "Section dividers use the #ebe8e4 one-pixel hairline.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Hairline Divider"], "verification": { "kind": "computed-style", "route": "/", "selector": "hr, .divider, [data-divider]", "property": "border-top-color", "expected": "#ebe8e4", "comparator": { "kind": "color-equivalent" }, "minMatches": 1 } },
+    { "id": "elevenlabs-blue-action-forbidden", "category": "component", "statement": "Interactive actions never use the #0447ff product-visual accent.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Filled Pill Button"], "verification": { "kind": "computed-style", "route": "/", "selector": "a, button, [role=button]", "property": "background-color", "expected": "#0447ff", "comparator": { "kind": "forbidden-anywhere" } } },
+    { "id": "elevenlabs-orange-action-forbidden", "category": "component", "statement": "Interactive actions never use the #ff4704 product-visual accent.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Filled Pill Button"], "verification": { "kind": "computed-style", "route": "/", "selector": "a, button, [role=button]", "property": "background-color", "expected": "#ff4704", "comparator": { "kind": "forbidden-anywhere" } } }
+  ],
+  "overrides": {
+    "surfaces": { "docs": { "content": { "displayScale": "reduced", "productVisuals": "optional" } } },
+    "templates": { "astro-website": { "content": { "requiredDataHooks": ["data-product-visual", "data-voice-product"] } } }
+  },
+  "createdAt": "2026-07-10T00:00:00Z",
+  "updatedAt": "2026-07-10T00:00:00Z"
+}

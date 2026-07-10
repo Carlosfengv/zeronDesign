@@ -1,0 +1,177 @@
+{
+  "id": "design-profile-authkit-frosted-glass-v2",
+  "schemaVersion": "design-profile@2",
+  "name": "AuthKit Frosted Glass Cathedral V2",
+  "status": "active",
+  "version": 2,
+  "scope": { "projectId": "authkit-style-reference" },
+  "source": {
+    "kind": "imported",
+    "sourceArtifactIds": ["fixture-authkit-design-source"],
+    "primarySourceArtifactId": "fixture-authkit-design-source",
+    "sourceHash": "135bc079096b05b3568a2c9351cb20d6f1f3c7c64060524d2474354dca2a7205",
+    "converterVersion": "design-profile-import@1",
+    "importedAt": "2026-07-10T00:00:00Z",
+    "integrity": "verified",
+    "notes": "Fixture source is /Users/carlos/Downloads/DESIGN (1).md; replace the fixture artifact id when importing into a RuntimeStore."
+  },
+  "product": {
+    "name": "AuthKit Style Reference",
+    "category": "dark authentication product website",
+    "audience": ["product designers", "frontend engineers"],
+    "primaryUseCases": ["authentication launch website", "auth product showcase"],
+    "productQualities": ["luminous", "precise", "premium", "focused"]
+  },
+  "brand": {
+    "voice": {
+      "tone": ["calm", "premium", "technical", "minimal"],
+      "sentenceStyle": "balanced",
+      "vocabulary": {
+        "prefer": ["secure", "identity", "workspace", "passwordless"],
+        "avoid": ["playful", "cartoon", "rainbow"]
+      },
+      "writingRules": ["Use sparse product-launch copy.", "Use concrete auth terminology."]
+    },
+    "messaging": {
+      "headlineStyle": "luminous product name or capability",
+      "bodyStyle": "short technical support copy",
+      "ctaStyle": "one violet auth submit action",
+      "proofStyle": "show auth forms and provider controls",
+      "forbiddenClaims": ["perfect security by default"]
+    }
+  },
+  "visual": {
+    "direction": "Frosted glass cathedral at midnight with a near-black canvas, blueprint grid, luminous text, and one functional violet.",
+    "principles": ["Use translucent glass plates.", "Keep the palette blue-white plus functional violet."],
+    "moodKeywords": ["midnight", "frosted", "luminous", "blueprint"],
+    "avoidKeywords": ["extra chromatic accents", "photography", "solid borders"],
+    "composition": { "hero": "centered wordmark with overlapping auth forms" },
+    "imagery": { "productSignal": "auth form UI in the first viewport" },
+    "motion": { "level": "subtle" }
+  },
+  "tokens": {
+    "color": {
+      "background": "#05060f",
+      "surface": "rgba(186,214,247,0.03)",
+      "text": "#d1e4fa",
+      "muted": "#9da7ba",
+      "primary": "#663af3",
+      "border": "rgba(186,215,247,0.12)",
+      "grid": "rgba(186,215,247,0.08)",
+      "spotlight": "rgba(102,58,243,0.18)"
+    },
+    "typography": {
+      "families": {
+        "body": "Untitled Sans, Inter, sans-serif",
+        "display": "aeonikPro, Space Grotesk, sans-serif",
+        "mono": "dotDigital, JetBrains Mono, monospace",
+        "eyebrow": "dotDigital, JetBrains Mono, monospace"
+      },
+      "scale": {
+        "display": { "fontSize": "76px", "lineHeight": "0.95", "fontWeight": "500" },
+        "eyebrow": { "fontSize": "15px", "lineHeight": "1.4", "fontWeight": "500", "letterSpacing": "0.10em" },
+        "body": { "fontSize": "16px", "lineHeight": "1.6", "fontWeight": "400" }
+      }
+    },
+    "gradients": {
+      "display": "linear-gradient(135deg, #d8ecf8, #98c0ef)",
+      "ambient": "conic-gradient(from 180deg at 50% 0%, rgba(102,58,243,0.24), transparent 35%)"
+    },
+    "radius": {
+      "scale": { "input": "6px", "badge": "6px", "card": "16px", "modal": "20px" },
+      "byComponent": { "authModal": "20px", "featureCard": "16px" }
+    },
+    "elevation": {
+      "glassCard": "inset 0 1px 1px rgba(216,236,248,0.2), 0 16px 32px rgba(0,0,0,0.3)",
+      "authModal": "inset 0 24px 48px rgba(168,216,245,0.06), 0 24px 64px rgba(0,0,0,0.42)"
+    },
+    "spacing": {
+      "baseUnit": "4px",
+      "layout": { "pageGutter": "48px", "section": "120px", "cardPadding": "24px", "gridSize": "96px" }
+    },
+    "shadow": { "soft": "0 16px 32px rgba(0,0,0,0.3)" }
+  },
+  "runtimeTokenMapping": {
+    "color.background": "#05060f",
+    "color.surface": "rgba(186,214,247,0.03)",
+    "color.surfaceStrong": "rgba(5,6,15,0.97)",
+    "color.text": "#d1e4fa",
+    "color.muted": "#9da7ba",
+    "color.primary": "#663af3",
+    "color.primaryContrast": "#ffffff",
+    "color.border": "rgba(186,215,247,0.12)",
+    "radius.card": "16px",
+    "radius.control": "999px",
+    "font.sans": "Untitled Sans, Inter, sans-serif",
+    "shadow.soft": "inset 0 1px 1px rgba(216,236,248,0.2), 0 16px 32px rgba(0,0,0,0.3)"
+  },
+  "extendedTokenMapping": {
+    "color.action": "rgba(186,214,247,0.06)",
+    "color.actionContrast": "#ffffff",
+    "color.authSubmit": "#663af3",
+    "font.display": "aeonikPro, Space Grotesk, sans-serif",
+    "font.mono": "dotDigital, JetBrains Mono, monospace",
+    "type.display.size": "76px",
+    "type.display.lineHeight": "0.95",
+    "type.display.letterSpacing": "0",
+    "type.body.letterSpacing": "0",
+    "spacing.pageGutter": "48px",
+    "spacing.section": "120px",
+    "spacing.cardPadding": "24px",
+    "spacing.gridCell": "96px",
+    "radius.input": "6px",
+    "radius.badge": "6px",
+    "radius.largeCard": "20px",
+    "gradient.display": "linear-gradient(135deg, #d8ecf8, #98c0ef)",
+    "gradient.ambient": "conic-gradient(from 180deg at 50% 0%, rgba(102,58,243,0.24), transparent 35%)",
+    "shadow.cardStrong": "inset 0 1px 1px rgba(216,236,248,0.2), 0 24px 64px rgba(0,0,0,0.42)"
+  },
+  "components": {
+    "primitives": {
+      "button": { "role": "auth and navigation actions", "usage": ["Use violet only for auth submit."], "avoid": ["extra colored CTAs"] },
+      "input": { "role": "auth form field", "usage": ["Use translucent inset surface."], "avoid": ["plain white fields"] },
+      "card": { "role": "frosted product surface", "usage": ["Use inset frost edges."], "avoid": ["paper cards"] },
+      "badge": { "role": "capability label", "usage": ["Use cool translucent fill."], "avoid": ["bright solid badges"] }
+    },
+    "patterns": {
+      "hero": { "role": "centered auth product signal", "requiredElements": ["wordmark", "overlapping auth forms", "blueprint grid"] }
+    }
+  },
+  "content": {
+    "website": { "requiredSections": ["hero", "auth form showcase", "capability row", "customization workspace"] },
+    "docs": { "pageRules": ["Keep docs readable and reduce decorative glass."] }
+  },
+  "accessibility": { "wcag": "AA", "motion": ["Respect reduced motion."], "semantics": ["Use real form semantics."] },
+  "technical": {
+    "allowedTemplates": ["astro-website", "fumadocs-docs"],
+    "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+    "cssStrategy": "runtime-style-contract",
+    "dependencyPolicy": { "preferExisting": true },
+    "filePolicy": {
+      "designProfilePath": "/workspace/inputs/design-profile.json",
+      "designMarkdownPath": "/workspace/inputs/design.md",
+      "styleContractPath": "/workspace/state/style-contract.json"
+    }
+  },
+  "governance": { "conflictBehavior": "ask", "review": { "requireVisualReview": true } },
+  "signatureRules": [
+    { "id": "authkit-canvas", "category": "color", "statement": "The page canvas is #05060f.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Tokens — Colors"], "verification": { "kind": "token", "token": "color.background", "expected": "#05060f", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "authkit-display-font", "category": "typography", "statement": "Display headings use aeonikPro or Space Grotesk at weight 500.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["aeonikPro — Display headings only — the wordmark 'AuthKit', section headings, hero copy; weight 500 at 44-48px gives the wordmark a wide, calm presence rather than a bold shout · `--font-aeonikpro`"], "verification": { "kind": "token", "token": "font.display", "expected": "Space Grotesk", "comparator": { "kind": "contains" } } },
+    { "id": "authkit-eyebrow", "category": "typography", "statement": "Eyebrows use a mono/dotDigital role at 15px with 0.10em tracking.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["dotDigital — All-caps eyebrow labels ('Introducing', 'Extensible by design', 'Shine bright') — 0.10em tracked monospace-flavored caps act as quiet section markers between the display type and body copy · `--font-dotdigital`"], "verification": { "kind": "computed-style", "route": "/", "selector": ".runtime-kicker, [data-eyebrow]", "property": "letter-spacing", "referenceProperty": "font-size", "expected": "0.10", "comparator": { "kind": "numeric-ratio", "ratio": 0.10, "tolerance": 0.01 }, "minMatches": 1 } },
+    { "id": "authkit-skywash", "category": "typography", "statement": "The largest heading uses the #d8ecf8 to #98c0ef Skywash gradient.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Gradient System"], "verification": { "kind": "computed-style", "route": "/", "selector": "h1, h1 *", "property": "background-image", "expected": "linear-gradient", "comparator": { "kind": "contains" }, "minMatches": 1, "matchPolicy": "any" } },
+    { "id": "authkit-grid", "category": "composition", "statement": "The background includes an 80-100px blueprint grid.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Background Grid Layer"], "verification": { "kind": "computed-style", "route": "/", "selector": ".authkit-blueprint-grid, [data-blueprint-grid]", "property": "background-image", "expected": "linear-gradient", "comparator": { "kind": "contains" }, "minMatches": 1 } },
+    { "id": "authkit-grid-size", "category": "composition", "statement": "The blueprint grid uses a 96px cell within the required 80-100px range.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Background Grid Layer"], "verification": { "kind": "computed-style", "route": "/", "selector": ".authkit-blueprint-grid, [data-blueprint-grid]", "property": "background-size", "expected": "96px", "comparator": { "kind": "contains" }, "minMatches": 1 } },
+    { "id": "authkit-spotlight", "category": "composition", "statement": "A conic-gradient spotlight anchors the top center of the page.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Background Grid Layer"], "verification": { "kind": "computed-style", "route": "/", "selector": ".authkit-spotlight, [data-spotlight]", "property": "background-image", "expected": "conic-gradient", "comparator": { "kind": "contains" }, "minMatches": 1 } },
+    { "id": "authkit-auth-forms", "category": "composition", "statement": "The Website hero displays overlapping auth form product signals.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Auth-Form Modal Card"], "verification": { "kind": "dom", "route": "/", "selector": ".auth-form, [data-auth-form]", "minMatches": 2 } },
+    { "id": "authkit-violet-action", "category": "component", "statement": "#663af3 is reserved for the auth submit or continue action.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Violet CTA Button"], "verification": { "kind": "token", "token": "color.primary", "expected": "#663af3", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "authkit-auth-submit-violet", "category": "component", "statement": "At least one auth submit or continue action visibly uses the #663af3 semantic auth-submit fill.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Violet CTA Button"], "verification": { "kind": "computed-style", "route": "/", "selector": "[data-auth-submit], .auth-submit, [data-auth-form] button[type=submit], .auth-form button[type=submit]", "property": "background-color", "expected": "#663af3", "comparator": { "kind": "color-equivalent" }, "minMatches": 1, "matchPolicy": "any" } },
+    { "id": "authkit-violet-scope", "category": "component", "statement": "Non-auth links and buttons never use the #663af3 auth-submit fill.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Violet CTA Button"], "verification": { "kind": "computed-style", "route": "/", "selector": "a, button, [role=button]", "excludeWithin": "form, [data-auth-form], [data-auth-submit]", "property": "background-color", "expected": "#663af3", "comparator": { "kind": "forbidden-anywhere" } } },
+    { "id": "authkit-frost-elevation", "category": "component", "statement": "Cards use an inset frost edge and cool dark halo.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Elevation"], "verification": { "kind": "token", "token": "shadow.cardStrong", "expected": "inset 0 1px 1px", "comparator": { "kind": "contains" } } }
+  ],
+  "overrides": {
+    "surfaces": { "docs": { "signatureRules": [], "content": { "decoration": "restrained" } } },
+    "templates": { "astro-website": { "content": { "requiredDataHooks": ["data-blueprint-grid", "data-auth-form"] } } }
+  },
+  "createdAt": "2026-07-10T00:00:00Z",
+  "updatedAt": "2026-07-10T00:00:00Z"
+}
