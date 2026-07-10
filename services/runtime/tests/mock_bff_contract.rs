@@ -80,6 +80,28 @@ async fn post_json(app: Router, uri: impl AsRef<str>, body: Value) -> (StatusCod
     (status, value)
 }
 
+async fn put_json(app: Router, uri: impl AsRef<str>, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri.as_ref())
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let value = if body.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, value)
+}
+
 async fn get_json(app: Router, uri: impl AsRef<str>) -> (StatusCode, Value) {
     let response = app
         .oneshot(
@@ -93,6 +115,91 @@ async fn get_json(app: Router, uri: impl AsRef<str>) -> (StatusCode, Value) {
     let status = response.status();
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn design_profile_payload(scope: Value) -> Value {
+    json!({
+        "name": "Harness Calm Ops",
+        "profile": {
+            "status": "active",
+            "scope": scope,
+            "source": { "kind": "manual" },
+            "product": {
+                "name": "AnyDesign Runtime",
+                "category": "agent harness",
+                "audience": ["internal builders"],
+                "primaryUseCases": ["generate websites", "edit docs"],
+                "productQualities": ["reliable", "inspectable"]
+            },
+            "brand": {
+                "voice": {
+                    "tone": ["clear", "precise"],
+                    "sentenceStyle": "technical",
+                    "vocabulary": { "prefer": ["runtime", "evidence"], "avoid": ["magic"] },
+                    "writingRules": ["Use concrete status text."]
+                },
+                "messaging": {
+                    "headlineStyle": "specific",
+                    "bodyStyle": "concise",
+                    "ctaStyle": "verb first",
+                    "proofStyle": "evidence based",
+                    "forbiddenClaims": ["guaranteed"]
+                }
+            },
+            "visual": {
+                "direction": "quiet operational interface",
+                "principles": ["scan friendly"],
+                "moodKeywords": ["calm"],
+                "avoidKeywords": ["flashy"],
+                "composition": {},
+                "imagery": {},
+                "motion": {}
+            },
+            "tokens": {
+                "color": {},
+                "typography": {},
+                "radius": {},
+                "shadow": {},
+                "spacing": {}
+            },
+            "runtimeTokenMapping": {
+                "color.background": "#ffffff",
+                "color.surface": "#f8fafc",
+                "color.surfaceStrong": "#e2e8f0",
+                "color.text": "#0f172a",
+                "color.muted": "#475569",
+                "color.primary": "#2563eb",
+                "color.primaryContrast": "#ffffff",
+                "color.border": "#cbd5e1",
+                "radius.card": "8px",
+                "radius.control": "6px",
+                "font.sans": "Inter, sans-serif",
+                "shadow.soft": "0 1px 2px rgba(15, 23, 42, 0.12)"
+            },
+            "components": {
+                "primitives": {
+                    "button": { "intent": "clear action", "usage": ["primary actions"], "avoid": ["overuse"] },
+                    "input": { "intent": "precise entry", "usage": ["forms"], "avoid": ["placeholder-only labels"] },
+                    "card": { "intent": "group repeated items", "usage": ["lists"], "avoid": ["nested cards"] },
+                    "badge": { "intent": "show status", "usage": ["statuses"], "avoid": ["decorative noise"] }
+                }
+            },
+            "content": {},
+            "accessibility": {},
+            "technical": {
+                "allowedTemplates": ["astro-website", "fumadocs-docs"],
+                "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+                "cssStrategy": "runtime-style-contract",
+                "dependencyPolicy": {},
+                "filePolicy": {
+                    "designProfilePath": "/workspace/inputs/design-profile.json",
+                    "designMarkdownPath": "/workspace/inputs/design.md",
+                    "styleContractPath": "/workspace/state/style-contract.json"
+                }
+            },
+            "governance": { "conflictBehavior": "ask" }
+        }
+    })
 }
 
 async fn get_sse(app: Router, uri: impl AsRef<str>, last_event_id: Option<String>) -> String {
@@ -358,6 +465,96 @@ async fn bff_events_route_proxies_runtime_live_sse_with_last_event_id_query() {
     let terminal = String::from_utf8(terminal.to_vec()).unwrap();
     assert!(terminal.contains("run.completed"));
     assert!(terminal.contains(&format!("id: {}/4", run.id)));
+}
+
+#[tokio::test]
+async fn mock_bff_can_manage_design_profile_context_over_runtime_contract() {
+    let store = RuntimeStore::new();
+    let app = mock_bff_app(store.clone(), vec![]);
+
+    let (status, created) = post_json(
+        app.clone(),
+        "/design-profiles",
+        design_profile_payload(json!({ "projectId": "project-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let design_profile_id = created["designProfile"]["id"].as_str().unwrap();
+    assert_eq!(created["designProfile"]["version"], 1);
+
+    let (status, listed) = get_json(app.clone(), "/design-profiles?projectId=project-1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["designProfiles"].as_array().unwrap().len(), 1);
+
+    let mut update = design_profile_payload(json!({ "projectId": "project-1" }));
+    update["name"] = json!("Harness Calm Ops v2");
+    let (status, updated) = put_json(
+        app.clone(),
+        format!("/design-profiles/{design_profile_id}"),
+        update,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["designProfile"]["version"], 2);
+
+    let (status, versions) = get_json(
+        app.clone(),
+        format!("/design-profiles/{design_profile_id}/versions"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(versions["versions"].as_array().unwrap().len(), 2);
+
+    let (status, diff) = get_json(
+        app.clone(),
+        format!("/design-profiles/{design_profile_id}/diff?fromVersion=1&toVersion=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| change["path"] == "name"));
+
+    let (status, bound) = post_json(
+        app.clone(),
+        "/projects/project-1/design-profile",
+        json!({ "designProfileId": design_profile_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bound["designProfile"]["id"], design_profile_id);
+
+    let run_id = start_run(
+        app.clone(),
+        "project-1",
+        "brief",
+        "brief",
+        json!({
+            "contentSources": [
+                ContentSource::readable("source-1", "prompt", "Make a website")
+            ]
+        }),
+    )
+    .await;
+    let run = store.get_run(&run_id).await.unwrap();
+    assert_eq!(run.design_profile_id.as_deref(), Some(design_profile_id));
+    assert_eq!(run.design_profile_version, Some(2));
+
+    let (status, archived) = post_json(
+        app.clone(),
+        format!("/design-profiles/{design_profile_id}/archive"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(archived["designProfile"]["status"], "archived");
+
+    let (status, listed_active) =
+        get_json(app.clone(), "/design-profiles?projectId=project-1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_active["designProfiles"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

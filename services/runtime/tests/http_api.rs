@@ -7,7 +7,7 @@ use anydesign_runtime::{
     },
     preview::{promote_preview, PromotionGateReport},
     types::{
-        AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
+        sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
         ReviewFindingCategory, ReviewFindingSeverity, ReviewFindingStatus, SandboxBindingStatus,
         SandboxChannelProtocol,
     },
@@ -17,6 +17,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -126,6 +127,596 @@ fn runtime_style_contract_json(
     })
 }
 
+fn design_profile_request(project_id: &str, allowed_templates: Vec<&str>) -> Value {
+    design_profile_request_for_scope(
+        Some(project_id),
+        json!({ "projectId": project_id }),
+        allowed_templates,
+    )
+}
+
+#[tokio::test]
+async fn design_source_artifact_api_is_authorized_immutable_and_restart_safe() {
+    let storage = unique_temp_dir("design-source-artifact-api");
+    let mut config = phase_a_contract_config();
+    config.runtime_storage_dir = storage.clone();
+    config.internal_admin_token = Some("source-secret".to_string());
+    let app = http_api::router(config.clone());
+    let source = b"# AuthKit\n\r\nFrosted glass cathedral at midnight.\n";
+    let digest = sha256_hex(source);
+    let request_body = json!({
+        "scope": { "projectId": "project-source" },
+        "fileName": "DESIGN.md",
+        "mediaType": "text/markdown",
+        "contentBase64": BASE64_STANDARD.encode(source),
+        "clientSha256": digest,
+    });
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-source-artifacts")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let hash_mismatch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-source-artifacts")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "source-secret")
+                .body(Body::from(
+                    json!({
+                        "scope": { "projectId": "project-source" },
+                        "fileName": "DESIGN.md",
+                        "mediaType": "text/markdown",
+                        "contentBase64": BASE64_STANDARD.encode(source),
+                        "clientSha256": "0".repeat(64),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hash_mismatch.status(), StatusCode::BAD_REQUEST);
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-source-artifacts")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "source-secret")
+                .body(Body::from(request_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = to_bytes(created.into_body(), 16_384).await.unwrap();
+    let created_json: Value = serde_json::from_slice(&created_body).unwrap();
+    let artifact_id = created_json["artifact"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        created_json["artifact"]["scope"]["projectId"],
+        "project-source"
+    );
+    assert_eq!(created_json["artifact"]["sha256"], digest);
+    assert_eq!(created_json["artifact"]["sizeBytes"], source.len() as u64);
+
+    let traversal = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-source-artifacts")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "source-secret")
+                .body(Body::from(
+                    json!({
+                        "scope": { "projectId": "project-source" },
+                        "fileName": "../../DESIGN.md",
+                        "mediaType": "text/markdown",
+                        "contentBase64": BASE64_STANDARD.encode(source),
+                        "clientSha256": digest,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+
+    let mut linked_profile = design_profile_request("project-source", vec!["astro-website"]);
+    linked_profile["profile"]["source"] = json!({
+        "kind": "imported",
+        "primarySourceArtifactId": artifact_id,
+        "sourceHash": digest,
+        "integrity": "verified"
+    });
+    let linked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(linked_profile.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(linked.status(), StatusCode::OK);
+
+    let mut mismatched_profile = design_profile_request("other-project", vec!["astro-website"]);
+    mismatched_profile["profile"]["source"] = linked_profile["profile"]["source"].clone();
+    let mismatched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(mismatched_profile.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+
+    let restarted = http_api::router(config);
+    let metadata = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/design-source-artifacts/{artifact_id}"))
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "source-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::OK);
+
+    let content = restarted
+        .oneshot(
+            Request::builder()
+                .uri(format!("/design-source-artifacts/{artifact_id}/content"))
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "source-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content.status(), StatusCode::OK);
+    assert_eq!(content.headers()["x-design-source-sha256"], digest.as_str());
+    assert_eq!(
+        to_bytes(content.into_body(), 16_384)
+            .await
+            .unwrap()
+            .as_ref(),
+        source
+    );
+
+    fs::write(
+        storage
+            .join("design-source-artifacts")
+            .join(&artifact_id)
+            .join("source.md"),
+        b"tampered",
+    )
+    .unwrap();
+    let corrupted = http_api::router({
+        let mut config = phase_a_contract_config();
+        config.runtime_storage_dir = storage.clone();
+        config.internal_admin_token = Some("source-secret".to_string());
+        config
+    })
+    .oneshot(
+        Request::builder()
+            .uri(format!("/design-source-artifacts/{artifact_id}/content"))
+            .header("x-anydesign-internal", "true")
+            .header("x-runtime-admin-token", "source-secret")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(corrupted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn imported_design_profile_requires_review_before_activation_and_survives_restart() {
+    let storage = unique_temp_dir("design-profile-import-activation");
+    let mut config = phase_a_contract_config();
+    config.runtime_storage_dir = storage.clone();
+    config.internal_admin_token = Some("profile-secret".to_string());
+    let app = http_api::router(config.clone());
+    let source =
+        b"# AuthKit\n\n## Tokens\n\n--color-primary: #663af3;\n\nFrosted glass cathedral.\n";
+    let create_source = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-source-artifacts")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-secret")
+                .body(Body::from(
+                    json!({
+                        "scope": { "projectId": "project-import" },
+                        "fileName": "DESIGN.md",
+                        "mediaType": "text/markdown",
+                        "contentBase64": BASE64_STANDARD.encode(source),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let source_body = to_bytes(create_source.into_body(), 16_384).await.unwrap();
+    let source_json: Value = serde_json::from_slice(&source_body).unwrap();
+    let source_id = source_json["artifact"]["id"].as_str().unwrap();
+
+    let import_body = json!({
+        "name": "AuthKit Imported",
+        "scope": { "projectId": "project-import" },
+        "sourceArtifactId": source_id,
+    });
+    let unauthorized_import = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles/import")
+                .header("content-type", "application/json")
+                .body(Body::from(import_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_import.status(), StatusCode::UNAUTHORIZED);
+
+    let imported = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles/import")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-secret")
+                .body(Body::from(import_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::OK);
+    let imported_body = to_bytes(imported.into_body(), 128_000).await.unwrap();
+    let imported_json: Value = serde_json::from_slice(&imported_body).unwrap();
+    let profile_id = imported_json["designProfileDraft"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        imported_json["designProfileDraft"]["schemaVersion"],
+        "design-profile@2"
+    );
+    assert_eq!(imported_json["designProfileDraft"]["status"], "draft");
+    assert_eq!(
+        imported_json["designProfileDraft"]["candidate"]["tokens"]["color"]["--color-primary"],
+        "#663af3"
+    );
+    assert_eq!(imported_json["conversionReport"]["extractedTokenCount"], 1);
+    assert!(imported_json["conversionReport"]["unmappedItems"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+
+    let bind_draft = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/project-import/design-profile")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "designProfileId": profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bind_draft.status(), StatusCode::CONFLICT);
+
+    let incomplete_activation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/design-profiles/{profile_id}/activate"))
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-secret")
+                .body(Body::from(json!({ "expectedVersion": 1 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(incomplete_activation.status(), StatusCode::CONFLICT);
+    let incomplete_body = to_bytes(incomplete_activation.into_body(), 32_768)
+        .await
+        .unwrap();
+    let incomplete_json: Value = serde_json::from_slice(&incomplete_body).unwrap();
+    assert!(incomplete_json["validationIssues"]
+        .as_array()
+        .is_some_and(|issues| !issues.is_empty()));
+
+    let mut candidate =
+        design_profile_request("project-import", vec!["astro-website"])["profile"].clone();
+    candidate["signatureRules"] = json!([{
+        "id": "authkit-primary",
+        "category": "color",
+        "statement": "The primary action color is AuthKit violet.",
+        "priority": "required",
+        "appliesTo": ["website"],
+        "verification": {
+            "kind": "token",
+            "token": "color.primary",
+            "expected": "#663af3",
+            "comparator": { "kind": "color-equivalent" }
+        }
+    }]);
+    candidate["runtimeTokenMapping"]["color.primary"] = json!("#663af3");
+    let update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/design-profiles/{profile_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "expectedVersion": 1,
+                        "name": "AuthKit Imported",
+                        "profile": candidate,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let stale_update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/design-profiles/{profile_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "expectedVersion": 1,
+                        "name": "Stale",
+                        "profile": {},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+
+    let activated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/design-profiles/{profile_id}/activate"))
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-secret")
+                .body(Body::from(json!({ "expectedVersion": 2 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activated.status(), StatusCode::OK);
+    let activated_body = to_bytes(activated.into_body(), 64_000).await.unwrap();
+    let activated_json: Value = serde_json::from_slice(&activated_body).unwrap();
+    assert_eq!(activated_json["designProfile"]["version"], 3);
+    assert_eq!(activated_json["designProfile"]["status"], "active");
+    assert_eq!(
+        activated_json["designProfile"]["source"]["integrity"],
+        "verified"
+    );
+
+    let fidelity = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/design-profiles/{profile_id}/versions/3/fidelity-report?surface=website&template=astro-website"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fidelity.status(), StatusCode::OK);
+    let fidelity_body = to_bytes(fidelity.into_body(), 64_000).await.unwrap();
+    let fidelity_json: Value = serde_json::from_slice(&fidelity_body).unwrap();
+    assert_eq!(
+        fidelity_json["styleContractVersion"],
+        "runtime-style-contract@p3"
+    );
+    assert_eq!(fidelity_json["sourceHashMatches"], true);
+    assert_eq!(
+        fidelity_json["requiredSignatureRuleIds"],
+        json!(["authkit-primary"])
+    );
+    assert_eq!(
+        fidelity_json["capsuleIncludedRuleIds"],
+        json!(["authkit-primary"])
+    );
+    assert_eq!(fidelity_json["capsuleMissingRuleIds"], json!([]));
+
+    drop(app);
+    let restarted = http_api::router(config);
+    let recovered = restarted
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/design-profiles/{profile_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered_body = to_bytes(recovered.into_body(), 64_000).await.unwrap();
+    let recovered_json: Value = serde_json::from_slice(&recovered_body).unwrap();
+    assert_eq!(recovered_json["designProfile"]["version"], 3);
+
+    let recovered_report = restarted
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/design-profiles/{profile_id}/versions/2/conversion-report"
+                ))
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_report.status(), StatusCode::OK);
+    let report_body = to_bytes(recovered_report.into_body(), 128_000)
+        .await
+        .unwrap();
+    let report_json: Value = serde_json::from_slice(&report_body).unwrap();
+    assert_eq!(report_json["requiredSignatureRuleCount"], 1);
+
+    fs::remove_dir_all(storage).unwrap();
+}
+
+fn design_profile_request_for_scope(
+    project_id: Option<&str>,
+    scope: Value,
+    allowed_templates: Vec<&str>,
+) -> Value {
+    let profile = json!({
+        "status": "active",
+        "scope": scope,
+        "source": { "kind": "manual" },
+        "product": {
+            "name": "AnyDesign Runtime",
+            "category": "agent harness",
+            "audience": ["internal builders"],
+            "primaryUseCases": ["generate websites", "edit docs"],
+            "productQualities": ["reliable", "inspectable"]
+        },
+        "brand": {
+            "voice": {
+                "tone": ["clear", "precise"],
+                "sentenceStyle": "technical",
+                "vocabulary": { "prefer": ["runtime", "evidence"], "avoid": ["magic"] },
+                "writingRules": ["Use concrete status text."]
+            },
+            "messaging": {
+                "headlineStyle": "specific",
+                "bodyStyle": "concise",
+                "ctaStyle": "verb first",
+                "proofStyle": "evidence based",
+                "forbiddenClaims": ["guaranteed"]
+            }
+        },
+        "visual": {
+            "direction": "quiet operational interface",
+            "principles": ["scan friendly"],
+            "moodKeywords": ["calm"],
+            "avoidKeywords": ["flashy"],
+            "composition": {},
+            "imagery": {},
+            "motion": {}
+        },
+        "tokens": {
+            "color": {},
+            "typography": {},
+            "radius": {},
+            "shadow": {},
+            "spacing": {}
+        },
+        "runtimeTokenMapping": {
+            "color.background": "#ffffff",
+            "color.surface": "#f8fafc",
+            "color.surfaceStrong": "#e2e8f0",
+            "color.text": "#0f172a",
+            "color.muted": "#475569",
+            "color.primary": "#2563eb",
+            "color.primaryContrast": "#ffffff",
+            "color.border": "#cbd5e1",
+            "radius.card": "8px",
+            "radius.control": "6px",
+            "font.sans": "Inter, sans-serif",
+            "shadow.soft": "0 1px 2px rgba(15, 23, 42, 0.12)"
+        },
+        "components": {
+            "primitives": {
+                "button": { "intent": "clear action", "usage": ["primary actions"], "avoid": ["overuse"] },
+                "input": { "intent": "precise entry", "usage": ["forms"], "avoid": ["placeholder-only labels"] },
+                "card": { "intent": "group repeated items", "usage": ["lists"], "avoid": ["nested cards"] },
+                "badge": { "intent": "show status", "usage": ["statuses"], "avoid": ["decorative noise"] }
+            }
+        },
+        "content": {},
+        "accessibility": {},
+        "technical": {
+            "allowedTemplates": allowed_templates,
+            "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+            "cssStrategy": "runtime-style-contract",
+            "dependencyPolicy": {},
+            "filePolicy": {
+                "designProfilePath": "/workspace/inputs/design-profile.json",
+                "designMarkdownPath": "/workspace/inputs/design.md",
+                "styleContractPath": "/workspace/state/style-contract.json"
+            }
+        },
+        "governance": { "conflictBehavior": "ask" }
+    });
+    let mut request = json!({
+        "name": "Harness Calm Ops",
+        "profile": profile
+    });
+    if let Some(project_id) = project_id {
+        request["projectId"] = json!(project_id);
+    }
+    request
+}
+
 #[tokio::test]
 async fn root_route_returns_runtime_index_for_browser_access() {
     let app = http_api::router_with_state(AppState {
@@ -146,6 +737,973 @@ async fn root_route_returns_runtime_index_for_browser_access() {
     assert!(body.contains("/health"));
     assert!(body.contains("zeron-real-website-1783303319260"));
     assert!(body.contains("zeron-real-docs-1783303417188"));
+}
+
+#[tokio::test]
+async fn design_profile_api_create_bind_and_resolve_for_runs() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = to_bytes(created.into_body(), 16384).await.unwrap();
+    let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
+    let profile_id = created_payload["designProfile"]["id"].as_str().unwrap();
+    assert_eq!(created_payload["designProfile"]["version"], 1);
+    assert_eq!(
+        created_payload["designProfile"]["schemaVersion"],
+        "design-profile@1"
+    );
+    assert_eq!(
+        created_payload["designProfile"]["components"]["primitives"]["button"]["role"],
+        "clear action"
+    );
+    assert!(
+        created_payload["designProfile"]["components"]["primitives"]["button"]
+            .get("intent")
+            .is_none()
+    );
+
+    let fetched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/design-profiles/{profile_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+
+    let update_profile =
+        design_profile_request("project-1", vec!["astro-website"])["profile"].clone();
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/design-profiles/{profile_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Harness Calm Ops v2",
+                        "profile": update_profile
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated_body = to_bytes(updated.into_body(), 16384).await.unwrap();
+    let updated_payload: Value = serde_json::from_slice(&updated_body).unwrap();
+    assert_eq!(updated_payload["designProfile"]["id"], profile_id);
+    assert_eq!(updated_payload["designProfile"]["version"], 2);
+    assert_eq!(
+        updated_payload["designProfile"]["name"],
+        "Harness Calm Ops v2"
+    );
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles?projectId=project-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = to_bytes(listed.into_body(), 16384).await.unwrap();
+    let listed_payload: Value = serde_json::from_slice(&listed_body).unwrap();
+    assert_eq!(
+        listed_payload["designProfiles"].as_array().unwrap().len(),
+        1
+    );
+
+    let bound = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/project-1/design-profile")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "designProfileId": profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound.status(), StatusCode::OK);
+
+    let active = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-1/design-profile")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let active_body = to_bytes(active.into_body(), 16384).await.unwrap();
+    let active_payload: Value = serde_json::from_slice(&active_body).unwrap();
+    assert_eq!(active_payload["designProfile"]["id"], profile_id);
+
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let started_body = to_bytes(started.into_body(), 4096).await.unwrap();
+    let started_payload: Value = serde_json::from_slice(&started_body).unwrap();
+    let run_id = started_payload["runId"].as_str().unwrap();
+    let run = store.get_run(run_id).await.unwrap();
+    assert_eq!(run.design_profile_id.as_deref(), Some(profile_id));
+    assert_eq!(run.design_profile_version, Some(2));
+    assert!(run.design_profile_hash.is_some());
+
+    let archived = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/design-profiles/{profile_id}/archive"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::OK);
+    let archived_body = to_bytes(archived.into_body(), 16384).await.unwrap();
+    let archived_payload: Value = serde_json::from_slice(&archived_body).unwrap();
+    assert_eq!(archived_payload["designProfile"]["status"], "archived");
+    assert_eq!(archived_payload["designProfile"]["version"], 3);
+
+    let versions = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/design-profiles/{profile_id}/versions"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(versions.status(), StatusCode::OK);
+    let versions_body = to_bytes(versions.into_body(), 16384).await.unwrap();
+    let versions_payload: Value = serde_json::from_slice(&versions_body).unwrap();
+    assert_eq!(versions_payload["designProfileId"], profile_id);
+    let version_numbers = versions_payload["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["version"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(version_numbers, vec![1, 2, 3]);
+
+    let diff = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/design-profiles/{profile_id}/diff?fromVersion=1&toVersion=2"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.status(), StatusCode::OK);
+    let diff_body = to_bytes(diff.into_body(), 16384).await.unwrap();
+    let diff_payload: Value = serde_json::from_slice(&diff_body).unwrap();
+    assert_eq!(diff_payload["fromVersion"], 1);
+    assert_eq!(diff_payload["toVersion"], 2);
+    assert!(diff_payload["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| change["path"] == "name"
+            && change["before"] == "Harness Calm Ops"
+            && change["after"] == "Harness Calm Ops v2"));
+    assert!(!diff_payload["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| matches!(
+            change["path"].as_str(),
+            Some("id" | "version" | "createdAt" | "updatedAt")
+        )));
+
+    let archive_diff = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/design-profiles/{profile_id}/diff?fromVersion=2&toVersion=3"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archive_diff.status(), StatusCode::OK);
+    let archive_diff_body = to_bytes(archive_diff.into_body(), 16384).await.unwrap();
+    let archive_diff_payload: Value = serde_json::from_slice(&archive_diff_body).unwrap();
+    assert!(archive_diff_payload["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| change["path"] == "status"
+            && change["before"] == "active"
+            && change["after"] == "archived"));
+
+    let listed_active = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles?projectId=project-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed_active_body = to_bytes(listed_active.into_body(), 16384).await.unwrap();
+    let listed_active_payload: Value = serde_json::from_slice(&listed_active_body).unwrap();
+    assert_eq!(
+        listed_active_payload["designProfiles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let listed_with_archived = app
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles?projectId=project-1&includeArchived=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed_with_archived_body = to_bytes(listed_with_archived.into_body(), 16384)
+        .await
+        .unwrap();
+    let listed_with_archived_payload: Value =
+        serde_json::from_slice(&listed_with_archived_body).unwrap();
+    assert_eq!(
+        listed_with_archived_payload["designProfiles"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn required_unsupported_extended_token_blocks_build_with_capability_state() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let mut create_request = design_profile_request("project-capability", vec!["astro-website"]);
+    create_request["profile"]["schemaVersion"] = json!("design-profile@2");
+    create_request["profile"]["extendedTokenMapping"] =
+        json!({ "imagery.unsupportedShader": "required" });
+    create_request["profile"]["signatureRules"] = json!([{
+        "id": "unsupported-required-token",
+        "category": "imagery",
+        "statement": "The unsupported shader token is required.",
+        "priority": "required",
+        "appliesTo": ["website"],
+        "verification": {
+            "kind": "token",
+            "token": "imagery.unsupportedShader",
+            "expected": "required",
+            "comparator": { "kind": "exact" }
+        }
+    }]);
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(create_request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = to_bytes(created.into_body(), 32_768).await.unwrap();
+    let created_json: Value = serde_json::from_slice(&created_body).unwrap();
+    let profile_id = created_json["designProfile"]["id"].as_str().unwrap();
+
+    let brief_run = store
+        .create_run(
+            "project-capability".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "builders".to_string(),
+                content_hierarchy: vec!["Home".to_string()],
+                page_structure: json!([]),
+                visual_direction: "specific".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .update_run_status(&brief_run.id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+    let started = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-capability",
+                        "phase": "build",
+                        "agentProfile": "build",
+                        "inputContext": {
+                            "briefId": brief_id,
+                            "designProfileId": profile_id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let started_status = started.status();
+    let started_body = to_bytes(started.into_body(), 16_384).await.unwrap();
+    assert_eq!(
+        started_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&started_body)
+    );
+    let started_json: Value = serde_json::from_slice(&started_body).unwrap();
+    assert_eq!(started_json["status"], "needs_user_input");
+    let run_id = started_json["runId"].as_str().unwrap();
+    let run = store.get_run(run_id).await.unwrap();
+    assert_eq!(
+        run.design_profile_blocking_capability_rule_ids,
+        vec!["unsupported-required-token"]
+    );
+    assert!(store.events(run_id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::StateChanged { state, .. }
+            if state == "needs_user_input:design_profile_capability_gap"
+    )));
+}
+
+#[tokio::test]
+async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-unique", vec!["astro-website"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), 16384).await.unwrap();
+    let first_payload: Value = serde_json::from_slice(&first_body).unwrap();
+    let first_profile_id = first_payload["designProfile"]["id"].as_str().unwrap();
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Second active profile",
+                        "profile": design_profile_request("project-unique", vec!["astro-website"])["profile"].clone()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let second_body = to_bytes(second.into_body(), 4096).await.unwrap();
+    let second_payload: Value = serde_json::from_slice(&second_body).unwrap();
+    assert!(second_payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("already has active design profile"));
+
+    let archived = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/design-profiles/{first_profile_id}/archive"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::OK);
+
+    let second_after_archive = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Second active profile",
+                        "profile": design_profile_request("project-unique", vec!["astro-website"])["profile"].clone()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_after_archive.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn start_run_resolves_design_profile_by_workspace_then_project_precedence() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let workspace_created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request_for_scope(
+                        None,
+                        json!({ "workspaceId": "workspace-1" }),
+                        vec!["astro-website"],
+                    )
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let workspace_body = to_bytes(workspace_created.into_body(), 16384)
+        .await
+        .unwrap();
+    let workspace_payload: Value = serde_json::from_slice(&workspace_body).unwrap();
+    let workspace_profile_id = workspace_payload["designProfile"]["id"].as_str().unwrap();
+
+    let project_created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let project_body = to_bytes(project_created.into_body(), 16384).await.unwrap();
+    let project_payload: Value = serde_json::from_slice(&project_body).unwrap();
+    let project_profile_id = project_payload["designProfile"]["id"].as_str().unwrap();
+
+    let workspace_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "workspaceId": "workspace-1",
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workspace_run.status(), StatusCode::OK);
+    let workspace_run_body = to_bytes(workspace_run.into_body(), 4096).await.unwrap();
+    let workspace_run_payload: Value = serde_json::from_slice(&workspace_run_body).unwrap();
+    let workspace_run_id = workspace_run_payload["runId"].as_str().unwrap();
+    assert_eq!(
+        store
+            .get_run(workspace_run_id)
+            .await
+            .unwrap()
+            .design_profile_id
+            .as_deref(),
+        Some(workspace_profile_id)
+    );
+    store
+        .update_run_status(workspace_run_id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+
+    let bound = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/project-1/design-profile")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "designProfileId": project_profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound.status(), StatusCode::OK);
+
+    let project_run = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "workspaceId": "workspace-1",
+                            "contentSources": [
+                                ContentSource::readable("source-2", "prompt", "Make another website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(project_run.status(), StatusCode::OK);
+    let project_run_body = to_bytes(project_run.into_body(), 4096).await.unwrap();
+    let project_run_payload: Value = serde_json::from_slice(&project_run_body).unwrap();
+    let project_run_id = project_run_payload["runId"].as_str().unwrap();
+    assert_eq!(
+        store
+            .get_run(project_run_id)
+            .await
+            .unwrap()
+            .design_profile_id
+            .as_deref(),
+        Some(project_profile_id)
+    );
+}
+
+#[tokio::test]
+async fn start_run_resolves_design_profile_by_organization_fallback() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request_for_scope(
+                        None,
+                        json!({ "organizationId": "org-1" }),
+                        vec!["astro-website"],
+                    )
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created_body = to_bytes(created.into_body(), 16384).await.unwrap();
+    let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
+    let profile_id = created_payload["designProfile"]["id"].as_str().unwrap();
+
+    let started = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "organizationId": "org-1",
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let started_body = to_bytes(started.into_body(), 4096).await.unwrap();
+    let started_payload: Value = serde_json::from_slice(&started_body).unwrap();
+    let run_id = started_payload["runId"].as_str().unwrap();
+    assert_eq!(
+        store
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .design_profile_id
+            .as_deref(),
+        Some(profile_id)
+    );
+}
+
+#[tokio::test]
+async fn start_run_with_missing_explicit_design_profile_returns_not_found() {
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: RuntimeStore::new(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "brief",
+                        "agentProfile": "brief",
+                        "inputContext": {
+                            "designProfileId": "design-profile-missing",
+                            "contentSources": [
+                                ContentSource::readable("source-1", "prompt", "Make a website")
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn start_run_design_profile_template_conflict_enters_needs_user_input() {
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    store
+        .update_run_status(&brief_run.id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-1", vec!["fumadocs-docs"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(created.into_body(), 16384).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let profile_id = payload["designProfile"]["id"].as_str().unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "projectId": "project-1",
+                        "phase": "build",
+                        "agentProfile": "build",
+                        "inputContext": {
+                            "briefId": brief_id,
+                            "designProfileId": profile_id
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected start run response: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    let response_payload: Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(response_payload["status"], "needs_user_input");
+    let run_id = response_payload["runId"].as_str().unwrap();
+    let run = store.get_run(run_id).await.unwrap();
+    assert_eq!(run.status, AgentRunStatus::NeedsUserInput);
+    assert_eq!(run.design_profile_id.as_deref(), Some(profile_id));
+    assert!(store.events(run_id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StateChanged { state, .. }
+                if state == "needs_user_input:design_profile_conflict"
+        )
+    }));
+    assert!(store
+        .conversation_items("project-1")
+        .await
+        .iter()
+        .any(
+            |item| item.kind == "approval_request" && item.text.contains("DesignProfile conflict")
+        ));
+}
+
+#[tokio::test]
+async fn continue_edit_run_design_profile_conflict_enters_needs_user_input() {
+    let store = RuntimeStore::new();
+    let app = http_api::router_with_state(AppState {
+        config: RuntimeConfig::from_env(),
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(created.into_body(), 16384).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    let profile_id = payload["designProfile"]["id"].as_str().unwrap();
+    let profile = store.get_design_profile(profile_id).await.unwrap();
+    let edit_run = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            None,
+            Some("version-1".to_string()),
+        )
+        .await;
+    let edit_run = store
+        .attach_run_design_profile(&edit_run.id, &profile)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{}/continue", edit_run.id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": "Make the page flashy and loud." }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let response_payload: Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(response_payload["status"], "needs_user_input");
+    let run = store.get_run(&edit_run.id).await.unwrap();
+    assert_eq!(run.status, AgentRunStatus::NeedsUserInput);
+    assert!(store.events(&edit_run.id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StateChanged { state, .. }
+                if state == "needs_user_input:design_profile_conflict"
+        )
+    }));
+    assert!(store
+        .conversation_items("project-1")
+        .await
+        .iter()
+        .any(|item| item.kind == "approval_request"
+            && item.text.contains("visual keyword \"flashy\"")));
+
+    let override_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/runs/{}/continue", edit_run.id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "userMessage": "临时覆盖 DesignProfile，继续执行" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(override_response.status(), StatusCode::OK);
+    let override_body = to_bytes(override_response.into_body(), 4096).await.unwrap();
+    let override_payload: Value = serde_json::from_slice(&override_body).unwrap();
+    assert_eq!(override_payload["status"], "running");
+    assert!(store
+        .conversation_items("project-1")
+        .await
+        .iter()
+        .any(|item| item.kind == "design_profile_override"
+            && item.text.contains("override accepted")
+            && item
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata["designProfileId"] == profile_id)));
 }
 
 #[tokio::test]

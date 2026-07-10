@@ -16,11 +16,14 @@ use crate::{
         },
     },
     types::{
-        AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource, ConversationItem,
+        sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
+        ConversationItem, DesignProfile, DesignProfileConversionReport, DesignProfileDraft,
+        DesignProfileFidelityReport, DesignProfileUnmappedItem, DesignProfileValidationIssue,
+        DesignSourceArtifact, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -29,18 +32,22 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::Utc;
 use futures::stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     convert::Infallible,
     fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
 use tokio::sync::broadcast;
+
+const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
+const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = (MAX_DESIGN_SOURCE_BYTES + 2) / 3 * 4;
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -94,6 +101,60 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/runs/{run_id}/cancel", post(cancel_run))
         .route("/runs/{run_id}/events", get(stream_run_events))
         .route(
+            "/design-source-artifacts",
+            post(create_design_source_artifact)
+                .layer(DefaultBodyLimit::max(MAX_DESIGN_SOURCE_REQUEST_BYTES)),
+        )
+        .route(
+            "/design-source-artifacts/{artifact_id}",
+            get(get_design_source_artifact),
+        )
+        .route(
+            "/design-source-artifacts/{artifact_id}/content",
+            get(get_design_source_artifact_content),
+        )
+        .route(
+            "/design-profiles",
+            post(create_design_profile).get(list_design_profiles),
+        )
+        .route("/design-profiles/import", post(import_design_profile))
+        .route(
+            "/design-profiles/{design_profile_id}",
+            get(get_design_profile).put(update_design_profile),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/versions",
+            get(design_profile_versions),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/diff",
+            get(design_profile_diff),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/archive",
+            post(archive_design_profile),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/activate",
+            post(activate_design_profile),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/conversion-report",
+            get(current_design_profile_conversion_report),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/versions/{version}/conversion-report",
+            get(versioned_design_profile_conversion_report),
+        )
+        .route(
+            "/design-profiles/{design_profile_id}/versions/{version}/fidelity-report",
+            get(design_profile_fidelity_report),
+        )
+        .route(
+            "/projects/{project_id}/design-profile",
+            post(bind_project_design_profile).get(project_design_profile),
+        )
+        .route(
             "/projects/{project_id}/conversation",
             get(project_conversation),
         )
@@ -115,6 +176,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/artifacts/{project_id}/current/{*artifact_path}",
             get(artifact_current_file),
         )
+        .route("/_next/{*artifact_path}", get(next_artifact_asset_file))
         .route("/internal/template-build", post(internal_template_build))
         .route("/internal/previews/promote", post(internal_promote_preview))
         .route(
@@ -184,6 +246,10 @@ pub struct StartRunInputContext {
     pub base_version_id: Option<String>,
     pub sandbox_binding_id: Option<String>,
     pub parent_run_id: Option<String>,
+    pub design_profile_id: Option<String>,
+    pub design_fidelity_mode: Option<String>,
+    pub workspace_id: Option<String>,
+    pub organization_id: Option<String>,
     #[serde(default)]
     pub finding_ids: Vec<String>,
 }
@@ -231,6 +297,148 @@ pub struct RunStatusResponse {
     #[serde(rename = "runId")]
     pub run_id: String,
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDesignSourceArtifactRequest {
+    pub scope: Value,
+    pub file_name: String,
+    pub media_type: String,
+    pub content_base64: String,
+    pub client_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DesignSourceArtifactResponse {
+    pub artifact: DesignSourceArtifact,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDesignProfileRequest {
+    pub name: String,
+    pub scope: Value,
+    pub source_artifact_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDesignProfileResponse {
+    pub design_profile_draft: DesignProfileDraft,
+    pub conversion_report: DesignProfileConversionReport,
+    pub requires_review: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateDesignProfileRequest {
+    pub expected_version: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivationConflictResponse {
+    pub error: String,
+    pub current_version: u32,
+    pub validation_issues: Vec<DesignProfileValidationIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDesignProfileRequest {
+    pub project_id: Option<String>,
+    pub name: String,
+    pub profile: Option<Value>,
+    #[serde(flatten)]
+    pub legacy_profile: Map<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDesignProfileRequest {
+    pub expected_version: Option<u32>,
+    pub name: String,
+    pub profile: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileResponse {
+    pub design_profile: DesignProfile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<DesignProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindProjectDesignProfileRequest {
+    pub design_profile_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDesignProfileResponse {
+    pub project_id: String,
+    pub design_profile: Option<DesignProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<DesignProfile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDesignProfilesQuery {
+    pub project_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub organization_id: Option<String>,
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDesignProfilesResponse {
+    pub design_profiles: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileDiffQuery {
+    pub from_version: u32,
+    pub to_version: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileFidelityQuery {
+    pub surface: Option<String>,
+    pub template: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileVersionsResponse {
+    pub design_profile_id: String,
+    pub versions: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileDiffResponse {
+    pub design_profile_id: String,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub changes: Vec<DesignProfileDiffChange>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignProfileDiffChange {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -361,6 +569,918 @@ fn default_true() -> bool {
     true
 }
 
+async fn create_design_source_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDesignSourceArtifactRequest>,
+) -> Result<Json<DesignSourceArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    if request.content_base64.len() > MAX_DESIGN_SOURCE_BASE64_BYTES {
+        return Err(bad_request(format!(
+            "contentBase64 exceeds the {MAX_DESIGN_SOURCE_BYTES}-byte decoded source limit"
+        )));
+    }
+    let content = BASE64_STANDARD
+        .decode(request.content_base64.as_bytes())
+        .map_err(|_| bad_request("contentBase64 must be valid base64".to_string()))?;
+    if content.len() > MAX_DESIGN_SOURCE_BYTES {
+        return Err(bad_request(format!(
+            "decoded design source exceeds {MAX_DESIGN_SOURCE_BYTES} bytes"
+        )));
+    }
+    let digest = sha256_hex(&content);
+    if let Some(client_sha256) = request.client_sha256.as_deref() {
+        if client_sha256.len() != 64 || !client_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(bad_request(
+                "clientSha256 must be a 64-character hexadecimal digest".to_string(),
+            ));
+        }
+        if !digest.eq_ignore_ascii_case(client_sha256) {
+            return Err(bad_request(
+                "clientSha256 does not match decoded design source bytes".to_string(),
+            ));
+        }
+    }
+    let artifact = state
+        .store
+        .create_design_source_artifact(
+            request.scope,
+            request.file_name,
+            request.media_type,
+            content,
+        )
+        .await
+        .map_err(design_source_error)?;
+    Ok(Json(DesignSourceArtifactResponse { artifact }))
+}
+
+async fn get_design_source_artifact(
+    State(state): State<AppState>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DesignSourceArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    validate_required_string("artifactId", &artifact_id)?;
+    let artifact = state
+        .store
+        .get_design_source_artifact(&artifact_id)
+        .await
+        .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
+    Ok(Json(DesignSourceArtifactResponse { artifact }))
+}
+
+async fn get_design_source_artifact_content(
+    State(state): State<AppState>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    validate_required_string("artifactId", &artifact_id)?;
+    let artifact = state
+        .store
+        .get_design_source_artifact(&artifact_id)
+        .await
+        .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
+    let content = state
+        .store
+        .read_design_source_artifact_content(&artifact_id)
+        .await
+        .map_err(design_source_error)?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&format!("{}; charset=utf-8", artifact.media_type)).map_err(
+            |_| internal_error(anyhow::anyhow!("invalid stored design source media type")),
+        )?,
+    );
+    response_headers.insert(
+        "x-design-source-sha256",
+        HeaderValue::from_str(&artifact.sha256)
+            .map_err(|_| internal_error(anyhow::anyhow!("invalid stored design source hash")))?,
+    );
+    response_headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok((response_headers, content))
+}
+
+async fn import_design_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ImportDesignProfileRequest>,
+) -> Result<Json<ImportDesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    validate_required_string("name", &request.name)?;
+    crate::types::validate_design_source_scope(&request.scope).map_err(bad_request)?;
+    let artifact = state
+        .store
+        .get_design_source_artifact(&request.source_artifact_id)
+        .await
+        .ok_or_else(|| {
+            not_found(format!(
+                "design source artifact not found: {}",
+                request.source_artifact_id
+            ))
+        })?;
+    if artifact.scope != request.scope {
+        return Err(bad_request(
+            "design source artifact scope must exactly match import scope".to_string(),
+        ));
+    }
+    let content = state
+        .store
+        .read_design_source_artifact_content(&artifact.id)
+        .await
+        .map_err(design_source_error)?;
+    let source = std::str::from_utf8(&content)
+        .map_err(|_| bad_request("design source artifact content must be UTF-8".to_string()))?;
+    let now = Utc::now();
+    let profile_id = state.store.next_id("design-profile");
+    let report_id = state.store.next_id("design-profile-conversion-report");
+    let parsed = parse_design_profile_source(source);
+    let converter_version = "design-profile-import@1";
+    let candidate = json!({
+        "visual": {
+            "direction": parsed.headings.first().cloned().unwrap_or_else(|| request.name.clone()),
+            "principles": [],
+            "moodKeywords": [],
+            "avoidKeywords": [],
+            "composition": {},
+            "imagery": {},
+            "motion": {}
+        },
+        "tokens": {
+            "color": parsed.tokens,
+            "typography": {},
+            "radius": {},
+            "shadow": {},
+            "spacing": {}
+        },
+        "signatureRules": []
+    });
+    let validation_issues = design_profile_candidate_issues(&candidate, true);
+    let source_metadata = json!({
+        "kind": "imported",
+        "sourceArtifactIds": [artifact.id.clone()],
+        "primarySourceArtifactId": artifact.id.clone(),
+        "sourceHash": artifact.sha256.clone(),
+        "converterVersion": converter_version,
+        "importedAt": now,
+        "integrity": "verified"
+    });
+    let draft = DesignProfileDraft {
+        id: profile_id.clone(),
+        schema_version: DESIGN_PROFILE_SCHEMA_V2.to_string(),
+        version: 1,
+        name: request.name,
+        status: "draft".to_string(),
+        scope: request.scope,
+        source: source_metadata,
+        candidate,
+        conversion_report_id: report_id.clone(),
+        validation_issues,
+        created_at: now,
+        updated_at: now,
+    };
+    let report = DesignProfileConversionReport {
+        id: report_id,
+        design_profile_id: profile_id,
+        profile_version: 1,
+        converter_version: converter_version.to_string(),
+        deterministic_parser_version: "markdown-css-parser@1".to_string(),
+        source_artifact_id: artifact.id,
+        source_hash: artifact.sha256,
+        extracted_sections: parsed.headings,
+        extracted_token_count: parsed.extracted_token_count,
+        extracted_component_count: parsed.extracted_component_count,
+        required_signature_rule_count: 0,
+        unmapped_items: parsed.unmapped_items,
+        warnings: parsed.warnings,
+        created_at: now,
+    };
+    let (draft, report) = state
+        .store
+        .create_design_profile_draft(draft, report)
+        .await
+        .map_err(design_profile_error)?;
+    Ok(Json(ImportDesignProfileResponse {
+        design_profile_draft: draft,
+        conversion_report: report,
+        requires_review: true,
+    }))
+}
+
+async fn create_design_profile(
+    State(state): State<AppState>,
+    Json(request): Json<CreateDesignProfileRequest>,
+) -> Result<Json<DesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_create_design_profile_request(&request)?;
+    let now = Utc::now();
+    let id = state.store.next_id("design-profile");
+    let payload = design_profile_payload_from_request(&request)?;
+    let mut profile = DesignProfile {
+        id,
+        schema_version: payload
+            .get("schemaVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(crate::types::DESIGN_PROFILE_SCHEMA_V1)
+            .to_string(),
+        name: request.name.clone(),
+        status: payload_string(&payload, "status")?,
+        version: 1,
+        scope: scope_with_project_id(
+            payload_value(&payload, "scope").unwrap_or(Value::Null),
+            request.project_id.as_deref(),
+        ),
+        source: payload_value(&payload, "source").unwrap_or_else(|| json!({ "kind": "manual" })),
+        product: payload_required_value(&payload, "product")?,
+        brand: payload_required_value(&payload, "brand")?,
+        visual: payload_required_value(&payload, "visual")?,
+        tokens: payload_required_value(&payload, "tokens")?,
+        runtime_token_mapping: payload_required_value(&payload, "runtimeTokenMapping")?,
+        extended_token_mapping: payload_value(&payload, "extendedTokenMapping")
+            .unwrap_or_else(|| json!({})),
+        components: payload_required_value(&payload, "components")?,
+        content: payload_required_value(&payload, "content")?,
+        accessibility: payload_required_value(&payload, "accessibility")?,
+        technical: payload_required_value(&payload, "technical")?,
+        governance: payload_required_value(&payload, "governance")?,
+        signature_rules: payload
+            .get("signatureRules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        overrides: payload_value(&payload, "overrides").unwrap_or_else(|| json!({})),
+        created_at: now,
+        updated_at: now,
+    };
+    normalize_design_profile_component_roles(&mut profile.components)?;
+    validate_design_profile_source_reference(&state.store, &profile).await?;
+    let profile = state
+        .store
+        .create_design_profile(profile)
+        .await
+        .map_err(design_profile_error)?;
+    Ok(Json(DesignProfileResponse {
+        design_profile: profile.clone(),
+        profile: Some(profile),
+    }))
+}
+
+async fn list_design_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<ListDesignProfilesQuery>,
+) -> Result<Json<ListDesignProfilesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_optional_string("projectId", query.project_id.as_deref())?;
+    validate_optional_string("workspaceId", query.workspace_id.as_deref())?;
+    validate_optional_string("organizationId", query.organization_id.as_deref())?;
+    let active_profiles = state
+        .store
+        .list_design_profiles(
+            query.project_id.as_deref(),
+            query.workspace_id.as_deref(),
+            query.organization_id.as_deref(),
+            query.include_archived,
+        )
+        .await;
+    let drafts = state
+        .store
+        .list_design_profile_drafts(
+            query.project_id.as_deref(),
+            query.workspace_id.as_deref(),
+            query.organization_id.as_deref(),
+        )
+        .await;
+    let active_ids = active_profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut design_profiles = active_profiles
+        .into_iter()
+        .map(|profile| serde_json::to_value(profile).unwrap_or(Value::Null))
+        .collect::<Vec<_>>();
+    design_profiles.extend(
+        drafts
+            .into_iter()
+            .filter(|draft| !active_ids.contains(&draft.id))
+            .map(|draft| serde_json::to_value(draft).unwrap_or(Value::Null)),
+    );
+    Ok(Json(ListDesignProfilesResponse { design_profiles }))
+}
+
+async fn get_design_profile(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("designProfileId", &design_profile_id)?;
+    if let Some(profile) = state.store.get_design_profile(&design_profile_id).await {
+        return Ok(Json(json!({
+            "designProfile": profile,
+            "profile": profile,
+        })));
+    }
+    let draft = state
+        .store
+        .get_design_profile_draft(&design_profile_id)
+        .await
+        .ok_or_else(|| not_found(format!("design profile not found: {design_profile_id}")))?;
+    Ok(Json(json!({
+        "designProfile": draft,
+        "profile": draft,
+    })))
+}
+
+async fn design_profile_versions(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+) -> Result<Json<DesignProfileVersionsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("designProfileId", &design_profile_id)?;
+    let active_versions = state
+        .store
+        .design_profile_versions(&design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    let draft_versions = state
+        .store
+        .design_profile_draft_versions(&design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    let mut versions = active_versions
+        .into_iter()
+        .map(|profile| serde_json::to_value(profile).unwrap_or(Value::Null))
+        .chain(
+            draft_versions
+                .into_iter()
+                .map(|draft| serde_json::to_value(draft).unwrap_or(Value::Null)),
+        )
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|record| record.get("version").and_then(Value::as_u64).unwrap_or(0));
+    if versions.is_empty() {
+        return Err(not_found(format!(
+            "design profile not found: {design_profile_id}"
+        )));
+    }
+    Ok(Json(DesignProfileVersionsResponse {
+        design_profile_id,
+        versions,
+    }))
+}
+
+async fn design_profile_diff(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+    Query(query): Query<DesignProfileDiffQuery>,
+) -> Result<Json<DesignProfileDiffResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("designProfileId", &design_profile_id)?;
+    if query.from_version == 0 || query.to_version == 0 {
+        return Err(bad_request(
+            "fromVersion and toVersion must be positive".to_string(),
+        ));
+    }
+    let versions = state
+        .store
+        .design_profile_versions(&design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    if versions.is_empty() {
+        return Err(not_found(format!(
+            "design profile not found: {design_profile_id}"
+        )));
+    }
+    let from_profile = versions
+        .iter()
+        .find(|profile| profile.version == query.from_version)
+        .ok_or_else(|| {
+            not_found(format!(
+                "design profile version not found: {design_profile_id}@{}",
+                query.from_version
+            ))
+        })?;
+    let to_profile = versions
+        .iter()
+        .find(|profile| profile.version == query.to_version)
+        .ok_or_else(|| {
+            not_found(format!(
+                "design profile version not found: {design_profile_id}@{}",
+                query.to_version
+            ))
+        })?;
+    let changes = diff_design_profiles(from_profile, to_profile);
+    Ok(Json(DesignProfileDiffResponse {
+        design_profile_id,
+        from_version: query.from_version,
+        to_version: query.to_version,
+        changes,
+    }))
+}
+
+async fn archive_design_profile(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+) -> Result<Json<DesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("designProfileId", &design_profile_id)?;
+    let profile = state
+        .store
+        .archive_design_profile(&design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    Ok(Json(DesignProfileResponse {
+        design_profile: profile.clone(),
+        profile: Some(profile),
+    }))
+}
+
+async fn activate_design_profile(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<ActivateDesignProfileRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_design_source_authorization(&state.config, &headers)
+        .map_err(error_response_as_value)?;
+    let draft = state
+        .store
+        .get_design_profile_draft(&design_profile_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("design profile draft not found: {design_profile_id}") })),
+            )
+        })?;
+    if draft.version != request.expected_version {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "design profile version conflict",
+                "currentVersion": draft.version,
+                "validationIssues": draft.validation_issues,
+            })),
+        ));
+    }
+
+    let now = Utc::now();
+    let mut value = draft.candidate.clone();
+    let object = value.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "draft candidate must be an object",
+                "currentVersion": draft.version,
+                "validationIssues": [{
+                    "path": "candidate",
+                    "code": "invalid_type",
+                    "message": "candidate must be an object",
+                    "blocking": true
+                }]
+            })),
+        )
+    })?;
+    object.insert("id".to_string(), json!(draft.id));
+    object.insert("schemaVersion".to_string(), json!(DESIGN_PROFILE_SCHEMA_V2));
+    object.insert("name".to_string(), json!(draft.name));
+    object.insert("status".to_string(), json!("active"));
+    object.insert("version".to_string(), json!(draft.version + 1));
+    object.insert("scope".to_string(), draft.scope.clone());
+    object.insert("source".to_string(), draft.source.clone());
+    object.insert("createdAt".to_string(), json!(draft.created_at));
+    object.insert("updatedAt".to_string(), json!(now));
+    let mut profile: DesignProfile = serde_json::from_value(value).map_err(|error| {
+        let issues = design_profile_candidate_issues(&draft.candidate, true);
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("draft activation validation failed: {error}"),
+                "currentVersion": draft.version,
+                "validationIssues": issues,
+            })),
+        )
+    })?;
+    normalize_design_profile_component_roles(&mut profile.components)
+        .map_err(error_response_as_value)?;
+    if let Err(error) = profile.validate_for_runtime() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("draft activation validation failed: {error}"),
+                "currentVersion": draft.version,
+                "validationIssues": [{
+                    "path": "candidate",
+                    "code": "runtime_validation",
+                    "message": error,
+                    "blocking": true
+                }]
+            })),
+        ));
+    }
+    validate_design_profile_source_reference(&state.store, &profile)
+        .await
+        .map_err(error_response_as_value)?;
+    let profile = state
+        .store
+        .create_design_profile(profile)
+        .await
+        .map_err(|error| error_response_as_value(design_profile_error(error)))?;
+    Ok(Json(json!({
+        "designProfile": profile,
+        "profile": profile,
+    })))
+}
+
+async fn current_design_profile_conversion_report(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DesignProfileConversionReport>, (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    let report = state
+        .store
+        .design_profile_conversion_report(&design_profile_id, None)
+        .await
+        .map_err(design_profile_error)?
+        .ok_or_else(|| {
+            not_found(format!(
+                "design profile conversion report not found: {design_profile_id}"
+            ))
+        })?;
+    Ok(Json(report))
+}
+
+async fn versioned_design_profile_conversion_report(
+    State(state): State<AppState>,
+    Path((design_profile_id, version)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Result<Json<DesignProfileConversionReport>, (StatusCode, Json<ErrorResponse>)> {
+    require_design_source_authorization(&state.config, &headers)?;
+    if version == 0 {
+        return Err(bad_request("version must be positive".to_string()));
+    }
+    let report = state
+        .store
+        .design_profile_conversion_report(&design_profile_id, Some(version))
+        .await
+        .map_err(design_profile_error)?
+        .ok_or_else(|| {
+            not_found(format!(
+                "design profile conversion report not found: {design_profile_id}@{version}"
+            ))
+        })?;
+    Ok(Json(report))
+}
+
+async fn design_profile_fidelity_report(
+    State(state): State<AppState>,
+    Path((design_profile_id, version)): Path<(String, u32)>,
+    Query(query): Query<DesignProfileFidelityQuery>,
+) -> Result<Json<DesignProfileFidelityReport>, (StatusCode, Json<ErrorResponse>)> {
+    let surface = query
+        .surface
+        .as_deref()
+        .ok_or_else(|| bad_request("surface is required".to_string()))?;
+    let template = query
+        .template
+        .as_deref()
+        .ok_or_else(|| bad_request("template is required".to_string()))?;
+    if version == 0 {
+        return Err(bad_request("version must be positive".to_string()));
+    }
+    let versions = state
+        .store
+        .design_profile_versions(&design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    let profile = versions
+        .into_iter()
+        .find(|profile| profile.version == version)
+        .ok_or_else(|| {
+            not_found(format!(
+                "design profile version not found: {design_profile_id}@{version}"
+            ))
+        })?;
+    let effective = profile
+        .effective_for(surface, template)
+        .map_err(bad_request)?;
+    let materialized: DesignProfile = serde_json::from_value(effective.profile.clone())
+        .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+    let capsule =
+        crate::agent_loop::render_design_profile_markdown(&materialized).map_err(internal_error)?;
+    let mut required_signature_rule_ids = materialized
+        .signature_rules
+        .iter()
+        .filter(|rule| rule.get("priority").and_then(Value::as_str) == Some("required"))
+        .filter(|rule| signature_rule_applies_to_surface(rule, surface))
+        .filter_map(|rule| {
+            rule.get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    required_signature_rule_ids.sort();
+    let capsule_included_rule_ids = required_signature_rule_ids
+        .iter()
+        .filter(|id| capsule.contains(&format!("[{id}]")))
+        .cloned()
+        .collect::<Vec<_>>();
+    let capsule_missing_rule_ids = required_signature_rule_ids
+        .iter()
+        .filter(|id| !capsule_included_rule_ids.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unsupported_extended_tokens =
+        unsupported_extended_tokens_for_template(&materialized.extended_token_mapping, template);
+
+    let source_integrity = profile
+        .source
+        .get("integrity")
+        .and_then(Value::as_str)
+        .unwrap_or(
+            if profile.schema_version == crate::types::DESIGN_PROFILE_SCHEMA_V1 {
+                "unverified"
+            } else {
+                "missing"
+            },
+        )
+        .to_string();
+    let source_hash_matches = if let Some(artifact_id) = profile
+        .source
+        .get("primarySourceArtifactId")
+        .and_then(Value::as_str)
+    {
+        match state.store.get_design_source_artifact(artifact_id).await {
+            Some(artifact) => Some(
+                profile.source.get("sourceHash").and_then(Value::as_str)
+                    == Some(artifact.sha256.as_str())
+                    && state
+                        .store
+                        .read_design_source_artifact_content(artifact_id)
+                        .await
+                        .is_ok(),
+            ),
+            None => Some(false),
+        }
+    } else {
+        None
+    };
+    let mut warnings = Vec::new();
+    if source_hash_matches == Some(false) {
+        warnings.push("source artifact integrity verification failed".to_string());
+    }
+    if !unsupported_extended_tokens.is_empty() {
+        warnings.push(format!(
+            "template does not support extended tokens: {}",
+            unsupported_extended_tokens.join(", ")
+        ));
+    }
+    if !capsule_missing_rule_ids.is_empty() {
+        warnings.push("Design Capsule is missing required signature rules".to_string());
+    }
+    Ok(Json(DesignProfileFidelityReport {
+        design_profile_id,
+        version,
+        schema_version: profile.schema_version,
+        surface: surface.to_string(),
+        template: template.to_string(),
+        style_contract_version: if matches!(template, "astro-website" | "fumadocs-docs") {
+            "runtime-style-contract@p3".to_string()
+        } else {
+            "runtime-style-contract@p2".to_string()
+        },
+        effective_profile_hash: effective.effective_profile_hash,
+        source_integrity,
+        source_hash_matches,
+        required_signature_rule_ids,
+        capsule_included_rule_ids,
+        capsule_missing_rule_ids,
+        unsupported_extended_tokens,
+        warnings,
+    }))
+}
+
+async fn update_design_profile(
+    State(state): State<AppState>,
+    Path(design_profile_id): Path<String>,
+    Json(request): Json<UpdateDesignProfileRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("designProfileId", &design_profile_id)?;
+    validate_required_string("name", &request.name)?;
+    let existing = state.store.get_design_profile(&design_profile_id).await;
+    if existing.is_none() {
+        let _draft = state
+            .store
+            .get_design_profile_draft(&design_profile_id)
+            .await
+            .ok_or_else(|| not_found(format!("design profile not found: {design_profile_id}")))?;
+        let expected_version = request.expected_version.ok_or_else(|| {
+            bad_request("expectedVersion is required when updating a draft".to_string())
+        })?;
+        let issues = design_profile_candidate_issues(&request.profile, true);
+        let updated = state
+            .store
+            .update_design_profile_draft(
+                &design_profile_id,
+                expected_version,
+                request.name,
+                request.profile,
+                issues,
+            )
+            .await
+            .map_err(design_profile_error)?;
+        return Ok(Json(json!({
+            "designProfile": updated,
+            "profile": updated,
+        })));
+    }
+    let existing = existing.expect("existing design profile checked above");
+    if existing.schema_version == DESIGN_PROFILE_SCHEMA_V2 {
+        let expected_version = request.expected_version.ok_or_else(|| {
+            bad_request("expectedVersion is required when updating a V2 profile".to_string())
+        })?;
+        if expected_version != existing.version {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!(
+                        "design profile version conflict: expected {expected_version}, current {}",
+                        existing.version
+                    ),
+                }),
+            ));
+        }
+    }
+    let payload = request
+        .profile
+        .as_object()
+        .cloned()
+        .ok_or_else(|| bad_request("profile must be an object".to_string()))?;
+    let now = Utc::now();
+    let mut profile = DesignProfile {
+        id: existing.id,
+        schema_version: payload
+            .get("schemaVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(&existing.schema_version)
+            .to_string(),
+        name: request.name,
+        status: payload_string(&payload, "status")?,
+        version: existing.version + 1,
+        scope: payload_required_value(&payload, "scope")?,
+        source: payload_value(&payload, "source").unwrap_or(existing.source),
+        product: payload_required_value(&payload, "product")?,
+        brand: payload_required_value(&payload, "brand")?,
+        visual: payload_required_value(&payload, "visual")?,
+        tokens: payload_required_value(&payload, "tokens")?,
+        runtime_token_mapping: payload_required_value(&payload, "runtimeTokenMapping")?,
+        extended_token_mapping: payload_value(&payload, "extendedTokenMapping")
+            .unwrap_or(existing.extended_token_mapping),
+        components: payload_required_value(&payload, "components")?,
+        content: payload_required_value(&payload, "content")?,
+        accessibility: payload_required_value(&payload, "accessibility")?,
+        technical: payload_required_value(&payload, "technical")?,
+        governance: payload_required_value(&payload, "governance")?,
+        signature_rules: payload
+            .get("signatureRules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or(existing.signature_rules),
+        overrides: payload_value(&payload, "overrides").unwrap_or(existing.overrides),
+        created_at: existing.created_at,
+        updated_at: now,
+    };
+    normalize_design_profile_component_roles(&mut profile.components)?;
+    validate_design_profile_source_reference(&state.store, &profile).await?;
+    let profile = state
+        .store
+        .create_design_profile(profile)
+        .await
+        .map_err(design_profile_error)?;
+    Ok(Json(json!({
+        "designProfile": profile,
+        "profile": profile,
+    })))
+}
+
+fn diff_design_profiles(
+    from_profile: &DesignProfile,
+    to_profile: &DesignProfile,
+) -> Vec<DesignProfileDiffChange> {
+    let mut from_value = serde_json::to_value(from_profile).unwrap_or(Value::Null);
+    let mut to_value = serde_json::to_value(to_profile).unwrap_or(Value::Null);
+    remove_design_profile_diff_metadata(&mut from_value);
+    remove_design_profile_diff_metadata(&mut to_value);
+    let mut changes = Vec::new();
+    collect_value_diff("", &from_value, &to_value, &mut changes);
+    changes
+}
+
+fn remove_design_profile_diff_metadata(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["id", "version", "createdAt", "updatedAt"] {
+        object.remove(key);
+    }
+}
+
+fn collect_value_diff(
+    path: &str,
+    before: &Value,
+    after: &Value,
+    changes: &mut Vec<DesignProfileDiffChange>,
+) {
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (Value::Object(before_object), Value::Object(after_object)) => {
+            let keys = before_object
+                .keys()
+                .chain(after_object.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match (before_object.get(&key), after_object.get(&key)) {
+                    (Some(before_child), Some(after_child)) => {
+                        collect_value_diff(&child_path, before_child, after_child, changes);
+                    }
+                    (Some(before_child), None) => changes.push(DesignProfileDiffChange {
+                        path: child_path,
+                        before: Some(before_child.clone()),
+                        after: None,
+                    }),
+                    (None, Some(after_child)) => changes.push(DesignProfileDiffChange {
+                        path: child_path,
+                        before: None,
+                        after: Some(after_child.clone()),
+                    }),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => changes.push(DesignProfileDiffChange {
+            path: path.to_string(),
+            before: Some(before.clone()),
+            after: Some(after.clone()),
+        }),
+    }
+}
+
+async fn bind_project_design_profile(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<BindProjectDesignProfileRequest>,
+) -> Result<Json<ProjectDesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("projectId", &project_id)?;
+    validate_required_string("designProfileId", &request.design_profile_id)?;
+    if state
+        .store
+        .get_design_profile(&request.design_profile_id)
+        .await
+        .is_none()
+        && state
+            .store
+            .get_design_profile_draft(&request.design_profile_id)
+            .await
+            .is_some()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "draft design profile cannot be bound to a project".to_string(),
+            }),
+        ));
+    }
+    let profile = state
+        .store
+        .bind_project_design_profile(&project_id, &request.design_profile_id)
+        .await
+        .map_err(design_profile_error)?;
+    Ok(Json(ProjectDesignProfileResponse {
+        project_id,
+        design_profile: Some(profile.clone()),
+        profile: Some(profile),
+    }))
+}
+
+async fn project_design_profile(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectDesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("projectId", &project_id)?;
+    let profile = state.store.project_design_profile(&project_id).await;
+    Ok(Json(ProjectDesignProfileResponse {
+        project_id,
+        design_profile: profile.clone(),
+        profile,
+    }))
+}
+
 async fn start_run(
     State(state): State<AppState>,
     Json(request): Json<StartRunRequest>,
@@ -368,6 +1488,10 @@ async fn start_run(
     validate_start_run_request(&request)?;
     validate_sandbox_context(&state.store, &request).await?;
     validate_project_lifecycle_context(&state.store, &request).await?;
+    let design_profile = resolve_design_profile_context(&state.store, &request).await?;
+    let design_profile_target = design_profile_execution_target(&state.store, &request).await?;
+    let design_profile_conflict =
+        preflight_design_profile_conflicts(&state.store, &request, design_profile.as_ref()).await?;
     let content_sources = merge_content_sources(
         inherited_build_content_sources(&state.store, &request).await,
         request.input_context.content_sources.clone(),
@@ -413,6 +1537,188 @@ async fn start_run(
             )
             .await
     };
+    let run = if let Some(profile) = design_profile.as_ref() {
+        let effective_target = if design_profile_conflict.is_none() {
+            design_profile_target.as_ref()
+        } else {
+            None
+        };
+        if let Some((surface, template)) = effective_target {
+            state
+                .store
+                .attach_run_effective_design_profile(
+                    &run.id,
+                    profile,
+                    Some(surface),
+                    Some(template),
+                )
+                .await
+                .map_err(design_profile_error)?
+        } else {
+            state
+                .store
+                .attach_run_design_profile(&run.id, profile)
+                .await
+                .map_err(design_profile_error)?
+        }
+    } else {
+        run
+    };
+    let run = if let Some(profile) = design_profile.as_ref() {
+        let configured = state
+            .store
+            .configure_run_design_fidelity(
+                &run.id,
+                profile,
+                request.input_context.design_fidelity_mode.as_deref(),
+            )
+            .await
+            .map_err(design_profile_error)?;
+        if let Some(mode) = request.input_context.design_fidelity_mode.as_deref() {
+            state
+                .store
+                .append_audit_record(
+                    &run.project_id,
+                    &run.id,
+                    "design_profile.fidelity_mode",
+                    format!("mode={mode}"),
+                    "allow",
+                    "explicit StartRun input",
+                )
+                .await;
+        }
+        configured
+    } else {
+        run
+    };
+    if let Some(profile) = design_profile.as_ref() {
+        if let Some((blocked_state, message)) =
+            design_profile_prebuild_failure(&state.store, &run, profile).await
+        {
+            state
+                .store
+                .append_conversation_item(
+                    &run.project_id,
+                    Some(&run.id),
+                    "approval_request",
+                    Some("assistant"),
+                    &message,
+                    Some(json!({
+                        "state": blocked_state,
+                        "designProfileId": profile.id,
+                    })),
+                )
+                .await;
+            state
+                .store
+                .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+                .await
+                .map_err(conflict_error)?;
+            state
+                .store
+                .append_event(AgentEvent::StateChanged {
+                    run_id: run.id.clone(),
+                    state: blocked_state,
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(internal_error)?;
+            return Ok(Json(StartRunResponse {
+                run_id: run.id,
+                status: "needs_user_input",
+            }));
+        }
+    }
+    if !run.design_profile_unsupported_extended_tokens.is_empty() {
+        state
+            .store
+            .append_audit_record(
+                &run.project_id,
+                &run.id,
+                "design_profile.capability_gap",
+                format!(
+                    "unsupportedExtendedTokens={}",
+                    run.design_profile_unsupported_extended_tokens.join(",")
+                ),
+                if run.design_profile_blocking_capability_rule_ids.is_empty() {
+                    "allow"
+                } else {
+                    "ask"
+                },
+                "effective profile versus template style contract",
+            )
+            .await;
+    }
+    if !run.design_profile_blocking_capability_rule_ids.is_empty() {
+        state
+            .store
+            .append_conversation_item(
+                &run.project_id,
+                Some(&run.id),
+                "approval_request",
+                Some("assistant"),
+                "Required DesignProfile rules depend on template capabilities that are not supported.",
+                Some(json!({
+                    "state": "needs_user_input:design_profile_capability_gap",
+                    "ruleIds": run.design_profile_blocking_capability_rule_ids,
+                    "unsupportedExtendedTokens": run.design_profile_unsupported_extended_tokens,
+                })),
+            )
+            .await;
+        state
+            .store
+            .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+            .await
+            .map_err(conflict_error)?;
+        state
+            .store
+            .append_event(AgentEvent::StateChanged {
+                run_id: run.id.clone(),
+                state: "needs_user_input:design_profile_capability_gap".to_string(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(internal_error)?;
+        return Ok(Json(StartRunResponse {
+            run_id: run.id,
+            status: "needs_user_input",
+        }));
+    }
+    if let Some(conflict_reason) = design_profile_conflict {
+        state
+            .store
+            .append_conversation_item(
+                &run.project_id,
+                Some(&run.id),
+                "approval_request",
+                Some("assistant"),
+                format!("DesignProfile conflict requires confirmation: {conflict_reason}"),
+                Some(json!({
+                    "reason": conflict_reason,
+                    "designProfileId": run.design_profile_id.as_deref(),
+                    "state": "needs_user_input:design_profile_conflict",
+                })),
+            )
+            .await;
+        state
+            .store
+            .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+            .await
+            .map_err(conflict_error)?;
+        state
+            .store
+            .append_event(AgentEvent::StateChanged {
+                run_id: run.id.clone(),
+                state: "needs_user_input:design_profile_conflict".to_string(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(internal_error)?;
+        return Ok(Json(StartRunResponse {
+            run_id: run.id,
+            status: "needs_user_input",
+        }));
+    }
     let run = if let Some(sandbox_binding_id) = request.input_context.sandbox_binding_id.as_deref()
     {
         state
@@ -898,6 +2204,67 @@ async fn continue_run(
         }));
     }
     if run.phase == AgentPhase::Edit {
+        let design_profile_override_accepted = run.status == AgentRunStatus::NeedsUserInput
+            && run.design_profile_id.is_some()
+            && is_design_profile_override_message(&request.user_message)
+            && has_design_profile_conflict_state(&state.store, &run_id).await;
+        if design_profile_override_accepted {
+            state
+                .store
+                .append_conversation_item(
+                    &run.project_id,
+                    Some(&run_id),
+                    "design_profile_override",
+                    Some("user"),
+                    "DesignProfile override accepted for this run.",
+                    Some(json!({
+                        "designProfileId": run.design_profile_id.as_deref(),
+                        "designProfileVersion": run.design_profile_version,
+                        "designProfileHash": run.design_profile_hash.as_deref(),
+                        "decision": "override",
+                        "state": "accepted",
+                        "userMessage": request.user_message.clone(),
+                    })),
+                )
+                .await;
+        }
+        if let Some(conflict_reason) =
+            classify_design_profile_edit_conflict(&state.store, &run, &request.user_message).await?
+        {
+            state
+                .store
+                .append_conversation_item(
+                    &run.project_id,
+                    Some(&run_id),
+                    "approval_request",
+                    Some("assistant"),
+                    format!("DesignProfile conflict requires confirmation: {conflict_reason}"),
+                    Some(json!({
+                        "reason": conflict_reason,
+                        "designProfileId": run.design_profile_id.as_deref(),
+                        "state": "needs_user_input:design_profile_conflict",
+                    })),
+                )
+                .await;
+            state
+                .store
+                .update_run_status(&run_id, AgentRunStatus::NeedsUserInput)
+                .await
+                .map_err(conflict_error)?;
+            state
+                .store
+                .append_event(AgentEvent::StateChanged {
+                    run_id: run_id.clone(),
+                    state: "needs_user_input:design_profile_conflict".to_string(),
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(internal_error)?;
+            return Ok(Json(RunStatusResponse {
+                run_id,
+                status: "needs_user_input".to_string(),
+            }));
+        }
         match edit::classify_edit_intent(&state.store, &run, &request.user_message)
             .await
             .map_err(internal_error)?
@@ -1397,6 +2764,20 @@ async fn artifact_current_file(
     artifact_response(&state.config, &project_id, &artifact_path)
 }
 
+async fn next_artifact_asset_file(
+    State(state): State<AppState>,
+    Path(artifact_path): Path<String>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
+    let project_id = artifact_project_id_from_referer(&headers)
+        .ok_or_else(|| not_found("Next artifact asset requires an artifact referer".to_string()))?;
+    artifact_response(
+        &state.config,
+        &project_id,
+        &format!("_next/{artifact_path}"),
+    )
+}
+
 fn artifact_response(
     config: &RuntimeConfig,
     project_id: &str,
@@ -1508,6 +2889,18 @@ fn rewrite_artifact_html(html: &str, project_id: &str) -> String {
         .replace("\\\"/_astro/", &format!("\\\"{prefix}/_astro/"))
         .replace("\\\"/docs", &format!("\\\"{prefix}/docs"))
         .replace("\\\"/\\\"", &format!("\\\"{prefix}/\\\""))
+}
+
+fn artifact_project_id_from_referer(headers: &HeaderMap) -> Option<String> {
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())?;
+    let marker = "/artifacts/";
+    let start = referer.find(marker)? + marker.len();
+    let rest = &referer[start..];
+    let end = rest.find("/current")?;
+    let project_id = &rest[..end];
+    (!project_id.trim().is_empty()).then(|| project_id.to_string())
 }
 
 fn content_type_for_path(path: &FsPath) -> &'static str {
@@ -1797,6 +3190,611 @@ fn internal_admin_authorized(config: &RuntimeConfig, headers: &HeaderMap) -> boo
     internal && token == Some(expected_token)
 }
 
+fn scope_with_project_id(scope: Value, project_id: Option<&str>) -> Value {
+    let mut object = match scope {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    if let Some(project_id) = project_id {
+        object
+            .entry("projectId".to_string())
+            .or_insert_with(|| Value::String(project_id.to_string()));
+    }
+    Value::Object(object)
+}
+
+fn design_profile_payload_from_request(
+    request: &CreateDesignProfileRequest,
+) -> Result<Map<String, Value>, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(profile) = request.profile.as_ref() {
+        return profile
+            .as_object()
+            .cloned()
+            .ok_or_else(|| bad_request("profile must be an object".to_string()));
+    }
+    Ok(request.legacy_profile.clone())
+}
+
+fn payload_string(
+    payload: &Map<String, Value>,
+    field: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request(format!("profile.{field} must be a string")))?;
+    validate_required_string(&format!("profile.{field}"), value)?;
+    Ok(value.to_string())
+}
+
+fn payload_required_value(
+    payload: &Map<String, Value>,
+    field: &str,
+) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+    payload
+        .get(field)
+        .cloned()
+        .ok_or_else(|| bad_request(format!("profile.{field} is required")))
+}
+
+fn payload_value(payload: &Map<String, Value>, field: &str) -> Option<Value> {
+    payload.get(field).cloned()
+}
+
+fn normalize_design_profile_component_roles(
+    components: &mut Value,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(primitives) = components
+        .get_mut("primitives")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    for (name, guideline) in primitives {
+        let Some(guideline) = guideline.as_object_mut() else {
+            continue;
+        };
+        let role = guideline.get("role").and_then(Value::as_str);
+        let intent = guideline.get("intent").and_then(Value::as_str);
+        if let (Some(role), Some(intent)) = (role, intent) {
+            if role != intent {
+                return Err(bad_request(format!(
+                    "components.primitives.{name}.role conflicts with legacy intent"
+                )));
+            }
+        }
+        let canonical_role = role.or(intent).map(ToString::to_string);
+        if let Some(canonical_role) = canonical_role {
+            guideline.insert("role".to_string(), Value::String(canonical_role));
+            guideline.remove("intent");
+        }
+    }
+    Ok(())
+}
+
+fn signature_rule_applies_to_surface(rule: &Value, surface: &str) -> bool {
+    match rule.get("appliesTo") {
+        Some(Value::String(value)) => value == "all",
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(surface)),
+        _ => false,
+    }
+}
+
+fn unsupported_extended_tokens_for_template(mapping: &Value, template: &str) -> Vec<String> {
+    let supported: &[&str] = match template {
+        "astro-website" => &[
+            "font.display",
+            "font.mono",
+            "type.display.size",
+            "type.display.lineHeight",
+            "type.display.letterSpacing",
+            "type.body.letterSpacing",
+            "spacing.pageGutter",
+            "spacing.section",
+            "spacing.cardPadding",
+            "radius.input",
+            "radius.badge",
+            "radius.largeCard",
+            "gradient.display",
+            "gradient.ambient",
+            "shadow.cardStrong",
+        ],
+        "fumadocs-docs" => &[
+            "font.display",
+            "font.mono",
+            "type.display.letterSpacing",
+            "type.body.letterSpacing",
+            "spacing.pageGutter",
+            "spacing.section",
+            "radius.input",
+            "radius.badge",
+            "gradient.display",
+        ],
+        _ => &[],
+    };
+    let mut unsupported = mapping
+        .as_object()
+        .map(|tokens| {
+            tokens
+                .keys()
+                .filter(|token| !supported.contains(&token.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    unsupported.sort();
+    unsupported
+}
+
+struct ParsedDesignProfileSource {
+    headings: Vec<String>,
+    tokens: Map<String, Value>,
+    extracted_token_count: usize,
+    extracted_component_count: usize,
+    unmapped_items: Vec<DesignProfileUnmappedItem>,
+    warnings: Vec<String>,
+}
+
+fn parse_design_profile_source(source: &str) -> ParsedDesignProfileSource {
+    let mut headings = Vec::new();
+    let mut tokens = Map::new();
+    let mut extracted_component_count = 0usize;
+    let mut unmapped_items = Vec::new();
+    let mut offset = 0usize;
+    let mut operational_instruction_detected = false;
+
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+        let start_byte = offset;
+        let end_byte = offset + raw_line.len();
+        offset = end_byte;
+        if trimmed.is_empty() || trimmed.starts_with("```") {
+            continue;
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        if [
+            "ignore system",
+            "ignore previous",
+            "call the tool",
+            "call tool",
+            "change permission",
+            "read /",
+            "upload data",
+            "exfiltrate",
+        ]
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
+        {
+            operational_instruction_detected = true;
+        }
+
+        if let Some(heading) = trimmed.strip_prefix('#') {
+            let heading = heading.trim_start_matches('#').trim();
+            if !heading.is_empty() {
+                if heading.to_ascii_lowercase().contains("component")
+                    || ["button", "input", "card", "badge"]
+                        .iter()
+                        .any(|name| heading.eq_ignore_ascii_case(name))
+                {
+                    extracted_component_count += 1;
+                }
+                headings.push(heading.to_string());
+                continue;
+            }
+        }
+
+        if let Some((name, value)) =
+            parse_css_custom_property(trimmed).or_else(|| parse_markdown_token_row(trimmed))
+        {
+            if let Some(existing) = tokens.get(&name) {
+                if existing.as_str() != Some(value.as_str()) {
+                    unmapped_items.push(unmapped_source_item(
+                        "token-conflict",
+                        start_byte,
+                        end_byte,
+                        line,
+                        "duplicate",
+                    ));
+                }
+            } else {
+                tokens.insert(name, Value::String(value));
+            }
+            continue;
+        }
+
+        unmapped_items.push(unmapped_source_item(
+            headings.last().map(String::as_str).unwrap_or("document"),
+            start_byte,
+            end_byte,
+            line,
+            "unsupported-field",
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if headings.is_empty() {
+        warnings.push("No Markdown headings were extracted".to_string());
+    }
+    if tokens.is_empty() {
+        warnings.push("No CSS custom properties or token table rows were extracted".to_string());
+    }
+    if !unmapped_items.is_empty() {
+        warnings.push(format!(
+            "{} source items require review",
+            unmapped_items.len()
+        ));
+    }
+    if operational_instruction_detected {
+        warnings.push(
+            "Operational instruction detected and excluded from design semantics".to_string(),
+        );
+    }
+    let extracted_token_count = tokens.len();
+    ParsedDesignProfileSource {
+        headings,
+        tokens,
+        extracted_token_count,
+        extracted_component_count,
+        unmapped_items,
+        warnings,
+    }
+}
+
+fn parse_css_custom_property(line: &str) -> Option<(String, String)> {
+    let line = line.trim().trim_end_matches(';');
+    let (name, value) = line.split_once(':')?;
+    let name = name.trim();
+    let value = value.trim();
+    if !name.starts_with("--") || name.len() < 3 || value.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+fn parse_markdown_token_row(line: &str) -> Option<(String, String)> {
+    if !line.starts_with('|') || !line.ends_with('|') {
+        return None;
+    }
+    let cells = line
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if cells.len() < 2
+        || cells.iter().all(|cell| {
+            cell.chars()
+                .all(|character| matches!(character, '-' | ':' | ' '))
+        })
+    {
+        return None;
+    }
+    let name = cells[0].trim_matches('`');
+    let value = cells[1].trim_matches('`');
+    let token_like_name = name.starts_with("--")
+        || name.contains('.')
+        || name.contains('-')
+        || name.to_ascii_lowercase().contains("color");
+    if !token_like_name || value.is_empty() || value.eq_ignore_ascii_case("value") {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+fn unmapped_source_item(
+    source_section: &str,
+    start_byte: usize,
+    end_byte: usize,
+    line: &str,
+    reason: &str,
+) -> DesignProfileUnmappedItem {
+    let excerpt = line.chars().take(500).collect::<String>();
+    DesignProfileUnmappedItem {
+        source_section: source_section.to_string(),
+        start_byte,
+        end_byte,
+        excerpt_hash: sha256_hex(excerpt.as_bytes()),
+        excerpt,
+        reason: reason.to_string(),
+    }
+}
+
+fn design_profile_candidate_issues(
+    candidate: &Value,
+    imported: bool,
+) -> Vec<DesignProfileValidationIssue> {
+    let required_fields = [
+        "product",
+        "brand",
+        "visual",
+        "tokens",
+        "runtimeTokenMapping",
+        "components",
+        "content",
+        "accessibility",
+        "technical",
+        "governance",
+    ];
+    let mut issues = Vec::new();
+    let object = match candidate.as_object() {
+        Some(object) => object,
+        None => {
+            issues.push(DesignProfileValidationIssue {
+                path: "candidate".to_string(),
+                code: "invalid_type".to_string(),
+                message: "candidate must be an object".to_string(),
+                blocking: true,
+            });
+            return issues;
+        }
+    };
+    for field in required_fields {
+        if !object.contains_key(field) {
+            issues.push(DesignProfileValidationIssue {
+                path: field.to_string(),
+                code: "required".to_string(),
+                message: format!("{field} is required before activation"),
+                blocking: true,
+            });
+        }
+    }
+    if imported
+        && object
+            .get("signatureRules")
+            .and_then(Value::as_array)
+            .is_none_or(|rules| {
+                !rules
+                    .iter()
+                    .any(|rule| rule.get("priority").and_then(Value::as_str) == Some("required"))
+            })
+    {
+        issues.push(DesignProfileValidationIssue {
+            path: "signatureRules".to_string(),
+            code: "required_signature_rule".to_string(),
+            message: "imported profile requires at least one required signature rule".to_string(),
+            blocking: true,
+        });
+    }
+    issues
+}
+
+async fn resolve_design_profile_context(
+    store: &RuntimeStore,
+    request: &StartRunRequest,
+) -> Result<Option<DesignProfile>, (StatusCode, Json<ErrorResponse>)> {
+    store
+        .resolve_design_profile(
+            &request.project_id,
+            request.input_context.workspace_id.as_deref(),
+            request.input_context.organization_id.as_deref(),
+            request.input_context.design_profile_id.as_deref(),
+        )
+        .await
+        .map_err(design_profile_error)
+}
+
+async fn design_profile_execution_target(
+    store: &RuntimeStore,
+    request: &StartRunRequest,
+) -> Result<Option<(String, String)>, (StatusCode, Json<ErrorResponse>)> {
+    if request.phase != AgentPhase::Build {
+        return Ok(None);
+    }
+    let Some(brief_id) = request.input_context.brief_id.as_deref() else {
+        return Ok(None);
+    };
+    let brief = store
+        .get_brief(brief_id)
+        .await
+        .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
+    let surface = match brief.recommended_template.as_str() {
+        "astro-website" | "nextjs-website" => "website",
+        "fumadocs-docs" | "docusaurus-docs" => "docs",
+        template => {
+            return Err(bad_request(format!(
+                "unsupported brief template for DesignProfile: {template}"
+            )))
+        }
+    };
+    Ok(Some((surface.to_string(), brief.recommended_template)))
+}
+
+async fn design_profile_prebuild_failure(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    profile: &DesignProfile,
+) -> Option<(String, String)> {
+    if run.phase != AgentPhase::Build {
+        return None;
+    }
+    if profile.status != "active" {
+        return Some((
+            "needs_user_input:design_profile_integrity_failed".to_string(),
+            "DesignProfile must be active before Build.".to_string(),
+        ));
+    }
+    if run.design_profile_hash.as_deref() != Some(profile.stable_hash().as_str()) {
+        return Some((
+            "needs_user_input:design_profile_integrity_failed".to_string(),
+            "DesignProfile hash no longer matches the run snapshot.".to_string(),
+        ));
+    }
+    if let (Some(surface), Some(template), Some(expected_hash)) = (
+        run.design_profile_surface.as_deref(),
+        run.design_profile_template.as_deref(),
+        run.design_profile_effective_hash.as_deref(),
+    ) {
+        match profile.effective_for(surface, template) {
+            Ok(effective) if effective.effective_profile_hash == expected_hash => {}
+            _ => {
+                return Some((
+                    "needs_user_input:design_profile_integrity_failed".to_string(),
+                    "Effective DesignProfile hash or template resolution changed.".to_string(),
+                ))
+            }
+        }
+    }
+    if profile.schema_version == crate::types::DESIGN_PROFILE_SCHEMA_V1 {
+        store
+            .append_audit_record(
+                &run.project_id,
+                &run.id,
+                "design_profile.legacy_source",
+                "schemaVersion=design-profile@1",
+                "allow",
+                "legacy-warning: source artifact verification unavailable",
+            )
+            .await;
+        return None;
+    }
+    if profile.source.get("kind").and_then(Value::as_str) != Some("imported") {
+        return None;
+    }
+    if profile.source.get("integrity").and_then(Value::as_str) != Some("verified") {
+        return Some((
+            "needs_user_input:design_profile_integrity_failed".to_string(),
+            "Imported DesignProfile source integrity is not verified.".to_string(),
+        ));
+    }
+    let Some(artifact_id) = run.design_source_artifact_id.as_deref() else {
+        return Some((
+            "needs_user_input:design_profile_source_missing".to_string(),
+            "Imported DesignProfile source artifact is missing from the run snapshot.".to_string(),
+        ));
+    };
+    let Some(artifact) = store.get_design_source_artifact(artifact_id).await else {
+        return Some((
+            "needs_user_input:design_profile_source_missing".to_string(),
+            "Imported DesignProfile source artifact metadata is missing.".to_string(),
+        ));
+    };
+    if run.design_source_hash.as_deref() != Some(artifact.sha256.as_str())
+        || profile.source.get("sourceHash").and_then(Value::as_str)
+            != Some(artifact.sha256.as_str())
+    {
+        return Some((
+            "needs_user_input:design_profile_integrity_failed".to_string(),
+            "Imported DesignProfile source hash does not match the immutable artifact.".to_string(),
+        ));
+    }
+    if store
+        .read_design_source_artifact_content(artifact_id)
+        .await
+        .is_err()
+    {
+        return Some((
+            "needs_user_input:design_profile_integrity_failed".to_string(),
+            "Imported DesignProfile source bytes failed integrity verification.".to_string(),
+        ));
+    }
+    None
+}
+
+async fn preflight_design_profile_conflicts(
+    store: &RuntimeStore,
+    request: &StartRunRequest,
+    design_profile: Option<&DesignProfile>,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(design_profile) = design_profile else {
+        return Ok(None);
+    };
+    if request.phase != AgentPhase::Build {
+        return Ok(None);
+    }
+    let Some(brief_id) = request.input_context.brief_id.as_deref() else {
+        return Ok(None);
+    };
+    let brief = store
+        .get_brief(brief_id)
+        .await
+        .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
+    let allowed = design_profile
+        .technical
+        .get("allowedTemplates")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !allowed.is_empty() && !allowed.contains(&brief.recommended_template.as_str()) {
+        return Ok(Some(format!(
+            "Brief recommendedTemplate={} is not allowed by DesignProfile {}",
+            brief.recommended_template, design_profile.id
+        )));
+    }
+    Ok(None)
+}
+
+async fn classify_design_profile_edit_conflict(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    user_message: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    if run.status == AgentRunStatus::NeedsUserInput
+        && is_design_profile_override_message(user_message)
+    {
+        return Ok(None);
+    }
+    let Some(design_profile_id) = run.design_profile_id.as_deref() else {
+        return Ok(None);
+    };
+    let profile = store
+        .get_design_profile(design_profile_id)
+        .await
+        .ok_or_else(|| not_found(format!("design profile not found: {design_profile_id}")))?;
+    let normalized = user_message.to_lowercase();
+    if let Some(keyword) = profile
+        .visual
+        .get("avoidKeywords")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|keyword| normalized.contains(&keyword.to_lowercase()))
+    {
+        return Ok(Some(format!(
+            "User edit requests visual keyword \"{keyword}\" forbidden by DesignProfile {}",
+            profile.id
+        )));
+    }
+    if let Some(claim) = profile
+        .brand
+        .get("messaging")
+        .and_then(|messaging| messaging.get("forbiddenClaims"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|claim| normalized.contains(&claim.to_lowercase()))
+    {
+        return Ok(Some(format!(
+            "User edit requests forbidden claim \"{claim}\" from DesignProfile {}",
+            profile.id
+        )));
+    }
+    Ok(None)
+}
+
+async fn has_design_profile_conflict_state(store: &RuntimeStore, run_id: &str) -> bool {
+    store.events(run_id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::StateChanged { state, .. }
+                if state == "needs_user_input:design_profile_conflict"
+        )
+    })
+}
+
+fn is_design_profile_override_message(message: &str) -> bool {
+    let normalized = message.trim().to_lowercase();
+    normalized.contains("override")
+        || normalized.contains("temporary")
+        || normalized.contains("continue anyway")
+        || normalized.contains("临时覆盖")
+        || normalized.contains("继续执行")
+        || normalized.contains("仍然执行")
+        || normalized.contains("忽略 profile")
+        || normalized.contains("忽略profile")
+}
+
 fn validate_start_run_request(
     request: &StartRunRequest,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -1819,7 +3817,34 @@ fn validate_start_run_request(
         "parentRunId",
         request.input_context.parent_run_id.as_deref(),
     )?;
+    validate_optional_string(
+        "designProfileId",
+        request.input_context.design_profile_id.as_deref(),
+    )?;
+    if let Some(mode) = request.input_context.design_fidelity_mode.as_deref() {
+        if !matches!(mode, "profile_only" | "source_fallback") {
+            return Err(bad_request(
+                "designFidelityMode must be profile_only or source_fallback".to_string(),
+            ));
+        }
+    }
+    validate_optional_string("workspaceId", request.input_context.workspace_id.as_deref())?;
+    validate_optional_string(
+        "organizationId",
+        request.input_context.organization_id.as_deref(),
+    )?;
     validate_string_list("findingIds", &request.input_context.finding_ids)?;
+    Ok(())
+}
+
+fn validate_create_design_profile_request(
+    request: &CreateDesignProfileRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    validate_required_string("name", &request.name)?;
+    validate_optional_string("projectId", request.project_id.as_deref())?;
+    if request.profile.is_none() && request.legacy_profile.is_empty() {
+        return Err(bad_request("profile is required".to_string()));
+    }
     Ok(())
 }
 
@@ -1920,6 +3945,10 @@ fn bad_request(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
 }
 
+fn error_response_as_value(error: (StatusCode, Json<ErrorResponse>)) -> (StatusCode, Json<Value>) {
+    (error.0, Json(json!({ "error": error.1.error })))
+}
+
 fn sandbox_binding_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     let message = error.to_string();
     if message.contains("sandbox binding not found") {
@@ -1927,6 +3956,85 @@ fn sandbox_binding_error(error: anyhow::Error) -> (StatusCode, Json<ErrorRespons
     } else {
         conflict_error(anyhow::anyhow!(message))
     }
+}
+
+fn design_profile_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let message = error.to_string();
+    if message.contains("design profile not found") {
+        not_found(message)
+    } else if message.contains("invalid design profile") {
+        bad_request(message)
+    } else {
+        conflict_error(anyhow::anyhow!(message))
+    }
+}
+
+fn design_source_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let message = error.to_string();
+    if message.contains("design source artifact not found") {
+        not_found(message)
+    } else if message.contains("invalid design source artifact") {
+        bad_request(message)
+    } else {
+        internal_error(anyhow::anyhow!(message))
+    }
+}
+
+fn require_design_source_authorization(
+    config: &RuntimeConfig,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if internal_admin_authorized(config, headers) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "design source artifacts require service authorization".to_string(),
+        }),
+    ))
+}
+
+async fn validate_design_profile_source_reference(
+    store: &RuntimeStore,
+    profile: &DesignProfile,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(artifact_id) = profile
+        .source
+        .get("primarySourceArtifactId")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    validate_required_string("profile.source.primarySourceArtifactId", artifact_id)?;
+    let artifact = store
+        .get_design_source_artifact(artifact_id)
+        .await
+        .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
+    if artifact.scope != profile.scope {
+        return Err(bad_request(
+            "profile source artifact scope must exactly match profile scope".to_string(),
+        ));
+    }
+    let source_hash = profile
+        .source
+        .get("sourceHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            bad_request(
+                "profile.source.sourceHash is required with primarySourceArtifactId".to_string(),
+            )
+        })?;
+    if !artifact.sha256.eq_ignore_ascii_case(source_hash) {
+        return Err(bad_request(
+            "profile.source.sourceHash does not match the referenced artifact".to_string(),
+        ));
+    }
+    store
+        .read_design_source_artifact_content(artifact_id)
+        .await
+        .map_err(design_source_error)?;
+    Ok(())
 }
 
 fn repair_run_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -1963,4 +4071,34 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
             error: error.to_string(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_project_id_from_referer_extracts_current_artifact_project() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:8080/artifacts/project-docs-1/current/docs"),
+        );
+
+        assert_eq!(
+            artifact_project_id_from_referer(&headers).as_deref(),
+            Some("project-docs-1")
+        );
+    }
+
+    #[test]
+    fn artifact_project_id_from_referer_rejects_non_artifact_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:8080/docs"),
+        );
+
+        assert_eq!(artifact_project_id_from_referer(&headers), None);
+    }
 }

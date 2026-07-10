@@ -2,11 +2,12 @@ use crate::{
     profiles::policy,
     repair_loop::RepairAttempt,
     types::{
-        AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, AuditRecord, Brief,
-        BriefStatus, ContentSource, ConversationItem, PendingPermission, ProjectVersion,
-        ProjectVersionStatus, ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence,
-        ReviewFindingSeverity, ReviewFindingStatus, SandboxBinding, SandboxBindingStatus,
-        SandboxChannelProtocol,
+        sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, AuditRecord,
+        Brief, BriefStatus, ContentSource, ConversationItem, DesignProfile,
+        DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
+        PendingPermission, ProjectVersion, ProjectVersionStatus, ReviewFinding,
+        ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity, ReviewFindingStatus,
+        SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
@@ -49,6 +50,12 @@ pub struct RuntimeStore {
     repair_attempt_log_path: Arc<PathBuf>,
     pending_permission_log_path: Arc<PathBuf>,
     sandbox_binding_log_path: Arc<PathBuf>,
+    design_profile_log_path: Arc<PathBuf>,
+    design_profile_draft_log_path: Arc<PathBuf>,
+    design_profile_conversion_report_log_path: Arc<PathBuf>,
+    project_design_profile_log_path: Arc<PathBuf>,
+    design_source_artifact_log_path: Arc<PathBuf>,
+    design_source_blob_dir: Arc<PathBuf>,
     audit_log_path: Arc<PathBuf>,
 }
 
@@ -73,6 +80,11 @@ struct RuntimeStoreInner {
     project_versions: HashMap<String, ProjectVersion>,
     project_current_versions: HashMap<String, String>,
     sandbox_bindings: HashMap<String, SandboxBinding>,
+    design_profiles: HashMap<String, DesignProfile>,
+    design_profile_drafts: HashMap<String, DesignProfileDraft>,
+    design_profile_conversion_reports: HashMap<String, DesignProfileConversionReport>,
+    design_source_artifacts: HashMap<String, DesignSourceArtifact>,
+    project_design_profiles: HashMap<String, String>,
     run_scoped_resources: HashMap<String, RunScopedResources>,
     continue_interrupt_requests: HashSet<String>,
 }
@@ -102,6 +114,14 @@ struct BriefSnapshot {
     project_id: String,
     status: BriefStatus,
     brief: Brief,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectDesignProfileSnapshot {
+    project_id: String,
+    design_profile_id: String,
+    updated_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,6 +154,151 @@ fn repair_finding_status_for_run_status(status: AgentRunStatus) -> Option<Review
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeLevel {
+    Workspace,
+    Organization,
+}
+
+fn active_profiles_for_scope<'a>(
+    profiles: impl Iterator<Item = &'a DesignProfile>,
+    level: ScopeLevel,
+    id: &str,
+) -> Vec<DesignProfile> {
+    profiles
+        .filter(|profile| profile.status == "active")
+        .filter(|profile| match level {
+            ScopeLevel::Workspace => profile.workspace_id() == Some(id),
+            ScopeLevel::Organization => profile.organization_id() == Some(id),
+        })
+        .cloned()
+        .collect()
+}
+
+fn conversion_report_key(design_profile_id: &str, version: u32) -> String {
+    format!("{design_profile_id}@{version}")
+}
+
+fn design_profile_capability_gaps(
+    effective: &crate::types::EffectiveDesignProfile,
+) -> (Vec<String>, Vec<String>) {
+    let supported = match effective.template.as_str() {
+        "astro-website" | "nextjs-website" => [
+            "font.display",
+            "font.mono",
+            "type.display.size",
+            "type.display.lineHeight",
+            "type.display.letterSpacing",
+            "type.body.letterSpacing",
+            "spacing.pageGutter",
+            "spacing.section",
+            "spacing.cardPadding",
+            "radius.input",
+            "radius.badge",
+            "radius.largeCard",
+            "gradient.display",
+            "gradient.ambient",
+            "shadow.cardStrong",
+        ]
+        .as_slice(),
+        "fumadocs-docs" | "docusaurus-docs" => [
+            "font.display",
+            "font.mono",
+            "type.display.letterSpacing",
+            "type.body.letterSpacing",
+            "spacing.pageGutter",
+            "spacing.section",
+            "radius.input",
+            "radius.badge",
+            "gradient.display",
+        ]
+        .as_slice(),
+        _ => &[],
+    };
+    let mut unsupported = effective
+        .profile
+        .get("extendedTokenMapping")
+        .and_then(Value::as_object)
+        .map(|tokens| {
+            tokens
+                .keys()
+                .filter(|token| !supported.contains(&token.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    unsupported.sort();
+    let mut blocking_rules = effective
+        .profile
+        .get("signatureRules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rule| rule.get("priority").and_then(Value::as_str) == Some("required"))
+        .filter(|rule| {
+            rule.get("verification")
+                .and_then(|verification| verification.get("token"))
+                .and_then(Value::as_str)
+                .is_some_and(|token| unsupported.iter().any(|unsupported| unsupported == token))
+        })
+        .filter_map(|rule| {
+            rule.get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    blocking_rules.sort();
+    (unsupported, blocking_rules)
+}
+
+fn ensure_unique_project_active_profile(
+    inner: &RuntimeStoreInner,
+    profile: &DesignProfile,
+) -> Result<()> {
+    if profile.status != "active" {
+        return Ok(());
+    }
+    let Some(project_id) = profile.project_id() else {
+        return Ok(());
+    };
+    if let Some(existing) = inner.design_profiles.values().find(|candidate| {
+        candidate.id != profile.id
+            && candidate.status == "active"
+            && candidate.project_id() == Some(project_id)
+    }) {
+        return Err(anyhow!(
+            "project {project_id} already has active design profile {}; archive it before activating {}",
+            existing.id,
+            profile.id
+        ));
+    }
+    Ok(())
+}
+
+fn profile_visible_to_context(
+    profile: &DesignProfile,
+    project_id: &str,
+    workspace_id: Option<&str>,
+    organization_id: Option<&str>,
+) -> bool {
+    if let Some(scope_project_id) = profile.project_id() {
+        if scope_project_id != project_id {
+            return false;
+        }
+    }
+    if let Some(scope_workspace_id) = profile.workspace_id() {
+        if Some(scope_workspace_id) != workspace_id {
+            return false;
+        }
+    }
+    if let Some(scope_organization_id) = profile.organization_id() {
+        if Some(scope_organization_id) != organization_id {
+            return false;
+        }
+    }
+    true
+}
+
 impl Default for RuntimeStore {
     fn default() -> Self {
         let storage_root = default_storage_root();
@@ -152,6 +317,20 @@ impl Default for RuntimeStore {
             repair_attempt_log_path: Arc::new(storage_root.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(storage_root.join("pending-permissions.jsonl")),
             sandbox_binding_log_path: Arc::new(storage_root.join("sandbox-bindings.jsonl")),
+            design_profile_log_path: Arc::new(storage_root.join("design-profiles.jsonl")),
+            design_profile_draft_log_path: Arc::new(
+                storage_root.join("design-profile-drafts.jsonl"),
+            ),
+            design_profile_conversion_report_log_path: Arc::new(
+                storage_root.join("design-profile-conversion-reports.jsonl"),
+            ),
+            project_design_profile_log_path: Arc::new(
+                storage_root.join("project-design-profiles.jsonl"),
+            ),
+            design_source_artifact_log_path: Arc::new(
+                storage_root.join("design-source-artifacts.jsonl"),
+            ),
+            design_source_blob_dir: Arc::new(storage_root.join("design-source-artifacts")),
             audit_log_path: Arc::new(storage_root.join("audit-log.jsonl")),
         }
     }
@@ -178,6 +357,20 @@ impl RuntimeStore {
             repair_attempt_log_path: Arc::new(checkpoint_dir.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(checkpoint_dir.join("pending-permissions.jsonl")),
             sandbox_binding_log_path: Arc::new(checkpoint_dir.join("sandbox-bindings.jsonl")),
+            design_profile_log_path: Arc::new(checkpoint_dir.join("design-profiles.jsonl")),
+            design_profile_draft_log_path: Arc::new(
+                checkpoint_dir.join("design-profile-drafts.jsonl"),
+            ),
+            design_profile_conversion_report_log_path: Arc::new(
+                checkpoint_dir.join("design-profile-conversion-reports.jsonl"),
+            ),
+            project_design_profile_log_path: Arc::new(
+                checkpoint_dir.join("project-design-profiles.jsonl"),
+            ),
+            design_source_artifact_log_path: Arc::new(
+                checkpoint_dir.join("design-source-artifacts.jsonl"),
+            ),
+            design_source_blob_dir: Arc::new(checkpoint_dir.join("design-source-artifacts")),
             audit_log_path: Arc::new(checkpoint_dir.join("audit-log.jsonl")),
             checkpoint_dir: Arc::new(checkpoint_dir),
         }
@@ -204,6 +397,20 @@ impl RuntimeStore {
             repair_attempt_log_path: Arc::new(run_log_dir.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(run_log_dir.join("pending-permissions.jsonl")),
             sandbox_binding_log_path: Arc::new(run_log_dir.join("sandbox-bindings.jsonl")),
+            design_profile_log_path: Arc::new(run_log_dir.join("design-profiles.jsonl")),
+            design_profile_draft_log_path: Arc::new(
+                run_log_dir.join("design-profile-drafts.jsonl"),
+            ),
+            design_profile_conversion_report_log_path: Arc::new(
+                run_log_dir.join("design-profile-conversion-reports.jsonl"),
+            ),
+            project_design_profile_log_path: Arc::new(
+                run_log_dir.join("project-design-profiles.jsonl"),
+            ),
+            design_source_artifact_log_path: Arc::new(
+                run_log_dir.join("design-source-artifacts.jsonl"),
+            ),
+            design_source_blob_dir: Arc::new(run_log_dir.join("design-source-artifacts")),
             run_log_dir: Arc::new(run_log_dir),
         }
     }
@@ -259,6 +466,26 @@ impl RuntimeStore {
             sandbox_id: None,
             brief_version,
             design_version: None,
+            design_profile_id: None,
+            design_profile_version: None,
+            design_profile_hash: None,
+            design_profile_surface: None,
+            design_profile_template: None,
+            design_profile_surface_override_hash: None,
+            design_profile_template_override_hash: None,
+            design_profile_effective_hash: None,
+            design_profile_unsupported_extended_tokens: Vec::new(),
+            design_profile_blocking_capability_rule_ids: Vec::new(),
+            design_fidelity_mode: None,
+            design_source_artifact_id: None,
+            design_source_hash: None,
+            design_source_size_bytes: None,
+            design_source_budget_bytes: None,
+            design_source_bytes_read: 0,
+            design_source_sections: Vec::new(),
+            design_source_required_section_ids: Vec::new(),
+            design_source_read_section_hashes: Vec::new(),
+            design_context_read_files: Vec::new(),
             base_version_id,
             output_version_id: None,
             finding_ids: None,
@@ -329,6 +556,34 @@ impl RuntimeStore {
             sandbox_id: parent.sandbox_id.clone(),
             brief_version: parent.brief_version.clone(),
             design_version: parent.design_version.clone(),
+            design_profile_id: parent.design_profile_id.clone(),
+            design_profile_version: parent.design_profile_version,
+            design_profile_hash: parent.design_profile_hash.clone(),
+            design_profile_surface: parent.design_profile_surface.clone(),
+            design_profile_template: parent.design_profile_template.clone(),
+            design_profile_surface_override_hash: parent
+                .design_profile_surface_override_hash
+                .clone(),
+            design_profile_template_override_hash: parent
+                .design_profile_template_override_hash
+                .clone(),
+            design_profile_effective_hash: parent.design_profile_effective_hash.clone(),
+            design_profile_unsupported_extended_tokens: parent
+                .design_profile_unsupported_extended_tokens
+                .clone(),
+            design_profile_blocking_capability_rule_ids: parent
+                .design_profile_blocking_capability_rule_ids
+                .clone(),
+            design_fidelity_mode: parent.design_fidelity_mode.clone(),
+            design_source_artifact_id: parent.design_source_artifact_id.clone(),
+            design_source_hash: parent.design_source_hash.clone(),
+            design_source_size_bytes: parent.design_source_size_bytes,
+            design_source_budget_bytes: parent.design_source_budget_bytes,
+            design_source_bytes_read: 0,
+            design_source_sections: parent.design_source_sections.clone(),
+            design_source_required_section_ids: parent.design_source_required_section_ids.clone(),
+            design_source_read_section_hashes: Vec::new(),
+            design_context_read_files: Vec::new(),
             base_version_id: parent
                 .output_version_id
                 .clone()
@@ -441,6 +696,736 @@ impl RuntimeStore {
             .runs
             .insert(run.id.clone(), run.clone());
         Some(run)
+    }
+
+    pub async fn create_design_source_artifact(
+        &self,
+        scope: Value,
+        file_name: String,
+        media_type: String,
+        content: Vec<u8>,
+    ) -> Result<DesignSourceArtifact> {
+        if content.is_empty() {
+            return Err(anyhow!(
+                "invalid design source artifact: content must not be empty"
+            ));
+        }
+        if content.len() > MAX_DESIGN_SOURCE_BYTES {
+            return Err(anyhow!(
+                "invalid design source artifact: content exceeds {MAX_DESIGN_SOURCE_BYTES} bytes"
+            ));
+        }
+        std::str::from_utf8(&content)
+            .map_err(|_| anyhow!("invalid design source artifact: content must be UTF-8"))?;
+
+        let artifact = DesignSourceArtifact {
+            id: self.next_id("design-source"),
+            scope,
+            file_name,
+            media_type,
+            content_encoding: "identity".to_string(),
+            size_bytes: content.len() as u64,
+            sha256: sha256_hex(&content),
+            created_at: Utc::now(),
+        };
+        artifact
+            .validate_for_runtime()
+            .map_err(|error| anyhow!("invalid design source artifact: {error}"))?;
+
+        let artifact_dir = self.design_source_blob_dir.join(&artifact.id);
+        fs::create_dir_all(&artifact_dir)?;
+        let final_path = artifact_dir.join("source.md");
+        let temporary_path = artifact_dir.join(format!(
+            ".source.md.tmp-{}-{}",
+            std::process::id(),
+            Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| Utc::now().timestamp_micros())
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            fs::rename(&temporary_path, &final_path)?;
+            fs::File::open(&artifact_dir)?.sync_all()?;
+            self.append_design_source_artifact_snapshot(&artifact)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        write_result?;
+
+        self.inner
+            .write()
+            .await
+            .design_source_artifacts
+            .insert(artifact.id.clone(), artifact.clone());
+        Ok(artifact)
+    }
+
+    pub async fn get_design_source_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Option<DesignSourceArtifact> {
+        if let Some(artifact) = self
+            .inner
+            .read()
+            .await
+            .design_source_artifacts
+            .get(artifact_id)
+            .cloned()
+        {
+            return Some(artifact);
+        }
+        let artifact = self
+            .read_design_source_artifact(artifact_id)
+            .ok()
+            .flatten()?;
+        self.inner
+            .write()
+            .await
+            .design_source_artifacts
+            .insert(artifact.id.clone(), artifact.clone());
+        Some(artifact)
+    }
+
+    pub async fn read_design_source_artifact_content(&self, artifact_id: &str) -> Result<Vec<u8>> {
+        let artifact = self
+            .get_design_source_artifact(artifact_id)
+            .await
+            .ok_or_else(|| anyhow!("design source artifact not found: {artifact_id}"))?;
+        let path = self.design_source_blob_path(artifact_id);
+        let content = fs::read(&path).map_err(|error| {
+            anyhow!("design source artifact content missing: {artifact_id}: {error}")
+        })?;
+        if content.len() as u64 != artifact.size_bytes || sha256_hex(&content) != artifact.sha256 {
+            return Err(anyhow!(
+                "design source artifact integrity check failed: {artifact_id}"
+            ));
+        }
+        std::str::from_utf8(&content)
+            .map_err(|_| anyhow!("design source artifact content is not UTF-8: {artifact_id}"))?;
+        Ok(content)
+    }
+
+    pub async fn create_design_profile_draft(
+        &self,
+        draft: DesignProfileDraft,
+        report: DesignProfileConversionReport,
+    ) -> Result<(DesignProfileDraft, DesignProfileConversionReport)> {
+        if draft.schema_version != crate::types::DESIGN_PROFILE_SCHEMA_V2
+            || draft.status != "draft"
+            || draft.version == 0
+            || draft.name.trim().is_empty()
+        {
+            return Err(anyhow!("invalid design profile draft metadata"));
+        }
+        if report.design_profile_id != draft.id
+            || report.profile_version != draft.version
+            || report.id != draft.conversion_report_id
+        {
+            return Err(anyhow!(
+                "design profile conversion report does not match draft"
+            ));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profile_drafts(&mut inner)?;
+        if inner.design_profile_drafts.contains_key(&draft.id)
+            || inner.design_profiles.contains_key(&draft.id)
+        {
+            return Err(anyhow!("design profile already exists: {}", draft.id));
+        }
+        inner
+            .design_profile_drafts
+            .insert(draft.id.clone(), draft.clone());
+        inner.design_profile_conversion_reports.insert(
+            conversion_report_key(&draft.id, draft.version),
+            report.clone(),
+        );
+        drop(inner);
+        self.append_design_profile_draft_snapshot(&draft)?;
+        self.append_design_profile_conversion_report_snapshot(&report)?;
+        Ok((draft, report))
+    }
+
+    pub async fn get_design_profile_draft(
+        &self,
+        design_profile_id: &str,
+    ) -> Option<DesignProfileDraft> {
+        if let Some(draft) = self
+            .inner
+            .read()
+            .await
+            .design_profile_drafts
+            .get(design_profile_id)
+            .cloned()
+        {
+            return Some(draft);
+        }
+        let draft = self
+            .read_design_profile_draft(design_profile_id)
+            .ok()
+            .flatten()?;
+        self.inner
+            .write()
+            .await
+            .design_profile_drafts
+            .insert(draft.id.clone(), draft.clone());
+        Some(draft)
+    }
+
+    pub async fn list_design_profile_drafts(
+        &self,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        organization_id: Option<&str>,
+    ) -> Vec<DesignProfileDraft> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profile_drafts(&mut inner).ok();
+        let scope_filter_present =
+            project_id.is_some() || workspace_id.is_some() || organization_id.is_some();
+        let mut drafts = inner
+            .design_profile_drafts
+            .values()
+            .filter(|draft| {
+                if !scope_filter_present {
+                    return true;
+                }
+                project_id.is_some_and(|id| {
+                    draft.scope.get("projectId").and_then(Value::as_str) == Some(id)
+                }) || workspace_id.is_some_and(|id| {
+                    draft.scope.get("workspaceId").and_then(Value::as_str) == Some(id)
+                }) || organization_id.is_some_and(|id| {
+                    draft.scope.get("organizationId").and_then(Value::as_str) == Some(id)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drafts.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        drafts
+    }
+
+    pub async fn update_design_profile_draft(
+        &self,
+        design_profile_id: &str,
+        expected_version: u32,
+        name: String,
+        candidate: Value,
+        validation_issues: Vec<crate::types::DesignProfileValidationIssue>,
+    ) -> Result<DesignProfileDraft> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profile_drafts(&mut inner)?;
+        let current = inner
+            .design_profile_drafts
+            .get(design_profile_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("design profile draft not found: {design_profile_id}"))?;
+        if current.version != expected_version {
+            return Err(anyhow!(
+                "design profile version conflict: expected {expected_version}, current {}",
+                current.version
+            ));
+        }
+        let now = Utc::now();
+        let report_id = self.next_id("design-profile-conversion-report");
+        let draft = DesignProfileDraft {
+            id: current.id,
+            schema_version: current.schema_version,
+            version: current.version + 1,
+            name,
+            status: "draft".to_string(),
+            scope: current.scope,
+            source: current.source,
+            candidate,
+            conversion_report_id: report_id.clone(),
+            validation_issues,
+            created_at: current.created_at,
+            updated_at: now,
+        };
+        let previous_report = self
+            .read_design_profile_conversion_report(design_profile_id, expected_version)?
+            .ok_or_else(|| anyhow!("conversion report not found for draft revision"))?;
+        let report = DesignProfileConversionReport {
+            id: report_id,
+            design_profile_id: draft.id.clone(),
+            profile_version: draft.version,
+            required_signature_rule_count: draft
+                .candidate
+                .get("signatureRules")
+                .and_then(Value::as_array)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .filter(|rule| {
+                            rule.get("priority").and_then(Value::as_str) == Some("required")
+                        })
+                        .count()
+                })
+                .unwrap_or(0),
+            created_at: now,
+            ..previous_report
+        };
+        inner
+            .design_profile_drafts
+            .insert(draft.id.clone(), draft.clone());
+        inner.design_profile_conversion_reports.insert(
+            conversion_report_key(&draft.id, draft.version),
+            report.clone(),
+        );
+        drop(inner);
+        self.append_design_profile_draft_snapshot(&draft)?;
+        self.append_design_profile_conversion_report_snapshot(&report)?;
+        Ok(draft)
+    }
+
+    pub async fn design_profile_draft_versions(
+        &self,
+        design_profile_id: &str,
+    ) -> Result<Vec<DesignProfileDraft>> {
+        self.read_design_profile_draft_history(design_profile_id)
+    }
+
+    pub async fn design_profile_conversion_report(
+        &self,
+        design_profile_id: &str,
+        version: Option<u32>,
+    ) -> Result<Option<DesignProfileConversionReport>> {
+        let version = match version {
+            Some(version) => version,
+            None => self
+                .get_design_profile_draft(design_profile_id)
+                .await
+                .map(|draft| draft.version)
+                .ok_or_else(|| anyhow!("design profile draft not found: {design_profile_id}"))?,
+        };
+        self.read_design_profile_conversion_report(design_profile_id, version)
+    }
+
+    pub async fn create_design_profile(&self, profile: DesignProfile) -> Result<DesignProfile> {
+        profile
+            .validate_for_runtime()
+            .map_err(|error| anyhow!("invalid design profile: {error}"))?;
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner)?;
+        ensure_unique_project_active_profile(&inner, &profile)?;
+        inner
+            .design_profiles
+            .insert(profile.id.clone(), profile.clone());
+        drop(inner);
+        self.append_design_profile_snapshot(&profile)?;
+        Ok(profile)
+    }
+
+    pub async fn get_design_profile(&self, design_profile_id: &str) -> Option<DesignProfile> {
+        if let Some(profile) = self
+            .inner
+            .read()
+            .await
+            .design_profiles
+            .get(design_profile_id)
+            .cloned()
+        {
+            return Some(profile);
+        }
+        let profile = self.read_design_profile(design_profile_id).ok().flatten()?;
+        self.inner
+            .write()
+            .await
+            .design_profiles
+            .insert(profile.id.clone(), profile.clone());
+        Some(profile)
+    }
+
+    pub async fn design_profile_versions(
+        &self,
+        design_profile_id: &str,
+    ) -> Result<Vec<DesignProfile>> {
+        let versions = self.read_design_profile_history(design_profile_id)?;
+        if let Some(latest) = versions.last().cloned() {
+            self.inner
+                .write()
+                .await
+                .design_profiles
+                .insert(latest.id.clone(), latest);
+        }
+        Ok(versions)
+    }
+
+    pub async fn list_design_profiles(
+        &self,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+        organization_id: Option<&str>,
+        include_archived: bool,
+    ) -> Vec<DesignProfile> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner).ok();
+        let scope_filter_present =
+            project_id.is_some() || workspace_id.is_some() || organization_id.is_some();
+        let mut profiles = inner
+            .design_profiles
+            .values()
+            .filter(|profile| include_archived || profile.status != "archived")
+            .filter(|profile| {
+                if !scope_filter_present {
+                    return true;
+                }
+                project_id.is_some_and(|id| profile.project_id() == Some(id))
+                    || workspace_id.is_some_and(|id| profile.workspace_id() == Some(id))
+                    || organization_id.is_some_and(|id| profile.organization_id() == Some(id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| left.version.cmp(&right.version))
+        });
+        profiles
+    }
+
+    pub async fn archive_design_profile(&self, design_profile_id: &str) -> Result<DesignProfile> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner)?;
+        let mut profile = inner
+            .design_profiles
+            .get(design_profile_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("design profile not found: {design_profile_id}"))?;
+        profile.status = "archived".to_string();
+        profile.version += 1;
+        profile.updated_at = Utc::now();
+        inner
+            .design_profiles
+            .insert(profile.id.clone(), profile.clone());
+        drop(inner);
+        self.append_design_profile_snapshot(&profile)?;
+        Ok(profile)
+    }
+
+    pub async fn bind_project_design_profile(
+        &self,
+        project_id: &str,
+        design_profile_id: &str,
+    ) -> Result<DesignProfile> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner)?;
+        self.hydrate_project_design_profiles(&mut inner)?;
+        let profile = inner
+            .design_profiles
+            .get(design_profile_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("design profile not found: {design_profile_id}"))?;
+        if profile.status != "active" {
+            return Err(anyhow!(
+                "project active design profile must have status=active: {design_profile_id}"
+            ));
+        }
+        if let Some(scope_project_id) = profile.project_id() {
+            if scope_project_id != project_id {
+                return Err(anyhow!(
+                    "design profile {design_profile_id} is scoped to project {scope_project_id}"
+                ));
+            }
+        }
+        inner
+            .project_design_profiles
+            .insert(project_id.to_string(), design_profile_id.to_string());
+        drop(inner);
+        self.append_project_design_profile_snapshot(&ProjectDesignProfileSnapshot {
+            project_id: project_id.to_string(),
+            design_profile_id: design_profile_id.to_string(),
+            updated_at: Utc::now(),
+        })?;
+        Ok(profile)
+    }
+
+    pub async fn project_design_profile(&self, project_id: &str) -> Option<DesignProfile> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner).ok()?;
+        self.hydrate_project_design_profiles(&mut inner).ok()?;
+        let profile_id = inner.project_design_profiles.get(project_id)?.clone();
+        inner.design_profiles.get(&profile_id).cloned()
+    }
+
+    pub async fn resolve_design_profile(
+        &self,
+        project_id: &str,
+        workspace_id: Option<&str>,
+        organization_id: Option<&str>,
+        explicit_design_profile_id: Option<&str>,
+    ) -> Result<Option<DesignProfile>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_design_profiles(&mut inner)?;
+        self.hydrate_project_design_profiles(&mut inner)?;
+        if let Some(design_profile_id) = explicit_design_profile_id {
+            let profile = inner
+                .design_profiles
+                .get(design_profile_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("design profile not found: {design_profile_id}"))?;
+            if !profile_visible_to_context(&profile, project_id, workspace_id, organization_id) {
+                return Err(anyhow!(
+                    "design profile {design_profile_id} is not visible to project {project_id}"
+                ));
+            }
+            return Ok(Some(profile));
+        }
+        let Some(profile_id) = inner.project_design_profiles.get(project_id).cloned() else {
+            if let Some(workspace_id) = workspace_id {
+                let workspace_matches = active_profiles_for_scope(
+                    inner.design_profiles.values(),
+                    ScopeLevel::Workspace,
+                    workspace_id,
+                );
+                if workspace_matches.len() > 1 {
+                    return Err(anyhow!(
+                        "multiple workspace default design profiles match workspace {workspace_id}; pass designProfileId explicitly"
+                    ));
+                }
+                if let Some(profile) = workspace_matches.into_iter().next() {
+                    return Ok(Some(profile));
+                }
+            }
+            if let Some(organization_id) = organization_id {
+                let organization_matches = active_profiles_for_scope(
+                    inner.design_profiles.values(),
+                    ScopeLevel::Organization,
+                    organization_id,
+                );
+                if organization_matches.len() > 1 {
+                    return Err(anyhow!(
+                        "multiple organization default design profiles match organization {organization_id}; pass designProfileId explicitly"
+                    ));
+                }
+                if let Some(profile) = organization_matches.into_iter().next() {
+                    return Ok(Some(profile));
+                }
+            }
+            return Ok(None);
+        };
+        let profile = inner
+            .design_profiles
+            .get(&profile_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("design profile not found: {profile_id}"))?;
+        if profile.status != "active" {
+            return Err(anyhow!(
+                "project active design profile is not active: {profile_id}"
+            ));
+        }
+        Ok(Some(profile))
+    }
+
+    pub async fn attach_run_design_profile(
+        &self,
+        run_id: &str,
+        profile: &DesignProfile,
+    ) -> Result<AgentRun> {
+        self.attach_run_effective_design_profile(run_id, profile, None, None)
+            .await
+    }
+
+    pub async fn attach_run_effective_design_profile(
+        &self,
+        run_id: &str,
+        profile: &DesignProfile,
+        surface: Option<&str>,
+        template: Option<&str>,
+    ) -> Result<AgentRun> {
+        let effective = match (surface, template) {
+            (Some(surface), Some(template)) => Some(
+                profile
+                    .effective_for(surface, template)
+                    .map_err(|error| anyhow!(error))?,
+            ),
+            (None, None) => None,
+            _ => return Err(anyhow!("surface and template must be provided together")),
+        };
+        let (unsupported_extended_tokens, blocking_capability_rule_ids) = effective
+            .as_ref()
+            .map(design_profile_capability_gaps)
+            .unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        if !inner.runs.contains_key(run_id) {
+            if let Some(run) = self.read_run(run_id)? {
+                inner.runs.insert(run.id.clone(), run);
+            }
+        }
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        run.design_profile_id = Some(profile.id.clone());
+        run.design_profile_version = Some(profile.version);
+        run.design_profile_hash = Some(profile.stable_hash());
+        run.design_profile_surface = effective.as_ref().map(|value| value.surface.clone());
+        run.design_profile_template = effective.as_ref().map(|value| value.template.clone());
+        run.design_profile_surface_override_hash = effective
+            .as_ref()
+            .and_then(|value| value.surface_override_hash.clone());
+        run.design_profile_template_override_hash = effective
+            .as_ref()
+            .and_then(|value| value.template_override_hash.clone());
+        run.design_profile_effective_hash = effective
+            .as_ref()
+            .map(|value| value.effective_profile_hash.clone());
+        run.design_profile_unsupported_extended_tokens = unsupported_extended_tokens;
+        run.design_profile_blocking_capability_rule_ids = blocking_capability_rule_ids;
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn configure_run_design_fidelity(
+        &self,
+        run_id: &str,
+        profile: &DesignProfile,
+        requested_mode: Option<&str>,
+    ) -> Result<AgentRun> {
+        if let Some(mode) = requested_mode {
+            if !matches!(mode, "profile_only" | "source_fallback") {
+                return Err(anyhow!(
+                    "designFidelityMode must be profile_only or source_fallback"
+                ));
+            }
+        }
+        let imported = profile.source.get("kind").and_then(Value::as_str) == Some("imported");
+        let source_artifact_id = profile
+            .source
+            .get("primarySourceArtifactId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let artifact = match source_artifact_id.as_deref() {
+            Some(artifact_id) => Some(
+                self.get_design_source_artifact(artifact_id)
+                    .await
+                    .ok_or_else(|| anyhow!("design source artifact not found: {artifact_id}"))?,
+            ),
+            None => None,
+        };
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let mode = requested_mode.unwrap_or(if imported && run.phase == AgentPhase::Build {
+            "source_fallback"
+        } else {
+            "profile_only"
+        });
+        if mode == "source_fallback" && !imported {
+            return Err(anyhow!(
+                "source_fallback requires an imported design profile"
+            ));
+        }
+        run.design_fidelity_mode = Some(mode.to_string());
+        if let Some(artifact) = artifact {
+            run.design_source_artifact_id = Some(artifact.id);
+            run.design_source_hash = Some(artifact.sha256);
+            run.design_source_size_bytes = Some(artifact.size_bytes);
+            run.design_source_budget_bytes = Some(48 * 1024);
+        }
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn set_run_design_source_index(
+        &self,
+        run_id: &str,
+        index: &DesignSourceIndex,
+        required_section_ids: Vec<String>,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.design_source_artifact_id.as_deref() != Some(&index.source_artifact_id)
+            || run.design_source_hash.as_deref() != Some(&index.source_hash)
+        {
+            return Err(anyhow!("design source index does not match run snapshot"));
+        }
+        run.design_source_sections = index.sections.clone();
+        run.design_source_required_section_ids = required_section_ids;
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn record_design_context_file_read(
+        &self,
+        run_id: &str,
+        path: &str,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if !run
+            .design_context_read_files
+            .iter()
+            .any(|value| value == path)
+        {
+            run.design_context_read_files.push(path.to_string());
+            run.design_context_read_files.sort();
+        }
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn record_design_source_sections_read(
+        &self,
+        run_id: &str,
+        section_hashes: &[String],
+        bytes_read: u64,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let budget = run.design_source_budget_bytes.unwrap_or(48 * 1024);
+        if run.design_source_bytes_read.saturating_add(bytes_read) > budget {
+            return Err(anyhow!("design profile source budget exceeded"));
+        }
+        run.design_source_bytes_read += bytes_read;
+        for hash in section_hashes {
+            if !run
+                .design_source_read_section_hashes
+                .iter()
+                .any(|value| value == hash)
+            {
+                run.design_source_read_section_hashes.push(hash.clone());
+            }
+        }
+        run.design_source_read_section_hashes.sort();
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
     }
 
     pub async fn child_runs(&self, parent_run_id: &str) -> Vec<AgentRun> {
@@ -1425,6 +2410,279 @@ impl RuntimeStore {
 
     pub fn sandbox_binding_log_path(&self) -> PathBuf {
         (*self.sandbox_binding_log_path).clone()
+    }
+
+    pub fn design_profile_log_path(&self) -> PathBuf {
+        (*self.design_profile_log_path).clone()
+    }
+
+    pub fn design_profile_draft_log_path(&self) -> PathBuf {
+        (*self.design_profile_draft_log_path).clone()
+    }
+
+    pub fn design_profile_conversion_report_log_path(&self) -> PathBuf {
+        (*self.design_profile_conversion_report_log_path).clone()
+    }
+
+    pub fn design_source_artifact_log_path(&self) -> PathBuf {
+        (*self.design_source_artifact_log_path).clone()
+    }
+
+    fn design_source_blob_path(&self, artifact_id: &str) -> PathBuf {
+        self.design_source_blob_dir
+            .join(artifact_id)
+            .join("source.md")
+    }
+
+    fn append_design_source_artifact_snapshot(
+        &self,
+        artifact: &DesignSourceArtifact,
+    ) -> Result<()> {
+        let path = self.design_source_artifact_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&path, artifact)
+    }
+
+    fn read_design_source_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<DesignSourceArtifact>> {
+        Ok(self
+            .read_design_source_artifacts()?
+            .into_iter()
+            .find(|artifact| artifact.id == artifact_id))
+    }
+
+    fn read_design_source_artifacts(&self) -> Result<Vec<DesignSourceArtifact>> {
+        let file = match fs::File::open(self.design_source_artifact_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut artifacts_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let artifact: DesignSourceArtifact = serde_json::from_str(&line)?;
+            artifacts_by_id.insert(artifact.id.clone(), artifact);
+        }
+        Ok(artifacts_by_id.into_values().collect())
+    }
+
+    pub fn project_design_profile_log_path(&self) -> PathBuf {
+        (*self.project_design_profile_log_path).clone()
+    }
+
+    fn append_design_profile_snapshot(&self, profile: &DesignProfile) -> Result<()> {
+        let path = self.design_profile_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, profile)
+    }
+
+    fn append_design_profile_draft_snapshot(&self, draft: &DesignProfileDraft) -> Result<()> {
+        let path = self.design_profile_draft_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&path, draft)
+    }
+
+    fn append_design_profile_conversion_report_snapshot(
+        &self,
+        report: &DesignProfileConversionReport,
+    ) -> Result<()> {
+        let path = self.design_profile_conversion_report_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&path, report)
+    }
+
+    fn read_design_profile_draft(
+        &self,
+        design_profile_id: &str,
+    ) -> Result<Option<DesignProfileDraft>> {
+        Ok(self
+            .read_design_profile_drafts()?
+            .into_iter()
+            .find(|draft| draft.id == design_profile_id))
+    }
+
+    fn read_design_profile_draft_history(
+        &self,
+        design_profile_id: &str,
+    ) -> Result<Vec<DesignProfileDraft>> {
+        let file = match fs::File::open(self.design_profile_draft_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut drafts = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let draft: DesignProfileDraft = serde_json::from_str(&line)?;
+            if draft.id == design_profile_id {
+                drafts.push(draft);
+            }
+        }
+        drafts.sort_by_key(|draft| draft.version);
+        Ok(drafts)
+    }
+
+    fn read_design_profile_drafts(&self) -> Result<Vec<DesignProfileDraft>> {
+        let file = match fs::File::open(self.design_profile_draft_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut drafts_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let draft: DesignProfileDraft = serde_json::from_str(&line)?;
+            drafts_by_id.insert(draft.id.clone(), draft);
+        }
+        Ok(drafts_by_id.into_values().collect())
+    }
+
+    fn hydrate_design_profile_drafts(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for draft in self.read_design_profile_drafts()? {
+            inner.design_profile_drafts.insert(draft.id.clone(), draft);
+        }
+        Ok(())
+    }
+
+    fn read_design_profile_conversion_report(
+        &self,
+        design_profile_id: &str,
+        version: u32,
+    ) -> Result<Option<DesignProfileConversionReport>> {
+        let file = match fs::File::open(self.design_profile_conversion_report_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut report = None;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let candidate: DesignProfileConversionReport = serde_json::from_str(&line)?;
+            if candidate.design_profile_id == design_profile_id
+                && candidate.profile_version == version
+            {
+                report = Some(candidate);
+            }
+        }
+        Ok(report)
+    }
+
+    fn read_design_profile(&self, design_profile_id: &str) -> Result<Option<DesignProfile>> {
+        Ok(self
+            .read_design_profiles()?
+            .into_iter()
+            .find(|profile| profile.id == design_profile_id))
+    }
+
+    fn read_design_profile_history(&self, design_profile_id: &str) -> Result<Vec<DesignProfile>> {
+        let file = match fs::File::open(self.design_profile_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut profiles = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let profile: DesignProfile = serde_json::from_str(&line)?;
+            if profile.id == design_profile_id {
+                profiles.push(profile);
+            }
+        }
+        profiles.sort_by(|left, right| {
+            left.version
+                .cmp(&right.version)
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+        });
+        Ok(profiles)
+    }
+
+    fn read_design_profiles(&self) -> Result<Vec<DesignProfile>> {
+        let file = match fs::File::open(self.design_profile_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut profiles_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let profile: DesignProfile = serde_json::from_str(&line)?;
+            profiles_by_id.insert(profile.id.clone(), profile);
+        }
+        Ok(profiles_by_id.into_values().collect())
+    }
+
+    fn hydrate_design_profiles(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for profile in self.read_design_profiles()? {
+            inner.design_profiles.insert(profile.id.clone(), profile);
+        }
+        Ok(())
+    }
+
+    fn append_project_design_profile_snapshot(
+        &self,
+        snapshot: &ProjectDesignProfileSnapshot,
+    ) -> Result<()> {
+        let path = self.project_design_profile_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, snapshot)
+    }
+
+    fn read_project_design_profile_snapshots(&self) -> Result<Vec<ProjectDesignProfileSnapshot>> {
+        let file = match fs::File::open(self.project_design_profile_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bindings_by_project = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let snapshot: ProjectDesignProfileSnapshot = serde_json::from_str(&line)?;
+            bindings_by_project.insert(snapshot.project_id.clone(), snapshot);
+        }
+        Ok(bindings_by_project.into_values().collect())
+    }
+
+    fn hydrate_project_design_profiles(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for snapshot in self.read_project_design_profile_snapshots()? {
+            inner
+                .project_design_profiles
+                .entry(snapshot.project_id)
+                .or_insert(snapshot.design_profile_id);
+        }
+        Ok(())
     }
 
     fn append_sandbox_binding_snapshot(&self, binding: &SandboxBinding) -> Result<()> {
@@ -2489,6 +3747,18 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     line.push('\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+fn append_jsonl_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
