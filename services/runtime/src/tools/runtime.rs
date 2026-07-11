@@ -170,6 +170,7 @@ pub struct ToolContext {
     pub policy_profile: RuntimePolicyProfile,
     pub npm_registry: String,
     pub runtime_public_base_url: String,
+    pub runtime_browser_proxy_base_url: String,
     pub runtime_storage_dir: PathBuf,
     pub allow_runtime_owned_writes: bool,
     pub remote_workspace: bool,
@@ -189,6 +190,7 @@ impl ToolContext {
             policy_profile: RuntimePolicyProfile::Production,
             npm_registry: "https://registry.internal.example/npm/".to_string(),
             runtime_public_base_url: "http://127.0.0.1:8080".to_string(),
+            runtime_browser_proxy_base_url: "http://127.0.0.1:8081".to_string(),
             runtime_storage_dir,
             allow_runtime_owned_writes: false,
             remote_workspace: false,
@@ -343,6 +345,7 @@ pub struct ToolExecutor {
     policy_profile: RuntimePolicyProfile,
     npm_registry: Arc<String>,
     runtime_public_base_url: Arc<String>,
+    runtime_browser_proxy_base_url: Arc<String>,
     remote_workspace: bool,
     runtime_storage_dir: Arc<PathBuf>,
     runtime_storage_overridden: bool,
@@ -375,6 +378,7 @@ impl ToolExecutor {
             policy_profile: RuntimePolicyProfile::Production,
             npm_registry: Arc::new("https://registry.internal.example/npm/".to_string()),
             runtime_public_base_url: Arc::new("http://127.0.0.1:8080".to_string()),
+            runtime_browser_proxy_base_url: Arc::new("http://127.0.0.1:8081".to_string()),
             remote_workspace: false,
         }
     }
@@ -391,6 +395,7 @@ impl ToolExecutor {
             policy_profile,
             npm_registry: Arc::new(npm_registry.into()),
             runtime_public_base_url: self.runtime_public_base_url.clone(),
+            runtime_browser_proxy_base_url: self.runtime_browser_proxy_base_url.clone(),
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
@@ -411,6 +416,7 @@ impl ToolExecutor {
             policy_profile: self.policy_profile,
             npm_registry: self.npm_registry.clone(),
             runtime_public_base_url: self.runtime_public_base_url.clone(),
+            runtime_browser_proxy_base_url: self.runtime_browser_proxy_base_url.clone(),
             remote_workspace: self.remote_workspace,
             runtime_storage_dir,
             runtime_storage_overridden: self.runtime_storage_overridden,
@@ -425,6 +431,24 @@ impl ToolExecutor {
             policy_profile: self.policy_profile,
             npm_registry: self.npm_registry.clone(),
             runtime_public_base_url: Arc::new(base_url.into().trim_end_matches('/').to_string()),
+            runtime_browser_proxy_base_url: self.runtime_browser_proxy_base_url.clone(),
+            remote_workspace: self.remote_workspace,
+            runtime_storage_dir: self.runtime_storage_dir.clone(),
+            runtime_storage_overridden: self.runtime_storage_overridden,
+        }
+    }
+
+    pub fn with_runtime_browser_proxy_base_url(&self, base_url: impl Into<String>) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            permission_engine: self.permission_engine.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy_profile: self.policy_profile,
+            npm_registry: self.npm_registry.clone(),
+            runtime_public_base_url: self.runtime_public_base_url.clone(),
+            runtime_browser_proxy_base_url: Arc::new(
+                base_url.into().trim_end_matches('/').to_string(),
+            ),
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
@@ -439,6 +463,7 @@ impl ToolExecutor {
             policy_profile: self.policy_profile,
             npm_registry: self.npm_registry.clone(),
             runtime_public_base_url: self.runtime_public_base_url.clone(),
+            runtime_browser_proxy_base_url: self.runtime_browser_proxy_base_url.clone(),
             remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
@@ -453,6 +478,7 @@ impl ToolExecutor {
             policy_profile: self.policy_profile,
             npm_registry: self.npm_registry.clone(),
             runtime_public_base_url: self.runtime_public_base_url.clone(),
+            runtime_browser_proxy_base_url: self.runtime_browser_proxy_base_url.clone(),
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: Arc::new(runtime_storage_dir.into()),
             runtime_storage_overridden: true,
@@ -887,6 +913,7 @@ impl ToolExecutor {
         ctx.policy_profile = self.policy_profile;
         ctx.npm_registry = (*self.npm_registry).clone();
         ctx.runtime_public_base_url = (*self.runtime_public_base_url).clone();
+        ctx.runtime_browser_proxy_base_url = (*self.runtime_browser_proxy_base_url).clone();
         ctx.remote_workspace = self.remote_workspace;
         ctx.runtime_storage_dir = (*self.runtime_storage_dir).clone();
         ctx

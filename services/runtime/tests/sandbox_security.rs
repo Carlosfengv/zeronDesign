@@ -7,6 +7,8 @@ const RBAC_YAML: &str =
     include_str!("../../../infra/agent-sandbox/rbac/runtime-service-account.yaml");
 const TEMPLATE_YAML: &str =
     include_str!("../../../infra/agent-sandbox/astro-website/sandbox-template.yaml");
+const RUNTIME_DEPLOYMENT_YAML: &str =
+    include_str!("../../../infra/agent-sandbox/runtime/deployment.yaml");
 const ASTRO_SANDBOX_DOCKERFILE: &str =
     include_str!("../../../infra/agent-sandbox/astro-website/Dockerfile");
 const WORKSPACE_INIT_SH: &str = include_str!("../../../infra/agent-sandbox/base/workspace-init.sh");
@@ -108,6 +110,28 @@ fn runtime_rbac_cannot_read_secrets_or_mutate_sandbox_pods() {
             );
         }
     }
+}
+
+#[test]
+fn workspace_channel_requires_mtls_workload_identities() {
+    let template_docs = yaml_documents(TEMPLATE_YAML);
+    let template = named_doc(&template_docs, "SandboxTemplate", "anydesign-astro-website");
+    assert_yaml_contains(template, "serviceAccountName");
+    assert_yaml_contains(template, "anydesign-sandbox");
+    assert_yaml_contains(template, "WORKSPACE_CHANNEL_TLS_MODE");
+    assert_yaml_contains(template, "anydesign-sandbox-channel-server");
+    assert_yaml_contains(template, "workspace-channel-tls");
+    assert!(WORKSPACE_CHANNEL_SERVER_JS.contains("https.createServer"));
+    assert!(WORKSPACE_CHANNEL_SERVER_JS.contains("requestCert: true"));
+    assert!(WORKSPACE_CHANNEL_SERVER_JS.contains("rejectUnauthorized: true"));
+    assert!(WORKSPACE_CHANNEL_SERVER_JS.contains("EXPECTED_RUNTIME_SAN"));
+
+    let runtime_docs = yaml_documents(RUNTIME_DEPLOYMENT_YAML);
+    let runtime = named_doc(&runtime_docs, "Deployment", "anydesign-runtime");
+    assert_yaml_contains(runtime, "WORKSPACE_CHANNEL_CLIENT_CERT_FILE");
+    assert_yaml_contains(runtime, "WORKSPACE_CHANNEL_CLIENT_KEY_FILE");
+    assert_yaml_contains(runtime, "WORKSPACE_CHANNEL_SERVER_SAN");
+    assert_yaml_contains(runtime, "anydesign-runtime-channel-client");
 }
 
 #[test]

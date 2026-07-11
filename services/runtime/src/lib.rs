@@ -9,6 +9,7 @@ pub mod model_gateway;
 pub mod permission;
 pub mod preview;
 pub mod profiles;
+pub mod public_principal;
 pub mod query_session;
 pub mod recovery;
 pub mod repair_loop;

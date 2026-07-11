@@ -263,6 +263,17 @@ pub struct ProjectRuntimeState {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAccessRecord {
+    pub project_id: String,
+    pub owner_principal_id: String,
+    pub workspace_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewLeaseStatus {

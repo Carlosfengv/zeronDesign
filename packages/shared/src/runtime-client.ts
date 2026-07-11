@@ -22,12 +22,14 @@ import {
   ListDesignProfilesResponseSchema,
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
+  ProjectAccessResponseSchema,
   ProjectDesignProfileResponseSchema,
   ProjectRuntimeStateResponseSchema,
   ResolvePermissionRequest,
   ResolvePermissionResponseSchema,
   StartRunRequest,
   StartRunResponseSchema,
+  UpsertProjectAccessRequest,
   UpdateDesignProfileRequest,
 } from "./api-types.js";
 import { AgentEventSchema, type AgentEvent } from "./events.js";
@@ -174,6 +176,12 @@ export type RuntimeClient = {
     projectId: string,
     versionId: string,
   ): Promise<z.output<typeof PreviewVersionResponseSchema>>;
+  upsertProjectAccess(
+    projectId: string,
+    request: UpsertProjectAccessRequest,
+  ): Promise<z.output<typeof ProjectAccessResponseSchema>>;
+  runtimePreviewPath(leaseId: string, previewPath?: string): string;
+  previewProxyHeaders(principalToken: string, previewPrefix: string): Record<string, string>;
   runEventsUrl(runId: string, options?: { lastEventId?: string }): string;
   runtimeRunEventsPath(runId: string): string;
   runEventsProxyHeaders(lastEventId?: string): Record<string, string>;
@@ -347,6 +355,20 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         `/preview/${encodePathSegment(projectId)}/${encodePathSegment(versionId)}`,
         PreviewVersionResponseSchema,
       ),
+    upsertProjectAccess: (projectId, request) =>
+      requestJson(
+        fetchImpl,
+        baseUrl,
+        `/internal/projects/${encodePathSegment(projectId)}/access`,
+        ProjectAccessResponseSchema,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json", ...internalHeaders },
+          body: JSON.stringify(request),
+        },
+      ),
+    runtimePreviewPath,
+    previewProxyHeaders,
     runEventsUrl: (runId, eventOptions) =>
       runEventsUrl(baseUrl, runId, eventOptions?.lastEventId),
     runtimeRunEventsPath,
@@ -376,6 +398,31 @@ export function runEventsUrl(
 
 export function runEventsProxyHeaders(lastEventId?: string): Record<string, string> {
   return lastEventId ? { "last-event-id": lastEventId } : {};
+}
+
+export function runtimePreviewPath(leaseId: string, previewPath = ""): string {
+  const suffix = previewPath
+    .split("/")
+    .filter(Boolean)
+    .map(encodePathSegment)
+    .join("/");
+  return `/previews/${encodePathSegment(leaseId)}/${suffix}`;
+}
+
+export function previewProxyHeaders(
+  principalToken: string,
+  previewPrefix: string,
+): Record<string, string> {
+  if (!principalToken.trim()) {
+    throw new Error("preview principal token is required");
+  }
+  if (!previewPrefix.startsWith("/projects/")) {
+    throw new Error("BFF preview prefix is required");
+  }
+  return {
+    authorization: `Bearer ${principalToken}`,
+    "x-anydesign-preview-prefix": previewPrefix,
+  };
 }
 
 export function parseRunEventMessage(data: string, id = ""): RunEventEnvelope {

@@ -1,27 +1,29 @@
 use crate::{
     artifact_publisher::{safe_segment, FileArtifactPublisher},
     channel_manager::ChannelManager,
-    config::{RuntimeConfig, SandboxBackendMode},
+    config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
     conversation::{RuntimeStore, SequencedAgentEvent},
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
     profiles::edit::{self, EditIntent},
+    public_principal::{PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION},
     query_session::QuerySession,
     recovery::{recover_interrupted_runs, RecoveryOutcome},
     tools::{
         control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
         runtime::ToolContext,
         sandbox::{
-            cleanup_staged_writes_for_run, cleanup_staged_writes_for_run_backend,
-            LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend,
+            cancel_run_sandbox_resources, cleanup_staged_writes_for_run,
+            cleanup_staged_writes_for_run_backend, LocalWorkspaceBackend,
+            SandboxChannelWorkspaceBackend, WorkspaceBackend,
         },
     },
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
         ConversationItem, DesignProfile, DesignProfileConversionReport, DesignProfileDraft,
         DesignProfileFidelityReport, DesignProfileUnmappedItem, DesignProfileValidationIssue,
-        DesignSourceArtifact, PreviewLeaseStatus, DESIGN_PROFILE_SCHEMA_V2,
+        DesignSourceArtifact, PreviewLeaseStatus, ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2,
         MAX_DESIGN_SOURCE_BYTES,
     },
 };
@@ -33,7 +35,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, Response,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -234,31 +236,77 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/internal/template-build", post(internal_template_build))
         .route("/internal/previews/promote", post(internal_promote_preview))
         .route(
+            "/internal/projects/{project_id}/access",
+            put(internal_upsert_project_access),
+        )
+        .route(
+            "/internal/projects/{project_id}/release-evidence",
+            get(internal_project_release_evidence),
+        )
+        .route(
+            "/internal/projects/{project_id}/release-sandbox",
+            post(internal_release_project_sandbox),
+        )
+        .route(
             "/permissions/{permission_id}/decision",
             post(resolve_permission),
         )
         .with_state(state)
 }
 
-async fn candidate_preview_root(
+pub fn capture_router_with_state(state: AppState) -> Router {
+    Router::new()
+        .route("/preview-captures/{lease_id}", get(candidate_capture_root))
+        .route("/preview-captures/{lease_id}/", get(candidate_capture_root))
+        .route(
+            "/preview-captures/{lease_id}/{*preview_path}",
+            get(candidate_capture_file),
+        )
+        .with_state(state)
+}
+
+async fn candidate_capture_root(
     State(state): State<AppState>,
     Path(lease_id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    proxy_candidate_preview(state, lease_id, String::new()).await
+    proxy_candidate_preview(state, lease_id, String::new(), HeaderMap::new(), false).await
+}
+
+async fn candidate_capture_file(
+    State(state): State<AppState>,
+    Path((lease_id, preview_path)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    proxy_candidate_preview(state, lease_id, preview_path, HeaderMap::new(), false).await
+}
+
+async fn candidate_preview_root(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    proxy_candidate_preview(state, lease_id, String::new(), headers, true).await
 }
 
 async fn candidate_preview_file(
     State(state): State<AppState>,
     Path((lease_id, preview_path)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    proxy_candidate_preview(state, lease_id, preview_path).await
+    proxy_candidate_preview(state, lease_id, preview_path, headers, true).await
 }
 
 async fn proxy_candidate_preview(
     state: AppState,
     lease_id: String,
     preview_path: String,
+    headers: HeaderMap,
+    public_access: bool,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let principal = if public_access {
+        authenticate_candidate_preview(&state, &headers, &lease_id).await?
+    } else {
+        None
+    };
     if preview_path
         .split('/')
         .any(|component| component == ".." || component.contains('\\'))
@@ -271,15 +319,31 @@ async fn proxy_candidate_preview(
         .await
         .filter(|lease| lease.status == PreviewLeaseStatus::Active)
         .ok_or_else(|| not_found("candidate preview lease is unavailable".to_string()))?;
+    authorize_candidate_preview(
+        &state,
+        principal.as_ref(),
+        &lease_id,
+        &lease.run_id,
+        &lease.project_id,
+    )
+    .await?;
+    let preview_prefix = if public_access {
+        validated_preview_prefix(&state.config, &headers, &lease.project_id, &lease_id)?
+    } else {
+        format!("/preview-captures/{lease_id}")
+    };
     let binding = state
         .store
         .get_sandbox_binding(&lease.sandbox_binding_id)
         .await
-        .filter(|binding| {
-            binding.sandbox_name == lease.sandbox_name
-                && binding.pod_uid.as_deref() == Some(lease.pod_uid.as_str())
-        })
-        .ok_or_else(|| not_found("candidate preview sandbox identity changed".to_string()))?;
+        .ok_or_else(|| not_found("candidate preview sandbox is unavailable".to_string()))?;
+    if binding.sandbox_name != lease.sandbox_name
+        || binding.pod_uid.as_deref() != Some(lease.pod_uid.as_str())
+    {
+        return Err(conflict_error(anyhow::anyhow!(
+            "candidate preview sandbox identity changed"
+        )));
+    }
 
     let endpoint = ChannelManager::shared()
         .endpoint(&state.store, &binding, &lease.run_id, 4321, "http", "")
@@ -315,11 +379,6 @@ async fn proxy_candidate_preview(
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
-    let cache_control = upstream_response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("no-store"));
     let mut bytes = upstream_response
         .bytes()
         .await
@@ -331,17 +390,16 @@ async fn proxy_candidate_preview(
         .is_some_and(|value| value.starts_with("text/html"))
     {
         if let Ok(html) = String::from_utf8(bytes.clone()) {
-            let prefix = format!("/previews/{lease_id}");
             bytes = html
-                .replace("href=\"/", &format!("href=\"{prefix}/"))
-                .replace("src=\"/", &format!("src=\"{prefix}/"))
+                .replace("href=\"/", &format!("href=\"{preview_prefix}/"))
+                .replace("src=\"/", &format!("src=\"{preview_prefix}/"))
                 .into_bytes();
         }
     }
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::CACHE_CONTROL, "private, no-store")
         .header("x-anydesign-preview-lease", lease_id)
         .body(Body::from(bytes))
         .map_err(|error| internal_error(anyhow::anyhow!(error)))
@@ -614,6 +672,22 @@ pub struct DesignProfileDiffChange {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertProjectAccessRequest {
+    pub owner_principal_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub organization_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAccessResponse {
+    pub project_access: ProjectAccessRecord,
 }
 
 #[derive(Debug, Serialize)]
@@ -1656,6 +1730,7 @@ async fn start_run(
     Json(request): Json<StartRunRequest>,
 ) -> Result<Json<StartRunResponse>, (StatusCode, Json<ErrorResponse>)> {
     validate_start_run_request(&request)?;
+    validate_project_access_before_initial_run(&state, &request).await?;
     validate_sandbox_context(&state.store, &request).await?;
     validate_project_lifecycle_context(&state.store, &request).await?;
     let design_profile = resolve_design_profile_context(&state.store, &request).await?;
@@ -1934,6 +2009,49 @@ async fn start_run(
         run_id: run.id,
         status: "queued",
     }))
+}
+
+async fn validate_project_access_before_initial_run(
+    state: &AppState,
+    request: &StartRunRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let production_auth_active = state.config.policy_profile
+        == crate::config::RuntimePolicyProfile::Production
+        && state.config.public_principal_auth_mode == PublicPrincipalAuthMode::Required
+        && state.config.validate_startup().is_ok();
+    if !production_auth_active
+        || request.input_context.parent_run_id.is_some()
+        || !matches!(request.phase, AgentPhase::Brief | AgentPhase::Build)
+    {
+        return Ok(());
+    }
+    let access = state
+        .store
+        .get_project_access(&request.project_id)
+        .await
+        .ok_or_else(|| {
+            conflict_error(anyhow::anyhow!(
+                "project access ownership must be registered before the initial run"
+            ))
+        })?;
+    if request
+        .input_context
+        .workspace_id
+        .as_deref()
+        .is_some_and(|workspace_id| access.workspace_id.as_deref() != Some(workspace_id))
+        || request
+            .input_context
+            .organization_id
+            .as_deref()
+            .is_some_and(|organization_id| {
+                access.organization_id.as_deref() != Some(organization_id)
+            })
+    {
+        return Err(conflict_error(anyhow::anyhow!(
+            "project access scope identity drift detected"
+        )));
+    }
+    Ok(())
 }
 
 async fn restore_edit_workspace_from_base_version(
@@ -2538,13 +2656,16 @@ async fn cancel_run(
     Path(run_id): Path<String>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     validate_required_string("runId", &run_id)?;
-    state
+    let cancelled = state
         .store
         .update_run_status(&run_id, AgentRunStatus::Cancelled)
         .await
         .map_err(run_update_error)?;
     if let Some(run) = state.store.get_run(&run_id).await {
         let workspace_root = effective_workspace_root(&state.config, &run.project_id);
+        cancel_run_sandbox_resources(&state.config, &state.store, &run, workspace_root.clone())
+            .await
+            .map_err(internal_error)?;
         if state.config.sandbox_backend_mode == SandboxBackendMode::Kubernetes
             && run.sandbox_id.is_some()
         {
@@ -2571,7 +2692,7 @@ async fn cancel_run(
         .await
         .map_err(internal_error)?;
     Ok(Json(RunStatusResponse {
-        run_id,
+        run_id: cancelled.id,
         status: "cancelled".to_string(),
     }))
 }
@@ -3262,6 +3383,213 @@ async fn internal_template_build(
     }))
 }
 
+async fn internal_upsert_project_access(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpsertProjectAccessRequest>,
+) -> Result<Json<ProjectAccessResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !internal_admin_authorized(&state.config, &headers) {
+        state
+            .store
+            .append_audit_record(
+                &project_id,
+                "",
+                "internal.project_access.upsert",
+                "project access record".to_string(),
+                "deny",
+                "missing or invalid internal service authorization",
+            )
+            .await;
+        return Err(unauthorized(
+            "project access update requires service authorization".to_string(),
+        ));
+    }
+    if project_id.trim().is_empty() || request.owner_principal_id.trim().is_empty() {
+        return Err(bad_request(
+            "projectId and ownerPrincipalId are required".to_string(),
+        ));
+    }
+    let record = state
+        .store
+        .upsert_project_access(
+            &project_id,
+            request.owner_principal_id,
+            request.workspace_id,
+            request.organization_id,
+        )
+        .await
+        .map_err(internal_error)?;
+    state
+        .store
+        .append_audit_record(
+            &project_id,
+            "",
+            "internal.project_access.upsert",
+            "project access record".to_string(),
+            "allow",
+            "project access record persisted",
+        )
+        .await;
+    Ok(Json(ProjectAccessResponse {
+        project_access: record,
+    }))
+}
+
+async fn internal_project_release_evidence(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    if !internal_admin_authorized(&state.config, &headers) {
+        return Err(unauthorized(
+            "release evidence requires service authorization".to_string(),
+        ));
+    }
+    let current = state
+        .store
+        .current_project_version(&project_id)
+        .await
+        .ok_or_else(|| not_found(format!("current version not found: {project_id}")))?;
+    let edit_run_id = current.created_by_run_id.clone();
+    let publish = state
+        .store
+        .artifact_publish_for_version(&project_id, &edit_run_id, &current.id)
+        .await
+        .ok_or_else(|| not_found(format!("artifact publish not found: {}", current.id)))?;
+    let base_version_id = publish.expected_current_version_id.clone().ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "release evidence requires an Edit promotion with a base version"
+        ))
+    })?;
+    let base_version = state
+        .store
+        .get_project_version(&base_version_id)
+        .await
+        .ok_or_else(|| not_found(format!("base version not found: {base_version_id}")))?;
+    let lease = state
+        .store
+        .preview_lease_for_run(&edit_run_id)
+        .await
+        .ok_or_else(|| not_found(format!("preview lease not found: {edit_run_id}")))?;
+    let binding = state
+        .store
+        .get_sandbox_binding(&lease.sandbox_binding_id)
+        .await
+        .ok_or_else(|| {
+            not_found(format!(
+                "sandbox binding not found: {}",
+                lease.sandbox_binding_id
+            ))
+        })?;
+    let events = state.store.events(&edit_run_id).await;
+    let build_events = state.store.events(&base_version.created_by_run_id).await;
+    let failure_counts = build_events.iter().chain(events.iter()).fold(
+        (0_u64, 0_u64),
+        |(recoverable, terminal), event| match event {
+            AgentEvent::ToolFailed {
+                recoverable: true, ..
+            } => (recoverable + 1, terminal),
+            AgentEvent::ToolFailed {
+                recoverable: false, ..
+            } => (recoverable, terminal + 1),
+            _ => (recoverable, terminal),
+        },
+    );
+    let preview_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::PreviewUpdated { .. }))
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("preview.updated event missing")))?;
+    let completed_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RunCompleted { .. }))
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("run.completed event missing")))?;
+    let screenshot_id = current
+        .screenshot_id
+        .clone()
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("screenshot ID missing")))?;
+    let screenshot_path = state
+        .config
+        .runtime_storage_dir
+        .join("screenshots")
+        .join(&project_id)
+        .join(&edit_run_id)
+        .join(format!("{screenshot_id}.json"));
+    // remote-fs-boundary: allow-begin runtime-owned-release-evidence
+    let screenshot: Value = serde_json::from_slice(
+        &fs::read(&screenshot_path).map_err(|error| internal_error(anyhow::anyhow!(error)))?,
+    )
+    .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+    // remote-fs-boundary: allow-end runtime-owned-release-evidence
+    Ok(Json(json!({
+        "projectId": project_id,
+        "buildRunId": base_version.created_by_run_id,
+        "editRunId": edit_run_id,
+        "bindingId": binding.id,
+        "podUid": binding.pod_uid,
+        "buildId": publish.build_id,
+        "candidateManifestHash": publish.candidate_manifest_hash,
+        "sourceSnapshotUri": publish.source_snapshot_uri,
+        "previewLeaseId": lease.id,
+        "previewLeaseStatus": lease.status,
+        "screenshotId": screenshot_id,
+        "nonblankPixelRatio": screenshot["nonblankPixelRatio"],
+        "screenshotPngSha256": screenshot["pngSha256"],
+        "screenshotDocumentSha256": screenshot["documentSha256"],
+        "versionBeforeCas": base_version_id,
+        "versionAfterCas": current.id,
+        "artifactManifestHash": publish.artifact_manifest_hash,
+        "artifactUrl": format!("/artifacts/{project_id}/current/"),
+        "events": {
+            "previewUpdated": format!("{}/{}", current.created_by_run_id, preview_index),
+            "runCompleted": format!("{}/{}", current.created_by_run_id, completed_index),
+            "sequenceValid": preview_index < completed_index,
+        },
+        "recoverableToolFailureCount": failure_counts.0,
+        "terminalToolFailureCount": failure_counts.1,
+        "sandboxStatus": binding.status,
+        "sandboxReleasedAt": binding.last_seen_at,
+    })))
+}
+
+async fn internal_release_project_sandbox(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    if !internal_admin_authorized(&state.config, &headers) {
+        return Err(unauthorized(
+            "sandbox release requires service authorization".to_string(),
+        ));
+    }
+    let binding = state
+        .store
+        .current_project_sandbox_binding(&project_id)
+        .await
+        .ok_or_else(|| not_found(format!("sandbox binding not found: {project_id}")))?;
+    let backend = sandbox_backend_for_config(&state.config);
+    backend
+        .release(&state.store, &binding.id)
+        .await
+        .map_err(internal_error)?;
+    let released = state
+        .store
+        .get_sandbox_binding(&binding.id)
+        .await
+        .ok_or_else(|| {
+            not_found(format!(
+                "released sandbox binding not found: {}",
+                binding.id
+            ))
+        })?;
+    Ok(Json(json!({
+        "projectId": project_id,
+        "bindingId": released.id,
+        "status": released.status,
+        "releasedAt": released.last_seen_at,
+    })))
+}
+
 fn project_workspace_root(config: &RuntimeConfig, project_id: &str) -> PathBuf {
     let safe = project_id
         .chars()
@@ -3413,6 +3741,170 @@ fn internal_admin_authorized(config: &RuntimeConfig, headers: &HeaderMap) -> boo
         .get("x-runtime-admin-token")
         .and_then(|value| value.to_str().ok());
     internal && token == Some(expected_token)
+}
+
+async fn authenticate_candidate_preview(
+    state: &AppState,
+    headers: &HeaderMap,
+    lease_id: &str,
+) -> Result<Option<crate::public_principal::PublicPrincipal>, (StatusCode, Json<ErrorResponse>)> {
+    if state.config.public_principal_auth_mode == PublicPrincipalAuthMode::Disabled {
+        return Ok(None);
+    }
+    let verifier = PublicPrincipalVerifier::from_public_key_files(
+        &state.config.public_principal_public_key_files,
+        state.config.public_principal_issuer.clone(),
+        state.config.public_principal_audience.clone(),
+        state.config.public_principal_max_ttl_seconds,
+    )
+    .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let principal = match verifier.verify_bearer(authorization, PREVIEW_READ_OPERATION) {
+        Ok(principal) => principal,
+        Err(error) => {
+            let status = if error == PublicPrincipalError::InvalidScope {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            state
+                .store
+                .append_audit_record(
+                    "",
+                    "",
+                    "public.preview.read",
+                    format!("leaseId={lease_id}"),
+                    "deny",
+                    error.message(),
+                )
+                .await;
+            return Err((
+                status,
+                Json(ErrorResponse {
+                    error: error.message().to_string(),
+                }),
+            ));
+        }
+    };
+    Ok(Some(principal))
+}
+
+async fn authorize_candidate_preview(
+    state: &AppState,
+    principal: Option<&crate::public_principal::PublicPrincipal>,
+    lease_id: &str,
+    run_id: &str,
+    lease_project_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    let run = state.store.get_run(run_id).await.ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "candidate preview lease references a missing run"
+        ))
+    })?;
+    if lease_project_id != run.project_id {
+        return Err(conflict_error(anyhow::anyhow!(
+            "candidate preview lease project identity drift detected"
+        )));
+    }
+    if principal.project_id != run.project_id {
+        state
+            .store
+            .append_audit_record(
+                &run.project_id,
+                run_id,
+                "public.preview.read",
+                preview_audit_summary(lease_id, &principal.principal_id),
+                "deny",
+                "principal project scope does not match preview run",
+            )
+            .await;
+        return Err(forbidden("public_auth.project_forbidden".to_string()));
+    }
+    let access = state
+        .store
+        .get_project_access(&run.project_id)
+        .await
+        .ok_or_else(|| forbidden("public_auth.project_forbidden".to_string()))?;
+    if access.project_id != run.project_id {
+        return Err(conflict_error(anyhow::anyhow!(
+            "project access identity drift detected"
+        )));
+    }
+    if access.owner_principal_id != principal.principal_id {
+        state
+            .store
+            .append_audit_record(
+                &run.project_id,
+                run_id,
+                "public.preview.read",
+                preview_audit_summary(lease_id, &principal.principal_id),
+                "deny",
+                "principal does not own the project",
+            )
+            .await;
+        return Err(forbidden("public_auth.project_forbidden".to_string()));
+    }
+    state
+        .store
+        .append_audit_record(
+            &run.project_id,
+            run_id,
+            "public.preview.read",
+            preview_audit_summary(lease_id, &principal.principal_id),
+            "allow",
+            "project-scoped public principal authorized",
+        )
+        .await;
+    Ok(())
+}
+
+fn preview_audit_summary(lease_id: &str, principal_id: &str) -> String {
+    format!(
+        "leaseId={lease_id},principalHash={}",
+        sha256_hex(principal_id.as_bytes())
+    )
+}
+
+fn validated_preview_prefix(
+    config: &RuntimeConfig,
+    headers: &HeaderMap,
+    project_id: &str,
+    lease_id: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let fallback = format!("/previews/{lease_id}");
+    let Some(value) = headers
+        .get("x-anydesign-preview-prefix")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return if config.public_principal_auth_mode == PublicPrincipalAuthMode::Disabled {
+            Ok(fallback)
+        } else {
+            Err(bad_request(
+                "x-anydesign-preview-prefix is required for public preview proxying".to_string(),
+            ))
+        };
+    };
+    let expected = format!("/projects/{project_id}/previews/{lease_id}");
+    let normalized = value.to_ascii_lowercase();
+    if value != expected
+        || normalized.contains("%2e")
+        || normalized.contains("%5c")
+        || value.contains("..")
+        || value.contains('\\')
+        || value.contains("://")
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err(bad_request(
+            "x-anydesign-preview-prefix is invalid".to_string(),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn scope_with_project_id(scope: Value, project_id: Option<&str>) -> Value {
@@ -4172,6 +4664,14 @@ fn not_found(error: String) -> (StatusCode, Json<ErrorResponse>) {
 
 fn bad_request(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+}
+
+fn unauthorized(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error }))
+}
+
+fn forbidden(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::FORBIDDEN, Json(ErrorResponse { error }))
 }
 
 fn error_response_as_value(error: (StatusCode, Json<ErrorResponse>)) -> (StatusCode, Json<Value>) {

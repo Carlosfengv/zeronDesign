@@ -1,14 +1,54 @@
 use anydesign_runtime::{
     config::SandboxBackendMode,
     http_api::{self, AppState},
-    model_gateway::{MockModelClient, ModelResponse, ToolCall},
+    model_gateway::{ModelClient, ModelRequest, ModelResponse, ToolCall},
     tools::control_plane::{sandbox_backend_for_config, SandboxBackend},
     types::{sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief},
     RuntimeConfig, RuntimeStore,
 };
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{net::TcpListener, time};
+
+#[derive(Clone)]
+struct RoutingFixtureModel {
+    store: RuntimeStore,
+    turns: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelClient for RoutingFixtureModel {
+    async fn next_response(&self, request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        let run = self
+            .store
+            .get_run(&request.run_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("fixture run not found"))?;
+        let turn = {
+            let mut turns = self.turns.lock().unwrap();
+            let turn = turns.entry(run.id.clone()).or_default();
+            *turn += 1;
+            *turn
+        };
+        match (run.phase, run.project_id.as_str(), turn) {
+            (AgentPhase::Build, "website-k3d", 1) => Ok(website_build_response()),
+            (AgentPhase::Build, "docs-k3d", 1) => Ok(docs_init_response()),
+            (AgentPhase::Build, "docs-k3d", 2) => Ok(docs_build_response()),
+            (AgentPhase::Edit, _, 1) => Ok(deterministic_edit_response("edit")),
+            _ => Err(anyhow::anyhow!(
+                "unexpected fixture model turn: project={} phase={:?} turn={turn}",
+                run.project_id,
+                run.phase
+            )),
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
@@ -23,6 +63,8 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     let storage = unique_temp_dir("k8s-public-runtime-storage");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let capture_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let capture_address = capture_listener.local_addr().unwrap();
     let mut config = RuntimeConfig::from_env();
     config.sandbox_backend_mode = SandboxBackendMode::Kubernetes;
     config.k8s_namespace = "anydesign-sandboxes".to_string();
@@ -30,45 +72,92 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     config.runtime_storage_dir = storage.clone();
     config.workspace_root = PathBuf::from("/workspace");
     config.runtime_public_base_url = format!("http://{address}");
+    config.runtime_browser_proxy_bind = capture_address;
     config.npm_registry =
         "http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/".to_string();
 
     let store = RuntimeStore::with_checkpoint_dir(&storage);
     let website_brief_id = confirmed_brief(&store, "website-k3d", website_brief()).await;
     let docs_brief_id = confirmed_brief(&store, "docs-k3d", docs_brief()).await;
-    let model = MockModelClient::new(vec![
-        website_build_response(),
-        docs_init_response(),
-        docs_build_response(),
-    ]);
+    let model = RoutingFixtureModel {
+        store: store.clone(),
+        turns: Arc::new(Mutex::new(HashMap::new())),
+    };
     let state = AppState {
         config: config.clone(),
         store: store.clone(),
         model: Arc::new(model),
     };
+    let capture_state = state.clone();
     let server = tokio::spawn(async move {
         axum::serve(listener, http_api::router_with_state(state))
             .await
             .unwrap();
     });
+    let capture_server = tokio::spawn(async move {
+        axum::serve(
+            capture_listener,
+            http_api::capture_router_with_state(capture_state),
+        )
+        .await
+        .unwrap();
+    });
     let client = reqwest::Client::new();
 
-    let website = run_build(
-        &client,
-        &config.runtime_public_base_url,
-        &store,
-        "website-k3d",
-        &website_brief_id,
-    )
-    .await;
-    let docs = run_build(
-        &client,
-        &config.runtime_public_base_url,
-        &store,
-        "docs-k3d",
-        &docs_brief_id,
-    )
-    .await;
+    let (website_build, docs_build) = tokio::join!(
+        run_build(
+            &client,
+            &config.runtime_public_base_url,
+            &store,
+            "website-k3d",
+            &website_brief_id,
+        ),
+        run_build(
+            &client,
+            &config.runtime_public_base_url,
+            &store,
+            "docs-k3d",
+            &docs_brief_id,
+        )
+    );
+    let website_build_version = store
+        .current_project_version("website-k3d")
+        .await
+        .expect("website build version");
+    let docs_build_version = store
+        .current_project_version("docs-k3d")
+        .await
+        .expect("docs build version");
+    let (website, docs) = tokio::join!(
+        run_edit(
+            &client,
+            &config.runtime_public_base_url,
+            &store,
+            "website-k3d",
+            &website_build_version.id,
+            website_build.sandbox_id.as_deref().unwrap(),
+        ),
+        run_edit(
+            &client,
+            &config.runtime_public_base_url,
+            &store,
+            "docs-k3d",
+            &docs_build_version.id,
+            docs_build.sandbox_id.as_deref().unwrap(),
+        )
+    );
+    assert_ne!(
+        store
+            .current_project_version("website-k3d")
+            .await
+            .unwrap()
+            .id,
+        website_build_version.id
+    );
+    assert_ne!(
+        store.current_project_version("docs-k3d").await.unwrap().id,
+        docs_build_version.id
+    );
 
     let backend: Arc<dyn SandboxBackend> = sandbox_backend_for_config(&config);
     let website_binding = website.sandbox_id.as_deref().expect("website binding");
@@ -109,18 +198,26 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
         .expect("docs artifact after release");
     assert!(website_artifact.status().is_success());
     assert!(docs_artifact.status().is_success());
-    assert!(website_artifact
-        .text()
-        .await
-        .unwrap()
-        .contains("K3d Website"));
-    assert!(docs_artifact.text().await.unwrap().contains("Docs"));
+    let website_html = website_artifact.text().await.unwrap();
+    let docs_html = docs_artifact.text().await.unwrap();
+    assert!(
+        website_html.contains("K3d Website Edited"),
+        "website artifact was: {website_html}"
+    );
+    assert!(
+        docs_html.contains("Docs Edited"),
+        "docs artifact was: {docs_html}"
+    );
 
     assert_event_order(&store, &website.id).await;
     assert_event_order(&store, &docs.id).await;
     write_evidence(
         &store,
         &storage,
+        &website_build,
+        &docs_build,
+        &website_build_version,
+        &docs_build_version,
         &website,
         &docs,
         &website_identity,
@@ -128,6 +225,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     )
     .await;
     server.abort();
+    capture_server.abort();
 }
 
 async fn confirmed_brief(store: &RuntimeStore, project_id: &str, brief: Brief) -> String {
@@ -181,6 +279,64 @@ async fn run_build(
             return run;
         }
         assert!(time::Instant::now() < deadline, "run timed out: {run_id}");
+        time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn run_edit(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &RuntimeStore,
+    project_id: &str,
+    base_version_id: &str,
+    sandbox_binding_id: &str,
+) -> anydesign_runtime::types::AgentRun {
+    let response = client
+        .post(format!("{base_url}/runs"))
+        .json(&json!({
+            "projectId": project_id,
+            "phase": "edit",
+            "agentProfile": "edit",
+            "inputContext": {
+                "baseVersionId": base_version_id,
+                "sandboxBindingId": sandbox_binding_id
+            }
+        }))
+        .send()
+        .await
+        .expect("start Public Runtime edit");
+    let status = response.status();
+    let payload: Value = response.json().await.expect("edit response JSON");
+    assert!(status.is_success(), "edit start failed: {payload}");
+    let run_id = payload["runId"].as_str().expect("runId");
+    let continued = client
+        .post(format!("{base_url}/runs/{run_id}/continue"))
+        .json(&json!({ "userMessage": "Apply the deterministic RC edit." }))
+        .send()
+        .await
+        .expect("continue Public Runtime edit");
+    assert!(continued.status().is_success());
+    let deadline = time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let run = store.get_run(run_id).await.expect("persisted edit run");
+        if run.status.is_terminal() {
+            let events = store.events(run_id).await;
+            assert_eq!(
+                run.status,
+                AgentRunStatus::Completed,
+                "edit failed: {run:?}; events={:?}",
+                events
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolFailed { .. })),
+                "edit contained failed tools: {events:?}"
+            );
+            assert!(run.output_version_id.is_some());
+            return run;
+        }
+        assert!(time::Instant::now() < deadline, "edit timed out: {run_id}");
         time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -279,6 +435,44 @@ fn docs_build_response() -> ModelResponse {
     ])
 }
 
+fn deterministic_edit_response(prefix: &str) -> ModelResponse {
+    let build_script = "const fs=require('fs');const docs=fs.existsSync('content/docs/index.mdx');const dir=docs?'out':'dist';fs.mkdirSync(dir,{recursive:true});const title=docs?'Docs Edited':'K3d Website Edited';fs.writeFileSync(dir+'/index.html','<!doctype html><style>body{font:44px sans-serif;background:#fff;color:#111}</style><h1>'+title+'</h1>');if(docs)fs.writeFileSync(dir+'/docs.html','<h1>Docs Overview Edited</h1>');";
+    let screenshot_id = "k3d-edit-shot";
+    ModelResponse::ToolCalls(vec![
+        ToolCall::new(
+            format!("{prefix}-write"),
+            "fs.write",
+            json!({ "path": "project/build.cjs", "text": build_script }),
+        ),
+        ToolCall::new(
+            format!("{prefix}-build"),
+            "project.build",
+            json!({ "cwd": "project" }),
+        ),
+        ToolCall::new(format!("{prefix}-preview"), "preview.start", json!({})),
+        ToolCall::new(
+            format!("{prefix}-open"),
+            "browser.open",
+            json!({ "url": "http://127.0.0.1:4321" }),
+        ),
+        ToolCall::new(
+            format!("{prefix}-shot"),
+            "browser.screenshot",
+            json!({ "screenshotId": screenshot_id }),
+        ),
+        ToolCall::new(
+            format!("{prefix}-promote"),
+            "preview.report_candidate",
+            json!({ "url": "http://127.0.0.1:4321", "screenshotId": screenshot_id }),
+        ),
+        ToolCall::new(
+            format!("{prefix}-complete"),
+            "run.complete",
+            json!({ "status": "completed", "summary": "K3d edit gate complete" }),
+        ),
+    ])
+}
+
 async fn assert_event_order(store: &RuntimeStore, run_id: &str) {
     let events = store.events(run_id).await;
     let preview = events
@@ -295,6 +489,10 @@ async fn assert_event_order(store: &RuntimeStore, run_id: &str) {
 async fn write_evidence(
     store: &RuntimeStore,
     storage: &std::path::Path,
+    website_build: &anydesign_runtime::types::AgentRun,
+    docs_build: &anydesign_runtime::types::AgentRun,
+    website_build_version: &anydesign_runtime::types::ProjectVersion,
+    docs_build_version: &anydesign_runtime::types::ProjectVersion,
     website: &anydesign_runtime::types::AgentRun,
     docs: &anydesign_runtime::types::AgentRun,
     website_binding: &anydesign_runtime::types::SandboxBinding,
@@ -343,13 +541,9 @@ async fn write_evidence(
         .await
         .unwrap();
     let docs_released = store.get_sandbox_binding(&docs_binding.id).await.unwrap();
-    let website_screenshot = screenshot_evidence(
-        storage,
-        &website.project_id,
-        &website.id,
-        "website-k3d-shot",
-    );
-    let docs_screenshot = screenshot_evidence(storage, &docs.project_id, &docs.id, "docs-k3d-shot");
+    let website_screenshot =
+        screenshot_evidence(storage, &website.project_id, &website.id, "k3d-edit-shot");
+    let docs_screenshot = screenshot_evidence(storage, &docs.project_id, &docs.id, "k3d-edit-shot");
     assert_ne!(
         website_screenshot["documentSha256"], docs_screenshot["documentSha256"],
         "Website and Docs browser evidence must come from different documents"
@@ -371,9 +565,11 @@ async fn write_evidence(
         },
         "projects": [
             {
-                "kind": "website", "projectId": website.project_id, "runId": website.id,
+                "kind": "website", "projectId": website.project_id,
+                "buildRunId": website_build.id, "editRunId": website.id,
                 "sandboxBindingId": website_binding.id, "podUid": website_binding.pod_uid,
-                "versionId": website_version.id,
+                "versionBeforeCas": website_build_version.id,
+                "versionAfterCas": website_version.id,
                 "buildId": website_publish.build_id,
                 "candidateManifestHash": website_publish.candidate_manifest_hash,
                 "sourceSnapshotUri": website_publish.source_snapshot_uri,
@@ -390,9 +586,11 @@ async fn write_evidence(
                 "sandboxReleasedAt": website_released.last_seen_at,
             },
             {
-                "kind": "docs", "projectId": docs.project_id, "runId": docs.id,
+                "kind": "docs", "projectId": docs.project_id,
+                "buildRunId": docs_build.id, "editRunId": docs.id,
                 "sandboxBindingId": docs_binding.id, "podUid": docs_binding.pod_uid,
-                "versionId": docs_version.id,
+                "versionBeforeCas": docs_build_version.id,
+                "versionAfterCas": docs_version.id,
                 "buildId": docs_publish.build_id,
                 "candidateManifestHash": docs_publish.candidate_manifest_hash,
                 "sourceSnapshotUri": docs_publish.source_snapshot_uri,

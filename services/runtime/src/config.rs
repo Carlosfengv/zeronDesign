@@ -46,6 +46,38 @@ pub enum RuntimePolicyProfile {
     LocalE2e,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPrincipalAuthMode {
+    Required,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceChannelTlsMode {
+    Required,
+    DebugLoopback,
+}
+
+impl WorkspaceChannelTlsMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "debug-loopback" | "debug_loopback" | "debug" => Self::DebugLoopback,
+            _ => Self::Required,
+        }
+    }
+}
+
+impl PublicPrincipalAuthMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "disabled" | "off" | "false" | "0" => Self::Disabled,
+            _ => Self::Required,
+        }
+    }
+}
+
 impl RuntimePolicyProfile {
     pub fn from_env_value(value: &str) -> Self {
         match value {
@@ -73,8 +105,19 @@ pub struct RuntimeConfig {
     pub runtime_storage_dir: PathBuf,
     pub workspace_root: PathBuf,
     pub runtime_public_base_url: String,
+    pub runtime_browser_proxy_bind: SocketAddr,
     pub workspace_channel_signing_key_file: Option<PathBuf>,
     pub workspace_channel_token_ttl_seconds: u64,
+    pub workspace_channel_tls_mode: WorkspaceChannelTlsMode,
+    pub workspace_channel_ca_file: Option<PathBuf>,
+    pub workspace_channel_client_cert_file: Option<PathBuf>,
+    pub workspace_channel_client_key_file: Option<PathBuf>,
+    pub workspace_channel_server_san: String,
+    pub public_principal_auth_mode: PublicPrincipalAuthMode,
+    pub public_principal_issuer: String,
+    pub public_principal_audience: String,
+    pub public_principal_public_key_files: Vec<PathBuf>,
+    pub public_principal_max_ttl_seconds: u64,
     pub k8s_namespace: String,
     pub sandbox_backend_mode: SandboxBackendMode,
     pub policy_profile: RuntimePolicyProfile,
@@ -84,6 +127,7 @@ pub struct RuntimeConfig {
     pub internal_admin_token: Option<String>,
     pub model_streaming: bool,
     pub model_strict_tools: bool,
+    pub model_request_timeout_seconds: u64,
     pub repository_commit: String,
     pub repository_dirty: bool,
     pub runtime_image_ref: Option<String>,
@@ -129,6 +173,10 @@ impl RuntimeConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
                 .trim_end_matches('/')
                 .to_string(),
+            runtime_browser_proxy_bind: env::var("RUNTIME_BROWSER_PROXY_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:8081".to_string())
+                .parse()
+                .expect("RUNTIME_BROWSER_PROXY_BIND must be a socket address"),
             workspace_channel_signing_key_file: env::var("WORKSPACE_CHANNEL_SIGNING_KEY_FILE")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -137,6 +185,46 @@ impl RuntimeConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(60),
+            workspace_channel_tls_mode: env::var("WORKSPACE_CHANNEL_TLS_MODE")
+                .ok()
+                .map(|value| WorkspaceChannelTlsMode::from_env_value(&value))
+                .unwrap_or(WorkspaceChannelTlsMode::Required),
+            workspace_channel_ca_file: optional_path_env("WORKSPACE_CHANNEL_CA_FILE"),
+            workspace_channel_client_cert_file: optional_path_env(
+                "WORKSPACE_CHANNEL_CLIENT_CERT_FILE",
+            ),
+            workspace_channel_client_key_file: optional_path_env(
+                "WORKSPACE_CHANNEL_CLIENT_KEY_FILE",
+            ),
+            workspace_channel_server_san: env::var("WORKSPACE_CHANNEL_SERVER_SAN").unwrap_or_else(
+                |_| {
+                    "spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox"
+                        .to_string()
+                },
+            ),
+            public_principal_auth_mode: env::var("PUBLIC_PRINCIPAL_AUTH_MODE")
+                .ok()
+                .map(|value| PublicPrincipalAuthMode::from_env_value(&value))
+                .unwrap_or(PublicPrincipalAuthMode::Required),
+            public_principal_issuer: env::var("PUBLIC_PRINCIPAL_ISSUER")
+                .unwrap_or_else(|_| "anydesign-bff".to_string()),
+            public_principal_audience: env::var("PUBLIC_PRINCIPAL_AUDIENCE")
+                .unwrap_or_else(|_| "anydesign-runtime-public".to_string()),
+            public_principal_public_key_files: env::var("PUBLIC_PRINCIPAL_PUBLIC_KEY_FILES")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            public_principal_max_ttl_seconds: env::var("PUBLIC_PRINCIPAL_MAX_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(120),
             k8s_namespace: env::var("K8S_NAMESPACE")
                 .unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
             sandbox_backend_mode: env::var("SANDBOX_BACKEND_MODE")
@@ -162,6 +250,10 @@ impl RuntimeConfig {
             model_strict_tools: env::var("MODEL_STRICT_TOOLS")
                 .ok()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            model_request_timeout_seconds: env::var("MODEL_REQUEST_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(180),
             repository_commit: env::var("RUNTIME_REPOSITORY_COMMIT")
                 .unwrap_or_else(|_| "unknown".to_string()),
             repository_dirty: truthy_env("RUNTIME_REPOSITORY_DIRTY"),
@@ -175,7 +267,22 @@ impl RuntimeConfig {
             .expect("runtime host and port should form a socket address")
     }
 
+    pub fn runtime_browser_proxy_base_url(&self) -> String {
+        format!("http://{}", self.runtime_browser_proxy_bind)
+    }
+
     pub fn validate_startup(&self) -> Result<(), String> {
+        if self.policy_profile == RuntimePolicyProfile::Production
+            && self.npm_registry.contains("registry.npmjs.org")
+        {
+            return Err(
+                "RUNTIME_NPM_REGISTRY must not use the public npm registry in production"
+                    .to_string(),
+            );
+        }
+        if !self.runtime_browser_proxy_bind.ip().is_loopback() {
+            return Err("RUNTIME_BROWSER_PROXY_BIND must use a loopback address".to_string());
+        }
         if self.sandbox_backend_mode == SandboxBackendMode::Kubernetes {
             let key_file = self
                 .workspace_channel_signing_key_file
@@ -190,6 +297,63 @@ impl RuntimeConfig {
                     key_file.display()
                 ));
             }
+            if self.policy_profile == RuntimePolicyProfile::Production
+                && self.workspace_channel_tls_mode != WorkspaceChannelTlsMode::Required
+            {
+                return Err("WORKSPACE_CHANNEL_TLS_MODE must be required in production".to_string());
+            }
+            if self.workspace_channel_tls_mode == WorkspaceChannelTlsMode::Required {
+                for (name, path) in [
+                    ("WORKSPACE_CHANNEL_CA_FILE", &self.workspace_channel_ca_file),
+                    (
+                        "WORKSPACE_CHANNEL_CLIENT_CERT_FILE",
+                        &self.workspace_channel_client_cert_file,
+                    ),
+                    (
+                        "WORKSPACE_CHANNEL_CLIENT_KEY_FILE",
+                        &self.workspace_channel_client_key_file,
+                    ),
+                ] {
+                    let path = path
+                        .as_ref()
+                        .ok_or_else(|| format!("{name} is required for mTLS workspace channels"))?;
+                    if !path.is_file() {
+                        return Err(format!("{name} does not exist: {}", path.display()));
+                    }
+                }
+                if !self.workspace_channel_server_san.starts_with("spiffe://") {
+                    return Err("WORKSPACE_CHANNEL_SERVER_SAN must be a SPIFFE URI".to_string());
+                }
+            }
+        }
+        if self.policy_profile == RuntimePolicyProfile::Production
+            && self.public_principal_auth_mode != PublicPrincipalAuthMode::Required
+        {
+            return Err("PUBLIC_PRINCIPAL_AUTH_MODE must be required in production".to_string());
+        }
+        if self.public_principal_auth_mode == PublicPrincipalAuthMode::Required {
+            if self.public_principal_public_key_files.is_empty() {
+                return Err(
+                    "PUBLIC_PRINCIPAL_PUBLIC_KEY_FILES is required when public principal auth is enabled"
+                        .to_string(),
+                );
+            }
+            for key_file in &self.public_principal_public_key_files {
+                if !key_file.is_file() {
+                    return Err(format!(
+                        "public principal verification key does not exist: {}",
+                        key_file.display()
+                    ));
+                }
+            }
+            if !(1..=300).contains(&self.public_principal_max_ttl_seconds) {
+                return Err(
+                    "PUBLIC_PRINCIPAL_MAX_TTL_SECONDS must be between 1 and 300".to_string()
+                );
+            }
+        }
+        if !(10..=600).contains(&self.model_request_timeout_seconds) {
+            return Err("MODEL_REQUEST_TIMEOUT_SECONDS must be between 10 and 600".to_string());
         }
         Ok(())
     }
@@ -197,6 +361,10 @@ impl RuntimeConfig {
 
 fn secret_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn optional_path_env(name: &str) -> Option<PathBuf> {
+    secret_env(name).map(PathBuf::from)
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -228,5 +396,47 @@ fn agent_model_from_env(provider: ModelProvider) -> String {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "moonshot-v1-8k".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phase_a_config() -> RuntimeConfig {
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.public_principal_public_key_files.clear();
+        config
+    }
+
+    #[test]
+    fn production_rejects_disabled_public_principal_auth() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::Production;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "PUBLIC_PRINCIPAL_AUTH_MODE must be required in production"
+        );
+    }
+
+    #[test]
+    fn required_public_principal_auth_rejects_missing_keys() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::Production;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("PUBLIC_PRINCIPAL_PUBLIC_KEY_FILES is required"));
+    }
+
+    #[test]
+    fn local_e2e_allows_explicitly_disabled_public_principal_auth() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.validate_startup().unwrap();
     }
 }

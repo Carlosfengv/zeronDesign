@@ -5,11 +5,12 @@ use anydesign_runtime::{
         runtime::ToolContext,
         sandbox::{
             JsonWorkspaceChannelBackend, JsonWorkspaceChannelCommandBackend, SandboxCommandBackend,
-            WebSocketWorkspaceChannelTransport, WorkspaceBackend,
+            WebSocketWorkspaceChannelTransport, WorkspaceBackend, WorkspaceChannelClientTls,
         },
     },
     types::AgentPhase,
     workspace_auth::{WorkspaceChannelClaims, WorkspaceChannelJwtIssuer},
+    RuntimeConfig,
 };
 use std::{
     fs,
@@ -172,7 +173,10 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
         .expect("WORKSPACE_CHANNEL_SIGNING_KEY_FILE must be set by run-k8s-e2e.sh");
     let issuer = WorkspaceChannelJwtIssuer::from_pkcs8_der_file(signing_key_file, 60)
         .expect("load workspace channel signing key");
-    let endpoint = format!("ws://127.0.0.1:{local_port}/workspace");
+    let tls = WorkspaceChannelClientTls::from_runtime_config(&RuntimeConfig::from_env())
+        .expect("load workspace channel mTLS config");
+    assert!(tls.is_some(), "k8s gate requires mTLS workspace channels");
+    let endpoint = format!("wss://127.0.0.1:{local_port}/workspace");
     let authorization = || {
         issuer
             .issue(WorkspaceChannelClaims {
@@ -200,6 +204,7 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     let workspace_backend = || {
         JsonWorkspaceChannelBackend::new(
             WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+                .with_tls(tls.clone())
                 .with_authorization(authorization())
                 .with_timeout(Duration::from_secs(5)),
             &workspace,
@@ -208,12 +213,13 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     let command_backend = || {
         JsonWorkspaceChannelCommandBackend::new(
             WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+                .with_tls(tls.clone())
                 .with_authorization(authorization())
                 .with_timeout(Duration::from_secs(5)),
             &workspace,
         )
     };
-    let second_endpoint = format!("ws://127.0.0.1:{second_local_port}/workspace");
+    let second_endpoint = format!("wss://127.0.0.1:{second_local_port}/workspace");
     let second_authorization = || {
         issuer
             .issue(WorkspaceChannelClaims {
@@ -235,6 +241,7 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     let second_workspace_backend = || {
         JsonWorkspaceChannelBackend::new(
             WebSocketWorkspaceChannelTransport::new(second_endpoint.clone())
+                .with_tls(tls.clone())
                 .with_authorization(second_authorization())
                 .with_timeout(Duration::from_secs(5)),
             &second_workspace,

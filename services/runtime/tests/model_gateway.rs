@@ -7,10 +7,28 @@ use anydesign_runtime::{
     tools::registry::ToolLoadingPolicy,
     types::AgentPhase,
 };
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
+use futures::stream;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::{net::TcpListener, sync::Mutex};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+use tokio::{
+    net::TcpListener,
+    sync::Mutex,
+    time::{sleep, Duration},
+};
 
 #[tokio::test]
 async fn http_model_gateway_client_posts_turn_request_and_maps_tool_calls() {
@@ -87,6 +105,43 @@ async fn http_model_gateway_client_reports_non_success_status() {
     assert!(error.contains("model gateway request failed"));
     assert!(error.contains("503 Service Unavailable"));
     assert!(error.contains("gateway unavailable"));
+}
+
+#[tokio::test]
+async fn http_model_gateway_client_bounds_the_complete_provider_turn() {
+    let app = Router::new().route(
+        "/v1/agent/turn",
+        post(|| async {
+            sleep(Duration::from_millis(250)).await;
+            Json(json!({ "type": "text", "text": "late" }))
+        }),
+    );
+    let base_url = spawn_gateway(app).await;
+    let client = HttpModelGatewayClient::new(base_url).with_timeout(Duration::from_millis(50));
+    let error = client
+        .next_response(ModelRequest {
+            run_id: "run-timeout".to_string(),
+            turn: 1,
+            model: "internal-balanced".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "bounded turn".to_string(),
+            messages: vec![],
+            tools: vec![],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap_err();
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+        .to_lowercase();
+    assert!(
+        message.contains("timeout") || message.contains("timed out"),
+        "unexpected timeout error: {message}"
+    );
 }
 
 #[tokio::test]
@@ -175,6 +230,59 @@ async fn openai_compatible_client_posts_chat_completion_and_maps_tool_calls() {
             json!({ "status": "completed", "summary": "done" }),
         )])
     );
+}
+
+#[tokio::test]
+async fn openai_compatible_client_retries_interrupted_response_streams() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(interrupt_twice_then_complete))
+        .with_state(attempts.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = OpenAiCompatibleModelClient::new(format!("{base_url}/v1"), "test-key", None)
+        .with_streaming(true)
+        .with_transport_retry(3, Duration::from_millis(10));
+
+    let response = client
+        .next_response(ModelRequest {
+            run_id: "run-retry".to_string(),
+            turn: 1,
+            model: "deepseek-chat".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: "retry interrupted streams".to_string(),
+            messages: vec![],
+            tools: vec![],
+            deferred_tools: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response, ModelResponse::TextOnly("OK".to_string()));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+async fn interrupt_twice_then_complete(State(attempts): State<Arc<AtomicUsize>>) -> Response {
+    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+        let body = Body::from_stream(stream::once(async {
+            Err::<String, io::Error>(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "simulated response interruption",
+            ))
+        }));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(body)
+            .unwrap();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n",
+        ))
+        .unwrap()
 }
 
 #[tokio::test]

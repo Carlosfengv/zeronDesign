@@ -7,10 +7,10 @@ use crate::{
         ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
         OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
-        ProjectRuntimeState, ProjectVersion, ProjectVersionStatus, ReviewFinding,
-        ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity, ReviewFindingStatus,
-        RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol,
-        MAX_DESIGN_SOURCE_BYTES,
+        ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
+        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
+        ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus,
+        SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
@@ -50,6 +50,7 @@ pub struct RuntimeStore {
     content_source_log_path: Arc<PathBuf>,
     project_version_log_path: Arc<PathBuf>,
     project_runtime_state_log_path: Arc<PathBuf>,
+    project_access_log_path: Arc<PathBuf>,
     preview_lease_log_path: Arc<PathBuf>,
     channel_lease_log_path: Arc<PathBuf>,
     artifact_publish_log_path: Arc<PathBuf>,
@@ -89,6 +90,7 @@ struct RuntimeStoreInner {
     project_versions: HashMap<String, ProjectVersion>,
     project_current_versions: HashMap<String, String>,
     project_runtime_states: HashMap<String, ProjectRuntimeState>,
+    project_access_records: HashMap<String, ProjectAccessRecord>,
     preview_leases: HashMap<String, PreviewLeaseRecord>,
     channel_leases: HashMap<String, ChannelLeaseRecord>,
     artifact_publishes: HashMap<String, ArtifactPublishRecord>,
@@ -346,6 +348,7 @@ impl Default for RuntimeStore {
             project_runtime_state_log_path: Arc::new(
                 storage_root.join("project-runtime-states.jsonl"),
             ),
+            project_access_log_path: Arc::new(storage_root.join("project-access.jsonl")),
             preview_lease_log_path: Arc::new(storage_root.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(storage_root.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(storage_root.join("artifact-publishes.jsonl")),
@@ -394,6 +397,7 @@ impl RuntimeStore {
             project_runtime_state_log_path: Arc::new(
                 checkpoint_dir.join("project-runtime-states.jsonl"),
             ),
+            project_access_log_path: Arc::new(checkpoint_dir.join("project-access.jsonl")),
             preview_lease_log_path: Arc::new(checkpoint_dir.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(checkpoint_dir.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(checkpoint_dir.join("artifact-publishes.jsonl")),
@@ -442,6 +446,7 @@ impl RuntimeStore {
             project_runtime_state_log_path: Arc::new(
                 run_log_dir.join("project-runtime-states.jsonl"),
             ),
+            project_access_log_path: Arc::new(run_log_dir.join("project-access.jsonl")),
             preview_lease_log_path: Arc::new(run_log_dir.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(run_log_dir.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(run_log_dir.join("artifact-publishes.jsonl")),
@@ -1723,7 +1728,16 @@ impl RuntimeStore {
             .map(|run| (run.id.clone(), run))
             .collect::<HashMap<_, _>>();
         for run in self.inner.read().await.runs.values().cloned() {
-            runs_by_id.insert(run.id.clone(), run);
+            match runs_by_id.entry(run.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(run);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if run_snapshot_is_newer(&run, entry.get()) {
+                        entry.insert(run);
+                    }
+                }
+            }
         }
         let recoverable = runs_by_id
             .values()
@@ -1735,10 +1749,17 @@ impl RuntimeStore {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !recoverable.is_empty() {
-            let mut inner = self.inner.write().await;
-            for run in runs_by_id.into_values() {
-                inner.runs.entry(run.id.clone()).or_insert(run);
+        let mut inner = self.inner.write().await;
+        for run in runs_by_id.into_values() {
+            match inner.runs.entry(run.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(run);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if run_snapshot_is_newer(&run, entry.get()) {
+                        entry.insert(run);
+                    }
+                }
             }
         }
         recoverable
@@ -3429,7 +3450,16 @@ impl RuntimeStore {
 
     fn hydrate_persisted_runs(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
         for run in self.read_runs()? {
-            inner.runs.entry(run.id.clone()).or_insert(run);
+            match inner.runs.entry(run.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(run);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if run_snapshot_is_newer(&run, entry.get()) {
+                        entry.insert(run);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -3502,6 +3532,84 @@ impl RuntimeStore {
             .project_runtime_states
             .insert(project_id.to_string(), state.clone());
         Some(state)
+    }
+
+    fn project_access_log_path(&self) -> PathBuf {
+        (*self.project_access_log_path).clone()
+    }
+
+    fn append_project_access_snapshot(&self, record: &ProjectAccessRecord) -> Result<()> {
+        let path = self.project_access_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, record)
+    }
+
+    fn read_project_access_records(&self) -> Result<Vec<ProjectAccessRecord>> {
+        read_latest_jsonl_by_key(
+            &self.project_access_log_path,
+            |record: &ProjectAccessRecord| record.project_id.clone(),
+        )
+    }
+
+    pub async fn get_project_access(&self, project_id: &str) -> Option<ProjectAccessRecord> {
+        if let Some(record) = self
+            .inner
+            .read()
+            .await
+            .project_access_records
+            .get(project_id)
+            .cloned()
+        {
+            return Some(record);
+        }
+        let record = self
+            .read_project_access_records()
+            .ok()?
+            .into_iter()
+            .find(|record| record.project_id == project_id)?;
+        self.inner
+            .write()
+            .await
+            .project_access_records
+            .insert(project_id.to_string(), record.clone());
+        Some(record)
+    }
+
+    pub async fn upsert_project_access(
+        &self,
+        project_id: &str,
+        owner_principal_id: String,
+        workspace_id: Option<String>,
+        organization_id: Option<String>,
+    ) -> Result<ProjectAccessRecord> {
+        if project_id.trim().is_empty() || owner_principal_id.trim().is_empty() {
+            return Err(anyhow!(
+                "project access requires project and owner principal ids"
+            ));
+        }
+        let now = Utc::now();
+        let created_at = self
+            .get_project_access(project_id)
+            .await
+            .map(|record| record.created_at)
+            .unwrap_or(now);
+        let record = ProjectAccessRecord {
+            project_id: project_id.to_string(),
+            owner_principal_id,
+            workspace_id,
+            organization_id,
+            created_at,
+            updated_at: now,
+        };
+        self.inner
+            .write()
+            .await
+            .project_access_records
+            .insert(project_id.to_string(), record.clone());
+        self.append_project_access_snapshot(&record)?;
+        Ok(record)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3680,6 +3788,17 @@ impl RuntimeStore {
     }
 
     pub async fn stop_preview_leases_for_binding(&self, binding_id: &str) -> Result<usize> {
+        let leases = self.active_preview_leases_for_binding(binding_id).await?;
+        for lease in &leases {
+            self.stop_preview_lease(&lease.id).await?;
+        }
+        Ok(leases.len())
+    }
+
+    pub async fn active_preview_leases_for_binding(
+        &self,
+        binding_id: &str,
+    ) -> Result<Vec<PreviewLeaseRecord>> {
         let mut leases = self.read_preview_leases()?;
         {
             let inner = self.inner.read().await;
@@ -3691,17 +3810,13 @@ impl RuntimeStore {
                 }
             }
         }
-        let ids = leases
+        let leases = leases
             .into_iter()
             .filter(|lease| {
                 lease.sandbox_binding_id == binding_id && lease.status == PreviewLeaseStatus::Active
             })
-            .map(|lease| lease.id)
             .collect::<Vec<_>>();
-        for id in &ids {
-            self.stop_preview_lease(id).await?;
-        }
-        Ok(ids.len())
+        Ok(leases)
     }
 
     pub async fn preview_lease_for_run(&self, run_id: &str) -> Option<PreviewLeaseRecord> {
@@ -4713,6 +4828,13 @@ impl RuntimeStore {
 
 fn checkpoint_path(checkpoint_dir: &Path, checkpoint_id: &str) -> PathBuf {
     checkpoint_dir.join(format!("{checkpoint_id}.json"))
+}
+
+fn run_snapshot_is_newer(candidate: &AgentRun, current: &AgentRun) -> bool {
+    candidate.updated_at > current.updated_at
+        || (candidate.updated_at == current.updated_at
+            && candidate.status.is_terminal()
+            && !current.status.is_terminal())
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {

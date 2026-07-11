@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   createRuntimeClient,
   parseRunEventMessage,
+  previewProxyHeaders,
   runEventsProxyHeaders,
   runEventsUrl,
+  runtimePreviewPath,
   RuntimeApiError,
   subscribeRunEvents,
   type EventSourceLike,
@@ -114,6 +116,73 @@ class MockEventSource implements EventSourceLike {
 }
 
 describe("runtime client", () => {
+  it("builds BFF preview proxy requests with only the minted principal token", () => {
+    expect(runtimePreviewPath("lease/1", "assets/app.js")).toBe(
+      "/previews/lease%2F1/assets/app.js",
+    );
+    expect(
+      previewProxyHeaders(
+        "principal.jwt.token",
+        "/projects/project-1/previews/lease-1",
+      ),
+    ).toEqual({
+      authorization: "Bearer principal.jwt.token",
+      "x-anydesign-preview-prefix": "/projects/project-1/previews/lease-1",
+    });
+    expect(() => previewProxyHeaders(" ", "/projects/project-1/previews/lease-1")).toThrow(
+      "preview principal token is required",
+    );
+  });
+
+  it("upserts project access using internal service authorization", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            projectAccess: {
+              projectId: "project-1",
+              ownerPrincipalId: "principal-1",
+              workspaceId: "workspace-1",
+              organizationId: null,
+              createdAt: timestamp,
+              updatedAt: timestamp,
+            },
+          };
+        },
+      };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      internalAdminToken: "runtime-admin-token",
+    });
+
+    await client.upsertProjectAccess("project-1", {
+      ownerPrincipalId: "principal-1",
+      workspaceId: "workspace-1",
+    });
+
+    expect(calls[0]).toEqual({
+      url: "http://runtime.local/internal/projects/project-1/access",
+      init: {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "x-anydesign-internal": "true",
+          "x-runtime-admin-token": "runtime-admin-token",
+        },
+        body: JSON.stringify({
+          ownerPrincipalId: "principal-1",
+          workspaceId: "workspace-1",
+        }),
+      },
+    });
+  });
+
   it("calls runtime JSON endpoints with shared response validation", async () => {
     const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
     const fetchImpl: RuntimeFetch = async (url, init) => {

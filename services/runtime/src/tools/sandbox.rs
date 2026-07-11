@@ -1,7 +1,8 @@
 use crate::{
     artifact_publisher::{safe_segment, ArtifactFile, ArtifactPublisher, FileArtifactPublisher},
     channel_manager::ChannelManager,
-    config::{RuntimeConfig, RuntimePolicyProfile},
+    config::{RuntimeConfig, RuntimePolicyProfile, WorkspaceChannelTlsMode},
+    conversation::RuntimeStore,
     permission::{
         check_command_policy, check_existing_path, check_lexical_workspace_path,
         check_workspace_path, PermissionError, PermissionReason, PermissionResult, RuleSource,
@@ -22,6 +23,10 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
+use rustls::{
+    pki_types::{CertificateDer, ServerName},
+    ClientConfig, RootCertStore,
+};
 use scraper::{Html as ParsedHtml, Selector};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,9 +47,16 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{client::IntoClientRequest, http::header::AUTHORIZATION, Message},
+    client_async, connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::client::{Request as WebSocketRequest, Response as WebSocketResponse},
+        http::header::AUTHORIZATION,
+        Message,
+    },
+    MaybeTlsStream, WebSocketStream,
 };
+use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 const MAX_DIRECT_WRITE_ARGUMENT_BYTES: usize = 96_000;
 const MAX_DIRECT_WRITE_TEXT_CHARS: usize = 48_000;
@@ -160,6 +172,62 @@ pub fn sandbox_tools_with_backends(
             workspace: workspace_backend,
         }),
     ]
+}
+
+pub async fn cancel_run_sandbox_resources(
+    config: &RuntimeConfig,
+    store: &RuntimeStore,
+    run: &crate::types::AgentRun,
+    workspace_root: PathBuf,
+) -> anyhow::Result<usize> {
+    let Some(binding_id) = run.sandbox_id.as_deref() else {
+        return Ok(0);
+    };
+    let leases = store.active_preview_leases_for_binding(binding_id).await?;
+    if leases.is_empty() {
+        ChannelManager::shared()
+            .release_binding(store, binding_id)
+            .await?;
+        return Ok(0);
+    }
+
+    let mut ctx = ToolContext::new(store.clone(), run.clone(), workspace_root);
+    ctx.remote_workspace =
+        config.sandbox_backend_mode == crate::config::SandboxBackendMode::Kubernetes;
+    ctx.runtime_storage_dir = config.runtime_storage_dir.clone();
+    ctx.runtime_public_base_url = config.runtime_public_base_url.clone();
+
+    if ctx.remote_workspace {
+        let key_file = config
+            .workspace_channel_signing_key_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workspace channel signing key is not configured"))?;
+        let issuer = WorkspaceChannelJwtIssuer::from_pkcs8_der_file(
+            key_file,
+            config.workspace_channel_token_ttl_seconds,
+        )?;
+        let tls = WorkspaceChannelClientTls::from_runtime_config(config)?;
+        let scheme = if tls.is_some() { "wss" } else { "ws" };
+        let command = SandboxChannelCommandBackend::new()
+            .with_tls(tls)
+            .with_endpoint_resolver(Arc::new(
+                SandboxBindingEndpointResolver::with_token_issuer(issuer)
+                    .with_channel_scheme(scheme),
+            ));
+        for lease in &leases {
+            command.stop_process(&ctx, &lease.id).await?;
+            store.stop_preview_lease(&lease.id).await?;
+        }
+    } else {
+        stop_preview_pid(&ctx);
+        for lease in &leases {
+            store.stop_preview_lease(&lease.id).await?;
+        }
+    }
+    ChannelManager::shared()
+        .release_binding(store, binding_id)
+        .await?;
+    Ok(leases.len())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +479,7 @@ pub trait WorkspaceChannelEndpointResolver: Send + Sync {
 pub struct SandboxBindingEndpointResolver {
     token_issuer: Option<Arc<WorkspaceChannelJwtIssuer>>,
     channel_manager: Arc<ChannelManager>,
+    channel_scheme: &'static str,
 }
 
 impl Default for SandboxBindingEndpointResolver {
@@ -418,6 +487,7 @@ impl Default for SandboxBindingEndpointResolver {
         Self {
             token_issuer: None,
             channel_manager: ChannelManager::shared(),
+            channel_scheme: "ws",
         }
     }
 }
@@ -427,7 +497,13 @@ impl SandboxBindingEndpointResolver {
         Self {
             token_issuer: Some(Arc::new(token_issuer)),
             channel_manager: ChannelManager::shared(),
+            channel_scheme: "ws",
         }
+    }
+
+    pub fn with_channel_scheme(mut self, channel_scheme: &'static str) -> Self {
+        self.channel_scheme = channel_scheme;
+        self
     }
 }
 
@@ -451,7 +527,7 @@ impl WorkspaceChannelEndpointResolver for SandboxBindingEndpointResolver {
                 &binding,
                 &ctx.run.id,
                 crate::sandbox_adapter::WORKSPACE_CHANNEL_PORT,
-                "ws",
+                self.channel_scheme,
                 "/workspace",
             )
             .await
@@ -510,10 +586,63 @@ pub struct WorkspaceChannelRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceChannelClientTls {
+    client_config: Arc<ClientConfig>,
+    expected_server_san: Arc<String>,
+}
+
+impl WorkspaceChannelClientTls {
+    pub fn from_runtime_config(config: &RuntimeConfig) -> io::Result<Option<Self>> {
+        if config.workspace_channel_tls_mode == WorkspaceChannelTlsMode::DebugLoopback {
+            return Ok(None);
+        }
+        let ca_file = required_tls_file(&config.workspace_channel_ca_file, "CA")?;
+        let cert_file =
+            required_tls_file(&config.workspace_channel_client_cert_file, "client cert")?;
+        let key_file = required_tls_file(&config.workspace_channel_client_key_file, "client key")?;
+        // remote-fs-boundary: allow-begin runtime-owned-workspace-channel-tls-secret
+        let mut ca_reader = io::BufReader::new(fs::File::open(ca_file)?);
+        let ca_certs = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+        let mut roots = RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(ca_certs);
+        if added == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace channel CA contains no certificates",
+            ));
+        }
+        let mut cert_reader = io::BufReader::new(fs::File::open(cert_file)?);
+        let cert_chain = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        let mut key_reader = io::BufReader::new(fs::File::open(key_file)?);
+        let private_key = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "client key is missing"))?;
+        // remote-fs-boundary: allow-end runtime-owned-workspace-channel-tls-secret
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cert_chain, private_key)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Some(Self {
+            client_config: Arc::new(client_config),
+            expected_server_san: Arc::new(config.workspace_channel_server_san.clone()),
+        }))
+    }
+}
+
+fn required_tls_file<'a>(path: &'a Option<PathBuf>, label: &str) -> io::Result<&'a Path> {
+    path.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("workspace channel {label} file is not configured"),
+        )
+    })
+}
+
+#[derive(Debug, Clone)]
 pub struct WebSocketWorkspaceChannelTransport {
     endpoint: String,
     authorization: Option<String>,
     timeout: Duration,
+    tls: Option<WorkspaceChannelClientTls>,
 }
 
 impl WebSocketWorkspaceChannelTransport {
@@ -522,6 +651,7 @@ impl WebSocketWorkspaceChannelTransport {
             endpoint: endpoint.into(),
             authorization: None,
             timeout: Duration::from_secs(30),
+            tls: None,
         }
     }
 
@@ -534,6 +664,11 @@ impl WebSocketWorkspaceChannelTransport {
         self.timeout = timeout;
         self
     }
+
+    pub fn with_tls(mut self, tls: Option<WorkspaceChannelClientTls>) -> Self {
+        self.tls = tls;
+        self
+    }
 }
 
 #[async_trait]
@@ -542,6 +677,7 @@ impl WorkspaceChannelTransport for WebSocketWorkspaceChannelTransport {
         let endpoint = self.endpoint.clone();
         let authorization = self.authorization.clone();
         let timeout = self.timeout;
+        let tls = self.tls.clone();
         time::timeout(timeout, async move {
             let mut last_error = None;
             let max_attempts = if authorization.is_some() { 1 } else { 3 };
@@ -550,6 +686,7 @@ impl WorkspaceChannelTransport for WebSocketWorkspaceChannelTransport {
                     &endpoint,
                     authorization.as_deref(),
                     request.clone(),
+                    tls.as_ref(),
                 )
                 .await
                 {
@@ -594,6 +731,7 @@ impl WorkspaceChannelTransport for WebSocketWorkspaceChannelTransport {
                 request,
                 target_root,
                 excluded_files,
+                self.tls.as_ref(),
             ),
         )
         .await
@@ -619,6 +757,7 @@ async fn websocket_channel_export_once(
     request: WorkspaceChannelRequest,
     target_root: &Path,
     excluded_files: &[String],
+    tls: Option<&WorkspaceChannelClientTls>,
 ) -> io::Result<WorkspaceExportReceipt> {
     let mut handshake = endpoint
         .into_client_request()
@@ -637,9 +776,7 @@ async fn websocket_channel_export_once(
             .parse()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
     );
-    let (mut socket, _) = connect_async(handshake)
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
+    let (mut socket, _) = connect_workspace_channel(handshake, tls).await?;
     socket
         .send(Message::Text(
             serde_json::to_string(&json!({
@@ -850,6 +987,7 @@ async fn websocket_channel_request_once(
     endpoint: &str,
     authorization: Option<&str>,
     request: WorkspaceChannelRequest,
+    tls: Option<&WorkspaceChannelClientTls>,
 ) -> io::Result<Value> {
     let mut handshake = endpoint
         .into_client_request()
@@ -874,9 +1012,7 @@ async fn websocket_channel_request_once(
             .parse()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
     );
-    let (mut socket, _) = connect_async(handshake)
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
+    let (mut socket, _) = connect_workspace_channel(handshake, tls).await?;
     let payload = serde_json::to_string(&json!({
         "op": request.op,
         "path": request.path,
@@ -953,10 +1089,82 @@ fn is_transient_workspace_channel_error(error: &io::Error) -> bool {
     )
 }
 
+async fn connect_workspace_channel(
+    handshake: WebSocketRequest,
+    tls: Option<&WorkspaceChannelClientTls>,
+) -> io::Result<(
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    WebSocketResponse,
+)> {
+    if let Some(tls) = tls {
+        let host = handshake
+            .uri()
+            .host()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "channel host is missing"))?
+            .to_string();
+        let port = handshake.uri().port_u16().unwrap_or(443);
+        let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid channel host"))?;
+        let tls_stream = tokio_rustls::TlsConnector::from(tls.client_config.clone())
+            .connect(server_name, tcp)
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
+        let stream = MaybeTlsStream::Rustls(tls_stream);
+        verify_workspace_channel_server_san(&stream, &tls.expected_server_san)?;
+        client_async(handshake, stream)
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))
+    } else {
+        connect_async(handshake)
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))
+    }
+}
+
+fn verify_workspace_channel_server_san(
+    stream: &MaybeTlsStream<TcpStream>,
+    expected_san: &str,
+) -> io::Result<()> {
+    let MaybeTlsStream::Rustls(stream) = stream else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mTLS workspace channel did not negotiate rustls",
+        ));
+    };
+    let certificates =
+        stream.get_ref().1.peer_certificates().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "server cert is missing")
+        })?;
+    let certificate: &CertificateDer<'_> = certificates
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "server cert is missing"))?;
+    let (_, parsed) = parse_x509_certificate(certificate.as_ref())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "server cert is invalid"))?;
+    let matches = parsed
+        .subject_alternative_name()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "server SAN is invalid"))?
+        .is_some_and(|extension| {
+            extension
+                .value
+                .general_names
+                .iter()
+                .any(|name| matches!(name, GeneralName::URI(uri) if *uri == expected_san))
+        });
+    if !matches {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace channel server SPIFFE SAN mismatch",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct SandboxChannelWorkspaceBackend {
     timeout: Duration,
     endpoint_resolver: Arc<dyn WorkspaceChannelEndpointResolver>,
+    tls: Option<WorkspaceChannelClientTls>,
 }
 
 impl Default for SandboxChannelWorkspaceBackend {
@@ -964,6 +1172,7 @@ impl Default for SandboxChannelWorkspaceBackend {
         Self {
             timeout: Duration::from_secs(30),
             endpoint_resolver: Arc::new(SandboxBindingEndpointResolver::default()),
+            tls: None,
         }
     }
 }
@@ -987,8 +1196,10 @@ impl SandboxChannelWorkspaceBackend {
             key_file,
             config.workspace_channel_token_ttl_seconds,
         )?;
-        Ok(Self::new().with_endpoint_resolver(Arc::new(
-            SandboxBindingEndpointResolver::with_token_issuer(issuer),
+        let tls = WorkspaceChannelClientTls::from_runtime_config(config)?;
+        let scheme = if tls.is_some() { "wss" } else { "ws" };
+        Ok(Self::new().with_tls(tls).with_endpoint_resolver(Arc::new(
+            SandboxBindingEndpointResolver::with_token_issuer(issuer).with_channel_scheme(scheme),
         )))
     }
 
@@ -1005,6 +1216,11 @@ impl SandboxChannelWorkspaceBackend {
         self
     }
 
+    pub fn with_tls(mut self, tls: Option<WorkspaceChannelClientTls>) -> Self {
+        self.tls = tls;
+        self
+    }
+
     async fn channel_backend(
         &self,
         ctx: &ToolContext,
@@ -1017,8 +1233,9 @@ impl SandboxChannelWorkspaceBackend {
                 format!("unsupported workspace channel endpoint: {endpoint}"),
             ));
         }
-        let mut transport =
-            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout);
+        let mut transport = WebSocketWorkspaceChannelTransport::new(endpoint)
+            .with_timeout(self.timeout)
+            .with_tls(self.tls.clone());
         if let Some(authorization) = authorization {
             transport = transport.with_authorization(authorization);
         }
@@ -1033,6 +1250,7 @@ impl SandboxChannelWorkspaceBackend {
 pub struct SandboxChannelCommandBackend {
     timeout: Duration,
     endpoint_resolver: Arc<dyn WorkspaceChannelEndpointResolver>,
+    tls: Option<WorkspaceChannelClientTls>,
 }
 
 impl Default for SandboxChannelCommandBackend {
@@ -1040,6 +1258,7 @@ impl Default for SandboxChannelCommandBackend {
         Self {
             timeout: Duration::from_secs(30),
             endpoint_resolver: Arc::new(SandboxBindingEndpointResolver::default()),
+            tls: None,
         }
     }
 }
@@ -1062,9 +1281,15 @@ impl SandboxChannelCommandBackend {
         self
     }
 
+    pub fn with_tls(mut self, tls: Option<WorkspaceChannelClientTls>) -> Self {
+        self.tls = tls;
+        self
+    }
+
     async fn channel_backend(
         &self,
         ctx: &ToolContext,
+        timeout: Duration,
     ) -> io::Result<JsonWorkspaceChannelCommandBackend<WebSocketWorkspaceChannelTransport>> {
         let endpoint = self.endpoint_resolver.endpoint(ctx).await?;
         let authorization = self.endpoint_resolver.authorization(ctx).await?;
@@ -1074,8 +1299,9 @@ impl SandboxChannelCommandBackend {
                 format!("unsupported workspace channel endpoint: {endpoint}"),
             ));
         }
-        let mut transport =
-            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout);
+        let mut transport = WebSocketWorkspaceChannelTransport::new(endpoint)
+            .with_timeout(timeout)
+            .with_tls(self.tls.clone());
         if let Some(authorization) = authorization {
             transport = transport.with_authorization(authorization);
         }
@@ -1084,6 +1310,10 @@ impl SandboxChannelCommandBackend {
             ctx.workspace_root.clone(),
         ))
     }
+}
+
+fn workspace_command_request_timeout(base: Duration, command_timeout_ms: u64) -> Duration {
+    base.max(Duration::from_millis(command_timeout_ms).saturating_add(Duration::from_secs(5)))
 }
 
 #[async_trait]
@@ -1095,7 +1325,8 @@ impl SandboxCommandBackend for SandboxChannelCommandBackend {
         cwd: &Path,
         timeout_ms: u64,
     ) -> io::Result<SandboxCommandOutput> {
-        self.channel_backend(ctx)
+        let request_timeout = workspace_command_request_timeout(self.timeout, timeout_ms);
+        self.channel_backend(ctx, request_timeout)
             .await?
             .run(ctx, argv, cwd, timeout_ms)
             .await
@@ -1108,7 +1339,7 @@ impl SandboxCommandBackend for SandboxChannelCommandBackend {
         argv: &[String],
         cwd: &Path,
     ) -> io::Result<SandboxProcessLease> {
-        self.channel_backend(ctx)
+        self.channel_backend(ctx, self.timeout)
             .await?
             .start_process(ctx, lease_id, argv, cwd)
             .await
@@ -1119,7 +1350,7 @@ impl SandboxCommandBackend for SandboxChannelCommandBackend {
         ctx: &ToolContext,
         lease_id: &str,
     ) -> io::Result<SandboxProcessLease> {
-        self.channel_backend(ctx)
+        self.channel_backend(ctx, self.timeout)
             .await?
             .process_status(ctx, lease_id)
             .await
@@ -1130,10 +1361,28 @@ impl SandboxCommandBackend for SandboxChannelCommandBackend {
         ctx: &ToolContext,
         lease_id: &str,
     ) -> io::Result<SandboxProcessLease> {
-        self.channel_backend(ctx)
+        self.channel_backend(ctx, self.timeout)
             .await?
             .stop_process(ctx, lease_id)
             .await
+    }
+}
+
+#[cfg(test)]
+mod workspace_command_timeout_tests {
+    use super::workspace_command_request_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn process_exec_transport_outlives_the_requested_command_timeout() {
+        assert_eq!(
+            workspace_command_request_timeout(Duration::from_secs(30), 120_000),
+            Duration::from_secs(125)
+        );
+        assert_eq!(
+            workspace_command_request_timeout(Duration::from_secs(30), 1_000),
+            Duration::from_secs(30)
+        );
     }
 }
 
@@ -6466,7 +6715,38 @@ impl Tool for BrowserScreenshotTool {
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Terminal("browser state has no URL".to_string()))?;
-        let capture = capture_runtime_screenshot(&ctx, &screenshot_id, url).await?;
+        let (capture_url, capture_lease_id) = if ctx.remote_workspace {
+            let preview = read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
+                .await
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "browser.screenshot requires an active Runtime preview lease".to_string(),
+                        "preview.lease_missing",
+                        json!({}),
+                    )
+                })?;
+            let lease_id = preview
+                .get("leaseId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::Terminal("preview state has no leaseId".to_string()))?
+                .to_string();
+            (
+                format!(
+                    "{}/preview-captures/{lease_id}/",
+                    ctx.runtime_browser_proxy_base_url
+                ),
+                Some(lease_id),
+            )
+        } else {
+            (url.to_string(), None)
+        };
+        let capture = capture_runtime_screenshot(
+            &ctx,
+            &screenshot_id,
+            &capture_url,
+            capture_lease_id.as_deref(),
+        )
+        .await?;
         let fixture_blank = input.get("blank").and_then(Value::as_bool).unwrap_or(false);
         if ctx.remote_workspace && capture.is_none() {
             return Err(typed_recoverable(
@@ -6530,6 +6810,7 @@ async fn capture_runtime_screenshot(
     ctx: &ToolContext,
     screenshot_id: &str,
     url: &str,
+    preview_lease_id: Option<&str>,
 ) -> Result<Option<RuntimeScreenshotCapture>, ToolError> {
     let Some(executable) = std::env::var("RUNTIME_BROWSER_EXECUTABLE")
         .ok()
@@ -6615,11 +6896,23 @@ async fn capture_runtime_screenshot(
         1.0 - dominant as f64 / total as f64
     };
     let capture = RuntimeScreenshotCapture {
-        uri: format!(
-            "runtime://screenshots/{}/{}/{}.png",
-            safe_segment(&ctx.run.project_id),
-            safe_segment(&ctx.run.id),
-            safe_segment(screenshot_id)
+        uri: preview_lease_id.map_or_else(
+            || {
+                format!(
+                    "runtime://screenshots/{}/{}/{}.png",
+                    safe_segment(&ctx.run.project_id),
+                    safe_segment(&ctx.run.id),
+                    safe_segment(screenshot_id)
+                )
+            },
+            |lease_id| {
+                format!(
+                    "runtime://preview-captures/{}/{}/{}",
+                    safe_segment(&ctx.run.project_id),
+                    safe_segment(&ctx.run.id),
+                    safe_segment(lease_id)
+                )
+            },
         ),
         png_sha256: sha256_hex(&png_bytes),
         document_sha256,
@@ -6638,7 +6931,6 @@ async fn capture_runtime_screenshot(
             "width": capture.width,
             "height": capture.height,
             "nonblankPixelRatio": capture.nonblank_pixel_ratio,
-            "url": url,
         }))
         .map_err(|error| ToolError::Terminal(error.to_string()))?,
     )
@@ -7858,7 +8150,7 @@ async fn maybe_restore_project_dependencies(
             json!({
                 "registry": registry,
                 "policyProfile": format!("{:?}", ctx.policy_profile),
-                "suggestedAction": "Use an allowed internal registry or local-e2e policy for public registry restores."
+                "suggestedAction": "Use the configured internal registry or local-e2e policy for public registry restores."
             }),
         ));
     }
@@ -7988,7 +8280,10 @@ fn package_install_permission(
         .and_then(Value::as_str)
         .unwrap_or(&ctx.npm_registry);
     let packages = package_specs_from_input(input);
-    let public_registry = is_public_registry(registry)
+    let configured_registry = registry.trim_end_matches('/')
+        == ctx.npm_registry.trim_end_matches('/')
+        && !registry.contains("registry.npmjs.org");
+    let public_registry = (!configured_registry && is_public_registry(registry))
         || packages
             .iter()
             .any(|package| package.starts_with("http://") || package.starts_with("https://"));
@@ -8111,12 +8406,13 @@ async fn run_package_install(
     )
     .await?;
     if !output.success {
+        let error_kind = dependency_install_failure_kind(&output.stderr);
         return Err(ToolError::typed_recoverable(
             format!(
                 "{tool_name} failed with status {:?}; log: {}",
                 output.status, log_path
             ),
-            "dependency.install_failed",
+            error_kind,
             json!({
                 "toolName": tool_name,
                 "packageManager": package_manager,
@@ -8127,7 +8423,11 @@ async fn run_package_install(
                 "status": output.status,
                 "logPath": log_path,
                 "stderr": truncate_for_metadata(&output.stderr),
-                "suggestedAction": "Open the package install log, fix registry or package errors, then rerun project.ensure_dependencies.",
+                "suggestedAction": if error_kind == "infrastructure.registry_unavailable" {
+                    "Verify the internal npm proxy and its upstream/cache availability, then rerun project.ensure_dependencies."
+                } else {
+                    "Open the package install log, fix registry or package errors, then rerun project.ensure_dependencies."
+                },
             }),
         ));
     }
@@ -8146,6 +8446,27 @@ async fn run_package_install(
         "stdout": output.stdout,
         "stderr": output.stderr,
     }))
+}
+
+fn dependency_install_failure_kind(stderr: &str) -> &'static str {
+    let stderr = stderr.to_ascii_lowercase();
+    if [
+        "eai_again",
+        "enotfound",
+        "econnrefused",
+        "econnreset",
+        "etimedout",
+        "network timeout",
+        "service unavailable",
+        "bad gateway",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
+    {
+        "infrastructure.registry_unavailable"
+    } else {
+        "dependency.install_failed"
+    }
 }
 
 async fn dependency_restore_reason(
@@ -8812,7 +9133,10 @@ async fn verify_screenshot_artifact(
             .unwrap_or_default();
         if !png_hash.is_some_and(|hash| hash.len() == 64)
             || !document_hash.is_some_and(|hash| hash.len() == 64)
-            || !screenshot_uri.is_some_and(|uri| uri.starts_with("runtime://screenshots/"))
+            || !screenshot_uri.is_some_and(|uri| {
+                uri.starts_with("runtime://screenshots/")
+                    || uri.starts_with("runtime://preview-captures/")
+            })
             || nonblank_ratio < 0.0005
         {
             return Err(typed_recoverable(
@@ -8885,7 +9209,7 @@ mod browser_worker_tests {
         let mut ctx = ToolContext::new(store, run, storage.join("workspace"));
         ctx.runtime_storage_dir = storage;
         let capture =
-            capture_runtime_screenshot(&ctx, "real-browser", &format!("http://{address}/"))
+            capture_runtime_screenshot(&ctx, "real-browser", &format!("http://{address}/"), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -9847,7 +10171,28 @@ fn project_build_argv(package_manager: &str) -> Vec<String> {
 }
 
 fn is_public_registry(registry: &str) -> bool {
-    registry.contains("registry.npmjs.org") || !registry.contains("internal")
+    let Ok(url) = reqwest::Url::parse(registry) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if host == "registry.npmjs.org" {
+        return true;
+    }
+    if host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".svc")
+        || host.contains(".svc.")
+        || host.split('.').any(|label| label == "internal")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+        })
+    {
+        return false;
+    }
+    matches!(url.scheme(), "http" | "https")
 }
 
 fn is_internal_preview_url(url: &str) -> bool {

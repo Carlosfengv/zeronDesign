@@ -2702,6 +2702,52 @@ async fn project_ensure_dependencies_timeout_has_structured_metadata() {
 }
 
 #[tokio::test]
+async fn project_ensure_dependencies_registry_failure_is_typed_infrastructure_error() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("project/package.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "sandbox-project",
+            "private": true,
+            "dependencies": { "next": "15.5.7" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let transport = ExecBehaviorTransport::new(ExecBehavior::Output {
+        status: 1,
+        success: false,
+        stdout: String::new(),
+        stderr: "npm error code EAI_AGAIN: internal registry unavailable".to_string(),
+    });
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport, &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-ensure-deps",
+                "project.ensure_dependencies",
+                json!({ "mode": "restore", "cwd": "project" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_error_kind(&results[0].result, "infrastructure.registry_unavailable");
+    assert_eq!(results[0].result.metadata.as_ref().unwrap()["status"], 1);
+}
+
+#[tokio::test]
 async fn package_install_restore_uses_pnpm_install_and_emits_tool_output() {
     let workspace = setup_workspace();
     fs::write(
@@ -3511,6 +3557,9 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
         "excluded",
     )
     .unwrap();
+    fs::write(workspace.join("project/404.html"), "not found").unwrap();
+    fs::create_dir_all(workspace.join("project/_next")).unwrap();
+    fs::write(workspace.join("project/_next/runtime.js"), "runtime").unwrap();
     let port = free_tcp_port();
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../infra/agent-sandbox/base/workspace-channel-server.js");
@@ -3570,6 +3619,39 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
             .status,
         "stopped"
     );
+    let heartbeat = workspace.join("project/process-timeout-heartbeat.txt");
+    let heartbeat_script = r#"
+const { spawn } = require('node:child_process');
+const child = spawn(process.execPath, ['-e', `
+  const fs = require('node:fs');
+  process.on('SIGTERM', () => {});
+  setInterval(() => fs.appendFileSync('process-timeout-heartbeat.txt', 'x'), 25);
+`], { stdio: 'ignore' });
+child.unref();
+setInterval(() => {}, 1000);
+"#;
+    let timed_out = command_backend
+        .run(
+            &ctx,
+            &[
+                "node".to_string(),
+                "-e".to_string(),
+                heartbeat_script.to_string(),
+            ],
+            &workspace.join("project"),
+            500,
+        )
+        .await
+        .expect("timed process.exec response");
+    assert!(!timed_out.success);
+    assert!(timed_out.stderr.contains("process.exec timed out"));
+    let heartbeat_after_timeout = fs::read(&heartbeat).expect("child must write heartbeat");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        fs::read(&heartbeat).expect("heartbeat remains readable"),
+        heartbeat_after_timeout,
+        "timed-out process.exec must terminate descendant processes before returning"
+    );
     let missing = backend
         .path_kind(&ctx, &workspace.join("project/missing-template-path"))
         .await
@@ -3605,6 +3687,14 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
     assert!(!export_target
         .join(".anydesign-candidate-manifest.json")
         .exists());
+    assert_eq!(
+        fs::read_to_string(export_target.join("404.html")).unwrap(),
+        "not found"
+    );
+    assert_eq!(
+        fs::read_to_string(export_target.join("_next/runtime.js")).unwrap(),
+        "runtime"
+    );
     let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
         sandbox_tools_with_workspace_backend(Arc::new(backend)),
         Default::default(),

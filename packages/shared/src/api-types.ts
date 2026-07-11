@@ -345,6 +345,25 @@ export const HealthResponseSchema = z.object({
   status: z.literal("ready"),
 });
 
+export const UpsertProjectAccessRequestSchema = z.object({
+  ownerPrincipalId: z.string().min(1),
+  workspaceId: z.string().min(1).optional(),
+  organizationId: z.string().min(1).optional(),
+});
+
+export const ProjectAccessRecordSchema = z.object({
+  projectId: z.string().min(1),
+  ownerPrincipalId: z.string().min(1),
+  workspaceId: z.string().min(1).nullable().optional(),
+  organizationId: z.string().min(1).nullable().optional(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+
+export const ProjectAccessResponseSchema = z.object({
+  projectAccess: ProjectAccessRecordSchema,
+});
+
 export const ErrorResponseSchema = z.object({
   error: z.string().min(1),
 });
@@ -394,4 +413,6 @@ export type ProjectRuntimeStateResponse = z.infer<typeof ProjectRuntimeStateResp
 export type PromotePreviewRequest = z.infer<typeof PromotePreviewRequestSchema>;
 export type PromotePreviewResponse = z.infer<typeof PromotePreviewResponseSchema>;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+export type UpsertProjectAccessRequest = z.infer<typeof UpsertProjectAccessRequestSchema>;
+export type ProjectAccessResponse = z.infer<typeof ProjectAccessResponseSchema>;
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;

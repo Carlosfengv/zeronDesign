@@ -1,15 +1,16 @@
 use anydesign_runtime::{
-    config::{RuntimePolicyProfile, SandboxBackendMode},
+    config::{PublicPrincipalAuthMode, RuntimePolicyProfile, SandboxBackendMode},
     http_api::{self, AppState},
     model_gateway::{
         MockModelClient, ModelResponse, OpenAiCompatibleModelClient, ToolCall,
         ToolInputParseFailure,
     },
     preview::{promote_preview, PromotionGateReport},
+    public_principal::{PublicPrincipalClaims, PublicPrincipalJwtIssuer, PREVIEW_READ_OPERATION},
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
-        ReviewFindingCategory, ReviewFindingSeverity, ReviewFindingStatus, SandboxBindingStatus,
-        SandboxChannelProtocol,
+        PreviewLeaseStatus, ReviewFindingCategory, ReviewFindingSeverity, ReviewFindingStatus,
+        SandboxBindingStatus, SandboxChannelProtocol,
     },
     RuntimeConfig, RuntimeStore,
 };
@@ -18,6 +19,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -86,8 +88,29 @@ impl Drop for SandboxChannelEnvOverride {
 fn phase_a_contract_config() -> RuntimeConfig {
     let mut config = RuntimeConfig::from_env();
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+    config.policy_profile = RuntimePolicyProfile::LocalE2e;
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
     config.runtime_storage_dir = unique_temp_dir("http-runtime-storage");
     config
+}
+
+fn public_principal_token(
+    issuer: &PublicPrincipalJwtIssuer,
+    principal_id: &str,
+    project_id: &str,
+) -> String {
+    issuer
+        .issue(PublicPrincipalClaims {
+            iss: String::new(),
+            aud: String::new(),
+            sub: principal_id.to_string(),
+            jti: format!("public-jti-{principal_id}-0001"),
+            exp: 0,
+            iat: 0,
+            project_id: project_id.to_string(),
+            operations: vec![PREVIEW_READ_OPERATION.to_string()],
+        })
+        .unwrap()
 }
 
 #[tokio::test]
@@ -766,7 +789,7 @@ fn design_profile_request_for_scope(
 #[tokio::test]
 async fn root_route_returns_runtime_index_for_browser_access() {
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -1761,7 +1784,7 @@ async fn start_run_and_stream_events() {
         json!({ "status": "completed", "summary": "Brief ready" }),
     )])]);
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(model),
     });
@@ -1926,7 +1949,7 @@ async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_a
         )]),
     ]);
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(model),
     });
@@ -3521,7 +3544,7 @@ async fn project_conversation_returns_user_visible_items_by_default() {
 #[tokio::test]
 async fn cancel_run_marks_terminal_cancelled() {
     let store = RuntimeStore::new();
-    let run = store
+    let mut run = store
         .create_run(
             "project-1".to_string(),
             AgentPhase::Export,
@@ -3530,8 +3553,46 @@ async fn cancel_run_marks_terminal_cancelled() {
             vec![],
         )
         .await;
+    let binding = store
+        .create_sandbox_binding(
+            "project-1",
+            "sandbox-cancel".to_string(),
+            "claim-cancel".to_string(),
+            "workspace-cancel".to_string(),
+            "pool-cancel".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_runtime_identity_with_uids(
+            &binding.id,
+            "sandbox-cancel".to_string(),
+            Some("sandbox-cancel".to_string()),
+            Some("sandbox-uid-cancel".to_string()),
+            Some("pod-uid-cancel".to_string()),
+        )
+        .await
+        .unwrap();
+    run = store
+        .bind_run_to_sandbox(&run.id, &binding.id)
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Busy)
+        .await
+        .unwrap();
+    let lease = store
+        .create_preview_lease(&run.id, "build-cancel".to_string(), "a".repeat(64), 900)
+        .await
+        .unwrap();
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -3547,13 +3608,22 @@ async fn cancel_run_marks_terminal_cancelled() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
     let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "cancel response: {payload}");
     assert_eq!(payload["status"], "cancelled");
     assert_eq!(
         store.get_run(&run.id).await.unwrap().status,
         AgentRunStatus::Cancelled
+    );
+    assert_eq!(
+        store.get_preview_lease(&lease.id).await.unwrap().status,
+        PreviewLeaseStatus::Stopped
+    );
+    assert_eq!(
+        store.get_sandbox_binding(&binding.id).await.unwrap().status,
+        SandboxBindingStatus::Idle
     );
 }
 
@@ -3676,7 +3746,7 @@ async fn continue_run_records_user_message_and_resumes() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -3855,7 +3925,7 @@ async fn resolve_permission_allow_resumes_run() {
         .create_permission_request("project-1", &run.id, "shell.run")
         .await;
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -3923,7 +3993,7 @@ async fn resolve_permission_after_restart_resumes_same_run() {
 
     let reloaded_store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
     let app = http_api::router_with_state(AppState {
-        config: RuntimeConfig::from_env(),
+        config: phase_a_contract_config(),
         store: reloaded_store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -6195,13 +6265,51 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
         )
         .await
         .unwrap();
-    let app = http_api::router_with_state(AppState {
-        config: phase_a_contract_config(),
+    store
+        .upsert_project_access(
+            "preview-project",
+            "principal-preview-owner".to_string(),
+            Some("workspace-preview".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let public_key_path = unique_temp_dir("public-principal-key").join("current.der");
+    fs::create_dir_all(public_key_path.parent().unwrap()).unwrap();
+    fs::write(
+        &public_key_path,
+        signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let issuer = PublicPrincipalJwtIssuer::from_signing_key(
+        signing_key,
+        "anydesign-bff",
+        "anydesign-runtime-public",
+        60,
+    );
+    let owner_token = public_principal_token(&issuer, "principal-preview-owner", "preview-project");
+    let cross_project_token =
+        public_principal_token(&issuer, "principal-preview-owner", "another-project");
+    let wrong_owner_token =
+        public_principal_token(&issuer, "principal-not-owner", "preview-project");
+    let mut config = phase_a_contract_config();
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+    config.public_principal_public_key_files = vec![public_key_path];
+    config.public_principal_max_ttl_seconds = 60;
+    let state = AppState {
+        config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
-    });
+    };
+    let capture_app = http_api::capture_router_with_state(state.clone());
+    let app = http_api::router_with_state(state);
 
-    let response = app
+    let missing = app
         .clone()
         .oneshot(
             Request::builder()
@@ -6211,17 +6319,121 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
         )
         .await
         .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let cross_project = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/previews/{}/", lease.id))
+                .header("authorization", format!("Bearer {cross_project_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!("/projects/preview-project/previews/{}", lease.id),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_project.status(), StatusCode::FORBIDDEN);
+
+    let wrong_owner = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/previews/{}/", lease.id))
+                .header("authorization", format!("Bearer {wrong_owner_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!("/projects/preview-project/previews/{}", lease.id),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_owner.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/previews/{}/", lease.id))
+                .header("authorization", format!("Bearer {owner_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!("/projects/preview-project/previews/{}", lease.id),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-anydesign-preview-lease"], lease.id);
     let html =
         String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap();
-    assert!(html.contains(&format!("/previews/{}/assets/app.js", lease.id)));
+    assert!(html.contains(&format!(
+        "/projects/preview-project/previews/{}/assets/app.js",
+        lease.id
+    )));
+
+    let capture = capture_app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/preview-captures/{}/", lease.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(capture.status(), StatusCode::OK);
+    let capture_html =
+        String::from_utf8(to_bytes(capture.into_body(), 4096).await.unwrap().to_vec()).unwrap();
+    assert!(capture_html.contains(&format!("/preview-captures/{}/assets/app.js", lease.id)));
+    let audit_json = serde_json::to_string(&store.audit_records().await).unwrap();
+    assert!(!audit_json.contains(&owner_token));
+    assert!(!audit_json.contains(&wrong_owner_token));
+    assert!(audit_json.contains(&sha256_hex(b"principal-preview-owner")));
+
+    store
+        .update_sandbox_binding_runtime_identity_with_uids(
+            &binding.id,
+            "sandbox-preview-proxy".to_string(),
+            Some("sandbox-preview-proxy".to_string()),
+            Some("sandbox-uid-preview-proxy".to_string()),
+            Some("replacement-pod-uid".to_string()),
+        )
+        .await
+        .unwrap();
+    let replaced = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/previews/{}/", lease.id))
+                .header("authorization", format!("Bearer {owner_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!("/projects/preview-project/previews/{}", lease.id),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CONFLICT);
 
     store.stop_preview_lease(&lease.id).await.unwrap();
     let stopped = app
         .oneshot(
             Request::builder()
                 .uri(format!("/previews/{}/", lease.id))
+                .header("authorization", format!("Bearer {owner_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!("/projects/preview-project/previews/{}", lease.id),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6229,6 +6441,195 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
         .unwrap();
     upstream.abort();
     assert_eq!(stopped.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn project_access_internal_route_requires_admin_and_persists_across_store_restart() {
+    let storage = unique_temp_dir("project-access-persistence");
+    let store = RuntimeStore::with_checkpoint_dir(storage.clone());
+    let mut config = phase_a_contract_config();
+    config.internal_admin_token = Some("admin-project-access-token".to_string());
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let body = json!({
+        "ownerPrincipalId": "principal-owner-1",
+        "workspaceId": "workspace-1",
+        "organizationId": "organization-1"
+    })
+    .to_string();
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/projects/project-access-1/access")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/projects/project-access-1/access")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-project-access-token")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    drop(store);
+    let restarted = RuntimeStore::with_checkpoint_dir(storage);
+    let record = restarted
+        .get_project_access("project-access-1")
+        .await
+        .unwrap();
+    assert_eq!(record.owner_principal_id, "principal-owner-1");
+    assert_eq!(record.workspace_id.as_deref(), Some("workspace-1"));
+    assert_eq!(record.organization_id.as_deref(), Some("organization-1"));
+}
+
+#[tokio::test]
+async fn release_evidence_and_sandbox_release_routes_fail_closed_without_admin_identity() {
+    let store = RuntimeStore::new();
+    let mut config = phase_a_contract_config();
+    config.internal_admin_token = Some("release-evidence-admin".to_string());
+    let app = http_api::router_with_state(AppState {
+        config,
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    for (method, uri) in [
+        ("GET", "/internal/projects/project-1/release-evidence"),
+        ("POST", "/internal/projects/project-1/release-sandbox"),
+    ] {
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("x-anydesign-internal", "true")
+                    .header("x-runtime-admin-token", "wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn production_initial_run_requires_registered_project_access() {
+    let store = RuntimeStore::new();
+    let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+    let public_key_path = unique_temp_dir("initial-run-public-key").join("current.der");
+    fs::create_dir_all(public_key_path.parent().unwrap()).unwrap();
+    fs::write(
+        &public_key_path,
+        signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut config = phase_a_contract_config();
+    config.policy_profile = RuntimePolicyProfile::Production;
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+    config.public_principal_public_key_files = vec![public_key_path];
+    config.validate_startup().unwrap();
+    let app = http_api::router_with_state(AppState {
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let request_body = |workspace_id: &str| {
+        json!({
+            "projectId": "owned-project",
+            "phase": "brief",
+            "agentProfile": "brief",
+            "inputContext": { "workspaceId": workspace_id }
+        })
+        .to_string()
+    };
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body("workspace-owned")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::CONFLICT);
+
+    store
+        .upsert_project_access(
+            "owned-project",
+            "principal-owned".to_string(),
+            Some("workspace-owned".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+    let drifted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body("workspace-other")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drifted.status(), StatusCode::CONFLICT);
+
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body("workspace-owned")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
 }
 
 #[tokio::test]

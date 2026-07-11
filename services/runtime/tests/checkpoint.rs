@@ -1,3 +1,4 @@
+use anydesign_runtime::config::{SandboxBackendMode, WorkspaceChannelTlsMode};
 use anydesign_runtime::{
     agent_loop::AgentLoop,
     conversation::RuntimeStore,
@@ -869,8 +870,11 @@ async fn startup_recovery_spawns_run_with_checkpoint_message_window() {
         )])],
         captured_requests.clone(),
     );
+    let mut config = RuntimeConfig::from_env();
+    config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+    config.workspace_channel_tls_mode = WorkspaceChannelTlsMode::DebugLoopback;
     let state = AppState {
-        config: RuntimeConfig::from_env(),
+        config,
         store: reloaded_store.clone(),
         model: Arc::new(model),
     };
@@ -1095,6 +1099,34 @@ async fn runtime_restart_marks_running_run_failed_when_checkpoint_is_missing() {
                 .metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata["recoverable"] == true)));
+}
+
+#[tokio::test]
+async fn persisted_terminal_run_overrides_stale_in_memory_recovery_snapshot() {
+    let checkpoint_dir = unique_temp_dir("checkpoints-terminal-wins");
+    let writer = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+    let run_id = create_run(&writer).await;
+    writer
+        .update_run_status(&run_id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+
+    let restarting = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+    assert_eq!(
+        restarting.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Running
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    writer
+        .update_run_status(&run_id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+
+    assert!(restarting.runs_requiring_recovery().await.is_empty());
+    assert_eq!(
+        restarting.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Completed
+    );
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

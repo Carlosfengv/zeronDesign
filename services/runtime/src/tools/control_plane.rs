@@ -40,6 +40,9 @@ pub fn control_plane_executor() -> ToolExecutor {
 pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor {
     let executor = match config.sandbox_backend_mode {
         SandboxBackendMode::Kubernetes => {
+            let tls = sandbox::WorkspaceChannelClientTls::from_runtime_config(config)
+                .expect("workspace channel mTLS configuration must be valid");
+            let channel_scheme = if tls.is_some() { "wss" } else { "ws" };
             let resolver: Arc<dyn sandbox::WorkspaceChannelEndpointResolver> = config
                 .workspace_channel_signing_key_file
                 .as_ref()
@@ -51,19 +54,28 @@ pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor
                     .expect(
                         "workspace channel signing key must be a readable Ed25519 PKCS#8 DER key",
                     );
-                    Arc::new(sandbox::SandboxBindingEndpointResolver::with_token_issuer(
-                        issuer,
-                    )) as Arc<dyn sandbox::WorkspaceChannelEndpointResolver>
+                    Arc::new(
+                        sandbox::SandboxBindingEndpointResolver::with_token_issuer(issuer)
+                            .with_channel_scheme(channel_scheme),
+                    ) as Arc<dyn sandbox::WorkspaceChannelEndpointResolver>
                 })
-                .unwrap_or_else(|| Arc::new(sandbox::SandboxBindingEndpointResolver::default()));
+                .unwrap_or_else(|| {
+                    Arc::new(
+                        sandbox::SandboxBindingEndpointResolver::default()
+                            .with_channel_scheme(channel_scheme),
+                    )
+                });
             control_plane_executor_with_backends(
                 sandbox_backend_for_config(config),
                 Arc::new(
                     sandbox::SandboxChannelWorkspaceBackend::new()
+                        .with_tls(tls.clone())
                         .with_endpoint_resolver(resolver.clone()),
                 ),
                 Arc::new(
-                    sandbox::SandboxChannelCommandBackend::new().with_endpoint_resolver(resolver),
+                    sandbox::SandboxChannelCommandBackend::new()
+                        .with_tls(tls)
+                        .with_endpoint_resolver(resolver),
                 ),
             )
         }
@@ -74,6 +86,7 @@ pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor
     executor
         .with_policy_profile_and_registry(config.policy_profile, config.npm_registry.clone())
         .with_runtime_public_base_url(config.runtime_public_base_url.clone())
+        .with_runtime_browser_proxy_base_url(config.runtime_browser_proxy_base_url())
         .with_remote_workspace(config.sandbox_backend_mode == SandboxBackendMode::Kubernetes)
         .with_runtime_storage_dir(config.runtime_storage_dir.clone())
         .with_workspace_root(&config.workspace_root)

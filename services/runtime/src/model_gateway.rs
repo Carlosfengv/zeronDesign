@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 use tokio::sync::Mutex;
 
@@ -17,6 +18,8 @@ use crate::{
 };
 
 const MAX_STREAMING_TOOL_ARGUMENT_CHARS: usize = 96_000;
+const OPENAI_TRANSPORT_ATTEMPTS: u32 = 5;
+const OPENAI_TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -112,7 +115,8 @@ pub trait ModelClient: Send + Sync {
 pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredModelClient> {
     match config.model_provider {
         ModelProvider::InternalGateway => Ok(ConfiguredModelClient::InternalGateway(
-            HttpModelGatewayClient::new(config.model_gateway_url.clone()),
+            HttpModelGatewayClient::new(config.model_gateway_url.clone())
+                .with_timeout(Duration::from_secs(config.model_request_timeout_seconds)),
         )),
         ModelProvider::DeepSeek => {
             let api_key = config
@@ -126,7 +130,8 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     Some("deepseek"),
                 )
                 .with_streaming(config.model_streaming)
-                .with_strict_tools(config.model_strict_tools),
+                .with_strict_tools(config.model_strict_tools)
+                .with_timeout(Duration::from_secs(config.model_request_timeout_seconds)),
             ))
         }
         ModelProvider::KimiGlobal => {
@@ -140,7 +145,8 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     Some("kimi_global"),
                 )
                 .with_streaming(config.model_streaming)
-                .with_strict_tools(config.model_strict_tools),
+                .with_strict_tools(config.model_strict_tools)
+                .with_timeout(Duration::from_secs(config.model_request_timeout_seconds)),
             ))
         }
         ModelProvider::KimiChina => {
@@ -156,7 +162,8 @@ pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredMode
                     Some("kimi_cn"),
                 )
                 .with_streaming(config.model_streaming)
-                .with_strict_tools(config.model_strict_tools),
+                .with_strict_tools(config.model_strict_tools)
+                .with_timeout(Duration::from_secs(config.model_request_timeout_seconds)),
             ))
         }
     }
@@ -198,6 +205,7 @@ impl ModelClient for ConfiguredModelClient {
 pub struct HttpModelGatewayClient {
     endpoint: String,
     client: reqwest::Client,
+    request_timeout: Duration,
 }
 
 impl HttpModelGatewayClient {
@@ -207,17 +215,24 @@ impl HttpModelGatewayClient {
         Self {
             endpoint,
             client: reqwest::Client::new(),
+            request_timeout: Duration::from_secs(180),
         }
     }
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
-}
 
-#[async_trait]
-impl ModelClient for HttpModelGatewayClient {
-    async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("model gateway HTTP client");
+        self
+    }
+
+    async fn execute(&self, request: ModelRequest) -> Result<ModelResponse> {
         let response = self
             .client
             .post(&self.endpoint)
@@ -238,6 +253,20 @@ impl ModelClient for HttpModelGatewayClient {
     }
 }
 
+#[async_trait]
+impl ModelClient for HttpModelGatewayClient {
+    async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+        tokio::time::timeout(self.request_timeout, self.execute(request))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "model gateway turn timed out after {}ms",
+                    self.request_timeout.as_millis()
+                )
+            })?
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleModelClient {
     provider_id: String,
@@ -246,6 +275,9 @@ pub struct OpenAiCompatibleModelClient {
     streaming: bool,
     strict_tools: bool,
     client: reqwest::Client,
+    request_timeout: Duration,
+    transport_attempts: u32,
+    transport_retry_base_delay: Duration,
 }
 
 impl OpenAiCompatibleModelClient {
@@ -263,6 +295,9 @@ impl OpenAiCompatibleModelClient {
             streaming: false,
             strict_tools: false,
             client: reqwest::Client::new(),
+            request_timeout: Duration::from_secs(180),
+            transport_attempts: OPENAI_TRANSPORT_ATTEMPTS,
+            transport_retry_base_delay: OPENAI_TRANSPORT_RETRY_BASE_DELAY,
         }
     }
 
@@ -274,6 +309,62 @@ impl OpenAiCompatibleModelClient {
     pub fn with_strict_tools(mut self, strict_tools: bool) -> Self {
         self.strict_tools = strict_tools;
         self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("OpenAI-compatible HTTP client");
+        self
+    }
+
+    pub fn with_transport_retry(mut self, attempts: u32, base_delay: Duration) -> Self {
+        self.transport_attempts = attempts.max(1);
+        self.transport_retry_base_delay = base_delay;
+        self
+    }
+
+    async fn execute(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let (mut body, tool_name_map) = openai_chat_request(&request, self.strict_tools);
+        if self.streaming {
+            body["stream"] = Value::Bool(true);
+        }
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| openai_transport_error(&self.provider_id, "sending request", error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "{} model request failed: status={} body={}",
+                self.provider_id,
+                status,
+                body
+            ));
+        }
+        if self.streaming {
+            return openai_streaming_model_response(response, &tool_name_map, &self.provider_id)
+                .await;
+        }
+        let response_body = response.text().await.map_err(|error| {
+            openai_transport_error(&self.provider_id, "reading response", error)
+        })?;
+        let response = serde_json::from_str::<OpenAiChatCompletionResponse>(&response_body)
+            .map_err(|error| {
+                anyhow!(
+                    "{} model response decode failed: {error}; body={}",
+                    self.provider_id,
+                    response_body.chars().take(2_000).collect::<String>()
+                )
+            })?;
+        Ok(response.into_model_response(&tool_name_map))
     }
 
     pub fn provider_id(&self) -> &str {
@@ -288,40 +379,33 @@ impl OpenAiCompatibleModelClient {
 #[async_trait]
 impl ModelClient for OpenAiCompatibleModelClient {
     async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let (mut body, tool_name_map) = openai_chat_request(&request, self.strict_tools);
-        if self.streaming {
-            body["stream"] = Value::Bool(true);
-        }
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "{} model request failed: status={} body={}",
-                self.provider_id,
-                status,
-                body
-            ));
-        }
-        if self.streaming {
-            return openai_streaming_model_response(response, &tool_name_map).await;
-        }
-        let response_body = response.text().await?;
-        let response = serde_json::from_str::<OpenAiChatCompletionResponse>(&response_body)
-            .map_err(|error| {
+        let execute_with_retry = async {
+            for attempt in 1..=self.transport_attempts {
+                match self.execute(request.clone()).await {
+                    Err(error)
+                        if error.downcast_ref::<OpenAiTransportError>().is_some()
+                            && attempt < self.transport_attempts =>
+                    {
+                        let multiplier = 1_u32 << (attempt - 1).min(30);
+                        tokio::time::sleep(
+                            self.transport_retry_base_delay.saturating_mul(multiplier),
+                        )
+                        .await;
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("transport retry loop always returns")
+        };
+        tokio::time::timeout(self.request_timeout, execute_with_retry)
+            .await
+            .map_err(|_| {
                 anyhow!(
-                    "{} model response decode failed: {error}; body={}",
+                    "{} model turn timed out after {}ms",
                     self.provider_id,
-                    response_body.chars().take(2_000).collect::<String>()
+                    self.request_timeout.as_millis()
                 )
-            })?;
-        Ok(response.into_model_response(&tool_name_map))
+            })?
     }
 }
 
@@ -419,6 +503,7 @@ impl OpenAiChatCompletionResponse {
 async fn openai_streaming_model_response(
     response: reqwest::Response,
     tool_name_map: &HashMap<String, String>,
+    provider_id: &str,
 ) -> Result<ModelResponse> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -426,7 +511,8 @@ async fn openai_streaming_model_response(
     let mut tool_calls = BTreeMap::<u64, OpenAiStreamingToolCall>::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk =
+            chunk.map_err(|error| openai_transport_error(provider_id, "reading stream", error))?;
         buffer.push_str(std::str::from_utf8(&chunk)?);
         while let Some(boundary) = buffer.find("\n\n") {
             let event = buffer.drain(..boundary + 2).collect::<String>();
@@ -460,6 +546,30 @@ async fn openai_streaming_model_response(
         tool_name_map,
     ))
 }
+
+fn openai_transport_error(
+    provider_id: &str,
+    operation: &str,
+    error: reqwest::Error,
+) -> anyhow::Error {
+    let message = if error.is_timeout() {
+        format!("{provider_id} model turn timed out while {operation}")
+    } else {
+        format!("{provider_id} model transport failed while {operation}: {error}")
+    };
+    anyhow!(OpenAiTransportError(message))
+}
+
+#[derive(Debug)]
+struct OpenAiTransportError(String);
+
+impl std::fmt::Display for OpenAiTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OpenAiTransportError {}
 
 #[derive(Debug, Default)]
 struct OpenAiStreamingToolCall {
