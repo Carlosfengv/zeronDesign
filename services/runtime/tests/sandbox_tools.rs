@@ -17,12 +17,16 @@ use anydesign_runtime::{
         streaming::{tool_result_error_text, StreamingToolExecutor},
     },
     types::{
-        sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, DesignProfile, DesignSourceIndex,
-        DesignSourceIndexSection, SandboxChannelProtocol,
+        sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, ArtifactPublishStatus, DesignProfile,
+        DesignSourceIndex, DesignSourceIndexSection, PreviewLeaseStatus, SandboxBindingStatus,
+        SandboxChannelProtocol,
     },
+    workspace_auth::{WorkspaceChannelClaims, WorkspaceChannelJwtIssuer},
 };
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
+use ed25519_dalek::{pkcs8::EncodePublicKey, Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -204,7 +208,11 @@ impl WorkspaceChannelTransport for RecordingChannelTransport {
                 ]
             }),
             "fs.stat" => {
-                if request.path.ends_with("project") {
+                if request.path.ends_with("pnpm-lock.yaml")
+                    || request.path.ends_with("package-lock.json")
+                {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "not found"));
+                } else if request.path.ends_with("project") {
                     json!({ "kind": "dir" })
                 } else {
                     json!({ "kind": "file" })
@@ -220,6 +228,30 @@ impl WorkspaceChannelTransport for RecordingChannelTransport {
                     request.payload["argv"][0].as_str().unwrap_or(""),
                     request.path
                 ),
+                "stderr": ""
+            }),
+            "process.start" => json!({
+                "leaseId": request.payload["leaseId"],
+                "status": "running",
+                "pid": 4321,
+                "exitCode": Value::Null,
+                "stdout": "",
+                "stderr": ""
+            }),
+            "process.status" => json!({
+                "leaseId": request.payload["leaseId"],
+                "status": "running",
+                "pid": 4321,
+                "exitCode": Value::Null,
+                "stdout": "",
+                "stderr": ""
+            }),
+            "process.stop" => json!({
+                "leaseId": request.payload["leaseId"],
+                "status": "stopped",
+                "pid": 4321,
+                "exitCode": 0,
+                "stdout": "",
                 "stderr": ""
             }),
             other => {
@@ -407,7 +439,10 @@ async fn fs_read_write_list_and_search_are_workspace_bounded() {
         .await;
 
     assert_eq!(results.len(), 4);
-    assert!(results.iter().all(|result| !result.result.is_error));
+    assert!(
+        results.iter().all(|result| !result.result.is_error),
+        "workspace backend tool failures: {results:#?}"
+    );
     assert_eq!(results[1].result.content["text"], "hello runtime");
     assert!(results[2].result.content["entries"]
         .as_array()
@@ -613,7 +648,7 @@ async fn fs_read_directory_failure_has_structured_metadata() {
 
     let results = executor
         .execute_calls(
-            store,
+            store.clone(),
             &run_id,
             vec![ToolCall::new(
                 "tool-read-dir",
@@ -687,14 +722,72 @@ async fn fs_read_and_write_execute_through_workspace_backend() {
         .await;
 
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(|result| !result.result.is_error));
+    assert!(
+        results.iter().all(|result| !result.result.is_error),
+        "workspace backend tool failures: {results:#?}"
+    );
     assert_eq!(results[0].result.content["text"], "remote channel text");
     assert!(backend.reads.lock().unwrap()[0].ends_with("project/existing.md"));
     let writes = backend.writes.lock().unwrap().clone();
-    assert_eq!(writes.len(), 1);
-    assert!(writes[0].0.ends_with("project/generated.md"));
-    assert_eq!(writes[0].1, "written through backend");
+    assert_eq!(writes.len(), 2);
+    assert!(writes
+        .iter()
+        .any(|(path, _)| path.ends_with("state/read-tracking.json")));
+    let generated = writes
+        .iter()
+        .find(|(path, _)| path.ends_with("project/generated.md"))
+        .unwrap();
+    assert_eq!(generated.1, "written through backend");
     assert!(!workspace.join("project/generated.md").exists());
+}
+
+#[tokio::test]
+async fn remote_fs_tools_do_not_require_the_host_workspace_to_exist() {
+    let host_workspace = unique_temp_dir("remote-host-workspace-absent").join("missing-root");
+    assert!(!host_workspace.exists());
+    let backend = RecordingWorkspaceBackend::new("remote-only text");
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(
+            sandbox_tools_with_workspace_backend(Arc::new(backend.clone())),
+            Default::default(),
+            &host_workspace,
+        )
+        .with_remote_workspace(true),
+    );
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "remote-read",
+                    "fs.read",
+                    json!({ "path": "project/remote-only.md" }),
+                ),
+                ToolCall::new(
+                    "remote-write",
+                    "fs.write",
+                    json!({ "path": "project/generated.md", "text": "remote write" }),
+                ),
+            ],
+        )
+        .await;
+
+    assert!(
+        results.iter().all(|result| !result.result.is_error),
+        "remote tools must be lexical and backend-driven: {results:#?}"
+    );
+    assert_eq!(results[0].result.content["text"], "remote-only text");
+    assert!(backend
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(path, text)| path.ends_with("project/generated.md") && text == "remote write"));
+    assert!(!host_workspace.exists());
 }
 
 #[tokio::test]
@@ -1008,7 +1101,11 @@ async fn fs_commit_chunks_rejects_missing_chunk_without_writing_target() {
         .await;
 
     assert_eq!(results.len(), 2);
-    assert!(!results[0].result.is_error);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
     assert!(results[1].result.is_error);
     assert!(tool_result_error_text(&results[1].result).contains("missing chunk 1/2"));
     assert!(!workspace.join("project/missing-chunk.md").exists());
@@ -1772,6 +1869,71 @@ async fn project_inspect_returns_lifecycle_style_and_dependency_state() {
 }
 
 #[tokio::test]
+async fn runtime_project_state_is_authoritative_and_workspace_hint_is_protected() {
+    let workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "state-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    let authority = store
+        .get_project_runtime_state("project-1")
+        .await
+        .expect("runtime project state");
+    assert_eq!(authority.app_root, "project");
+    assert_eq!(authority.template_key, "astro-website");
+
+    let generic_write = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "state-generic-write",
+                "fs.write",
+                json!({ "path": "state/project.json", "text": "{}" }),
+            )],
+        )
+        .await;
+    assert!(generic_write[0].result.is_error);
+    assert_error_kind(&generic_write[0].result, "path.runtime_owned");
+
+    fs::write(
+        workspace.join("state/project.json"),
+        json!({
+            "appRoot": "attacker-controlled",
+            "templateKey": "fumadocs-docs",
+            "framework": "fumadocs",
+            "packageManager": "pnpm"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let conflict = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "state-inspect-conflict",
+                "project.inspect",
+                json!({}),
+            )],
+        )
+        .await;
+    assert!(conflict[0].result.is_error);
+    assert_error_kind(&conflict[0].result, "project.state_conflict");
+}
+
+#[tokio::test]
 async fn project_init_fumadocs_docs_writes_docs_source_contract() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();
@@ -2084,6 +2246,12 @@ async fn fumadocs_docs_rejects_pages_router_writes_with_structured_metadata() {
 #[tokio::test]
 async fn project_build_accepts_valid_fumadocs_docs_source_contract() {
     let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/out/docs")).unwrap();
+    fs::write(
+        workspace.join("project/out/docs/index.html"),
+        "docs candidate",
+    )
+    .unwrap();
     let transport = RecordingChannelTransport::default();
     let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
     let store = RuntimeStore::new();
@@ -2124,7 +2292,10 @@ async fn project_build_accepts_valid_fumadocs_docs_source_contract() {
     assert!(results[1].result.content["sourceSnapshotUri"]
         .as_str()
         .unwrap()
-        .contains("file:///workspace/outputs/build/source-snapshots/"));
+        .starts_with("runtime://source-snapshots/project-1/"));
+    assert!(results[1].result.content["candidateManifestHash"]
+        .as_str()
+        .is_some_and(|hash| hash.len() == 64));
     let requests = transport.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| {
         request.op == "process.exec"
@@ -2600,6 +2771,8 @@ async fn package_install_restore_uses_pnpm_install_and_emits_tool_output() {
 #[tokio::test]
 async fn project_build_auto_restores_missing_dependencies_before_build() {
     let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(workspace.join("project/dist/index.html"), "astro candidate").unwrap();
     fs::write(
         workspace.join("project/package.json"),
         serde_json::to_string_pretty(&json!({
@@ -2725,6 +2898,13 @@ async fn project_build_dependency_restore_policy_denial_is_typed_recoverable() {
 #[tokio::test]
 async fn project_build_uses_project_package_manager_for_build_command() {
     let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/dist/assets")).unwrap();
+    fs::write(workspace.join("project/dist/index.html"), "vite candidate").unwrap();
+    fs::write(
+        workspace.join("project/dist/assets/image.bin"),
+        [0_u8, 159, 255, 10],
+    )
+    .unwrap();
     fs::write(
         workspace.join("project/package.json"),
         serde_json::to_string_pretty(&json!({
@@ -2743,6 +2923,19 @@ async fn project_build_uses_project_package_manager_for_build_command() {
     let transport = RecordingChannelTransport::default();
     let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
     let store = RuntimeStore::new();
+    store
+        .upsert_project_runtime_state(
+            "project-1",
+            "project".to_string(),
+            "astro-website".to_string(),
+            "astro-website@runtime-p3".to_string(),
+            "astro".to_string(),
+            "pnpm".to_string(),
+            "pnpm-lock.yaml".to_string(),
+            "https://registry.internal.example/npm/".to_string(),
+        )
+        .await
+        .unwrap();
     let run_id = create_run(&store).await;
     let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
         sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
@@ -2763,8 +2956,23 @@ async fn project_build_uses_project_package_manager_for_build_command() {
         .await;
 
     assert_eq!(results.len(), 1);
-    assert!(!results[0].result.is_error);
+    assert!(
+        !results[0].result.is_error,
+        "{}",
+        tool_result_error_text(&results[0].result)
+    );
     assert_eq!(results[0].result.content["packageManager"], "pnpm");
+    let manifest_path = results[0].result.content["candidateManifestPath"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("/workspace/");
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join(manifest_path)).unwrap()).unwrap();
+    assert!(manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "assets/image.bin"));
     let requests = transport.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| {
         request.op == "process.exec"
@@ -2772,6 +2980,68 @@ async fn project_build_uses_project_package_manager_for_build_command() {
                 .as_array()
                 .is_some_and(|argv| argv[0] == "pnpm" && argv[1] == "run" && argv[2] == "build")
     }));
+}
+
+#[tokio::test]
+async fn successful_project_build_freezes_candidate_and_rejects_source_mutation() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "frozen candidate",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("project/package.json"),
+        json!({
+            "name": "frozen-project",
+            "private": true,
+            "scripts": { "build": "vite build" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport, &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let build = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+    assert!(!build[0].result.is_error);
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Validating
+    );
+
+    let mutation = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-write-after-build",
+                "fs.write",
+                json!({ "path": "project/after-build.txt", "text": "denied" }),
+            )],
+        )
+        .await;
+    assert!(mutation[0].result.is_error);
+    assert_error_kind(&mutation[0].result, "project.candidate_frozen");
+    assert!(!workspace.join("project/after-build.txt").exists());
 }
 
 #[tokio::test]
@@ -2831,12 +3101,24 @@ async fn package_install_prefers_project_state_package_manager_over_lockfile() {
     )
     .unwrap();
     let transport = RecordingChannelTransport::default();
-    let workspace_backend = JsonWorkspaceChannelBackend::new(transport.clone(), &workspace);
     let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
     let store = RuntimeStore::new();
+    store
+        .upsert_project_runtime_state(
+            "project-1",
+            "project".to_string(),
+            "astro-website".to_string(),
+            "astro-website@runtime-p3".to_string(),
+            "astro".to_string(),
+            "npm".to_string(),
+            "package-lock.json".to_string(),
+            "https://registry.internal.example/npm/".to_string(),
+        )
+        .await
+        .unwrap();
     let run_id = create_run(&store).await;
     let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
-        sandbox_tools_with_backends(Arc::new(workspace_backend), Arc::new(command_backend)),
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
         Default::default(),
         &workspace,
     ));
@@ -3031,17 +3313,19 @@ async fn fs_tools_can_execute_over_json_workspace_channel() {
 
     let requests = transport.requests.lock().unwrap().clone();
     let ops: Vec<_> = requests.iter().map(|request| request.op).collect();
-    assert_eq!(ops.iter().filter(|op| **op == "fs.read").count(), 2);
+    assert_eq!(ops.iter().filter(|op| **op == "fs.read").count(), 3);
     assert_eq!(ops.iter().filter(|op| **op == "fs.list").count(), 2);
     assert_eq!(ops.iter().filter(|op| **op == "fs.stat").count(), 3);
-    assert_eq!(ops.iter().filter(|op| **op == "fs.write").count(), 1);
+    assert_eq!(ops.iter().filter(|op| **op == "fs.write").count(), 2);
     assert_eq!(ops.iter().filter(|op| **op == "fs.removeFile").count(), 1);
     assert!(requests
         .iter()
         .all(|request| request.path.starts_with("/workspace/")));
     let write = requests
         .iter()
-        .find(|request| request.op == "fs.write")
+        .find(|request| {
+            request.op == "fs.write" && request.path == "/workspace/project/new-channel.md"
+        })
         .unwrap();
     assert_eq!(write.path, "/workspace/project/new-channel.md");
     assert_eq!(write.payload["text"], "hello channel");
@@ -3168,7 +3452,11 @@ async fn sandbox_channel_workspace_backend_resolves_endpoint_from_run_context() 
         results[0].result.content["text"],
         "websocket:/workspace/project/socket-bound.md"
     );
-    assert_eq!(seen_sandbox_ids.lock().unwrap().as_slice(), [binding.id]);
+    let seen_sandbox_ids = seen_sandbox_ids.lock().unwrap();
+    assert!(!seen_sandbox_ids.is_empty());
+    assert!(seen_sandbox_ids
+        .iter()
+        .all(|sandbox_id| sandbox_id == &binding.id));
     assert_eq!(
         requests.lock().unwrap()[0]["path"],
         "/workspace/project/socket-bound.md"
@@ -3196,13 +3484,24 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
     )
     .unwrap();
     fs::write(local_package.join("index.js"), "module.exports = 'ok';\n").unwrap();
+    fs::write(
+        workspace.join("project/binary.dat"),
+        [0_u8, 1, 2, 127, 128, 254, 255],
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("project/.anydesign-candidate-manifest.json"),
+        "excluded",
+    )
+    .unwrap();
     let port = free_tcp_port();
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../infra/agent-sandbox/base/workspace-channel-server.js");
     let mut child = Command::new("node")
-        .arg(script)
+        .arg(&script)
         .env("WORKSPACE_ROOT", &workspace)
         .env("PORT", port.to_string())
+        .env("WORKSPACE_CHANNEL_ALLOW_TEST_PROCESS", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -3212,11 +3511,83 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
 
     let endpoint = format!("ws://127.0.0.1:{port}/workspace");
     let backend = JsonWorkspaceChannelBackend::new(
+        WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+            .with_timeout(Duration::from_secs(2)),
+        &workspace,
+    );
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(
         WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(Duration::from_secs(2)),
         &workspace,
     );
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
+    let run = store.get_run(&run_id).await.unwrap();
+    let ctx = ToolContext::new(store.clone(), run, workspace.clone());
+    let process = command_backend
+        .start_process(
+            &ctx,
+            "process-lease-test-0001",
+            &[
+                "node".to_string(),
+                "-e".to_string(),
+                "setInterval(() => {}, 1000)".to_string(),
+            ],
+            &workspace.join("project"),
+        )
+        .await
+        .expect("process.start lease");
+    assert_eq!(process.status, "running");
+    assert_eq!(
+        command_backend
+            .process_status(&ctx, "process-lease-test-0001")
+            .await
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        command_backend
+            .stop_process(&ctx, "process-lease-test-0001")
+            .await
+            .unwrap()
+            .status,
+        "stopped"
+    );
+    let missing = backend
+        .path_kind(&ctx, &workspace.join("project/missing-template-path"))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    backend
+        .write_string(
+            &ctx,
+            &workspace.join("project/new/nested/generated.md"),
+            "created with missing parents",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/new/nested/generated.md")).unwrap(),
+        "created with missing parents"
+    );
+    let export_target = workspace.join("runtime-export-target");
+    let receipt = backend
+        .export_tree(
+            &ctx,
+            &workspace.join("project"),
+            &export_target,
+            &[".anydesign-candidate-manifest.json".to_string()],
+        )
+        .await
+        .expect("archive.export stream");
+    assert!(receipt.file_count >= 3);
+    assert_eq!(
+        fs::read(export_target.join("binary.dat")).unwrap(),
+        [0_u8, 1, 2, 127, 128, 254, 255]
+    );
+    assert!(!export_target
+        .join(".anydesign-candidate-manifest.json")
+        .exists());
     let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
         sandbox_tools_with_workspace_backend(Arc::new(backend)),
         Default::default(),
@@ -3297,6 +3668,359 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
             .contains("file:../local-package")
     );
     assert!(!workspace.join("project/generated-by-server.md").exists());
+}
+
+#[tokio::test]
+async fn workspace_channel_server_requires_pod_bound_eddsa_token() {
+    let workspace = setup_workspace();
+    fs::write(workspace.join("project/authenticated.md"), "authorized").unwrap();
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let public_key_file = workspace.join("workspace-channel-public.der");
+    fs::write(
+        &public_key_file,
+        signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("public key DER")
+            .as_bytes(),
+    )
+    .unwrap();
+    let previous_signing_key = SigningKey::from_bytes(&[12_u8; 32]);
+    let previous_public_key_file = workspace.join("workspace-channel-public-previous.der");
+    fs::write(
+        &previous_public_key_file,
+        previous_signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("previous public key DER")
+            .as_bytes(),
+    )
+    .unwrap();
+    let issuer = WorkspaceChannelJwtIssuer::from_signing_key(signing_key.clone(), 60);
+    let token = issuer
+        .issue(WorkspaceChannelClaims {
+            iss: String::new(),
+            aud: String::new(),
+            exp: 0,
+            iat: 0,
+            jti: "auth-test-valid-0001".to_string(),
+            sandbox_binding_id: "binding-auth".to_string(),
+            sandbox_name: "sandbox-auth".to_string(),
+            pod_uid: "pod-uid-auth".to_string(),
+            project_id: "project-1".to_string(),
+            run_id: "run-auth".to_string(),
+            operations: vec!["fs.read".to_string()],
+        })
+        .expect("issue token");
+    let port = free_tcp_port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/agent-sandbox/base/workspace-channel-server.js");
+    let mut child = Command::new("node")
+        .arg(&script)
+        .env("WORKSPACE_ROOT", &workspace)
+        .env("PORT", port.to_string())
+        .env("WORKSPACE_CHANNEL_AUTH_MODE", "required")
+        .env("WORKSPACE_CHANNEL_PUBLIC_KEY_FILE", &public_key_file)
+        .env(
+            "WORKSPACE_CHANNEL_PUBLIC_KEY_FILES",
+            format!(
+                "{},{}",
+                public_key_file.display(),
+                previous_public_key_file.display()
+            ),
+        )
+        .env("POD_NAME", "sandbox-auth")
+        .env("POD_UID", "pod-uid-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node must start workspace-channel-server.js");
+    wait_for_tcp_port(port).await;
+
+    let endpoint = format!("ws://127.0.0.1:{port}/workspace");
+    let request = WorkspaceChannelRequest {
+        op: "fs.read",
+        path: "/workspace/project/authenticated.md".to_string(),
+        payload: json!({}),
+    };
+    let unauthorized = WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+        .with_timeout(Duration::from_secs(2))
+        .request(request.clone())
+        .await;
+    assert!(
+        unauthorized.is_err(),
+        "missing token must fail the handshake"
+    );
+
+    let wrong_pod_token = issuer
+        .issue(WorkspaceChannelClaims {
+            iss: String::new(),
+            aud: String::new(),
+            exp: 0,
+            iat: 0,
+            jti: "auth-test-wrong-pod-0001".to_string(),
+            sandbox_binding_id: "binding-auth".to_string(),
+            sandbox_name: "sandbox-auth".to_string(),
+            pod_uid: "wrong-pod-uid".to_string(),
+            project_id: "project-1".to_string(),
+            run_id: "run-auth".to_string(),
+            operations: vec!["fs.read".to_string()],
+        })
+        .expect("wrong pod token");
+    assert!(
+        WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+            .with_authorization(format!("Bearer {wrong_pod_token}"))
+            .request(request.clone())
+            .await
+            .is_err(),
+        "wrong Pod UID must fail the handshake"
+    );
+
+    let process_only_token = issuer
+        .issue(WorkspaceChannelClaims {
+            iss: String::new(),
+            aud: String::new(),
+            exp: 0,
+            iat: 0,
+            jti: "auth-test-process-only-0001".to_string(),
+            sandbox_binding_id: "binding-auth".to_string(),
+            sandbox_name: "sandbox-auth".to_string(),
+            pod_uid: "pod-uid-auth".to_string(),
+            project_id: "project-1".to_string(),
+            run_id: "run-auth".to_string(),
+            operations: vec!["process.exec".to_string()],
+        })
+        .expect("process-only token");
+    assert!(
+        WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+            .with_authorization(format!("Bearer {process_only_token}"))
+            .request(request.clone())
+            .await
+            .is_err(),
+        "operation scope mismatch must fail the handshake"
+    );
+
+    for (label, claims) in [
+        (
+            "wrong audience",
+            json!({
+                "iss": "anydesign-runtime",
+                "aud": "wrong-audience",
+                "iat": Utc::now().timestamp(),
+                "exp": Utc::now().timestamp() + 60,
+                "jti": "wrong-audience-0001",
+                "sandboxBindingId": "binding-auth",
+                "sandboxName": "sandbox-auth",
+                "podUid": "pod-uid-auth",
+                "projectId": "project-1",
+                "runId": "run-auth",
+                "operations": ["fs.read"]
+            }),
+        ),
+        (
+            "expired",
+            json!({
+                "iss": "anydesign-runtime",
+                "aud": "workspace-channel",
+                "iat": Utc::now().timestamp() - 120,
+                "exp": Utc::now().timestamp() - 60,
+                "jti": "expired-token-0001",
+                "sandboxBindingId": "binding-auth",
+                "sandboxName": "sandbox-auth",
+                "podUid": "pod-uid-auth",
+                "projectId": "project-1",
+                "runId": "run-auth",
+                "operations": ["fs.read"]
+            }),
+        ),
+    ] {
+        let invalid_token = sign_workspace_claims(&signing_key, &claims);
+        assert!(
+            WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+                .with_authorization(format!("Bearer {invalid_token}"))
+                .request(request.clone())
+                .await
+                .is_err(),
+            "{label} token must fail the handshake"
+        );
+    }
+
+    let response = WebSocketWorkspaceChannelTransport::new(endpoint.clone())
+        .with_authorization(format!("Bearer {token}"))
+        .with_timeout(Duration::from_secs(2))
+        .request(request.clone())
+        .await
+        .expect("pod-bound token should authorize fs.read");
+    let replay = WebSocketWorkspaceChannelTransport::new(endpoint)
+        .with_authorization(format!("Bearer {token}"))
+        .with_timeout(Duration::from_secs(2))
+        .request(request)
+        .await;
+    child.kill().await.ok();
+    child.wait().await.ok();
+    let mut restarted_child = Command::new("node")
+        .arg(&script)
+        .env("WORKSPACE_ROOT", &workspace)
+        .env("PORT", port.to_string())
+        .env("WORKSPACE_CHANNEL_AUTH_MODE", "required")
+        .env(
+            "WORKSPACE_CHANNEL_PUBLIC_KEY_FILES",
+            format!(
+                "{},{}",
+                public_key_file.display(),
+                previous_public_key_file.display()
+            ),
+        )
+        .env("POD_NAME", "sandbox-auth")
+        .env("POD_UID", "pod-uid-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node must restart workspace-channel-server.js");
+    wait_for_tcp_port(port).await;
+    let replay_after_restart =
+        WebSocketWorkspaceChannelTransport::new(format!("ws://127.0.0.1:{port}/workspace"))
+            .with_authorization(format!("Bearer {token}"))
+            .with_timeout(Duration::from_secs(2))
+            .request(WorkspaceChannelRequest {
+                op: "fs.read",
+                path: "/workspace/project/authenticated.md".to_string(),
+                payload: json!({}),
+            })
+            .await;
+
+    let previous_token = WorkspaceChannelJwtIssuer::from_signing_key(previous_signing_key, 60)
+        .issue(WorkspaceChannelClaims {
+            iss: String::new(),
+            aud: String::new(),
+            exp: 0,
+            iat: 0,
+            jti: "auth-test-previous-key-0001".to_string(),
+            sandbox_binding_id: "binding-auth".to_string(),
+            sandbox_name: "sandbox-auth".to_string(),
+            pod_uid: "pod-uid-auth".to_string(),
+            project_id: "project-1".to_string(),
+            run_id: "run-auth".to_string(),
+            operations: vec!["fs.read".to_string()],
+        })
+        .expect("previous key token");
+    let previous_key_response =
+        WebSocketWorkspaceChannelTransport::new(format!("ws://127.0.0.1:{port}/workspace"))
+            .with_authorization(format!("Bearer {previous_token}"))
+            .with_timeout(Duration::from_secs(2))
+            .request(WorkspaceChannelRequest {
+                op: "fs.read",
+                path: "/workspace/project/authenticated.md".to_string(),
+                payload: json!({}),
+            })
+            .await
+            .expect("previous rotation key should remain valid");
+    restarted_child.kill().await.ok();
+    assert_eq!(response["text"], "authorized");
+    assert_eq!(previous_key_response["text"], "authorized");
+    assert!(
+        replay.is_err(),
+        "the same jti must not authorize a second upgrade"
+    );
+    assert!(
+        replay_after_restart.is_err(),
+        "the same jti must remain consumed after a channel server restart"
+    );
+}
+
+fn sign_workspace_claims(signing_key: &SigningKey, claims: &Value) -> String {
+    let public_key = signing_key
+        .verifying_key()
+        .to_public_key_der()
+        .expect("public key DER");
+    let key_hash = sha256_hex(public_key.as_bytes());
+    let header = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "alg": "EdDSA",
+            "typ": "JWT",
+            "kid": format!("ed25519-{}", &key_hash[..16]),
+        }))
+        .unwrap(),
+    );
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+    let signing_input = format!("{header}.{payload}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
+#[tokio::test]
+async fn static_preview_server_serves_only_frozen_candidate_snapshots() {
+    let workspace = setup_workspace();
+    let candidate = workspace.join("outputs/candidates/build-preview-test");
+    fs::create_dir_all(candidate.join("docs")).unwrap();
+    fs::write(
+        candidate.join("index.html"),
+        "<!doctype html><h1>Frozen candidate</h1>",
+    )
+    .unwrap();
+    fs::write(candidate.join("docs/index.html"), "<h1>Docs route</h1>").unwrap();
+    let manifest = serde_json::to_string_pretty(&json!({
+        "schemaVersion": "candidate-manifest@1",
+        "buildId": "build-preview-test",
+        "files": [
+            { "path": "docs/index.html", "bytes": 19, "sha256": "fixture" },
+            { "path": "index.html", "bytes": 40, "sha256": "fixture" }
+        ]
+    }))
+    .unwrap();
+    fs::write(
+        candidate.join(".anydesign-candidate-manifest.json"),
+        &manifest,
+    )
+    .unwrap();
+    let manifest_hash = sha256_hex(manifest.as_bytes());
+    let port = free_tcp_port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/agent-sandbox/base/static-preview-server.js");
+    let mut child = Command::new("node")
+        .arg(script)
+        .env("WORKSPACE_ROOT", &workspace)
+        .env("CANDIDATE_PREVIEW_HOST", "127.0.0.1")
+        .env("CANDIDATE_PREVIEW_PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node must start static-preview-server.js");
+    wait_for_tcp_port(port).await;
+
+    let client = reqwest::Client::new();
+    let root = client
+        .get(format!(
+            "http://127.0.0.1:{port}/candidates/build-preview-test/"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        root.headers()["x-anydesign-candidate-manifest-hash"],
+        manifest_hash
+    );
+    assert!(root.text().await.unwrap().contains("Frozen candidate"));
+    let docs = client
+        .get(format!(
+            "http://127.0.0.1:{port}/candidates/build-preview-test/docs"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(docs.status(), reqwest::StatusCode::OK);
+    assert!(docs.text().await.unwrap().contains("Docs route"));
+    let mutable_project = client
+        .get(format!("http://127.0.0.1:{port}/project/index.html"))
+        .send()
+        .await
+        .unwrap();
+    child.kill().await.ok();
+    assert_eq!(mutable_project.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -4220,6 +4944,118 @@ async fn preview_start_status_and_stop_use_workspace_state() {
 }
 
 #[tokio::test]
+async fn kubernetes_preview_start_creates_pod_bound_candidate_lease() {
+    let workspace = setup_workspace();
+    write_successful_build_state(&workspace);
+    let mut build: Value = serde_json::from_str(
+        &fs::read_to_string(workspace.join("outputs/build/latest.json")).unwrap(),
+    )
+    .unwrap();
+    build["buildId"] = json!("build-test");
+    build["candidateOutputPath"] = json!("/workspace/outputs/candidates/build-test");
+    build["candidateManifestHash"] = json!("a".repeat(64));
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        serde_json::to_string_pretty(&build).unwrap(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let binding = store
+        .create_sandbox_binding(
+            "project-1",
+            "sandbox-preview".to_string(),
+            "claim-preview".to_string(),
+            "workspace-preview".to_string(),
+            "pool-preview".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_runtime_identity_with_uids(
+            &binding.id,
+            "sandbox-preview".to_string(),
+            Some("sandbox-preview".to_string()),
+            Some("sandbox-uid-preview".to_string()),
+            Some("pod-uid-preview".to_string()),
+        )
+        .await
+        .unwrap();
+    store
+        .bind_run_to_sandbox(&run_id, &binding.id)
+        .await
+        .unwrap();
+    let process_transport = RecordingChannelTransport::default();
+    let command_backend =
+        JsonWorkspaceChannelCommandBackend::new(process_transport.clone(), &workspace);
+    let executor = StreamingToolExecutor::new(
+        ToolExecutor::new_with_workspace_root(
+            sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+            Default::default(),
+            &workspace,
+        )
+        .with_runtime_public_base_url("http://runtime.test")
+        .with_remote_workspace(true),
+    );
+
+    let started = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "preview-lease-start",
+                "preview.start",
+                json!({}),
+            )],
+        )
+        .await;
+    assert!(!started[0].result.is_error);
+    assert_eq!(started[0].result.content["port"], 4321);
+    assert_eq!(started[0].result.content["managed"], true);
+    let lease_id = started[0].result.content["leaseId"].as_str().unwrap();
+    assert!(started[0].result.content["url"]
+        .as_str()
+        .unwrap()
+        .contains(lease_id));
+    let lease = store.get_preview_lease(lease_id).await.unwrap();
+    assert_eq!(lease.pod_uid, "pod-uid-preview");
+    assert_eq!(lease.candidate_manifest_hash, "a".repeat(64));
+    assert!(process_transport
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| {
+            request.op == "process.start"
+                && request.payload["leaseId"] == lease_id
+                && request.payload["argv"][1] == "/opt/anydesign/bootstrap/static-preview-server.js"
+        }));
+
+    let stopped = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "preview-lease-stop",
+                "preview.stop",
+                json!({}),
+            )],
+        )
+        .await;
+    assert!(!stopped[0].result.is_error);
+    assert_eq!(
+        store.get_preview_lease(lease_id).await.unwrap().status,
+        PreviewLeaseStatus::Stopped
+    );
+}
+
+#[tokio::test]
 async fn preview_start_spawns_static_server_from_dist() {
     let workspace = setup_workspace();
     write_successful_build_state(&workspace);
@@ -4386,41 +5222,65 @@ async fn preview_publish_builds_screenshots_and_promotes_candidate() {
         &workspace,
     ));
 
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "publish candidate",
+    )
+    .unwrap();
     let results = executor
         .execute_calls(
             store.clone(),
             &run_id,
-            vec![
-                ToolCall::new(
-                    "tool-init",
-                    "project.init",
-                    json!({ "template": "astro-website" }),
-                ),
-                ToolCall::new(
-                    "tool-publish",
-                    "preview.publish",
-                    json!({
-                        "url": preview_url,
-                        "screenshotId": "publish-shot"
-                    }),
-                ),
-            ],
+            vec![ToolCall::new(
+                "tool-publish",
+                "preview.publish",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "publish-shot"
+                }),
+            )],
         )
         .await;
 
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 1);
     assert!(
-        !results[1].result.is_error,
+        !results[0].result.is_error,
         "{}",
-        tool_result_error_text(&results[1].result)
+        tool_result_error_text(&results[0].result)
     );
-    assert_eq!(results[1].result.content["published"], true);
-    assert_eq!(results[1].result.content["build"]["success"], true);
+    assert_eq!(results[0].result.content["published"], true);
+    assert_eq!(results[0].result.content["build"]["success"], true);
     assert_eq!(
-        results[1].result.content["screenshot"]["screenshotId"],
+        results[0].result.content["screenshot"]["screenshotId"],
         "publish-shot"
     );
-    assert_eq!(results[1].result.content["promotion"]["status"], "promoted");
+    assert_eq!(results[0].result.content["promotion"]["status"], "promoted");
+    let publish_id = results[0].result.content["promotion"]["artifactPublishId"]
+        .as_str()
+        .expect("promotion must expose artifactPublishId");
+    assert_eq!(
+        results[0].result.content["promotion"]["artifactManifestHash"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    let publish = store.get_artifact_publish(publish_id).await.unwrap();
+    assert_eq!(publish.status, ArtifactPublishStatus::Promoted);
+    assert!(publish.immutable_artifact_uri.is_some());
+    assert!(publish.source_snapshot_uri.starts_with("runtime://"));
     assert!(workspace
         .join("outputs/screenshots/publish-shot.json")
         .exists());
@@ -4611,6 +5471,12 @@ async fn preview_publish_records_passing_token_fidelity_before_run_complete() {
         )
         .await;
     assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "fidelity candidate",
+    )
+    .unwrap();
     let published = executor
         .execute_calls(
             store.clone(),
@@ -4750,6 +5616,12 @@ async fn preview_publish_rejects_unchanged_source_after_failed_fidelity_check() 
         )
         .await;
     assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "fidelity failing candidate",
+    )
+    .unwrap();
 
     let first_publish = executor
         .execute_calls(
@@ -4762,7 +5634,11 @@ async fn preview_publish_rejects_unchanged_source_after_failed_fidelity_check() 
             )],
         )
         .await;
-    assert!(!first_publish[0].result.is_error);
+    assert!(
+        !first_publish[0].result.is_error,
+        "{}",
+        tool_result_error_text(&first_publish[0].result)
+    );
     assert_eq!(
         first_publish[0].result.content["designProfileFidelity"]["requiredFailedRuleIds"],
         json!(["required-source"])

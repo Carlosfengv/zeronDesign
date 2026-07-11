@@ -471,7 +471,7 @@ async fn each_sandbox_tool_decision_writes_one_audit_record() {
         json!({ "appRoot": "project/custom-app" }).to_string(),
     )
     .unwrap();
-    let local_package = workspace.join("project/local-package");
+    let local_package = workspace.join("local-package");
     fs::create_dir_all(&local_package).unwrap();
     fs::write(
         local_package.join("package.json"),

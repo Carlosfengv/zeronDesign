@@ -591,7 +591,11 @@ pub enum PermissionError {
     InvalidPathComponent(PathBuf),
 }
 
+// remote-fs-boundary: allow-begin local-workspace-path-policy
 pub fn check_existing_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
+    if !path.exists() {
+        return check_create_path(path, workspace_root);
+    }
     let real =
         std::fs::canonicalize(path).map_err(|_| PermissionError::CannotResolve(path.to_owned()))?;
     ensure_workspace_path(&real, workspace_root)?;
@@ -610,12 +614,34 @@ pub fn check_workspace_path(
     }
 }
 
+pub fn check_lexical_workspace_path(
+    path: &Path,
+    workspace_root: &Path,
+) -> Result<PathBuf, PermissionError> {
+    let normalized = normalize_workspace_path(path)?;
+    let normalized_root = normalize_workspace_path(workspace_root)?;
+    if !normalized.starts_with(&normalized_root) {
+        return Err(PermissionError::ExternalDirectory(normalized));
+    }
+    ensure_not_secret_path(&normalized)?;
+    Ok(normalized)
+}
+
 pub fn check_create_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, PermissionError> {
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
         return Err(PermissionError::InvalidPathComponent(path.to_owned()));
+    }
+
+    if !workspace_root.exists() {
+        let normalized = normalize_workspace_path(path)?;
+        if !is_lexically_inside_workspace(&normalized, workspace_root) {
+            return Err(PermissionError::ExternalDirectory(normalized));
+        }
+        ensure_not_secret_path(&normalized)?;
+        return Ok(normalized);
     }
 
     let mut existing_ancestor = path;
@@ -644,6 +670,30 @@ pub fn check_create_path(path: &Path, workspace_root: &Path) -> Result<PathBuf, 
     Ok(normalized)
 }
 
+fn is_lexically_inside_workspace(path: &Path, workspace_root: &Path) -> bool {
+    normalize_workspace_path(path).ok().is_some_and(|path| {
+        path.starts_with(
+            normalize_workspace_path(workspace_root)
+                .unwrap_or_else(|_| workspace_root.to_path_buf()),
+        )
+    })
+}
+
+fn normalize_workspace_path(path: &Path) -> Result<PathBuf, PermissionError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(PermissionError::InvalidPathComponent(path.to_owned()))
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 fn ensure_workspace_path(real: &Path, workspace_root: &Path) -> Result<(), PermissionError> {
     let workspace_root = std::fs::canonicalize(workspace_root)
         .map_err(|_| PermissionError::CannotResolve(workspace_root.to_owned()))?;
@@ -652,6 +702,7 @@ fn ensure_workspace_path(real: &Path, workspace_root: &Path) -> Result<(), Permi
     }
     Ok(())
 }
+// remote-fs-boundary: allow-end local-workspace-path-policy
 
 fn ensure_not_secret_path(real: &Path) -> Result<(), PermissionError> {
     if is_secret_path(real.to_str().unwrap_or("")) {

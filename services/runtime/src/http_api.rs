@@ -1,4 +1,6 @@
 use crate::{
+    artifact_publisher::{safe_segment, FileArtifactPublisher},
+    channel_manager::ChannelManager,
     config::{RuntimeConfig, SandboxBackendMode},
     conversation::{RuntimeStore, SequencedAgentEvent},
     model_gateway::{model_client_from_config, ModelClient},
@@ -11,23 +13,25 @@ use crate::{
         control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
         runtime::ToolContext,
         sandbox::{
-            cleanup_staged_writes_for_run, LocalWorkspaceBackend, SandboxChannelWorkspaceBackend,
-            WorkspaceBackend,
+            cleanup_staged_writes_for_run, cleanup_staged_writes_for_run_backend,
+            LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend,
         },
     },
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
         ConversationItem, DesignProfile, DesignProfileConversionReport, DesignProfileDraft,
         DesignProfileFidelityReport, DesignProfileUnmappedItem, DesignProfileValidationIssue,
-        DesignSourceArtifact, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
+        DesignSourceArtifact, PreviewLeaseStatus, DESIGN_PROFILE_SCHEMA_V2,
+        MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        Html,
+        Html, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -54,6 +58,15 @@ pub struct HealthResponse {
     pub status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionResponse {
+    pub service: &'static str,
+    pub repository_commit: String,
+    pub repository_dirty: bool,
+    pub image_ref: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: RuntimeConfig,
@@ -73,6 +86,9 @@ pub fn app_state(config: RuntimeConfig) -> AppState {
 }
 
 pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
+    ChannelManager::shared().reconcile(&state.store).await?;
+    state.store.reconcile_artifact_promotions().await?;
+    garbage_collect_artifacts(&state).await?;
     let outcomes = recover_interrupted_runs(&state.store).await?;
     for outcome in outcomes {
         if let RecoveryOutcome::Resumed { run_id, .. } = outcome {
@@ -80,6 +96,37 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         }
     }
     Ok(state)
+}
+
+async fn garbage_collect_artifacts(state: &AppState) -> anyhow::Result<()> {
+    let publisher = FileArtifactPublisher::new(&state.config.runtime_storage_dir);
+    for publish in state
+        .store
+        .garbage_collectable_artifact_publishes(Utc::now())
+        .await?
+    {
+        let is_current = state
+            .store
+            .current_project_version(&publish.project_id)
+            .await
+            .is_some_and(|version| version.id == publish.version_id);
+        if is_current {
+            continue;
+        }
+        publisher.garbage_collect(&publish)?;
+        state
+            .store
+            .transition_artifact_publish(
+                &publish.id,
+                crate::types::ArtifactPublishStatus::GarbageCollected,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn recovered_router(config: RuntimeConfig) -> anyhow::Result<Router> {
@@ -96,6 +143,7 @@ pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/runs", post(start_run))
         .route("/runs/{run_id}/continue", post(continue_run))
         .route("/runs/{run_id}/cancel", post(cancel_run))
@@ -164,6 +212,12 @@ pub fn router_with_state(state: AppState) -> Router {
         )
         .route("/preview/{project_id}/current", get(preview_current))
         .route("/preview/{project_id}/{version_id}", get(preview_version))
+        .route("/previews/{lease_id}", get(candidate_preview_root))
+        .route("/previews/{lease_id}/", get(candidate_preview_root))
+        .route(
+            "/previews/{lease_id}/{*preview_path}",
+            get(candidate_preview_file),
+        )
         .route(
             "/artifacts/{project_id}/current",
             get(artifact_current_index),
@@ -184,6 +238,113 @@ pub fn router_with_state(state: AppState) -> Router {
             post(resolve_permission),
         )
         .with_state(state)
+}
+
+async fn candidate_preview_root(
+    State(state): State<AppState>,
+    Path(lease_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    proxy_candidate_preview(state, lease_id, String::new()).await
+}
+
+async fn candidate_preview_file(
+    State(state): State<AppState>,
+    Path((lease_id, preview_path)): Path<(String, String)>,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    proxy_candidate_preview(state, lease_id, preview_path).await
+}
+
+async fn proxy_candidate_preview(
+    state: AppState,
+    lease_id: String,
+    preview_path: String,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if preview_path
+        .split('/')
+        .any(|component| component == ".." || component.contains('\\'))
+    {
+        return Err(not_found("candidate preview path is invalid".to_string()));
+    }
+    let lease = state
+        .store
+        .get_preview_lease(&lease_id)
+        .await
+        .filter(|lease| lease.status == PreviewLeaseStatus::Active)
+        .ok_or_else(|| not_found("candidate preview lease is unavailable".to_string()))?;
+    let binding = state
+        .store
+        .get_sandbox_binding(&lease.sandbox_binding_id)
+        .await
+        .filter(|binding| {
+            binding.sandbox_name == lease.sandbox_name
+                && binding.pod_uid.as_deref() == Some(lease.pod_uid.as_str())
+        })
+        .ok_or_else(|| not_found("candidate preview sandbox identity changed".to_string()))?;
+
+    let endpoint = ChannelManager::shared()
+        .endpoint(&state.store, &binding, &lease.run_id, 4321, "http", "")
+        .await
+        .map_err(internal_error)?;
+    let mut upstream =
+        reqwest::Url::parse(&endpoint).map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+    upstream.set_path(&format!("/candidates/{}/{}", lease.build_id, preview_path));
+    let upstream_response = reqwest::Client::new()
+        .get(upstream)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| not_found(format!("candidate preview upstream unavailable: {error}")))?;
+    let status = upstream_response.status();
+    if !status.is_success() {
+        return Err(not_found(format!(
+            "candidate preview file not found: {preview_path}"
+        )));
+    }
+    let manifest_hash = upstream_response
+        .headers()
+        .get("x-anydesign-candidate-manifest-hash")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| not_found("candidate preview manifest evidence missing".to_string()))?;
+    if manifest_hash != lease.candidate_manifest_hash {
+        return Err(conflict_error(anyhow::anyhow!(
+            "candidate preview manifest hash mismatch"
+        )));
+    }
+    let content_type = upstream_response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
+    let cache_control = upstream_response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("no-store"));
+    let mut bytes = upstream_response
+        .bytes()
+        .await
+        .map_err(|error| internal_error(anyhow::anyhow!(error)))?
+        .to_vec();
+    if content_type
+        .to_str()
+        .ok()
+        .is_some_and(|value| value.starts_with("text/html"))
+    {
+        if let Ok(html) = String::from_utf8(bytes.clone()) {
+            let prefix = format!("/previews/{lease_id}");
+            bytes = html
+                .replace("href=\"/", &format!("href=\"{prefix}/"))
+                .replace("src=\"/", &format!("src=\"{prefix}/"))
+                .into_bytes();
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header("x-anydesign-preview-lease", lease_id)
+        .body(Body::from(bytes))
+        .map_err(|error| internal_error(anyhow::anyhow!(error)))
 }
 
 async fn root(State(state): State<AppState>) -> Html<String> {
@@ -225,6 +386,15 @@ async fn root(State(state): State<AppState>) -> Html<String> {
 
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse { status: "ready" })
+}
+
+async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        service: "anydesign-runtime",
+        repository_commit: state.config.repository_commit.clone(),
+        repository_dirty: state.config.repository_dirty,
+        image_ref: state.config.runtime_image_ref.clone(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1792,11 +1962,15 @@ async fn restore_project_source_snapshot(
     source_snapshot_uri: &str,
 ) -> anyhow::Result<()> {
     let workspace_root = effective_workspace_root(config, &run.project_id);
-    let snapshot_root = workspace_file_uri_to_workspace_path(&workspace_root, source_snapshot_uri)?;
     let project_root = workspace_root.join("project");
-    let ctx = ToolContext::new(store.clone(), run.clone(), workspace_root.clone());
+    let mut ctx = ToolContext::new(store.clone(), run.clone(), workspace_root.clone());
+    ctx.remote_workspace = config.sandbox_backend_mode == SandboxBackendMode::Kubernetes;
+    ctx.runtime_storage_dir = config.runtime_storage_dir.clone();
     let backend: Box<dyn WorkspaceBackend> = match config.sandbox_backend_mode {
-        SandboxBackendMode::Kubernetes => Box::new(SandboxChannelWorkspaceBackend::new()),
+        SandboxBackendMode::Kubernetes => Box::new(
+            SandboxChannelWorkspaceBackend::from_runtime_config(config)
+                .map_err(|error| anyhow::anyhow!(error))?,
+        ),
         SandboxBackendMode::PhaseAContract => Box::new(LocalWorkspaceBackend),
     };
     if let Err(error) = backend.remove_dir_all(&ctx, &project_root).await {
@@ -1804,10 +1978,45 @@ async fn restore_project_source_snapshot(
             return Err(anyhow::anyhow!(error));
         }
     }
-    backend
-        .copy_dir_all(&ctx, &snapshot_root, &project_root, &[])
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(runtime_path) = source_snapshot_uri.strip_prefix("runtime://source-snapshots/") {
+        let segments = runtime_path.split('/').collect::<Vec<_>>();
+        if segments.len() != 2 || segments.iter().any(|segment| segment.is_empty()) {
+            return Err(anyhow::anyhow!("invalid Runtime source snapshot URI"));
+        }
+        let snapshot_project_id = segments[0];
+        let snapshot_id = segments[1];
+        if snapshot_project_id != safe_segment(&run.project_id) {
+            return Err(anyhow::anyhow!("source snapshot project mismatch"));
+        }
+        for file in FileArtifactPublisher::read_source_snapshot(
+            &config.runtime_storage_dir,
+            &run.project_id,
+            snapshot_id,
+        )? {
+            let target = project_root.join(&file.path);
+            backend
+                .write_bytes(&ctx, &target, &file.bytes)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let restored = backend
+                .read_bytes(&ctx, &target)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if restored != file.bytes {
+                return Err(anyhow::anyhow!(
+                    "source snapshot integrity check failed after restore: {}",
+                    file.path.display()
+                ));
+            }
+        }
+    } else {
+        let snapshot_root =
+            workspace_file_uri_to_workspace_path(&workspace_root, source_snapshot_uri)?;
+        backend
+            .copy_dir_all(&ctx, &snapshot_root, &project_root, &[])
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
     let dependency_state = serde_json::to_string_pretty(&json!({
         "needsRestore": true,
         "reason": "source_snapshot_restored_without_node_modules",
@@ -2335,10 +2544,21 @@ async fn cancel_run(
         .await
         .map_err(run_update_error)?;
     if let Some(run) = state.store.get_run(&run_id).await {
-        cleanup_staged_writes_for_run(
-            &effective_workspace_root(&state.config, &run.project_id),
-            &run_id,
-        );
+        let workspace_root = effective_workspace_root(&state.config, &run.project_id);
+        if state.config.sandbox_backend_mode == SandboxBackendMode::Kubernetes
+            && run.sandbox_id.is_some()
+        {
+            let mut ctx = ToolContext::new(state.store.clone(), run, workspace_root);
+            ctx.remote_workspace = true;
+            ctx.runtime_storage_dir = state.config.runtime_storage_dir.clone();
+            let backend = SandboxChannelWorkspaceBackend::from_runtime_config(&state.config)
+                .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+            cleanup_staged_writes_for_run_backend(&backend, &ctx, &run_id)
+                .await
+                .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
+        } else {
+            cleanup_staged_writes_for_run(&workspace_root, &run_id);
+        }
     }
     state
         .store
@@ -2754,14 +2974,14 @@ async fn artifact_current_index(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
-    artifact_response(&state.config, &project_id, "")
+    artifact_response(&state, &project_id, "").await
 }
 
 async fn artifact_current_file(
     State(state): State<AppState>,
     Path((project_id, artifact_path)): Path<(String, String)>,
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
-    artifact_response(&state.config, &project_id, &artifact_path)
+    artifact_response(&state, &project_id, &artifact_path).await
 }
 
 async fn next_artifact_asset_file(
@@ -2771,23 +2991,35 @@ async fn next_artifact_asset_file(
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
     let project_id = artifact_project_id_from_referer(&headers)
         .ok_or_else(|| not_found("Next artifact asset requires an artifact referer".to_string()))?;
-    artifact_response(
-        &state.config,
-        &project_id,
-        &format!("_next/{artifact_path}"),
-    )
+    artifact_response(&state, &project_id, &format!("_next/{artifact_path}")).await
 }
 
-fn artifact_response(
-    config: &RuntimeConfig,
+// remote-fs-boundary: allow-begin runtime-storage-artifact-serving
+async fn artifact_response(
+    state: &AppState,
     project_id: &str,
     artifact_path: &str,
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
-    let output_root = artifact_output_root(config, project_id).ok_or_else(|| {
-        not_found(format!(
-            "artifact output not found for project: {project_id}"
-        ))
-    })?;
+    let current = state
+        .store
+        .current_project_version(project_id)
+        .await
+        .ok_or_else(|| {
+            not_found(format!(
+                "current artifact not found for project: {project_id}"
+            ))
+        })?;
+    let output_root = FileArtifactPublisher::version_root(
+        &state.config.runtime_storage_dir,
+        project_id,
+        &current.id,
+    );
+    if !output_root.is_dir() {
+        return Err(not_found(format!(
+            "immutable artifact output not found for version: {}",
+            current.id
+        )));
+    }
     let path = resolve_artifact_file(&output_root, artifact_path)?;
     let content_type = content_type_for_path(&path);
     let bytes =
@@ -2802,16 +3034,6 @@ fn artifact_response(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok((headers, bytes))
-}
-
-fn artifact_output_root(config: &RuntimeConfig, project_id: &str) -> Option<PathBuf> {
-    [
-        project_workspace_root(config, project_id),
-        config.workspace_root.clone(),
-    ]
-    .into_iter()
-    .flat_map(|root| [root.join("project/dist"), root.join("project/out")])
-    .find(|path| path.exists())
 }
 
 fn resolve_artifact_file(
@@ -2872,6 +3094,7 @@ fn static_artifact_path(
     }
     Ok(path)
 }
+// remote-fs-boundary: allow-end runtime-storage-artifact-serving
 
 fn rewrite_artifact_html(html: &str, project_id: &str) -> String {
     let prefix = format!("/artifacts/{project_id}/current");
@@ -3073,11 +3296,13 @@ fn read_first_json_file(roots: &[PathBuf], relative: &str) -> Option<Value> {
         .find_map(|root| read_json_file(&root.join(relative)))
 }
 
+// remote-fs-boundary: allow-begin phase-a-runtime-state-fallback
 fn read_json_file(path: &FsPath) -> Option<Value> {
     fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
 }
+// remote-fs-boundary: allow-end phase-a-runtime-state-fallback
 
 async fn read_runtime_state_json(
     state: &AppState,
@@ -3923,7 +4148,11 @@ fn spawn_session(state: AppState, run_id: String) {
     tokio::spawn(async move {
         let tool_executor = if let Some(run) = state.store.get_run(&run_id).await {
             let workspace_root = effective_workspace_root(&state.config, &run.project_id);
-            let _ = fs::create_dir_all(&workspace_root);
+            if state.config.sandbox_backend_mode == SandboxBackendMode::PhaseAContract {
+                // remote-fs-boundary: allow-begin phase-a-workspace-bootstrap
+                let _ = fs::create_dir_all(&workspace_root);
+                // remote-fs-boundary: allow-end phase-a-workspace-bootstrap
+            }
             control_plane_executor_for_config(&state.config).with_workspace_root(workspace_root)
         } else {
             control_plane_executor_for_config(&state.config)

@@ -2065,7 +2065,10 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>ok</title>');";
 
     let results = loop_runner.run(&run.id).await.unwrap();
 
-    assert!(results.iter().all(|result| !result.is_error));
+    assert!(
+        results.iter().all(|result| !result.is_error),
+        "tool-driven build returned errors: {results:#?}"
+    );
     let run = store.get_run(&run.id).await.unwrap();
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert!(run.output_version_id.is_some());
@@ -2222,7 +2225,10 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>chunked</title>'+sourc
 
     let results = loop_runner.run(&run.id).await.unwrap();
 
-    assert!(results.iter().all(|result| !result.is_error));
+    assert!(
+        results.iter().all(|result| !result.is_error),
+        "chunked build returned errors: {results:#?}"
+    );
     let run = store.get_run(&run.id).await.unwrap();
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert!(run.output_version_id.is_some());

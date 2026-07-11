@@ -2,16 +2,19 @@ use crate::{
     profiles::policy,
     repair_loop::RepairAttempt,
     types::{
-        sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, AuditRecord,
-        Brief, BriefStatus, ContentSource, ConversationItem, DesignProfile,
+        sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus,
+        ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief, BriefStatus,
+        ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
-        PendingPermission, ProjectVersion, ProjectVersionStatus, ReviewFinding,
+        OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
+        ProjectRuntimeState, ProjectVersion, ProjectVersionStatus, ReviewFinding,
         ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity, ReviewFindingStatus,
-        SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
+        RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol,
+        MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -46,6 +49,12 @@ pub struct RuntimeStore {
     conversation_log_dir: Arc<PathBuf>,
     content_source_log_path: Arc<PathBuf>,
     project_version_log_path: Arc<PathBuf>,
+    project_runtime_state_log_path: Arc<PathBuf>,
+    preview_lease_log_path: Arc<PathBuf>,
+    channel_lease_log_path: Arc<PathBuf>,
+    artifact_publish_log_path: Arc<PathBuf>,
+    promotion_commit_log_path: Arc<PathBuf>,
+    outbox_log_path: Arc<PathBuf>,
     review_finding_log_path: Arc<PathBuf>,
     repair_attempt_log_path: Arc<PathBuf>,
     pending_permission_log_path: Arc<PathBuf>,
@@ -79,6 +88,11 @@ struct RuntimeStoreInner {
     run_checkpoints: HashMap<String, Vec<String>>,
     project_versions: HashMap<String, ProjectVersion>,
     project_current_versions: HashMap<String, String>,
+    project_runtime_states: HashMap<String, ProjectRuntimeState>,
+    preview_leases: HashMap<String, PreviewLeaseRecord>,
+    channel_leases: HashMap<String, ChannelLeaseRecord>,
+    artifact_publishes: HashMap<String, ArtifactPublishRecord>,
+    outbox_events: HashMap<String, RuntimeOutboxEvent>,
     sandbox_bindings: HashMap<String, SandboxBinding>,
     design_profiles: HashMap<String, DesignProfile>,
     design_profile_drafts: HashMap<String, DesignProfileDraft>,
@@ -118,6 +132,19 @@ struct BriefSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ArtifactPromotionCommit {
+    id: String,
+    project_id: String,
+    run_id: String,
+    version: ProjectVersion,
+    run: AgentRun,
+    publish: ArtifactPublishRecord,
+    outbox: RuntimeOutboxEvent,
+    committed_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectDesignProfileSnapshot {
     project_id: String,
     design_profile_id: String,
@@ -150,7 +177,10 @@ fn repair_finding_status_for_run_status(status: AgentRunStatus) -> Option<Review
         | AgentRunStatus::Partial
         | AgentRunStatus::Blocked
         | AgentRunStatus::Failed => Some(ReviewFindingStatus::NeedsUserInput),
-        AgentRunStatus::Queued | AgentRunStatus::Running | AgentRunStatus::Cancelled => None,
+        AgentRunStatus::Queued
+        | AgentRunStatus::Running
+        | AgentRunStatus::Validating
+        | AgentRunStatus::Cancelled => None,
     }
 }
 
@@ -313,6 +343,14 @@ impl Default for RuntimeStore {
             conversation_log_dir: Arc::new(storage_root.join("conversation-items")),
             content_source_log_path: Arc::new(storage_root.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(storage_root.join("project-versions.jsonl")),
+            project_runtime_state_log_path: Arc::new(
+                storage_root.join("project-runtime-states.jsonl"),
+            ),
+            preview_lease_log_path: Arc::new(storage_root.join("preview-leases.jsonl")),
+            channel_lease_log_path: Arc::new(storage_root.join("channel-leases.jsonl")),
+            artifact_publish_log_path: Arc::new(storage_root.join("artifact-publishes.jsonl")),
+            promotion_commit_log_path: Arc::new(storage_root.join("promotion-commits.jsonl")),
+            outbox_log_path: Arc::new(storage_root.join("event-outbox.jsonl")),
             review_finding_log_path: Arc::new(storage_root.join("review-findings.jsonl")),
             repair_attempt_log_path: Arc::new(storage_root.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(storage_root.join("pending-permissions.jsonl")),
@@ -353,6 +391,14 @@ impl RuntimeStore {
             conversation_log_dir: Arc::new(checkpoint_dir.join("conversation-items")),
             content_source_log_path: Arc::new(checkpoint_dir.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(checkpoint_dir.join("project-versions.jsonl")),
+            project_runtime_state_log_path: Arc::new(
+                checkpoint_dir.join("project-runtime-states.jsonl"),
+            ),
+            preview_lease_log_path: Arc::new(checkpoint_dir.join("preview-leases.jsonl")),
+            channel_lease_log_path: Arc::new(checkpoint_dir.join("channel-leases.jsonl")),
+            artifact_publish_log_path: Arc::new(checkpoint_dir.join("artifact-publishes.jsonl")),
+            promotion_commit_log_path: Arc::new(checkpoint_dir.join("promotion-commits.jsonl")),
+            outbox_log_path: Arc::new(checkpoint_dir.join("event-outbox.jsonl")),
             review_finding_log_path: Arc::new(checkpoint_dir.join("review-findings.jsonl")),
             repair_attempt_log_path: Arc::new(checkpoint_dir.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(checkpoint_dir.join("pending-permissions.jsonl")),
@@ -393,6 +439,14 @@ impl RuntimeStore {
             conversation_log_dir: Arc::new(run_log_dir.join("conversation-items")),
             content_source_log_path: Arc::new(run_log_dir.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(run_log_dir.join("project-versions.jsonl")),
+            project_runtime_state_log_path: Arc::new(
+                run_log_dir.join("project-runtime-states.jsonl"),
+            ),
+            preview_lease_log_path: Arc::new(run_log_dir.join("preview-leases.jsonl")),
+            channel_lease_log_path: Arc::new(run_log_dir.join("channel-leases.jsonl")),
+            artifact_publish_log_path: Arc::new(run_log_dir.join("artifact-publishes.jsonl")),
+            promotion_commit_log_path: Arc::new(run_log_dir.join("promotion-commits.jsonl")),
+            outbox_log_path: Arc::new(run_log_dir.join("event-outbox.jsonl")),
             review_finding_log_path: Arc::new(run_log_dir.join("review-findings.jsonl")),
             repair_attempt_log_path: Arc::new(run_log_dir.join("repair-attempts.jsonl")),
             pending_permission_log_path: Arc::new(run_log_dir.join("pending-permissions.jsonl")),
@@ -452,6 +506,7 @@ impl RuntimeStore {
     ) -> AgentRun {
         let now = Utc::now();
         let run_id = self.next_id("run");
+        let project_state_snapshot = self.get_project_runtime_state(&project_id).await;
         let profile_snapshot = policy::snapshot_for_profile(phase, &agent_profile, None);
         let run = AgentRun {
             id: run_id.clone(),
@@ -491,6 +546,7 @@ impl RuntimeStore {
             finding_ids: None,
             input_message_ids: vec![self.next_id("message")],
             checkpoint_id: None,
+            project_state_snapshot,
             profile_snapshot,
             started_at: now,
             updated_at: now,
@@ -596,6 +652,7 @@ impl RuntimeStore {
             },
             input_message_ids: vec![self.next_id("message")],
             checkpoint_id: parent.checkpoint_id.clone(),
+            project_state_snapshot: parent.project_state_snapshot.clone(),
             profile_snapshot,
             started_at: now,
             updated_at: now,
@@ -688,6 +745,14 @@ impl RuntimeStore {
     pub async fn get_run(&self, run_id: &str) -> Option<AgentRun> {
         if let Some(run) = self.inner.read().await.runs.get(run_id).cloned() {
             return Some(run);
+        }
+        {
+            let mut inner = self.inner.write().await;
+            self.hydrate_persisted_runs(&mut inner).ok()?;
+            self.hydrate_artifact_transactions(&mut inner).ok()?;
+            if let Some(run) = inner.runs.get(run_id).cloned() {
+                return Some(run);
+            }
         }
         let run = self.read_run(run_id).ok().flatten()?;
         self.inner
@@ -1662,7 +1727,12 @@ impl RuntimeStore {
         }
         let recoverable = runs_by_id
             .values()
-            .filter(|run| matches!(run.status, AgentRunStatus::Queued | AgentRunStatus::Running))
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    AgentRunStatus::Queued | AgentRunStatus::Running | AgentRunStatus::Validating
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !recoverable.is_empty() {
@@ -3380,6 +3450,848 @@ impl RuntimeStore {
         append_jsonl(&path, version)
     }
 
+    fn project_runtime_state_log_path(&self) -> PathBuf {
+        (*self.project_runtime_state_log_path).clone()
+    }
+
+    fn append_project_runtime_state_snapshot(&self, state: &ProjectRuntimeState) -> Result<()> {
+        let path = self.project_runtime_state_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, state)
+    }
+
+    fn read_project_runtime_states(&self) -> Result<Vec<ProjectRuntimeState>> {
+        let file = match fs::File::open(self.project_runtime_state_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut states_by_project = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let state: ProjectRuntimeState = serde_json::from_str(&line)?;
+            states_by_project.insert(state.project_id.clone(), state);
+        }
+        Ok(states_by_project.into_values().collect())
+    }
+
+    pub async fn get_project_runtime_state(&self, project_id: &str) -> Option<ProjectRuntimeState> {
+        if let Some(state) = self
+            .inner
+            .read()
+            .await
+            .project_runtime_states
+            .get(project_id)
+            .cloned()
+        {
+            return Some(state);
+        }
+        let state = self
+            .read_project_runtime_states()
+            .ok()?
+            .into_iter()
+            .find(|state| state.project_id == project_id)?;
+        self.inner
+            .write()
+            .await
+            .project_runtime_states
+            .insert(project_id.to_string(), state.clone());
+        Some(state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_project_runtime_state(
+        &self,
+        project_id: &str,
+        app_root: String,
+        template_key: String,
+        template_version: String,
+        framework: String,
+        package_manager: String,
+        lockfile: String,
+        registry: String,
+    ) -> Result<ProjectRuntimeState> {
+        let revision = self
+            .get_project_runtime_state(project_id)
+            .await
+            .map(|state| state.revision + 1)
+            .unwrap_or(1);
+        let state = ProjectRuntimeState {
+            project_id: project_id.to_string(),
+            revision,
+            app_root,
+            template_key,
+            template_version,
+            framework,
+            package_manager,
+            lockfile,
+            registry,
+            updated_at: Utc::now(),
+        };
+        self.inner
+            .write()
+            .await
+            .project_runtime_states
+            .insert(project_id.to_string(), state.clone());
+        self.append_project_runtime_state_snapshot(&state)?;
+        Ok(state)
+    }
+
+    pub async fn set_run_project_state_snapshot(
+        &self,
+        run_id: &str,
+        state: ProjectRuntimeState,
+    ) -> Result<AgentRun> {
+        let run = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_persisted_runs(&mut inner)?;
+            let run = inner
+                .runs
+                .get_mut(run_id)
+                .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+            run.project_state_snapshot = Some(state);
+            run.updated_at = Utc::now();
+            run.clone()
+        };
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    fn preview_lease_log_path(&self) -> PathBuf {
+        (*self.preview_lease_log_path).clone()
+    }
+
+    fn append_preview_lease_snapshot(&self, lease: &PreviewLeaseRecord) -> Result<()> {
+        let path = self.preview_lease_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, lease)
+    }
+
+    fn read_preview_leases(&self) -> Result<Vec<PreviewLeaseRecord>> {
+        let file = match fs::File::open(self.preview_lease_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut leases_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let lease: PreviewLeaseRecord = serde_json::from_str(&line)?;
+            leases_by_id.insert(lease.id.clone(), lease);
+        }
+        Ok(leases_by_id.into_values().collect())
+    }
+
+    pub async fn create_preview_lease(
+        &self,
+        run_id: &str,
+        build_id: String,
+        candidate_manifest_hash: String,
+        ttl_seconds: u64,
+    ) -> Result<PreviewLeaseRecord> {
+        let run = self
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let binding_id = run
+            .sandbox_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("run is not bound to a sandbox"))?;
+        let binding = self
+            .get_sandbox_binding(binding_id)
+            .await
+            .ok_or_else(|| anyhow!("sandbox binding not found: {binding_id}"))?;
+        let pod_uid = binding
+            .pod_uid
+            .clone()
+            .ok_or_else(|| anyhow!("sandbox binding has no verified pod UID"))?;
+        let now = Utc::now();
+        let lease = PreviewLeaseRecord {
+            id: sha256_hex(&rand::random::<[u8; 32]>()),
+            project_id: run.project_id,
+            run_id: run.id,
+            sandbox_binding_id: binding.id,
+            sandbox_name: binding.sandbox_name,
+            pod_uid,
+            build_id,
+            candidate_manifest_hash,
+            status: PreviewLeaseStatus::Active,
+            created_at: now,
+            expires_at: now + Duration::seconds(ttl_seconds.clamp(30, 3600) as i64),
+        };
+        self.inner
+            .write()
+            .await
+            .preview_leases
+            .insert(lease.id.clone(), lease.clone());
+        self.append_preview_lease_snapshot(&lease)?;
+        Ok(lease)
+    }
+
+    pub async fn get_preview_lease(&self, lease_id: &str) -> Option<PreviewLeaseRecord> {
+        let mut lease = self
+            .inner
+            .read()
+            .await
+            .preview_leases
+            .get(lease_id)
+            .cloned()
+            .or_else(|| {
+                self.read_preview_leases()
+                    .ok()?
+                    .into_iter()
+                    .find(|lease| lease.id == lease_id)
+            })?;
+        if lease.status == PreviewLeaseStatus::Active && lease.expires_at <= Utc::now() {
+            lease.status = PreviewLeaseStatus::Expired;
+            self.inner
+                .write()
+                .await
+                .preview_leases
+                .insert(lease.id.clone(), lease.clone());
+            self.append_preview_lease_snapshot(&lease).ok();
+        }
+        Some(lease)
+    }
+
+    pub async fn stop_preview_lease(&self, lease_id: &str) -> Result<PreviewLeaseRecord> {
+        let mut lease = self
+            .get_preview_lease(lease_id)
+            .await
+            .ok_or_else(|| anyhow!("preview lease not found: {lease_id}"))?;
+        lease.status = PreviewLeaseStatus::Stopped;
+        self.inner
+            .write()
+            .await
+            .preview_leases
+            .insert(lease.id.clone(), lease.clone());
+        self.append_preview_lease_snapshot(&lease)?;
+        Ok(lease)
+    }
+
+    pub async fn stop_preview_leases_for_binding(&self, binding_id: &str) -> Result<usize> {
+        let mut leases = self.read_preview_leases()?;
+        {
+            let inner = self.inner.read().await;
+            for lease in inner.preview_leases.values() {
+                if let Some(existing) = leases.iter_mut().find(|item| item.id == lease.id) {
+                    *existing = lease.clone();
+                } else {
+                    leases.push(lease.clone());
+                }
+            }
+        }
+        let ids = leases
+            .into_iter()
+            .filter(|lease| {
+                lease.sandbox_binding_id == binding_id && lease.status == PreviewLeaseStatus::Active
+            })
+            .map(|lease| lease.id)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.stop_preview_lease(id).await?;
+        }
+        Ok(ids.len())
+    }
+
+    pub async fn preview_lease_for_run(&self, run_id: &str) -> Option<PreviewLeaseRecord> {
+        let mut leases = self.read_preview_leases().ok()?;
+        leases.extend(self.inner.read().await.preview_leases.values().cloned());
+        leases
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id)
+            .max_by_key(|lease| lease.created_at)
+    }
+
+    fn append_channel_lease_snapshot(&self, lease: &ChannelLeaseRecord) -> Result<()> {
+        if let Some(parent) = self.channel_lease_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&self.channel_lease_log_path, lease)
+    }
+
+    fn read_channel_leases(&self) -> Result<Vec<ChannelLeaseRecord>> {
+        read_latest_jsonl_by_key(
+            &self.channel_lease_log_path,
+            |lease: &ChannelLeaseRecord| lease.id.clone(),
+        )
+    }
+
+    fn hydrate_channel_leases(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for lease in self.read_channel_leases()? {
+            inner.channel_leases.insert(lease.id.clone(), lease);
+        }
+        Ok(())
+    }
+
+    pub async fn put_channel_lease(&self, lease: ChannelLeaseRecord) -> Result<ChannelLeaseRecord> {
+        {
+            let mut inner = self.inner.write().await;
+            self.hydrate_channel_leases(&mut inner)?;
+            if let Some(previous) = inner.channel_leases.get(&lease.id) {
+                if !channel_lease_transition_allowed(previous.status, lease.status) {
+                    return Err(anyhow!(
+                        "invalid channel lease transition {:?} -> {:?}: {}",
+                        previous.status,
+                        lease.status,
+                        lease.id
+                    ));
+                }
+            }
+            inner.channel_leases.insert(lease.id.clone(), lease.clone());
+        }
+        self.append_channel_lease_snapshot(&lease)?;
+        Ok(lease)
+    }
+
+    pub async fn get_channel_lease(&self, lease_id: &str) -> Option<ChannelLeaseRecord> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_channel_leases(&mut inner).ok()?;
+        inner.channel_leases.get(lease_id).cloned()
+    }
+
+    pub async fn channel_leases(&self) -> Result<Vec<ChannelLeaseRecord>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_channel_leases(&mut inner)?;
+        Ok(inner.channel_leases.values().cloned().collect())
+    }
+
+    pub async fn active_channel_lease(
+        &self,
+        binding_id: &str,
+        target_port: u16,
+    ) -> Result<Option<ChannelLeaseRecord>> {
+        Ok(self.channel_leases().await?.into_iter().find(|lease| {
+            lease.sandbox_binding_id == binding_id
+                && lease.target_port == target_port
+                && lease.status == ChannelLeaseStatus::Ready
+        }))
+    }
+
+    fn append_artifact_publish_snapshot(&self, publish: &ArtifactPublishRecord) -> Result<()> {
+        if let Some(parent) = self.artifact_publish_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&self.artifact_publish_log_path, publish)
+    }
+
+    fn read_artifact_publishes(&self) -> Result<Vec<ArtifactPublishRecord>> {
+        read_latest_jsonl_by_key(
+            &self.artifact_publish_log_path,
+            |publish: &ArtifactPublishRecord| publish.id.clone(),
+        )
+    }
+
+    fn read_promotion_commits(&self) -> Result<Vec<ArtifactPromotionCommit>> {
+        read_latest_jsonl_by_key(
+            &self.promotion_commit_log_path,
+            |commit: &ArtifactPromotionCommit| commit.id.clone(),
+        )
+    }
+
+    fn read_outbox_events(&self) -> Result<Vec<RuntimeOutboxEvent>> {
+        read_latest_jsonl_by_key(&self.outbox_log_path, |event: &RuntimeOutboxEvent| {
+            event.id.clone()
+        })
+    }
+
+    fn hydrate_artifact_transactions(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for publish in self.read_artifact_publishes()? {
+            inner.artifact_publishes.insert(publish.id.clone(), publish);
+        }
+        let mut commits = self.read_promotion_commits()?;
+        commits.sort_by_key(|commit| commit.committed_at);
+        for commit in commits {
+            inner
+                .project_current_versions
+                .insert(commit.project_id.clone(), commit.version.id.clone());
+            inner
+                .project_versions
+                .insert(commit.version.id.clone(), commit.version);
+            let replace_run = inner
+                .runs
+                .get(&commit.run.id)
+                .is_none_or(|run| run.updated_at <= commit.run.updated_at);
+            if replace_run {
+                inner.runs.insert(commit.run.id.clone(), commit.run);
+            }
+            let replace_publish = inner
+                .artifact_publishes
+                .get(&commit.publish.id)
+                .is_none_or(|publish| publish.revision <= commit.publish.revision);
+            if replace_publish {
+                inner
+                    .artifact_publishes
+                    .insert(commit.publish.id.clone(), commit.publish);
+            }
+            inner
+                .outbox_events
+                .entry(commit.outbox.id.clone())
+                .or_insert(commit.outbox);
+        }
+        for event in self.read_outbox_events()? {
+            inner.outbox_events.insert(event.id.clone(), event);
+        }
+        Ok(())
+    }
+
+    pub async fn begin_artifact_publish(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        build_id: &str,
+        version_id: &str,
+        candidate_manifest_hash: &str,
+        source_snapshot_uri: &str,
+        expected_current_version_id: Option<&str>,
+    ) -> Result<ArtifactPublishRecord> {
+        let idempotency_key = format!("{project_id}/{run_id}/{build_id}");
+        let run = self
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.project_id != project_id {
+            return Err(anyhow!("run does not belong to project: {project_id}"));
+        }
+        let binding = match run.sandbox_id.as_deref() {
+            Some(binding_id) => self.get_sandbox_binding(binding_id).await,
+            None => None,
+        };
+        let mut inner = self.inner.write().await;
+        self.hydrate_artifact_transactions(&mut inner)?;
+        if let Some(existing) = inner
+            .artifact_publishes
+            .values()
+            .find(|publish| publish.idempotency_key == idempotency_key)
+            .cloned()
+        {
+            if existing.version_id != version_id
+                || existing.candidate_manifest_hash != candidate_manifest_hash
+                || existing.source_snapshot_uri != source_snapshot_uri
+            {
+                return Err(anyhow!(
+                    "artifact publish idempotency key already belongs to different content"
+                ));
+            }
+            return Ok(existing);
+        }
+        let now = Utc::now();
+        let publish = ArtifactPublishRecord {
+            id: self.next_id("publish"),
+            idempotency_key,
+            project_id: project_id.to_string(),
+            run_id: run_id.to_string(),
+            build_id: build_id.to_string(),
+            version_id: version_id.to_string(),
+            sandbox_binding_id: binding.as_ref().map(|binding| binding.id.clone()),
+            pod_uid: binding.and_then(|binding| binding.pod_uid),
+            candidate_manifest_hash: candidate_manifest_hash.to_string(),
+            artifact_manifest_hash: None,
+            source_snapshot_uri: source_snapshot_uri.to_string(),
+            expected_current_version_id: expected_current_version_id.map(str::to_string),
+            status: ArtifactPublishStatus::Staging,
+            revision: 1,
+            staged_uri: None,
+            immutable_artifact_uri: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            gc_after: None,
+        };
+        self.append_artifact_publish_snapshot(&publish)?;
+        inner
+            .artifact_publishes
+            .insert(publish.id.clone(), publish.clone());
+        Ok(publish)
+    }
+
+    pub async fn transition_artifact_publish(
+        &self,
+        publish_id: &str,
+        status: ArtifactPublishStatus,
+        artifact_manifest_hash: Option<&str>,
+        staged_uri: Option<&str>,
+        immutable_artifact_uri: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<ArtifactPublishRecord> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_artifact_transactions(&mut inner)?;
+        let current = inner
+            .artifact_publishes
+            .get(publish_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("artifact publish not found: {publish_id}"))?;
+        if !artifact_publish_transition_allowed(current.status, status) {
+            return Err(anyhow!(
+                "invalid artifact publish transition: {:?} -> {:?}",
+                current.status,
+                status
+            ));
+        }
+        let mut publish = current;
+        publish.status = status;
+        publish.revision += 1;
+        publish.updated_at = Utc::now();
+        if let Some(hash) = artifact_manifest_hash {
+            publish.artifact_manifest_hash = Some(hash.to_string());
+        }
+        if let Some(uri) = staged_uri {
+            publish.staged_uri = Some(uri.to_string());
+        }
+        if let Some(uri) = immutable_artifact_uri {
+            publish.immutable_artifact_uri = Some(uri.to_string());
+        }
+        if let Some(error) = last_error {
+            publish.last_error = Some(error.to_string());
+        }
+        if matches!(
+            status,
+            ArtifactPublishStatus::GarbageCollectable | ArtifactPublishStatus::Failed
+        ) {
+            publish.gc_after = Some(Utc::now() + Duration::hours(24));
+        }
+        self.append_artifact_publish_snapshot(&publish)?;
+        inner
+            .artifact_publishes
+            .insert(publish.id.clone(), publish.clone());
+        Ok(publish)
+    }
+
+    pub async fn get_artifact_publish(&self, publish_id: &str) -> Option<ArtifactPublishRecord> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_artifact_transactions(&mut inner).ok()?;
+        inner.artifact_publishes.get(publish_id).cloned()
+    }
+
+    pub async fn garbage_collectable_artifact_publishes(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<ArtifactPublishRecord>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_artifact_transactions(&mut inner)?;
+        Ok(inner
+            .artifact_publishes
+            .values()
+            .filter(|publish| {
+                publish.status == ArtifactPublishStatus::GarbageCollectable
+                    && publish.gc_after.is_some_and(|gc_after| gc_after <= now)
+            })
+            .cloned()
+            .collect())
+    }
+
+    pub async fn artifact_publish_for_version(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+    ) -> Option<ArtifactPublishRecord> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_artifact_transactions(&mut inner).ok()?;
+        inner
+            .artifact_publishes
+            .values()
+            .filter(|publish| {
+                publish.project_id == project_id
+                    && publish.run_id == run_id
+                    && publish.version_id == version_id
+            })
+            .max_by_key(|publish| publish.revision)
+            .cloned()
+    }
+
+    pub async fn commit_artifact_promotion_cas(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+        publish_id: &str,
+        expected_current_version_id: Option<&str>,
+    ) -> Result<(ProjectVersion, RuntimeOutboxEvent)> {
+        let persisted_current = self
+            .read_current_project_version(project_id)?
+            .map(|version| version.id);
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        self.hydrate_artifact_transactions(&mut inner)?;
+        let actual_current = inner
+            .project_current_versions
+            .get(project_id)
+            .cloned()
+            .or(persisted_current);
+        if actual_current.as_deref() == Some(version_id) {
+            let version = inner.project_versions.get(version_id).cloned();
+            let publish = inner.artifact_publishes.get(publish_id);
+            if let (Some(version), Some(publish)) = (version, publish) {
+                if version.project_id == project_id
+                    && version.created_by_run_id == run_id
+                    && version.status == ProjectVersionStatus::Promoted
+                    && publish.project_id == project_id
+                    && publish.run_id == run_id
+                    && publish.version_id == version_id
+                    && publish.status == ArtifactPublishStatus::Promoted
+                {
+                    let outbox_id = preview_updated_outbox_id(project_id, version_id);
+                    let outbox = inner
+                        .outbox_events
+                        .get(&outbox_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("promoted artifact is missing outbox event"))?;
+                    return Ok((version, outbox));
+                }
+            }
+        }
+        if actual_current.as_deref() != expected_current_version_id {
+            return Err(anyhow!(
+                "project current version compare-and-swap failed: expected {:?}, actual {:?}",
+                expected_current_version_id,
+                actual_current
+            ));
+        }
+        if !inner.project_versions.contains_key(version_id) {
+            if let Some(version) = self.read_project_version(version_id)? {
+                inner.project_versions.insert(version.id.clone(), version);
+            }
+        }
+        let mut version = inner
+            .project_versions
+            .get(version_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("project version not found: {version_id}"))?;
+        if version.project_id != project_id || version.created_by_run_id != run_id {
+            return Err(anyhow!("project version ownership mismatch"));
+        }
+        let mut run = inner
+            .runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let mut publish = inner
+            .artifact_publishes
+            .get(publish_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("artifact publish not found: {publish_id}"))?;
+        if publish.project_id != project_id
+            || publish.run_id != run_id
+            || publish.version_id != version_id
+        {
+            return Err(anyhow!("artifact publish ownership mismatch"));
+        }
+        if publish.status == ArtifactPublishStatus::Promoted
+            && version.status == ProjectVersionStatus::Promoted
+        {
+            let outbox_id = preview_updated_outbox_id(project_id, version_id);
+            let outbox = inner
+                .outbox_events
+                .get(&outbox_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("promoted artifact is missing outbox event"))?;
+            return Ok((version, outbox));
+        }
+        if version.status != ProjectVersionStatus::Candidate {
+            return Err(anyhow!("only candidate versions can be promoted"));
+        }
+        if publish.status != ArtifactPublishStatus::Promoting
+            || publish.immutable_artifact_uri.is_none()
+        {
+            return Err(anyhow!(
+                "artifact publish must be promoting with immutable bytes before CAS"
+            ));
+        }
+        let now = Utc::now();
+        version.status = ProjectVersionStatus::Promoted;
+        version.promoted_at = Some(now);
+        run.output_version_id = Some(version_id.to_string());
+        run.updated_at = now;
+        publish.status = ArtifactPublishStatus::Promoted;
+        publish.revision += 1;
+        publish.updated_at = now;
+        let outbox = RuntimeOutboxEvent {
+            id: preview_updated_outbox_id(project_id, version_id),
+            project_id: project_id.to_string(),
+            run_id: run_id.to_string(),
+            event: AgentEvent::PreviewUpdated {
+                run_id: run_id.to_string(),
+                url: version.preview_url.clone(),
+                version_id: version.id.clone(),
+                screenshot_id: version.screenshot_id.clone(),
+                timestamp: now,
+            },
+            status: OutboxDeliveryStatus::Pending,
+            delivery_attempts: 0,
+            created_at: now,
+            delivered_at: None,
+        };
+        let commit = ArtifactPromotionCommit {
+            id: format!("promotion:{project_id}:{version_id}"),
+            project_id: project_id.to_string(),
+            run_id: run_id.to_string(),
+            version: version.clone(),
+            run: run.clone(),
+            publish: publish.clone(),
+            outbox: outbox.clone(),
+            committed_at: now,
+        };
+        if let Some(parent) = self.promotion_commit_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&self.promotion_commit_log_path, &commit)?;
+        inner
+            .project_current_versions
+            .insert(project_id.to_string(), version_id.to_string());
+        inner
+            .project_versions
+            .insert(version_id.to_string(), version.clone());
+        inner.runs.insert(run_id.to_string(), run.clone());
+        inner
+            .artifact_publishes
+            .insert(publish_id.to_string(), publish.clone());
+        inner
+            .outbox_events
+            .insert(outbox.id.clone(), outbox.clone());
+        drop(inner);
+        self.append_project_version_snapshot(&version).ok();
+        self.append_run_snapshot(&run).ok();
+        self.append_artifact_publish_snapshot(&publish).ok();
+        Ok((version, outbox))
+    }
+
+    pub async fn dispatch_outbox_event(&self, outbox_id: &str) -> Result<RuntimeOutboxEvent> {
+        let mut outbox = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_artifact_transactions(&mut inner)?;
+            inner
+                .outbox_events
+                .get(outbox_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("outbox event not found: {outbox_id}"))?
+        };
+        if outbox.status == OutboxDeliveryStatus::Delivered {
+            return Ok(outbox);
+        }
+        let already_persisted = self.events(&outbox.run_id).await.iter().any(|event| {
+            matches!(
+                (event, &outbox.event),
+                (
+                    AgentEvent::PreviewUpdated { version_id: left, .. },
+                    AgentEvent::PreviewUpdated { version_id: right, .. }
+                ) if left == right
+            )
+        });
+        outbox.delivery_attempts += 1;
+        if !already_persisted {
+            if let Err(error) = self.append_event(outbox.event.clone()).await {
+                self.persist_outbox_snapshot(&outbox)?;
+                self.inner
+                    .write()
+                    .await
+                    .outbox_events
+                    .insert(outbox.id.clone(), outbox);
+                return Err(error);
+            }
+        }
+        outbox.status = OutboxDeliveryStatus::Delivered;
+        outbox.delivered_at = Some(Utc::now());
+        self.persist_outbox_snapshot(&outbox)?;
+        self.inner
+            .write()
+            .await
+            .outbox_events
+            .insert(outbox.id.clone(), outbox.clone());
+        Ok(outbox)
+    }
+
+    fn persist_outbox_snapshot(&self, outbox: &RuntimeOutboxEvent) -> Result<()> {
+        if let Some(parent) = self.outbox_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&self.outbox_log_path, outbox)
+    }
+
+    pub async fn reconcile_artifact_promotions(&self) -> Result<usize> {
+        let recoverable_publishes = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_artifact_transactions(&mut inner)?;
+            inner
+                .artifact_publishes
+                .values()
+                .filter(|publish| {
+                    matches!(
+                        publish.status,
+                        ArtifactPublishStatus::Promoting | ArtifactPublishStatus::ReconcileRequired
+                    ) && publish.immutable_artifact_uri.is_some()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for mut publish in recoverable_publishes {
+            if publish.status == ArtifactPublishStatus::ReconcileRequired {
+                publish = self
+                    .transition_artifact_publish(
+                        &publish.id,
+                        ArtifactPublishStatus::Promoting,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+            if let Err(error) = self
+                .commit_artifact_promotion_cas(
+                    &publish.project_id,
+                    &publish.run_id,
+                    &publish.version_id,
+                    &publish.id,
+                    publish.expected_current_version_id.as_deref(),
+                )
+                .await
+            {
+                let error_text = error.to_string();
+                let status = if error_text.contains("compare-and-swap failed") {
+                    ArtifactPublishStatus::GarbageCollectable
+                } else {
+                    ArtifactPublishStatus::ReconcileRequired
+                };
+                self.transition_artifact_publish(
+                    &publish.id,
+                    status,
+                    None,
+                    None,
+                    None,
+                    Some(&error_text),
+                )
+                .await?;
+            }
+        }
+        let pending = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_artifact_transactions(&mut inner)?;
+            inner
+                .outbox_events
+                .values()
+                .filter(|event| event.status == OutboxDeliveryStatus::Pending)
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut delivered = 0;
+        for outbox_id in pending {
+            self.dispatch_outbox_event(&outbox_id).await?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
     fn read_project_version(&self, version_id: &str) -> Result<Option<ProjectVersion>> {
         Ok(self
             .read_project_versions()?
@@ -3452,15 +4364,12 @@ impl RuntimeStore {
     }
 
     pub async fn get_project_version(&self, version_id: &str) -> Option<ProjectVersion> {
-        if let Some(version) = self
-            .inner
-            .read()
-            .await
-            .project_versions
-            .get(version_id)
-            .cloned()
         {
-            return Some(version);
+            let mut inner = self.inner.write().await;
+            self.hydrate_artifact_transactions(&mut inner).ok()?;
+            if let Some(version) = inner.project_versions.get(version_id).cloned() {
+                return Some(version);
+            }
         }
         let version = self.read_project_version(version_id).ok().flatten()?;
         self.inner
@@ -3477,7 +4386,51 @@ impl RuntimeStore {
         run_id: &str,
         version_id: &str,
     ) -> Result<ProjectVersion> {
+        self.promote_project_version_inner(project_id, run_id, version_id, None)
+            .await
+    }
+
+    pub async fn promote_project_version_cas(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+        expected_current_version_id: Option<&str>,
+    ) -> Result<ProjectVersion> {
+        self.promote_project_version_inner(
+            project_id,
+            run_id,
+            version_id,
+            Some(expected_current_version_id.map(str::to_string)),
+        )
+        .await
+    }
+
+    async fn promote_project_version_inner(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+        expected_current_version_id: Option<Option<String>>,
+    ) -> Result<ProjectVersion> {
+        let persisted_current = self
+            .read_current_project_version(project_id)?
+            .map(|version| version.id);
         let mut inner = self.inner.write().await;
+        let actual_current = inner
+            .project_current_versions
+            .get(project_id)
+            .cloned()
+            .or(persisted_current);
+        if let Some(expected_current) = expected_current_version_id {
+            if actual_current != expected_current {
+                return Err(anyhow!(
+                    "project current version compare-and-swap failed: expected {:?}, actual {:?}",
+                    expected_current,
+                    actual_current
+                ));
+            }
+        }
         if !inner.project_versions.contains_key(version_id) {
             if let Some(version) = self.read_project_version(version_id)? {
                 inner.project_versions.insert(version.id.clone(), version);
@@ -3523,14 +4476,12 @@ impl RuntimeStore {
     }
 
     pub async fn current_project_version(&self, project_id: &str) -> Option<ProjectVersion> {
-        if let Some(current_id) = self
-            .inner
-            .read()
-            .await
-            .project_current_versions
-            .get(project_id)
-            .cloned()
-        {
+        let current_id = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_artifact_transactions(&mut inner).ok()?;
+            inner.project_current_versions.get(project_id).cloned()
+        };
+        if let Some(current_id) = current_id {
             return self.get_project_version(&current_id).await;
         }
         let version = self
@@ -3629,6 +4580,8 @@ impl RuntimeStore {
             sandbox_claim_name,
             workspace_pvc_name,
             channel_service_name: None,
+            sandbox_uid: None,
+            pod_uid: None,
             warm_pool_name,
             namespace,
             status: SandboxBindingStatus::Claiming,
@@ -3697,6 +4650,24 @@ impl RuntimeStore {
         sandbox_name: String,
         channel_service_name: Option<String>,
     ) -> Result<SandboxBinding> {
+        self.update_sandbox_binding_runtime_identity_with_uids(
+            binding_id,
+            sandbox_name,
+            channel_service_name,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_sandbox_binding_runtime_identity_with_uids(
+        &self,
+        binding_id: &str,
+        sandbox_name: String,
+        channel_service_name: Option<String>,
+        sandbox_uid: Option<String>,
+        pod_uid: Option<String>,
+    ) -> Result<SandboxBinding> {
         let binding = {
             let mut inner = self.inner.write().await;
             if !inner.sandbox_bindings.contains_key(binding_id) {
@@ -3710,6 +4681,8 @@ impl RuntimeStore {
                 .ok_or_else(|| anyhow!("sandbox binding not found: {binding_id}"))?;
             binding.sandbox_name = sandbox_name;
             binding.channel_service_name = channel_service_name;
+            binding.sandbox_uid = sandbox_uid;
+            binding.pod_uid = pod_uid;
             binding.last_seen_at = Utc::now();
             binding.clone()
         };
@@ -3762,6 +4735,99 @@ fn append_jsonl_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn read_latest_jsonl_by_key<T, F>(path: &Path, key: F) -> Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+    F: Fn(&T) -> String,
+{
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut values = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: T = serde_json::from_str(&line)?;
+        values.insert(key(&value), value);
+    }
+    Ok(values.into_values().collect())
+}
+
+fn artifact_publish_transition_allowed(
+    from: ArtifactPublishStatus,
+    to: ArtifactPublishStatus,
+) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            (
+                ArtifactPublishStatus::Staging,
+                ArtifactPublishStatus::Staged
+            ) | (
+                ArtifactPublishStatus::Staging,
+                ArtifactPublishStatus::Failed
+            ) | (
+                ArtifactPublishStatus::Staging,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::Staged,
+                ArtifactPublishStatus::Validating
+            ) | (
+                ArtifactPublishStatus::Staged,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::Validating,
+                ArtifactPublishStatus::Promoting
+            ) | (
+                ArtifactPublishStatus::Validating,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::Promoting,
+                ArtifactPublishStatus::ReconcileRequired
+            ) | (
+                ArtifactPublishStatus::Promoting,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::ReconcileRequired,
+                ArtifactPublishStatus::Promoting
+            ) | (
+                ArtifactPublishStatus::ReconcileRequired,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::GarbageCollectable,
+                ArtifactPublishStatus::GarbageCollected
+            )
+        )
+}
+
+fn channel_lease_transition_allowed(from: ChannelLeaseStatus, to: ChannelLeaseStatus) -> bool {
+    from == to
+        || matches!(
+            (from, to),
+            (ChannelLeaseStatus::Acquiring, ChannelLeaseStatus::Ready)
+                | (ChannelLeaseStatus::Acquiring, ChannelLeaseStatus::Failed)
+                | (ChannelLeaseStatus::Acquiring, ChannelLeaseStatus::Stale)
+                | (ChannelLeaseStatus::Ready, ChannelLeaseStatus::Stale)
+                | (ChannelLeaseStatus::Ready, ChannelLeaseStatus::Releasing)
+                | (ChannelLeaseStatus::Ready, ChannelLeaseStatus::Failed)
+                | (ChannelLeaseStatus::Stale, ChannelLeaseStatus::Acquiring)
+                | (ChannelLeaseStatus::Stale, ChannelLeaseStatus::Releasing)
+                | (ChannelLeaseStatus::Stale, ChannelLeaseStatus::Released)
+                | (ChannelLeaseStatus::Releasing, ChannelLeaseStatus::Released)
+                | (ChannelLeaseStatus::Releasing, ChannelLeaseStatus::Failed)
+                | (ChannelLeaseStatus::Failed, ChannelLeaseStatus::Acquiring)
+                | (ChannelLeaseStatus::Released, ChannelLeaseStatus::Acquiring)
+        )
+}
+
+fn preview_updated_outbox_id(project_id: &str, version_id: &str) -> String {
+    format!("preview.updated:{project_id}:{version_id}")
+}
+
 fn default_storage_root() -> PathBuf {
     let sequence = DEFAULT_STORAGE_ROOT_COUNTER.fetch_add(1, Ordering::SeqCst);
     let unique = format!(
@@ -3812,6 +4878,7 @@ fn max_numeric_suffix_in_text(text: &str) -> u64 {
         "permission-",
         "finding-",
         "version-",
+        "publish-",
         "sandbox-binding-",
         "sandbox-",
         "screenshot-",

@@ -1,21 +1,24 @@
 use crate::{
-    config::RuntimePolicyProfile,
+    artifact_publisher::{safe_segment, ArtifactFile, ArtifactPublisher, FileArtifactPublisher},
+    channel_manager::ChannelManager,
+    config::{RuntimeConfig, RuntimePolicyProfile},
     permission::{
-        check_command_policy, check_create_path, check_existing_path, check_workspace_path,
-        PermissionError, PermissionReason, PermissionResult, RuleSource,
+        check_command_policy, check_existing_path, check_lexical_workspace_path,
+        check_workspace_path, PermissionError, PermissionReason, PermissionResult, RuleSource,
     },
-    preview::{promote_preview, PromotionGateReport},
-    sandbox_adapter::sandbox_channel_from_binding,
+    preview::{promote_preview_cas, validate_preview_promotion, PromotionGateReport},
     tools::{
         runtime::{ProgressSink, Tool, ToolContext, ToolError, ToolResult, ValidationError},
         schema::{object_schema, string_schema},
     },
     types::{
-        AgentEvent, AgentPhase, AgentRunStatus, ReviewFindingCategory, ReviewFindingEvidence,
-        ReviewFindingSeverity,
+        AgentEvent, AgentPhase, AgentRunStatus, ArtifactPublishStatus, ReviewFindingCategory,
+        ReviewFindingEvidence, ReviewFindingSeverity,
     },
+    workspace_auth::{WorkspaceChannelClaims, WorkspaceChannelJwtIssuer},
 };
 use async_trait::async_trait;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
@@ -23,6 +26,7 @@ use scraper::{Html as ParsedHtml, Selector};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs, io,
     path::{Component, Path, PathBuf},
@@ -37,7 +41,10 @@ use tokio::{
     sync::Mutex,
     time,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::header::AUTHORIZATION, Message},
+};
 
 const MAX_DIRECT_WRITE_ARGUMENT_BYTES: usize = 96_000;
 const MAX_DIRECT_WRITE_TEXT_CHARS: usize = 48_000;
@@ -127,12 +134,15 @@ pub fn sandbox_tools_with_backends(
         }),
         Arc::new(PreviewStartTool {
             workspace: workspace_backend.clone(),
+            command: command_backend.clone(),
         }),
         Arc::new(PreviewStatusTool {
             workspace: workspace_backend.clone(),
+            command: command_backend.clone(),
         }),
         Arc::new(PreviewStopTool {
             workspace: workspace_backend.clone(),
+            command: command_backend.clone(),
         }),
         Arc::new(DiagnosticsBuildLogTool {
             workspace: workspace_backend.clone(),
@@ -159,6 +169,14 @@ pub struct WorkspaceEntry {
     pub kind: WorkspaceEntryKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceExportReceipt {
+    pub target_root: PathBuf,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub manifest_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEntryKind {
     File,
@@ -175,6 +193,16 @@ pub enum WorkspacePathKind {
 pub struct SandboxCommandOutput {
     pub status: Option<i32>,
     pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxProcessLease {
+    pub lease_id: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -209,12 +237,55 @@ pub trait SandboxCommandBackend: Send + Sync {
         }
         Ok(output)
     }
+
+    async fn start_process(
+        &self,
+        _ctx: &ToolContext,
+        _lease_id: &str,
+        _argv: &[String],
+        _cwd: &Path,
+    ) -> io::Result<SandboxProcessLease> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sandbox command backend does not support process leases",
+        ))
+    }
+
+    async fn process_status(
+        &self,
+        _ctx: &ToolContext,
+        _lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sandbox command backend does not support process leases",
+        ))
+    }
+
+    async fn stop_process(
+        &self,
+        _ctx: &ToolContext,
+        _lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sandbox command backend does not support process leases",
+        ))
+    }
 }
 
 #[async_trait]
 pub trait WorkspaceBackend: Send + Sync {
     async fn read_to_string(&self, ctx: &ToolContext, path: &Path) -> io::Result<String>;
+    async fn read_bytes(&self, ctx: &ToolContext, path: &Path) -> io::Result<Vec<u8>> {
+        Ok(self.read_to_string(ctx, path).await?.into_bytes())
+    }
     async fn write_string(&self, ctx: &ToolContext, path: &Path, text: &str) -> io::Result<()>;
+    async fn write_bytes(&self, ctx: &ToolContext, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.write_string(ctx, path, text).await
+    }
     async fn rename(&self, ctx: &ToolContext, from: &Path, to: &Path) -> io::Result<()> {
         let text = self.read_to_string(ctx, from).await?;
         self.write_string(ctx, to, &text).await?;
@@ -231,20 +302,134 @@ pub trait WorkspaceBackend: Send + Sync {
         to: &Path,
         skip_dir_names: &[String],
     ) -> io::Result<()>;
+    async fn export_tree(
+        &self,
+        ctx: &ToolContext,
+        from: &Path,
+        target_root: &Path,
+        excluded_files: &[String],
+    ) -> io::Result<WorkspaceExportReceipt> {
+        export_workspace_tree(self, ctx, from, target_root, excluded_files).await
+    }
+}
+
+async fn export_workspace_tree<B: WorkspaceBackend + ?Sized>(
+    workspace: &B,
+    ctx: &ToolContext,
+    from: &Path,
+    target_root: &Path,
+    excluded_files: &[String],
+) -> io::Result<WorkspaceExportReceipt> {
+    // remote-fs-boundary: allow-begin runtime-storage-export-sink
+    if target_root.exists() {
+        fs::remove_dir_all(target_root)?;
+    }
+    fs::create_dir_all(target_root)?;
+    // remote-fs-boundary: allow-end runtime-storage-export-sink
+    let excluded = excluded_files
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut stack = vec![from.to_path_buf()];
+    let mut manifest = Vec::new();
+    let mut total_bytes = 0_u64;
+    while let Some(directory) = stack.pop() {
+        let mut entries = workspace.list_dir(ctx, &directory).await?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        for entry in entries {
+            let relative = entry.path.strip_prefix(from).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "export path escapes source root",
+                )
+            })?;
+            let relative_string = relative.to_string_lossy().replace('\\', "/");
+            match entry.kind {
+                WorkspaceEntryKind::Dir => stack.push(entry.path),
+                WorkspaceEntryKind::File => {
+                    if excluded.contains(relative_string.as_str()) {
+                        continue;
+                    }
+                    let bytes = workspace.read_bytes(ctx, &entry.path).await?;
+                    let output = target_root.join(relative);
+                    // remote-fs-boundary: allow-begin runtime-storage-export-sink
+                    if let Some(parent) = output.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&output, &bytes)?;
+                    // remote-fs-boundary: allow-end runtime-storage-export-sink
+                    total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                    manifest.push(json!({
+                        "path": relative_string,
+                        "bytes": bytes.len(),
+                        "sha256": sha256_hex(&bytes),
+                    }));
+                }
+            }
+        }
+    }
+    manifest.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    let manifest_hash = sha256_hex(
+        &serde_json::to_vec(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    Ok(WorkspaceExportReceipt {
+        target_root: target_root.to_path_buf(),
+        file_count: manifest.len(),
+        total_bytes,
+        manifest_hash,
+    })
 }
 
 #[async_trait]
 pub trait WorkspaceChannelTransport: Send + Sync {
     async fn request(&self, request: WorkspaceChannelRequest) -> io::Result<Value>;
+
+    async fn export_tree(
+        &self,
+        _request: WorkspaceChannelRequest,
+        _target_root: &Path,
+        _excluded_files: &[String],
+    ) -> io::Result<WorkspaceExportReceipt> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workspace channel transport does not support streaming export",
+        ))
+    }
 }
 
 #[async_trait]
 pub trait WorkspaceChannelEndpointResolver: Send + Sync {
     async fn endpoint(&self, ctx: &ToolContext) -> io::Result<String>;
+
+    async fn authorization(&self, _ctx: &ToolContext) -> io::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct SandboxBindingEndpointResolver;
+#[derive(Clone)]
+pub struct SandboxBindingEndpointResolver {
+    token_issuer: Option<Arc<WorkspaceChannelJwtIssuer>>,
+    channel_manager: Arc<ChannelManager>,
+}
+
+impl Default for SandboxBindingEndpointResolver {
+    fn default() -> Self {
+        Self {
+            token_issuer: None,
+            channel_manager: ChannelManager::shared(),
+        }
+    }
+}
+
+impl SandboxBindingEndpointResolver {
+    pub fn with_token_issuer(token_issuer: WorkspaceChannelJwtIssuer) -> Self {
+        Self {
+            token_issuer: Some(Arc::new(token_issuer)),
+            channel_manager: ChannelManager::shared(),
+        }
+    }
+}
 
 #[async_trait]
 impl WorkspaceChannelEndpointResolver for SandboxBindingEndpointResolver {
@@ -260,9 +445,60 @@ impl WorkspaceChannelEndpointResolver for SandboxBindingEndpointResolver {
             .get_sandbox_binding(sandbox_id)
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox binding not found"))?;
-        let channel = sandbox_channel_from_binding(&binding)
-            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))?;
-        Ok(channel.endpoint)
+        self.channel_manager
+            .endpoint(
+                &ctx.store,
+                &binding,
+                &ctx.run.id,
+                crate::sandbox_adapter::WORKSPACE_CHANNEL_PORT,
+                "ws",
+                "/workspace",
+            )
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))
+    }
+
+    async fn authorization(&self, ctx: &ToolContext) -> io::Result<Option<String>> {
+        let Some(issuer) = &self.token_issuer else {
+            return Ok(None);
+        };
+        let binding_id = ctx.run.sandbox_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "run is not bound to a sandbox channel",
+            )
+        })?;
+        let binding = ctx
+            .store
+            .get_sandbox_binding(binding_id)
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox binding not found"))?;
+        let pod_uid = binding.pod_uid.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sandbox binding has no verified pod UID",
+            )
+        })?;
+        let token = issuer.issue(WorkspaceChannelClaims {
+            iss: String::new(),
+            aud: String::new(),
+            exp: 0,
+            iat: 0,
+            jti: sha256_hex(&rand::random::<[u8; 32]>()),
+            sandbox_binding_id: binding.id,
+            sandbox_name: binding.sandbox_name,
+            pod_uid,
+            project_id: binding.project_id,
+            run_id: ctx.run.id.clone(),
+            operations: vec![
+                "fs.read".to_string(),
+                "fs.write".to_string(),
+                "process.exec".to_string(),
+                "process.manage".to_string(),
+                "archive.export".to_string(),
+            ],
+        })?;
+        Ok(Some(format!("Bearer {token}")))
     }
 }
 
@@ -276,6 +512,7 @@ pub struct WorkspaceChannelRequest {
 #[derive(Debug, Clone)]
 pub struct WebSocketWorkspaceChannelTransport {
     endpoint: String,
+    authorization: Option<String>,
     timeout: Duration,
 }
 
@@ -283,8 +520,14 @@ impl WebSocketWorkspaceChannelTransport {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            authorization: None,
             timeout: Duration::from_secs(30),
         }
+    }
+
+    pub fn with_authorization(mut self, authorization: impl Into<String>) -> Self {
+        self.authorization = Some(authorization.into());
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -297,13 +540,24 @@ impl WebSocketWorkspaceChannelTransport {
 impl WorkspaceChannelTransport for WebSocketWorkspaceChannelTransport {
     async fn request(&self, request: WorkspaceChannelRequest) -> io::Result<Value> {
         let endpoint = self.endpoint.clone();
+        let authorization = self.authorization.clone();
         let timeout = self.timeout;
         time::timeout(timeout, async move {
             let mut last_error = None;
-            for attempt in 1..=3 {
-                match websocket_channel_request_once(&endpoint, request.clone()).await {
+            let max_attempts = if authorization.is_some() { 1 } else { 3 };
+            for attempt in 1..=max_attempts {
+                match websocket_channel_request_once(
+                    &endpoint,
+                    authorization.as_deref(),
+                    request.clone(),
+                )
+                .await
+                {
                     Ok(value) => return Ok(value),
-                    Err(error) if is_transient_workspace_channel_error(&error) && attempt < 3 => {
+                    Err(error)
+                        if is_transient_workspace_channel_error(&error)
+                            && attempt < max_attempts =>
+                    {
                         last_error = Some(error);
                         time::sleep(Duration::from_millis(25 * attempt)).await;
                     }
@@ -325,13 +579,302 @@ impl WorkspaceChannelTransport for WebSocketWorkspaceChannelTransport {
             )
         })?
     }
+
+    async fn export_tree(
+        &self,
+        request: WorkspaceChannelRequest,
+        target_root: &Path,
+        excluded_files: &[String],
+    ) -> io::Result<WorkspaceExportReceipt> {
+        time::timeout(
+            self.timeout,
+            websocket_channel_export_once(
+                &self.endpoint,
+                self.authorization.as_deref(),
+                request,
+                target_root,
+                excluded_files,
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "workspace export timed out"))?
+    }
+}
+
+const WORKSPACE_EXPORT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const WORKSPACE_EXPORT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const WORKSPACE_EXPORT_MAX_FILES: usize = 20_000;
+
+struct StreamingExportFile {
+    path: String,
+    expected_hash: String,
+    remaining: u64,
+    file: tokio::fs::File,
+    digest: Sha256,
+}
+
+async fn websocket_channel_export_once(
+    endpoint: &str,
+    authorization: Option<&str>,
+    request: WorkspaceChannelRequest,
+    target_root: &Path,
+    excluded_files: &[String],
+) -> io::Result<WorkspaceExportReceipt> {
+    let mut handshake = endpoint
+        .into_client_request()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if let Some(authorization) = authorization {
+        handshake.headers_mut().insert(
+            AUTHORIZATION,
+            authorization
+                .parse()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        );
+    }
+    handshake.headers_mut().insert(
+        "x-anydesign-workspace-operation",
+        "archive.export"
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+    );
+    let (mut socket, _) = connect_async(handshake)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&json!({
+                "op": request.op,
+                "path": request.path,
+                "payload": request.payload,
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .into(),
+        ))
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+    // remote-fs-boundary: allow-begin runtime-storage-streaming-export-sink
+    if target_root.exists() {
+        tokio::fs::remove_dir_all(target_root).await?;
+    }
+    tokio::fs::create_dir_all(target_root).await?;
+    // remote-fs-boundary: allow-end runtime-storage-streaming-export-sink
+    let excluded = excluded_files
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut started = false;
+    let mut current: Option<StreamingExportFile> = None;
+    let mut manifest = Vec::new();
+    let mut total_bytes = 0_u64;
+    while let Some(message) = socket.next().await {
+        let message = message.map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+        match message {
+            Message::Text(text) => {
+                if current.as_ref().is_some_and(|file| file.remaining != 0) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "workspace export file ended before declared size",
+                    ));
+                }
+                if let Some(file) = current.take() {
+                    let actual_hash = format!("{:x}", file.digest.finalize());
+                    if actual_hash != file.expected_hash {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("workspace export checksum mismatch: {}", file.path),
+                        ));
+                    }
+                }
+                let frame: Value = serde_json::from_str(&text)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                match frame.get("type").and_then(Value::as_str) {
+                    Some("archive.start") => {
+                        if started
+                            || frame.get("format").and_then(Value::as_str)
+                                != Some("anydesign-tree-stream@1")
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid workspace export start frame",
+                            ));
+                        }
+                        started = true;
+                    }
+                    Some("archive.file") if started => {
+                        let relative =
+                            frame.get("path").and_then(Value::as_str).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "workspace export file path missing",
+                                )
+                            })?;
+                        let relative_path = PathBuf::from(relative);
+                        if relative_path.is_absolute()
+                            || relative_path
+                                .components()
+                                .any(|component| !matches!(component, Component::Normal(_)))
+                            || excluded.contains(relative)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "workspace export path is invalid",
+                            ));
+                        }
+                        let bytes =
+                            frame.get("bytes").and_then(Value::as_u64).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "workspace export file size missing",
+                                )
+                            })?;
+                        if bytes > WORKSPACE_EXPORT_MAX_FILE_BYTES
+                            || manifest.len() >= WORKSPACE_EXPORT_MAX_FILES
+                            || total_bytes.saturating_add(bytes) > WORKSPACE_EXPORT_MAX_BYTES
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::FileTooLarge,
+                                "workspace export exceeds configured limits",
+                            ));
+                        }
+                        let expected_hash = frame
+                            .get("sha256")
+                            .and_then(Value::as_str)
+                            .filter(|hash| {
+                                hash.len() == 64
+                                    && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "workspace export file hash missing",
+                                )
+                            })?
+                            .to_string();
+                        let output = target_root.join(&relative_path);
+                        // remote-fs-boundary: allow-begin runtime-storage-streaming-export-sink
+                        if let Some(parent) = output.parent() {
+                            tokio::fs::create_dir_all(parent).await?;
+                        }
+                        let file = tokio::fs::File::create(output).await?;
+                        // remote-fs-boundary: allow-end runtime-storage-streaming-export-sink
+                        manifest.push(json!({
+                            "path": relative,
+                            "bytes": bytes,
+                            "sha256": expected_hash,
+                        }));
+                        total_bytes += bytes;
+                        current = Some(StreamingExportFile {
+                            path: relative.to_string(),
+                            expected_hash,
+                            remaining: bytes,
+                            file,
+                            digest: Sha256::new(),
+                        });
+                    }
+                    Some("archive.end") if started => {
+                        manifest.sort_by(|left, right| {
+                            left["path"].as_str().cmp(&right["path"].as_str())
+                        });
+                        let manifest_hash =
+                            sha256_hex(&serde_json::to_vec(&manifest).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?);
+                        if frame.get("fileCount").and_then(Value::as_u64)
+                            != Some(manifest.len() as u64)
+                            || frame.get("totalBytes").and_then(Value::as_u64) != Some(total_bytes)
+                            || frame.get("manifestHash").and_then(Value::as_str)
+                                != Some(manifest_hash.as_str())
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "workspace export manifest mismatch",
+                            ));
+                        }
+                        return Ok(WorkspaceExportReceipt {
+                            target_root: target_root.to_path_buf(),
+                            file_count: manifest.len(),
+                            total_bytes,
+                            manifest_hash,
+                        });
+                    }
+                    Some("archive.error") => {
+                        return Err(io::Error::other(
+                            frame
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("workspace export failed"),
+                        ));
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected workspace export control frame",
+                        ))
+                    }
+                }
+            }
+            Message::Binary(bytes) => {
+                let file = current.as_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "workspace export binary frame has no file header",
+                    )
+                })?;
+                if bytes.len() as u64 > file.remaining {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "workspace export sent more bytes than declared",
+                    ));
+                }
+                file.file.write_all(&bytes).await?;
+                file.digest.update(&bytes);
+                file.remaining -= bytes.len() as u64;
+            }
+            Message::Close(_) => break,
+            Message::Ping(payload) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+            }
+            Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "workspace export stream ended before manifest",
+    ))
 }
 
 async fn websocket_channel_request_once(
     endpoint: &str,
+    authorization: Option<&str>,
     request: WorkspaceChannelRequest,
 ) -> io::Result<Value> {
-    let (mut socket, _) = connect_async(endpoint)
+    let mut handshake = endpoint
+        .into_client_request()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if let Some(authorization) = authorization {
+        handshake.headers_mut().insert(
+            AUTHORIZATION,
+            authorization
+                .parse()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        );
+    }
+    let operation = workspace_channel_operation(request.op).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("unsupported workspace channel operation: {}", request.op),
+        )
+    })?;
+    handshake.headers_mut().insert(
+        "x-anydesign-workspace-operation",
+        operation
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+    );
+    let (mut socket, _) = connect_async(handshake)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
     let payload = serde_json::to_string(&json!({
@@ -373,12 +916,30 @@ async fn websocket_channel_request_once(
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("workspace channel request failed");
-        return Err(io::Error::other(message.to_string()));
+        let kind = match response.get("code").and_then(Value::as_str) {
+            Some("ENOENT") => io::ErrorKind::NotFound,
+            Some("EACCES" | "EPERM") => io::ErrorKind::PermissionDenied,
+            Some("EEXIST") => io::ErrorKind::AlreadyExists,
+            _ => io::ErrorKind::Other,
+        };
+        return Err(io::Error::new(kind, message.to_string()));
     }
     if let Some(result) = response.get("result") {
         return Ok(result.clone());
     }
     Ok(response)
+}
+
+fn workspace_channel_operation(op: &str) -> Option<&'static str> {
+    match op {
+        "fs.read" | "fs.readBytes" | "fs.list" | "fs.stat" => Some("fs.read"),
+        "fs.write" | "fs.writeBytes" | "fs.removeFile" | "fs.removeDirAll" | "fs.copyDir"
+        | "fs.rename" => Some("fs.write"),
+        "process.exec" => Some("process.exec"),
+        "process.start" | "process.status" | "process.stop" => Some("process.manage"),
+        "archive.export" => Some("archive.export"),
+        _ => None,
+    }
 }
 
 fn is_transient_workspace_channel_error(error: &io::Error) -> bool {
@@ -402,7 +963,7 @@ impl Default for SandboxChannelWorkspaceBackend {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
-            endpoint_resolver: Arc::new(SandboxBindingEndpointResolver),
+            endpoint_resolver: Arc::new(SandboxBindingEndpointResolver::default()),
         }
     }
 }
@@ -410,6 +971,25 @@ impl Default for SandboxChannelWorkspaceBackend {
 impl SandboxChannelWorkspaceBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_runtime_config(config: &RuntimeConfig) -> io::Result<Self> {
+        let key_file = config
+            .workspace_channel_signing_key_file
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "workspace channel signing key is not configured",
+                )
+            })?;
+        let issuer = WorkspaceChannelJwtIssuer::from_pkcs8_der_file(
+            key_file,
+            config.workspace_channel_token_ttl_seconds,
+        )?;
+        Ok(Self::new().with_endpoint_resolver(Arc::new(
+            SandboxBindingEndpointResolver::with_token_issuer(issuer),
+        )))
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -430,14 +1010,20 @@ impl SandboxChannelWorkspaceBackend {
         ctx: &ToolContext,
     ) -> io::Result<JsonWorkspaceChannelBackend<WebSocketWorkspaceChannelTransport>> {
         let endpoint = self.endpoint_resolver.endpoint(ctx).await?;
+        let authorization = self.endpoint_resolver.authorization(ctx).await?;
         if !endpoint.starts_with("ws://") && !endpoint.starts_with("wss://") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("unsupported workspace channel endpoint: {endpoint}"),
             ));
         }
+        let mut transport =
+            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout);
+        if let Some(authorization) = authorization {
+            transport = transport.with_authorization(authorization);
+        }
         Ok(JsonWorkspaceChannelBackend::new(
-            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout),
+            transport,
             ctx.workspace_root.clone(),
         ))
     }
@@ -453,7 +1039,7 @@ impl Default for SandboxChannelCommandBackend {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
-            endpoint_resolver: Arc::new(SandboxBindingEndpointResolver),
+            endpoint_resolver: Arc::new(SandboxBindingEndpointResolver::default()),
         }
     }
 }
@@ -481,14 +1067,20 @@ impl SandboxChannelCommandBackend {
         ctx: &ToolContext,
     ) -> io::Result<JsonWorkspaceChannelCommandBackend<WebSocketWorkspaceChannelTransport>> {
         let endpoint = self.endpoint_resolver.endpoint(ctx).await?;
+        let authorization = self.endpoint_resolver.authorization(ctx).await?;
         if !endpoint.starts_with("ws://") && !endpoint.starts_with("wss://") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("unsupported workspace channel endpoint: {endpoint}"),
             ));
         }
+        let mut transport =
+            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout);
+        if let Some(authorization) = authorization {
+            transport = transport.with_authorization(authorization);
+        }
         Ok(JsonWorkspaceChannelCommandBackend::new(
-            WebSocketWorkspaceChannelTransport::new(endpoint).with_timeout(self.timeout),
+            transport,
             ctx.workspace_root.clone(),
         ))
     }
@@ -508,6 +1100,41 @@ impl SandboxCommandBackend for SandboxChannelCommandBackend {
             .run(ctx, argv, cwd, timeout_ms)
             .await
     }
+
+    async fn start_process(
+        &self,
+        ctx: &ToolContext,
+        lease_id: &str,
+        argv: &[String],
+        cwd: &Path,
+    ) -> io::Result<SandboxProcessLease> {
+        self.channel_backend(ctx)
+            .await?
+            .start_process(ctx, lease_id, argv, cwd)
+            .await
+    }
+
+    async fn process_status(
+        &self,
+        ctx: &ToolContext,
+        lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        self.channel_backend(ctx)
+            .await?
+            .process_status(ctx, lease_id)
+            .await
+    }
+
+    async fn stop_process(
+        &self,
+        ctx: &ToolContext,
+        lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        self.channel_backend(ctx)
+            .await?
+            .stop_process(ctx, lease_id)
+            .await
+    }
 }
 
 #[async_trait]
@@ -523,6 +1150,13 @@ impl WorkspaceBackend for SandboxChannelWorkspaceBackend {
         self.channel_backend(ctx)
             .await?
             .write_string(ctx, path, text)
+            .await
+    }
+
+    async fn write_bytes(&self, ctx: &ToolContext, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.channel_backend(ctx)
+            .await?
+            .write_bytes(ctx, path, bytes)
             .await
     }
 
@@ -564,6 +1198,19 @@ impl WorkspaceBackend for SandboxChannelWorkspaceBackend {
             .copy_dir_all(ctx, from, to, skip_dir_names)
             .await
     }
+
+    async fn export_tree(
+        &self,
+        ctx: &ToolContext,
+        from: &Path,
+        target_root: &Path,
+        excluded_files: &[String],
+    ) -> io::Result<WorkspaceExportReceipt> {
+        self.channel_backend(ctx)
+            .await?
+            .export_tree(ctx, from, target_root, excluded_files)
+            .await
+    }
 }
 
 #[derive(Clone)]
@@ -577,15 +1224,29 @@ where
     T: WorkspaceChannelTransport + 'static,
 {
     pub fn new(transport: T, workspace_root: impl Into<PathBuf>) -> Self {
+        // remote-fs-boundary: allow-begin channel-local-root-alias
         let workspace_root = workspace_root.into();
-        Self {
+        let backend = Self {
             transport: Arc::new(transport),
-            workspace_root: fs::canonicalize(&workspace_root).unwrap_or(workspace_root),
-        }
+            workspace_root: fs::canonicalize(&workspace_root)
+                .unwrap_or_else(|_| normalize_path(&workspace_root)),
+        };
+        // remote-fs-boundary: allow-end channel-local-root-alias
+        backend
     }
 
     fn workspace_path(&self, path: &Path) -> io::Result<String> {
         workspace_channel_path(path, &self.workspace_root)
+    }
+
+    async fn request(&self, op: &'static str, path: &Path, payload: Value) -> io::Result<Value> {
+        self.transport
+            .request(WorkspaceChannelRequest {
+                op,
+                path: self.workspace_path(path)?,
+                payload,
+            })
+            .await
     }
 }
 
@@ -602,15 +1263,14 @@ where
         timeout_ms: u64,
     ) -> io::Result<SandboxCommandOutput> {
         let value = self
-            .transport
-            .request(WorkspaceChannelRequest {
-                op: "process.exec",
-                path: self.workspace_path(cwd)?,
-                payload: json!({
+            .request(
+                "process.exec",
+                cwd,
+                json!({
                     "argv": argv,
                     "timeoutMs": timeout_ms,
                 }),
-            })
+            )
             .await?;
         Ok(SandboxCommandOutput {
             status: value
@@ -633,6 +1293,86 @@ where
                 .to_string(),
         })
     }
+
+    async fn start_process(
+        &self,
+        _ctx: &ToolContext,
+        lease_id: &str,
+        argv: &[String],
+        cwd: &Path,
+    ) -> io::Result<SandboxProcessLease> {
+        let value = self
+            .request(
+                "process.start",
+                cwd,
+                json!({ "leaseId": lease_id, "argv": argv }),
+            )
+            .await?;
+        process_lease_from_value(value)
+    }
+
+    async fn process_status(
+        &self,
+        _ctx: &ToolContext,
+        lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        let value = self
+            .request(
+                "process.status",
+                &self.workspace_root,
+                json!({ "leaseId": lease_id }),
+            )
+            .await?;
+        process_lease_from_value(value)
+    }
+
+    async fn stop_process(
+        &self,
+        _ctx: &ToolContext,
+        lease_id: &str,
+    ) -> io::Result<SandboxProcessLease> {
+        let value = self
+            .request(
+                "process.stop",
+                &self.workspace_root,
+                json!({ "leaseId": lease_id }),
+            )
+            .await?;
+        process_lease_from_value(value)
+    }
+}
+
+fn process_lease_from_value(value: Value) -> io::Result<SandboxProcessLease> {
+    Ok(SandboxProcessLease {
+        lease_id: value
+            .get("leaseId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process leaseId missing"))?
+            .to_string(),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process status missing"))?
+            .to_string(),
+        pid: value
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
+        exit_code: value
+            .get("exitCode")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+        stdout: value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        stderr: value
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 #[derive(Clone)]
@@ -646,11 +1386,15 @@ where
     T: WorkspaceChannelTransport + 'static,
 {
     pub fn new(transport: T, workspace_root: impl Into<PathBuf>) -> Self {
+        // remote-fs-boundary: allow-begin channel-local-root-alias
         let workspace_root = workspace_root.into();
-        Self {
+        let backend = Self {
             transport: Arc::new(transport),
-            workspace_root: fs::canonicalize(&workspace_root).unwrap_or(workspace_root),
-        }
+            workspace_root: fs::canonicalize(&workspace_root)
+                .unwrap_or_else(|_| normalize_path(&workspace_root)),
+        };
+        // remote-fs-boundary: allow-end channel-local-root-alias
+        backend
     }
 
     fn workspace_path(&self, path: &Path) -> io::Result<String> {
@@ -682,8 +1426,34 @@ where
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "fs.read missing text"))
     }
 
+    async fn read_bytes(&self, _ctx: &ToolContext, path: &Path) -> io::Result<Vec<u8>> {
+        let value = self.request("fs.readBytes", path, json!({})).await?;
+        let encoded = value.get("base64").and_then(Value::as_str).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "fs.readBytes missing base64")
+        })?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
     async fn write_string(&self, _ctx: &ToolContext, path: &Path, text: &str) -> io::Result<()> {
         self.request("fs.write", path, json!({ "text": text }))
+            .await?;
+        Ok(())
+    }
+
+    async fn write_bytes(&self, _ctx: &ToolContext, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.request(
+            "fs.writeBytes",
+            path,
+            json!({ "base64": base64::engine::general_purpose::STANDARD.encode(bytes) }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn rename(&self, _ctx: &ToolContext, from: &Path, to: &Path) -> io::Result<()> {
+        self.request("fs.rename", from, json!({ "to": self.workspace_path(to)? }))
             .await?;
         Ok(())
     }
@@ -759,29 +1529,80 @@ where
         .await?;
         Ok(())
     }
+
+    async fn export_tree(
+        &self,
+        ctx: &ToolContext,
+        from: &Path,
+        target_root: &Path,
+        excluded_files: &[String],
+    ) -> io::Result<WorkspaceExportReceipt> {
+        let request = WorkspaceChannelRequest {
+            op: "archive.export",
+            path: self.workspace_path(from)?,
+            payload: json!({ "excludedFiles": excluded_files }),
+        };
+        match self
+            .transport
+            .export_tree(request, target_root, excluded_files)
+            .await
+        {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                export_workspace_tree(self, ctx, from, target_root, excluded_files).await
+            }
+            result => result,
+        }
+    }
 }
 
 fn workspace_channel_path(path: &Path, workspace_root: &Path) -> io::Result<String> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
+    let workspace_root = normalize_path(workspace_root);
+    let relative = if path.starts_with("/workspace") {
+        path.strip_prefix("/workspace")
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "path outside workspace"))?
+            .to_path_buf()
+    } else if path.is_absolute() {
+        let normalized = normalize_path(path);
+        let comparable = if normalized.starts_with(&workspace_root) {
+            normalized
+        } else {
+            canonicalize_existing_prefix(path)?
+        };
+        comparable
+            .strip_prefix(&workspace_root)
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "path outside workspace"))?
+            .to_path_buf()
     } else {
-        workspace_root.join(path)
+        path.to_path_buf()
     };
-    let path = canonicalize_existing_prefix(&path)?;
-    let relative = path
-        .strip_prefix(workspace_root)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "path outside workspace"))?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path outside workspace",
+        ));
+    }
+    let relative = normalize_path(&relative);
     if relative.as_os_str().is_empty() {
         return Ok("/workspace".to_string());
     }
-    Ok(format!("/workspace/{}", relative.display()))
+    Ok(format!(
+        "/workspace/{}",
+        relative.to_string_lossy().replace('\\', "/")
+    ))
 }
 
+// Local macOS temp paths may be presented through /tmp while canonical paths use /private/tmp.
+// Remote Kubernetes paths take the lexical branch above and never depend on host existence.
+// remote-fs-boundary: allow-begin channel-local-path-alias-fallback
 fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
     if let Ok(real) = fs::canonicalize(path) {
         return Ok(real);
     }
-
     let mut ancestor = path.to_path_buf();
     let mut suffix = Vec::<OsString>::new();
     loop {
@@ -801,6 +1622,7 @@ fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
         }
     }
 }
+// remote-fs-boundary: allow-end channel-local-path-alias-fallback
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -817,6 +1639,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+// remote-fs-boundary: allow-begin local-workspace-backend
 fn copy_dir_all_local(from: &Path, to: &Path, skip_dir_names: &[String]) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
@@ -851,11 +1674,22 @@ impl WorkspaceBackend for LocalWorkspaceBackend {
         fs::read_to_string(path)
     }
 
+    async fn read_bytes(&self, _ctx: &ToolContext, path: &Path) -> io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+
     async fn write_string(&self, _ctx: &ToolContext, path: &Path, text: &str) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, text)
+    }
+
+    async fn write_bytes(&self, _ctx: &ToolContext, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, bytes)
     }
 
     async fn rename(&self, _ctx: &ToolContext, from: &Path, to: &Path) -> io::Result<()> {
@@ -910,6 +1744,7 @@ impl WorkspaceBackend for LocalWorkspaceBackend {
         copy_dir_all_local(from, to, skip_dir_names)
     }
 }
+// remote-fs-boundary: allow-end local-workspace-backend
 
 struct FsReadTool {
     workspace: Arc<dyn WorkspaceBackend>,
@@ -1180,7 +2015,7 @@ impl Tool for FsReadTool {
                     }),
                 }
             })?;
-        record_read_path(&ctx, &path, &text)?;
+        record_read_path(&*self.workspace, &ctx, &path, &text).await?;
         Ok(ToolResult::ok(
             json!({ "path": display_workspace_path(&path, &ctx), "text": text }),
         ))
@@ -1756,7 +2591,7 @@ impl Tool for FsPatchTool {
             .get("replaceAll")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let read_entry = read_tracking_entry(&ctx, &path);
+        let read_entry = read_tracking_entry(&*self.workspace, &ctx, &path).await;
         if read_entry.is_none() {
             return Err(typed_recoverable(
                 "fs.patch requires reading the target file first. Call fs.read on the path, then retry with a small unique oldStr of roughly 2-6 lines; do not paste the whole file.".to_string(),
@@ -1813,7 +2648,7 @@ impl Tool for FsPatchTool {
             .write_string(&ctx, &path, &new_content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&ctx, &path, &new_content)?;
+        record_read_path(&*self.workspace, &ctx, &path, &new_content).await?;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),
             "patched": true,
@@ -1896,7 +2731,7 @@ impl Tool for FsMultiPatchTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_existing_path(&input, &ctx)?;
         ensure_not_nested_package_root(&path, &ctx)?;
-        let read_entry = read_tracking_entry(&ctx, &path);
+        let read_entry = read_tracking_entry(&*self.workspace, &ctx, &path).await;
         if read_entry.is_none() {
             return Err(typed_recoverable(
                 "fs.multi_patch requires reading the target file first. Call fs.read on the path, then retry with small unique oldStr snippets.".to_string(),
@@ -1984,7 +2819,7 @@ impl Tool for FsMultiPatchTool {
             .write_string(&ctx, &path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&ctx, &path, &content)?;
+        record_read_path(&*self.workspace, &ctx, &path, &content).await?;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),
             "patched": true,
@@ -2085,9 +2920,9 @@ impl Tool for StyleUpdateTokensTool {
                     }),
                 )
             })?;
-        let token_path = check_existing_path(
+        let token_path = check_context_workspace_path(
             &resolve_path(token_file, &ctx.workspace_root),
-            &ctx.workspace_root,
+            &ctx,
         )
         .map_err(|error| {
             style_typed_recoverable(
@@ -2192,7 +3027,7 @@ impl Tool for StyleUpdateTokensTool {
             .write_string(&ctx, &token_path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&ctx, &token_path, &content)?;
+        record_read_path(&*self.workspace, &ctx, &token_path, &content).await?;
         Ok(ToolResult::ok(json!({
             "tokenFile": display_workspace_path(&token_path, &ctx),
             "updated": true,
@@ -2563,7 +3398,7 @@ impl Tool for ShellRunTool {
         let argv = argv_from_input(&input)?;
         let cwd = match input.get("cwd").and_then(Value::as_str) {
             Some(cwd) => {
-                check_existing_path(&resolve_path(cwd, &ctx.workspace_root), &ctx.workspace_root)
+                check_context_workspace_path(&resolve_path(cwd, &ctx.workspace_root), &ctx)
                     .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?
             }
             None => default_project_dir(&ctx),
@@ -2660,11 +3495,9 @@ impl Tool for ProjectInitTool {
                 .and_then(Value::as_str)
                 .unwrap_or("project"),
         )?;
-        let app_root = check_create_path(
-            &ctx.workspace_root.join(&app_root_relative),
-            &ctx.workspace_root,
-        )
-        .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let app_root =
+            check_context_workspace_path(&ctx.workspace_root.join(&app_root_relative), &ctx)
+                .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
 
         cleanup_conflicting_template_files(&*self.workspace, &ctx, &app_root, &template).await?;
         write_project_template_files(&*self.workspace, &ctx, &app_root, &template).await?;
@@ -2678,17 +3511,35 @@ impl Tool for ProjectInitTool {
             &style_contract,
         )
         .await?;
-        let state = json!({
-            "appRoot": app_root_relative,
-            "template": template,
-            "templateKey": template,
-            "templateVersion": format!("{template}@runtime-p3"),
-            "framework": if template == "fumadocs-docs" { "fumadocs" } else { "astro" },
-            "packageManager": "npm",
-            "lockfile": "package-lock.json",
-            "registry": ctx.npm_registry,
-            "initializedAt": Utc::now().to_rfc3339(),
-        });
+        let app_root_value = app_root_relative.to_string_lossy().replace('\\', "/");
+        let template_version = format!("{template}@runtime-p3");
+        let framework = if template == "fumadocs-docs" {
+            "fumadocs"
+        } else {
+            "astro"
+        };
+        let runtime_state = ctx
+            .store
+            .upsert_project_runtime_state(
+                &ctx.project_id,
+                app_root_value,
+                template.clone(),
+                template_version,
+                framework.to_string(),
+                "npm".to_string(),
+                "package-lock.json".to_string(),
+                ctx.npm_registry.clone(),
+            )
+            .await
+            .map_err(|error| ToolError::Terminal(error.to_string()))?;
+        ctx.store
+            .set_run_project_state_snapshot(&ctx.run.id, runtime_state.clone())
+            .await
+            .map_err(|error| ToolError::Terminal(error.to_string()))?;
+        let mut state = serde_json::to_value(&runtime_state)
+            .map_err(|error| ToolError::Terminal(error.to_string()))?;
+        state["template"] = json!(template);
+        state["initializedAt"] = json!(runtime_state.updated_at.to_rfc3339());
         write_workspace_json(&*self.workspace, &ctx, "state/project.json", &state).await?;
         Ok(ToolResult::ok(json!({
             "appRoot": display_workspace_path(&app_root, &ctx),
@@ -2805,12 +3656,8 @@ impl Tool for ProjectWritePageTool {
             project_page_relative_path(route).map_err(ToolError::Recoverable)?;
         let app_root = default_project_dir(&ctx);
         let raw_page_path = app_root.join("src/pages").join(&relative_page_path);
-        let page_path = if raw_page_path.exists() {
-            check_existing_path(&raw_page_path, &ctx.workspace_root)
-        } else {
-            check_create_path(&raw_page_path, &ctx.workspace_root)
-        }
-        .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
+        let page_path = check_context_workspace_path(&raw_page_path, &ctx)
+            .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
         ensure_not_nested_package_root(&page_path, &ctx)?;
         let page = render_project_page(route, title, style_profile, sections, &relative_page_path);
         self.workspace
@@ -2861,15 +3708,17 @@ impl Tool for ProjectInspectTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        let project = read_workspace_json(&*self.workspace, &ctx, "state/project.json").await;
-        let app_root_relative = project
+        let project_hint = read_workspace_json(&*self.workspace, &ctx, "state/project.json").await;
+        let project = ctx
+            .run
+            .project_state_snapshot
             .as_ref()
-            .and_then(|state| state.get("appRoot").and_then(Value::as_str))
-            .map(normalize_workspace_relative_path)
-            .transpose()?
-            .unwrap_or_else(|| PathBuf::from("project"));
+            .and_then(|state| serde_json::to_value(state).ok());
+        let app_root_relative = project_app_root_relative(&ctx);
         let app_root = ctx.workspace_root.join(&app_root_relative);
-        let package_manager = package_manager_from_project_state_or_lockfiles(&ctx, &app_root);
+        let package_manager =
+            package_manager_from_project_state_or_lockfiles(&*self.workspace, &ctx, &app_root)
+                .await;
         let package_json = self
             .workspace
             .read_to_string(&ctx, &app_root.join("package.json"))
@@ -2884,7 +3733,29 @@ impl Tool for ProjectInspectTool {
             read_workspace_json(&*self.workspace, &ctx, "state/dependency-state.json").await;
         let preview = read_workspace_json(&*self.workspace, &ctx, "state/preview.json").await;
         let browser = read_workspace_json(&*self.workspace, &ctx, "state/browser.json").await;
-        let key_source_files = project_key_source_files(&ctx, &app_root_relative, project.as_ref());
+        let key_source_files =
+            project_key_source_files(&*self.workspace, &ctx, &app_root_relative, project.as_ref())
+                .await;
+        let project_state_conflict = match (&project, &project_hint) {
+            (Some(authority), Some(hint)) => {
+                ["appRoot", "templateKey", "framework", "packageManager"]
+                    .iter()
+                    .any(|key| authority.get(key) != hint.get(key))
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if project_state_conflict {
+            return Err(ToolError::typed_recoverable(
+                "state/project.json conflicts with the RuntimeStore project state".to_string(),
+                "project.state_conflict",
+                json!({
+                    "runtimeState": project,
+                    "workspaceHint": project_hint,
+                    "suggestedAction": "Do not edit state/project.json directly. Re-run project.init through the Runtime or repair the workspace hint from the authoritative RuntimeStore state."
+                }),
+            ));
+        }
 
         Ok(ToolResult::ok(json!({
             "appRoot": format!("/workspace/{}", app_root_relative.to_string_lossy().replace('\\', "/")),
@@ -2893,6 +3764,8 @@ impl Tool for ProjectInspectTool {
             "framework": project.as_ref().and_then(|state| state.get("framework")).cloned().unwrap_or(Value::Null),
             "templateKey": project.as_ref().and_then(|state| state.get("templateKey")).cloned().unwrap_or(Value::Null),
             "project": project,
+            "projectHint": project_hint,
+            "projectStateConflict": false,
             "package": package_json,
             "keySourceFiles": key_source_files,
             "styleContractPath": if style_contract.is_some() { json!("/workspace/state/style-contract.json") } else { Value::Null },
@@ -2940,7 +3813,7 @@ impl Tool for ProjectBuildTool {
             .get("cwd")
             .and_then(Value::as_str)
             .map(|cwd| {
-                check_existing_path(&resolve_path(cwd, &ctx.workspace_root), &ctx.workspace_root)
+                check_context_workspace_path(&resolve_path(cwd, &ctx.workspace_root), &ctx)
                     .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
             })
             .transpose()?
@@ -2951,7 +3824,8 @@ impl Tool for ProjectBuildTool {
             .get("timeoutMs")
             .and_then(Value::as_u64)
             .unwrap_or(180_000);
-        let package_manager = package_manager_from_input_or_project(&json!({}), &ctx, &cwd)?;
+        let package_manager =
+            package_manager_from_input_or_project(&*self.workspace, &json!({}), &ctx, &cwd).await?;
         let dependency_restore = maybe_restore_project_dependencies(
             &*self.workspace,
             &*self.command,
@@ -3016,8 +3890,18 @@ impl Tool for ProjectBuildTool {
         let build_id = format!("build-{}", finished_at.timestamp_millis());
         let source_fingerprint = project_source_fingerprint(&*self.workspace, &ctx, &cwd).await?;
         let source_snapshot_path = format!("outputs/build/source-snapshots/{build_id}");
-        let source_snapshot_uri = format!("file:///workspace/{source_snapshot_path}");
         snapshot_project_source(&*self.workspace, &ctx, &cwd, &source_snapshot_path).await?;
+        let source_snapshot_root = ctx.workspace_root.join(&source_snapshot_path);
+        let source_snapshot_files =
+            collect_artifact_files(&*self.workspace, &ctx, &source_snapshot_root).await?;
+        let source_snapshot_uri = FileArtifactPublisher::new(&ctx.runtime_storage_dir)
+            .publish_source_snapshot(&ctx.project_id, &build_id, source_snapshot_files)
+            .await
+            .map_err(|error| {
+                ToolError::Terminal(format!(
+                    "failed to publish Runtime source snapshot: {error}"
+                ))
+            })?;
         let source_snapshot_text = format!(
             "buildId: {build_id}\ncwd: {}\nstatus: {status}\nfinishedAt: {}\nlogPath: /workspace/{log_path}\n",
             display_workspace_path(&cwd, &ctx),
@@ -3033,7 +3917,7 @@ impl Tool for ProjectBuildTool {
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
 
         let static_output_dir = if status == "success" {
-            detect_static_preview_output_dir(&ctx, &cwd)
+            detect_static_preview_output_dir_backend(&*self.workspace, &ctx, &cwd).await
         } else {
             None
         };
@@ -3045,6 +3929,25 @@ impl Tool for ProjectBuildTool {
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
             .map(str::to_string);
+
+        let candidate = if status == "success" {
+            let static_output_dir = static_output_dir.as_ref().ok_or_else(|| {
+                ToolError::typed_recoverable(
+                    "project.build succeeded but produced neither dist/ nor out/".to_string(),
+                    "project.static_output_missing",
+                    json!({
+                        "cwd": display_workspace_path(&cwd, &ctx),
+                        "suggestedAction": "Configure the project build to emit a static dist/ or out/ directory, then rerun project.build."
+                    }),
+                )
+            })?;
+            Some(
+                create_candidate_snapshot(&*self.workspace, &ctx, &build_id, static_output_dir)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let latest = json!({
             "buildId": build_id,
@@ -3065,6 +3968,9 @@ impl Tool for ProjectBuildTool {
             "sourceFingerprint": source_fingerprint,
             "staticOutputPath": static_output_path,
             "staticOutputName": static_output_name,
+            "candidateOutputPath": candidate.as_ref().map(|candidate| candidate.output_path.clone()),
+            "candidateManifestPath": candidate.as_ref().map(|candidate| candidate.manifest_path.clone()),
+            "candidateManifestHash": candidate.as_ref().map(|candidate| candidate.manifest_hash.clone()),
             "error": error_message,
         });
         write_workspace_json(&*self.workspace, &ctx, "outputs/build/latest.json", &latest).await?;
@@ -3084,8 +3990,111 @@ impl Tool for ProjectBuildTool {
                 }),
             ));
         }
+        ctx.store
+            .update_run_status(&ctx.run.id, AgentRunStatus::Validating)
+            .await
+            .map_err(|error| ToolError::Terminal(error.to_string()))?;
         Ok(ToolResult::ok(latest))
     }
+}
+
+#[derive(Debug, Clone)]
+struct CandidateSnapshot {
+    output_path: String,
+    manifest_path: String,
+    manifest_hash: String,
+}
+
+async fn create_candidate_snapshot(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    build_id: &str,
+    static_output_dir: &Path,
+) -> Result<CandidateSnapshot, ToolError> {
+    let candidates_root = ctx.workspace_root.join("outputs/candidates");
+    let staging_root = candidates_root.join(format!(".staging-{build_id}"));
+    let candidate_root = candidates_root.join(build_id);
+    let _ = workspace.remove_dir_all(ctx, &staging_root).await;
+    workspace
+        .copy_dir_all(ctx, static_output_dir, &staging_root, &[])
+        .await
+        .map_err(|error| {
+            ToolError::typed_recoverable(
+                format!("failed to create candidate snapshot: {error}"),
+                "project.candidate_snapshot_failed",
+                json!({ "buildId": build_id }),
+            )
+        })?;
+
+    let mut files = Vec::new();
+    let mut stack = vec![staging_root.clone()];
+    while let Some(directory) = stack.pop() {
+        let entries = workspace
+            .list_dir(ctx, &directory)
+            .await
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        for entry in entries {
+            match entry.kind {
+                WorkspaceEntryKind::Dir => stack.push(entry.path),
+                WorkspaceEntryKind::File => {
+                    let bytes = workspace
+                        .read_bytes(ctx, &entry.path)
+                        .await
+                        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+                    let relative = entry
+                        .path
+                        .strip_prefix(&staging_root)
+                        .map_err(|error| ToolError::Terminal(error.to_string()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.push(json!({
+                        "path": relative,
+                        "bytes": bytes.len(),
+                        "sha256": sha256_hex(&bytes),
+                    }));
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        left.get("path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("path").and_then(Value::as_str))
+    });
+    let manifest = json!({
+        "schemaVersion": "candidate-manifest@1",
+        "buildId": build_id,
+        "files": files,
+    });
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| ToolError::Terminal(error.to_string()))?;
+    let manifest_hash = sha256_hex(manifest_text.as_bytes());
+    workspace
+        .write_string(
+            ctx,
+            &staging_root.join(".anydesign-candidate-manifest.json"),
+            &manifest_text,
+        )
+        .await
+        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+    workspace
+        .rename(ctx, &staging_root, &candidate_root)
+        .await
+        .map_err(|error| {
+            ToolError::typed_recoverable(
+                format!("failed to freeze candidate snapshot: {error}"),
+                "project.candidate_snapshot_failed",
+                json!({ "buildId": build_id }),
+            )
+        })?;
+
+    Ok(CandidateSnapshot {
+        output_path: format!("/workspace/outputs/candidates/{build_id}"),
+        manifest_path: format!(
+            "/workspace/outputs/candidates/{build_id}/.anydesign-candidate-manifest.json"
+        ),
+        manifest_hash,
+    })
 }
 
 struct BuildFailureClassification {
@@ -3340,7 +4349,37 @@ impl Tool for PreviewReportCandidateTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        let url = required_str(&input, "url")?.to_string();
+        let requested_url = required_str(&input, "url")?.to_string();
+        let url = if ctx.remote_workspace {
+            let preview = read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
+                .await
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "preview.report_candidate requires an active Runtime preview lease".to_string(),
+                        "preview.lease_missing",
+                        json!({ "suggestedAction": "Call preview.start before preview.report_candidate." }),
+                    )
+                })?;
+            let proxy_url = preview
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "preview.report_candidate lease has no Runtime proxy URL".to_string(),
+                        "preview.lease_invalid",
+                        json!({ "preview": preview }),
+                    )
+                })?
+                .to_string();
+            if !proxy_url.starts_with(&ctx.runtime_public_base_url) {
+                return Err(ToolError::Terminal(
+                    "preview.report_candidate refused a URL outside the Runtime proxy".to_string(),
+                ));
+            }
+            proxy_url
+        } else {
+            requested_url
+        };
         verify_preview_accessible(&url).await?;
         let screenshot_id = input
             .get("screenshotId")
@@ -3448,6 +4487,7 @@ impl Tool for PreviewPublishTool {
 
         let preview_tool = PreviewStartTool {
             workspace: self.workspace.clone(),
+            command: self.command.clone(),
         };
         let mut preview_input = json!({});
         if ctx.policy_profile != RuntimePolicyProfile::LocalE2e {
@@ -4341,6 +5381,134 @@ async fn report_preview_candidate(
             Some(source_snapshot_uri.to_string()),
         )
         .await;
+    let candidate_manifest_hash = latest_build
+        .get("candidateManifestHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            typed_recoverable(
+                "preview.report_candidate requires candidate manifest evidence".to_string(),
+                "preview.candidate_manifest_missing",
+                json!({ "latestBuild": latest_build.clone() }),
+            )
+        })?;
+    let candidate_output_path = latest_build
+        .get("candidateOutputPath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            typed_recoverable(
+                "preview.report_candidate requires candidate output evidence".to_string(),
+                "preview.candidate_manifest_missing",
+                json!({ "latestBuild": latest_build.clone() }),
+            )
+        })?;
+    let candidate_root = resolve_path(candidate_output_path, &ctx.workspace_root);
+    let candidate_manifest = workspace
+        .read_to_string(
+            ctx,
+            &candidate_root.join(".anydesign-candidate-manifest.json"),
+        )
+        .await
+        .map_err(|error| {
+            typed_recoverable(
+                format!("failed to read candidate manifest: {error}"),
+                "artifact.candidate_mismatch",
+                json!({ "candidateOutputPath": candidate_output_path }),
+            )
+        })?;
+    let actual_manifest_hash = sha256_hex(candidate_manifest.as_bytes());
+    if actual_manifest_hash != candidate_manifest_hash {
+        return Err(typed_recoverable(
+            "candidate snapshot does not match build evidence".to_string(),
+            "artifact.candidate_mismatch",
+            json!({
+                "expectedManifestHash": candidate_manifest_hash,
+                "actualManifestHash": actual_manifest_hash,
+            }),
+        ));
+    }
+    let publisher = FileArtifactPublisher::new(&ctx.runtime_storage_dir);
+    let build_id = latest_build
+        .get("buildId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            typed_recoverable(
+                "preview.report_candidate requires buildId evidence".to_string(),
+                "preview.build_missing",
+                json!({ "latestBuild": latest_build.clone() }),
+            )
+        })?;
+    let expected_current_version_id = ctx
+        .run
+        .output_version_id
+        .as_deref()
+        .or(ctx.run.base_version_id.as_deref());
+    let publish = ctx
+        .store
+        .begin_artifact_publish(
+            &ctx.project_id,
+            &ctx.run.id,
+            build_id,
+            &candidate.id,
+            candidate_manifest_hash,
+            source_snapshot_uri,
+            expected_current_version_id,
+        )
+        .await
+        .map_err(|error| ToolError::Terminal(format!("artifact stage state failed: {error}")))?;
+    let export_root = ctx
+        .runtime_storage_dir
+        .join("artifact-exports")
+        .join(safe_segment(&ctx.run.id))
+        .join(safe_segment(&candidate.id));
+    let export_receipt = workspace
+        .export_tree(
+            ctx,
+            &candidate_root,
+            &export_root,
+            &[".anydesign-candidate-manifest.json".to_string()],
+        )
+        .await
+        .map_err(|error| ToolError::Terminal(format!("artifact export failed: {error}")))?;
+    let staged_artifact = match publisher
+        .stage_directory(
+            &ctx.project_id,
+            &candidate.id,
+            candidate_manifest_hash,
+            &export_receipt.target_root,
+        )
+        .await
+    {
+        Ok(staged) => staged,
+        Err(error) => {
+            cleanup_runtime_export(&export_receipt.target_root);
+            ctx.store
+                .transition_artifact_publish(
+                    &publish.id,
+                    ArtifactPublishStatus::Failed,
+                    None,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                )
+                .await
+                .ok();
+            return Err(ToolError::Terminal(format!(
+                "artifact stage failed: {error}"
+            )));
+        }
+    };
+    cleanup_runtime_export(&export_receipt.target_root);
+    ctx.store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Staged,
+            Some(&staged_artifact.artifact_manifest_hash),
+            Some(&staged_artifact.staged_uri),
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| ToolError::Terminal(format!("artifact staged state failed: {error}")))?;
     let _ = ctx
         .store
         .append_event(AgentEvent::PreviewCandidate {
@@ -4351,7 +5519,7 @@ async fn report_preview_candidate(
             timestamp: Utc::now(),
         })
         .await;
-    let review_run = ctx
+    let review_run = match ctx
         .store
         .create_child_run(
             &ctx.run.id,
@@ -4362,9 +5530,26 @@ async fn report_preview_candidate(
             vec![],
         )
         .await
-        .map_err(|error| {
-            ToolError::Recoverable(format!("failed to create visual review child run: {error}"))
-        })?;
+    {
+        Ok(run) => run,
+        Err(error) => {
+            publisher.abort(&staged_artifact).await.ok();
+            ctx.store
+                .transition_artifact_publish(
+                    &publish.id,
+                    ArtifactPublishStatus::GarbageCollectable,
+                    None,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                )
+                .await
+                .ok();
+            return Err(ToolError::Recoverable(format!(
+                "failed to create visual review child run: {error}"
+            )));
+        }
+    };
     ctx.store
         .append_conversation_item(
             &ctx.project_id,
@@ -4381,32 +5566,204 @@ async fn report_preview_candidate(
     let gate_report =
         promotion_gate_report_from_workspace(workspace, ctx, Some(&screenshot_id)).await;
     ctx.store
-        .update_run_status(&review_run.id, AgentRunStatus::Completed)
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Validating,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .map_err(|error| {
-            ToolError::Recoverable(format!(
-                "failed to complete visual review child run: {error}"
-            ))
+            ToolError::Terminal(format!("artifact validating state failed: {error}"))
         })?;
-    let promoted = promote_preview(
+    if let Err(error) = ctx
+        .store
+        .update_run_status(&review_run.id, AgentRunStatus::Completed)
+        .await
+    {
+        publisher.abort(&staged_artifact).await.ok();
+        ctx.store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::GarbageCollectable,
+                None,
+                None,
+                None,
+                Some(&error.to_string()),
+            )
+            .await
+            .ok();
+        return Err(ToolError::Recoverable(format!(
+            "failed to complete visual review child run: {error}"
+        )));
+    }
+    if let Err(error) = validate_preview_promotion(
+        &ctx.store,
+        &ctx.project_id,
+        &ctx.run.id,
+        &candidate.id,
+        gate_report.clone(),
+    )
+    .await
+    {
+        publisher.abort(&staged_artifact).await.ok();
+        ctx.store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::GarbageCollectable,
+                None,
+                None,
+                None,
+                Some(&error.to_string()),
+            )
+            .await
+            .ok();
+        return Err(ToolError::Recoverable(format!(
+            "preview promotion rejected: {error}"
+        )));
+    }
+    ctx.store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Promoting,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            ToolError::Terminal(format!("artifact promoting state failed: {error}"))
+        })?;
+    let artifact_uri = match publisher.promote(&staged_artifact).await {
+        Ok(uri) => uri,
+        Err(error) => {
+            ctx.store
+                .transition_artifact_publish(
+                    &publish.id,
+                    ArtifactPublishStatus::ReconcileRequired,
+                    None,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                )
+                .await
+                .ok();
+            return Err(ToolError::Terminal(format!(
+                "artifact promote failed: {error}"
+            )));
+        }
+    };
+    ctx.store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Promoting,
+            None,
+            None,
+            Some(&artifact_uri),
+            None,
+        )
+        .await
+        .map_err(|error| ToolError::Terminal(format!("artifact URI state failed: {error}")))?;
+    let promoted = match promote_preview_cas(
         &ctx.store,
         &ctx.project_id,
         &ctx.run.id,
         &candidate.id,
         gate_report,
+        expected_current_version_id,
     )
     .await
-    .map_err(|error| ToolError::Recoverable(format!("preview promotion rejected: {error}")))?;
+    {
+        Ok(promoted) => promoted,
+        Err(error) => {
+            let committed = ctx
+                .store
+                .get_artifact_publish(&publish.id)
+                .await
+                .is_some_and(|record| record.status == ArtifactPublishStatus::Promoted);
+            if !committed {
+                ctx.store
+                    .transition_artifact_publish(
+                        &publish.id,
+                        ArtifactPublishStatus::ReconcileRequired,
+                        None,
+                        None,
+                        None,
+                        Some(&error.to_string()),
+                    )
+                    .await
+                    .ok();
+            }
+            return Err(ToolError::Recoverable(format!(
+                "preview promotion rejected: {error}"
+            )));
+        }
+    };
     Ok(json!({
         "versionId": promoted.id,
         "reviewRunId": review_run.id.clone(),
         "status": promoted.status,
         "url": promoted.preview_url,
+        "artifactUri": artifact_uri,
+        "artifactManifestHash": staged_artifact.artifact_manifest_hash,
+        "artifactPublishId": publish.id,
+        "artifactExportBytes": export_receipt.total_bytes,
+        "artifactExportFileCount": export_receipt.file_count,
+        "artifactExportManifestHash": export_receipt.manifest_hash,
+        "candidateManifestHash": candidate_manifest_hash,
     }))
+}
+
+fn cleanup_runtime_export(path: &Path) {
+    // remote-fs-boundary: allow-begin runtime-storage-export-cleanup
+    fs::remove_dir_all(path).ok();
+    // remote-fs-boundary: allow-end runtime-storage-export-cleanup
+}
+
+async fn collect_artifact_files(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    candidate_root: &Path,
+) -> Result<Vec<ArtifactFile>, ToolError> {
+    let mut files = Vec::new();
+    let mut stack = vec![candidate_root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = workspace
+            .list_dir(ctx, &directory)
+            .await
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        for entry in entries {
+            match entry.kind {
+                WorkspaceEntryKind::Dir => stack.push(entry.path),
+                WorkspaceEntryKind::File => {
+                    let relative = entry
+                        .path
+                        .strip_prefix(candidate_root)
+                        .map_err(|error| ToolError::Terminal(error.to_string()))?
+                        .to_path_buf();
+                    if relative == Path::new(".anydesign-candidate-manifest.json") {
+                        continue;
+                    }
+                    files.push(ArtifactFile {
+                        path: relative,
+                        bytes: workspace
+                            .read_bytes(ctx, &entry.path)
+                            .await
+                            .map_err(|error| ToolError::Recoverable(error.to_string()))?,
+                    });
+                }
+            }
+        }
+    }
+    Ok(files)
 }
 
 struct PreviewStartTool {
     workspace: Arc<dyn WorkspaceBackend>,
+    command: Arc<dyn SandboxCommandBackend>,
 }
 
 #[async_trait]
@@ -4459,6 +5816,81 @@ impl Tool for PreviewStartTool {
                     "suggestedAction": "Fix the build error, rerun project.build, then start preview."
                 }),
             ));
+        }
+        if ctx.remote_workspace {
+            let build_id = build
+                .get("buildId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "preview.start requires buildId evidence".to_string(),
+                        "preview.build_evidence_invalid",
+                        json!({ "latestBuild": build.clone() }),
+                    )
+                })?;
+            let manifest_hash = build
+                .get("candidateManifestHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "preview.start requires candidate manifest evidence".to_string(),
+                        "preview.candidate_manifest_missing",
+                        json!({ "latestBuild": build.clone() }),
+                    )
+                })?;
+            let lease = ctx
+                .store
+                .create_preview_lease(
+                    &ctx.run.id,
+                    build_id.to_string(),
+                    manifest_hash.to_string(),
+                    900,
+                )
+                .await
+                .map_err(|error| ToolError::Terminal(error.to_string()))?;
+            let process = match self
+                .command
+                .start_process(
+                    &ctx,
+                    &lease.id,
+                    &[
+                        "node".to_string(),
+                        "/opt/anydesign/bootstrap/static-preview-server.js".to_string(),
+                    ],
+                    &ctx.workspace_root,
+                )
+                .await
+            {
+                Ok(process) => process,
+                Err(error) => {
+                    ctx.store.stop_preview_lease(&lease.id).await.ok();
+                    return Err(typed_recoverable(
+                        format!("preview process failed to start: {error}"),
+                        "preview.process_failed",
+                        json!({ "leaseId": lease.id }),
+                    ));
+                }
+            };
+            let url = format!("{}/previews/{}/", ctx.runtime_public_base_url, lease.id);
+            let state = json!({
+                "status": "running",
+                "url": url,
+                "port": 4321,
+                "command": "runtime-static-candidate",
+                "mode": "static",
+                "cwd": build.get("cwd").cloned().unwrap_or(Value::Null),
+                "staticOutputPath": build.get("candidateOutputPath").cloned().unwrap_or(Value::Null),
+                "candidateManifestHash": manifest_hash,
+                "leaseId": lease.id,
+                "leaseExpiresAt": lease.expires_at,
+                "pid": process.pid,
+                "processStatus": process.status,
+                "build": build,
+                "accessible": true,
+                "managed": true,
+            });
+            write_workspace_json(&*self.workspace, &ctx, "state/preview.json", &state).await?;
+            return Ok(ToolResult::ok(state));
         }
         let cwd = default_project_dir(&ctx);
         let explicit_url = input.get("url").and_then(Value::as_str);
@@ -4526,11 +5958,29 @@ fn static_preview_output_candidates(ctx: &ToolContext) -> [&'static str; 2] {
     }
 }
 
+// remote-fs-boundary: allow-begin local-preview-process
 fn detect_static_preview_output_dir(ctx: &ToolContext, app_root: &Path) -> Option<PathBuf> {
     static_preview_output_candidates(ctx)
         .into_iter()
         .map(|name| app_root.join(name))
         .find(|path| path.is_dir())
+}
+
+async fn detect_static_preview_output_dir_backend(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    app_root: &Path,
+) -> Option<PathBuf> {
+    for name in static_preview_output_candidates(ctx) {
+        let path = app_root.join(name);
+        if matches!(
+            workspace.path_kind(ctx, &path).await,
+            Ok(WorkspacePathKind::Dir)
+        ) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn static_preview_output_dir_from_build(
@@ -4679,9 +6129,11 @@ fn stop_preview_pid(ctx: &ToolContext) {
     }
     let _ = fs::remove_file(preview_pid_path(ctx));
 }
+// remote-fs-boundary: allow-end local-preview-process
 
 struct PreviewStatusTool {
     workspace: Arc<dyn WorkspaceBackend>,
+    command: Arc<dyn SandboxCommandBackend>,
 }
 
 #[async_trait]
@@ -4712,22 +6164,37 @@ impl Tool for PreviewStatusTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult::ok(
-            read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
-                .await
-                .unwrap_or_else(|| {
-                    json!({
-                        "status": "stopped",
-                        "accessible": false,
-                        "url": Value::Null,
-                    })
-                }),
-        ))
+        let mut state = read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
+            .await
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "stopped",
+                    "accessible": false,
+                    "url": Value::Null,
+                })
+            });
+        if ctx.remote_workspace {
+            if let Some(lease_id) = state.get("leaseId").and_then(Value::as_str) {
+                let process = self
+                    .command
+                    .process_status(&ctx, lease_id)
+                    .await
+                    .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+                state["processStatus"] = json!(process.status);
+                state["pid"] = json!(process.pid);
+                if process.status != "running" {
+                    state["status"] = json!("stopped");
+                    state["accessible"] = json!(false);
+                }
+            }
+        }
+        Ok(ToolResult::ok(state))
     }
 }
 
 struct PreviewStopTool {
     workspace: Arc<dyn WorkspaceBackend>,
+    command: Arc<dyn SandboxCommandBackend>,
 }
 
 #[async_trait]
@@ -4750,10 +6217,23 @@ impl Tool for PreviewStopTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        stop_preview_pid(&ctx);
         let mut state = read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
             .await
             .unwrap_or_else(|| json!({ "url": Value::Null }));
+        if let Some(lease_id) = state.get("leaseId").and_then(Value::as_str) {
+            if ctx.remote_workspace {
+                self.command
+                    .stop_process(&ctx, lease_id)
+                    .await
+                    .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+            }
+            ctx.store
+                .stop_preview_lease(lease_id)
+                .await
+                .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        } else {
+            stop_preview_pid(&ctx);
+        }
         state["status"] = json!("stopped");
         state["accessible"] = json!(false);
         state["pid"] = Value::Null;
@@ -4897,7 +6377,37 @@ impl Tool for BrowserOpenTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        let url = required_str(&input, "url")?.to_string();
+        let requested_url = required_str(&input, "url")?.to_string();
+        let url = if ctx.remote_workspace {
+            let preview = read_workspace_json(&*self.workspace, &ctx, "state/preview.json")
+                .await
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "browser.open requires an active Runtime preview lease".to_string(),
+                        "browser.preview_missing",
+                        json!({ "suggestedAction": "Call preview.start before browser.open." }),
+                    )
+                })?;
+            let proxy_url = preview
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    typed_recoverable(
+                        "browser.open preview lease has no Runtime proxy URL".to_string(),
+                        "browser.preview_invalid",
+                        json!({ "preview": preview }),
+                    )
+                })?
+                .to_string();
+            if !proxy_url.starts_with(&ctx.runtime_public_base_url) {
+                return Err(ToolError::Terminal(
+                    "browser.open refused a preview URL outside the Runtime proxy".to_string(),
+                ));
+            }
+            proxy_url
+        } else {
+            requested_url
+        };
         let state = json!({
             "url": url,
             "consoleErrors": [],
@@ -4943,7 +6453,32 @@ impl Tool for BrowserScreenshotTool {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| ctx.store.next_id("screenshot"));
-        let is_blank = input.get("blank").and_then(Value::as_bool).unwrap_or(false);
+        let browser_state = read_workspace_json(&*self.workspace, &ctx, "state/browser.json")
+            .await
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "browser.screenshot requires browser.open first".to_string(),
+                    "browser.not_open",
+                    json!({ "suggestedAction": "Call browser.open before browser.screenshot." }),
+                )
+            })?;
+        let url = browser_state
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Terminal("browser state has no URL".to_string()))?;
+        let capture = capture_runtime_screenshot(&ctx, &screenshot_id, url).await?;
+        let fixture_blank = input.get("blank").and_then(Value::as_bool).unwrap_or(false);
+        if ctx.remote_workspace && capture.is_none() {
+            return Err(typed_recoverable(
+                "Runtime browser worker is not configured".to_string(),
+                "browser.worker_unavailable",
+                json!({ "requiredEnv": "RUNTIME_BROWSER_EXECUTABLE" }),
+            ));
+        }
+        let is_blank = capture
+            .as_ref()
+            .map(|capture| capture.nonblank_pixel_ratio < 0.0005)
+            .unwrap_or(fixture_blank);
         let path = ctx
             .workspace_root
             .join("outputs/screenshots")
@@ -4951,10 +6486,13 @@ impl Tool for BrowserScreenshotTool {
         let artifact = json!({
             "screenshotId": screenshot_id,
             "blank": is_blank,
-            "url": read_workspace_json(&*self.workspace, &ctx, "state/browser.json")
-                .await
-                .and_then(|state| state.get("url").cloned())
-                .unwrap_or(Value::Null),
+            "url": url,
+            "runtimeScreenshotUri": capture.as_ref().map(|capture| capture.uri.clone()),
+            "pngSha256": capture.as_ref().map(|capture| capture.png_sha256.clone()),
+            "documentSha256": capture.as_ref().map(|capture| capture.document_sha256.clone()),
+            "width": capture.as_ref().map(|capture| capture.width),
+            "height": capture.as_ref().map(|capture| capture.height),
+            "nonblankPixelRatio": capture.as_ref().map(|capture| capture.nonblank_pixel_ratio),
         });
         self.workspace
             .write_string(
@@ -4969,7 +6507,187 @@ impl Tool for BrowserScreenshotTool {
             "screenshotId": artifact["screenshotId"],
             "path": format!("/workspace/outputs/screenshots/{}.json", artifact["screenshotId"].as_str().unwrap_or("unknown")),
             "blank": is_blank,
+            "runtimeScreenshotUri": artifact["runtimeScreenshotUri"],
+            "pngSha256": artifact["pngSha256"],
+            "documentSha256": artifact["documentSha256"],
+            "width": artifact["width"],
+            "height": artifact["height"],
+            "nonblankPixelRatio": artifact["nonblankPixelRatio"],
         })))
+    }
+}
+
+struct RuntimeScreenshotCapture {
+    uri: String,
+    png_sha256: String,
+    document_sha256: String,
+    width: u32,
+    height: u32,
+    nonblank_pixel_ratio: f64,
+}
+
+async fn capture_runtime_screenshot(
+    ctx: &ToolContext,
+    screenshot_id: &str,
+    url: &str,
+) -> Result<Option<RuntimeScreenshotCapture>, ToolError> {
+    let Some(executable) = std::env::var("RUNTIME_BROWSER_EXECUTABLE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let screenshot_dir = ctx
+        .runtime_storage_dir
+        .join("screenshots")
+        .join(safe_segment(&ctx.run.project_id))
+        .join(safe_segment(&ctx.run.id));
+    // remote-fs-boundary: allow-begin runtime-browser-screenshot-artifact
+    fs::create_dir_all(&screenshot_dir)
+        .map_err(|error| ToolError::Terminal(format!("create screenshot directory: {error}")))?;
+    let screenshot_path = screenshot_dir.join(format!("{}.png", safe_segment(screenshot_id)));
+    // remote-fs-boundary: allow-end runtime-browser-screenshot-artifact
+    let document_bytes = wait_for_runtime_proxy_document(url, Duration::from_secs(15)).await?;
+    let document_sha256 = sha256_hex(&document_bytes);
+    let output = TokioCommand::new(executable)
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-sandbox")
+        .arg("--hide-scrollbars")
+        .arg("--window-size=1440,900")
+        .arg(format!("--screenshot={}", screenshot_path.display()))
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| {
+            typed_recoverable(
+                format!("Runtime browser worker failed to start: {error}"),
+                "browser.worker_failed",
+                json!({}),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(typed_recoverable(
+            format!(
+                "Runtime browser worker failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            "browser.capture_failed",
+            json!({ "url": url }),
+        ));
+    }
+    // remote-fs-boundary: allow-begin runtime-browser-screenshot-artifact
+    let png_bytes = fs::read(&screenshot_path)
+        .map_err(|error| ToolError::Terminal(format!("read screenshot PNG: {error}")))?;
+    // remote-fs-boundary: allow-end runtime-browser-screenshot-artifact
+    let decoder = png::Decoder::new(png_bytes.as_slice());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| ToolError::Terminal(format!("decode screenshot PNG: {error}")))?;
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut pixels)
+        .map_err(|error| ToolError::Terminal(format!("decode screenshot pixels: {error}")))?;
+    let bytes = &pixels[..frame.buffer_size()];
+    let channels = frame.color_type.samples();
+    let mut colors = std::collections::HashMap::<[u8; 4], usize>::new();
+    for pixel in bytes.chunks_exact(channels) {
+        let rgba = match frame.color_type {
+            png::ColorType::Rgba => [pixel[0], pixel[1], pixel[2], pixel[3]],
+            png::ColorType::Rgb => [pixel[0], pixel[1], pixel[2], 255],
+            png::ColorType::GrayscaleAlpha => [pixel[0], pixel[0], pixel[0], pixel[1]],
+            png::ColorType::Grayscale => [pixel[0], pixel[0], pixel[0], 255],
+            png::ColorType::Indexed => {
+                return Err(ToolError::Terminal(
+                    "indexed screenshot PNG is unsupported".to_string(),
+                ));
+            }
+        };
+        *colors.entry(rgba).or_default() += 1;
+    }
+    let total = colors.values().sum::<usize>();
+    let dominant = colors.values().copied().max().unwrap_or(total);
+    let nonblank_pixel_ratio = if total == 0 {
+        0.0
+    } else {
+        1.0 - dominant as f64 / total as f64
+    };
+    let capture = RuntimeScreenshotCapture {
+        uri: format!(
+            "runtime://screenshots/{}/{}/{}.png",
+            safe_segment(&ctx.run.project_id),
+            safe_segment(&ctx.run.id),
+            safe_segment(screenshot_id)
+        ),
+        png_sha256: sha256_hex(&png_bytes),
+        document_sha256,
+        width: frame.width,
+        height: frame.height,
+        nonblank_pixel_ratio,
+    };
+    let metadata_path = screenshot_path.with_extension("json");
+    // remote-fs-boundary: allow-begin runtime-browser-screenshot-artifact
+    fs::write(
+        metadata_path,
+        serde_json::to_vec_pretty(&json!({
+            "uri": capture.uri,
+            "pngSha256": capture.png_sha256,
+            "documentSha256": capture.document_sha256,
+            "width": capture.width,
+            "height": capture.height,
+            "nonblankPixelRatio": capture.nonblank_pixel_ratio,
+            "url": url,
+        }))
+        .map_err(|error| ToolError::Terminal(error.to_string()))?,
+    )
+    .map_err(|error| ToolError::Terminal(format!("write screenshot metadata: {error}")))?;
+    // remote-fs-boundary: allow-end runtime-browser-screenshot-artifact
+    Ok(Some(capture))
+}
+
+async fn wait_for_runtime_proxy_document(
+    url: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, ToolError> {
+    let deadline = time::Instant::now() + timeout;
+    let client = reqwest::Client::new();
+    loop {
+        let last_error = match client.get(url).timeout(Duration::from_secs(3)).send().await {
+            Ok(response) if response.status().is_success() => {
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                match response.bytes().await {
+                    Ok(bytes)
+                        if !bytes.is_empty()
+                            && bytes.len() <= 5 * 1024 * 1024
+                            && content_type.contains("text/html") =>
+                    {
+                        return Ok(bytes.to_vec());
+                    }
+                    Ok(bytes) => format!(
+                        "preview proxy returned invalid document: content-type={content_type} bytes={}",
+                        bytes.len()
+                    ),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Ok(response) => format!("preview proxy returned {}", response.status()),
+            Err(error) => error.to_string(),
+        };
+        if time::Instant::now() >= deadline {
+            return Err(typed_recoverable(
+                format!("Runtime preview proxy is not ready for screenshot: {last_error}"),
+                "browser.preview_unavailable",
+                json!({ "url": url }),
+            ));
+        }
+        time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -5350,7 +7068,7 @@ fn validate_workspace_path_input(
         .and_then(Value::as_str)
         .ok_or_else(|| ValidationError::new(format!("{tool_name} requires path")))?;
     let resolved = resolve_path(path, &ctx.workspace_root);
-    match check_workspace_path(&resolved, &ctx.workspace_root) {
+    match check_context_workspace_path(&resolved, ctx) {
         Ok(_) => Ok(()),
         Err(PermissionError::SecretPath(_)) => Ok(()),
         Err(error) => Err(path_validation_error(tool_name, path, &resolved, error)),
@@ -5516,27 +7234,21 @@ fn nearest_patch_snippets(content: &str, old_str: &str) -> Vec<Value> {
 
 fn checked_existing_path(input: &Value, ctx: &ToolContext) -> Result<PathBuf, ToolError> {
     let path = required_str(input, "path")?;
-    check_workspace_path(
-        &resolve_path(path, &ctx.workspace_root),
-        &ctx.workspace_root,
-    )
-    .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
+    check_context_workspace_path(&resolve_path(path, &ctx.workspace_root), ctx)
+        .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
 }
 
 fn checked_write_path(input: &Value, ctx: &ToolContext) -> Result<PathBuf, ToolError> {
     let path = required_str(input, "path")?;
     let path = resolve_path(path, &ctx.workspace_root);
-    if path.exists() {
-        check_existing_path(&path, &ctx.workspace_root)
-    } else {
-        check_create_path(&path, &ctx.workspace_root)
-    }
-    .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
-    .and_then(|path| {
-        ensure_not_nested_package_root(&path, ctx)?;
-        ensure_fumadocs_app_router_write_path(&path, ctx)?;
-        Ok(path)
-    })
+    check_context_workspace_path(&path, ctx)
+        .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
+        .and_then(|path| {
+            ensure_runtime_owned_path_not_mutated(&path, ctx)?;
+            ensure_not_nested_package_root(&path, ctx)?;
+            ensure_fumadocs_app_router_write_path(&path, ctx)?;
+            Ok(path)
+        })
 }
 
 fn checked_delete_path(input: &Value, ctx: &ToolContext) -> Result<PathBuf, String> {
@@ -5544,13 +7256,16 @@ fn checked_delete_path(input: &Value, ctx: &ToolContext) -> Result<PathBuf, Stri
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| "fs.delete requires path".to_string())?;
-    let path = check_existing_path(
-        &resolve_path(path, &ctx.workspace_root),
-        &ctx.workspace_root,
-    )
-    .map_err(|error| format!("{error:?}"))?;
-    let app_root = default_project_dir(ctx);
-    let app_root = fs::canonicalize(&app_root).map_err(|error| error.to_string())?;
+    let path = check_context_workspace_path(&resolve_path(path, &ctx.workspace_root), ctx)
+        .map_err(|error| format!("{error:?}"))?;
+    let app_root = if ctx.remote_workspace {
+        check_lexical_workspace_path(&default_project_dir(ctx), &ctx.workspace_root)
+            .map_err(|error| format!("{error:?}"))?
+    } else {
+        // remote-fs-boundary: allow-begin local-delete-root-resolution
+        fs::canonicalize(default_project_dir(ctx)).map_err(|error| error.to_string())?
+        // remote-fs-boundary: allow-end local-delete-root-resolution
+    };
     if path == ctx.workspace_root
         || path == app_root
         || path == ctx.workspace_root.join("inputs")
@@ -5571,12 +7286,11 @@ fn check_existing_path_permission(
     ctx: &ToolContext,
     tool: &str,
 ) -> PermissionResult {
-    match input.get("path").and_then(Value::as_str).map(|path| {
-        check_workspace_path(
-            &resolve_path(path, &ctx.workspace_root),
-            &ctx.workspace_root,
-        )
-    }) {
+    match input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| check_context_workspace_path(&resolve_path(path, &ctx.workspace_root), ctx))
+    {
         Some(Ok(_)) => allow_with_input(input, "workspace path allowed"),
         Some(Err(error)) => deny(tool, format!("{error:?}")),
         None => deny(tool, "missing path"),
@@ -5588,14 +7302,15 @@ fn check_existing_write_path_permission(
     ctx: &ToolContext,
     tool: &str,
 ) -> PermissionResult {
-    match input.get("path").and_then(Value::as_str).map(|path| {
-        check_workspace_path(
-            &resolve_path(path, &ctx.workspace_root),
-            &ctx.workspace_root,
-        )
-    }) {
+    match input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| check_context_workspace_path(&resolve_path(path, &ctx.workspace_root), ctx))
+    {
         Some(Ok(path)) => {
-            if let Err(error) = ensure_not_nested_package_root(&path, ctx) {
+            if let Err(error) = ensure_runtime_owned_path_not_mutated(&path, ctx) {
+                deny(tool, error.message())
+            } else if let Err(error) = ensure_not_nested_package_root(&path, ctx) {
                 deny(tool, error.message())
             } else if let Err(error) = ensure_fumadocs_app_router_write_path(&path, ctx) {
                 deny(tool, error.message())
@@ -5613,14 +7328,12 @@ fn check_write_path_permission(input: &Value, ctx: &ToolContext, tool: &str) -> 
         return deny(tool, "missing path");
     };
     let path = resolve_path(path, &ctx.workspace_root);
-    let result = if path.exists() {
-        check_existing_path(&path, &ctx.workspace_root)
-    } else {
-        check_create_path(&path, &ctx.workspace_root)
-    };
+    let result = check_context_workspace_path(&path, ctx);
     match result {
         Ok(path) => {
-            if let Err(error) = ensure_not_nested_package_root(&path, ctx) {
+            if let Err(error) = ensure_runtime_owned_path_not_mutated(&path, ctx) {
+                deny(tool, error.message())
+            } else if let Err(error) = ensure_not_nested_package_root(&path, ctx) {
                 deny(tool, error.message())
             } else if let Err(error) = ensure_fumadocs_app_router_write_path(&path, ctx) {
                 deny(tool, error.message())
@@ -5630,6 +7343,46 @@ fn check_write_path_permission(input: &Value, ctx: &ToolContext, tool: &str) -> 
         }
         Err(error) => deny(tool, format!("{error:?}")),
     }
+}
+
+fn check_context_workspace_path(
+    path: &Path,
+    ctx: &ToolContext,
+) -> Result<PathBuf, PermissionError> {
+    if ctx.remote_workspace {
+        check_lexical_workspace_path(path, &ctx.workspace_root)
+    } else {
+        check_workspace_path(path, &ctx.workspace_root)
+    }
+}
+
+fn ensure_runtime_owned_path_not_mutated(path: &Path, ctx: &ToolContext) -> Result<(), ToolError> {
+    if ctx.allow_runtime_owned_writes {
+        return Ok(());
+    }
+    let relative = path.strip_prefix(&ctx.workspace_root).map_err(|_| {
+        ToolError::PermissionDenied("path must stay inside the workspace".to_string())
+    })?;
+    let runtime_owned = relative.starts_with("state")
+        || relative.starts_with("outputs/build")
+        || relative.starts_with("outputs/candidates")
+        || relative.starts_with("outputs/artifacts")
+        || relative.starts_with("outputs/screenshots")
+        || relative.starts_with("outputs/tool-results");
+    if runtime_owned {
+        return Err(typed_recoverable(
+            format!(
+                "runtime-owned path cannot be mutated with generic fs tools: {}",
+                display_workspace_path(path, ctx)
+            ),
+            "path.runtime_owned",
+            json!({
+                "path": display_workspace_path(path, ctx),
+                "suggestedAction": "Use the dedicated project, style, preview, build, or artifact tool that owns this state."
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn allow_with_input(input: &Value, reason: impl Into<String>) -> PermissionResult {
@@ -5700,42 +7453,39 @@ fn default_project_dir(ctx: &ToolContext) -> PathBuf {
 }
 
 fn project_app_root_relative(ctx: &ToolContext) -> PathBuf {
-    fs::read_to_string(ctx.workspace_root.join("state/project.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| {
-            value
-                .get("appRoot")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+    ctx.run
+        .project_state_snapshot
+        .as_ref()
+        .map(|state| state.app_root.clone())
         .and_then(|path| normalize_workspace_relative_path(&path).ok())
         .unwrap_or_else(|| PathBuf::from("project"))
 }
 
-fn package_manager_from_project_state_or_lockfiles(ctx: &ToolContext, app_root: &Path) -> String {
-    fs::read_to_string(ctx.workspace_root.join("state/project.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| {
-            value
-                .get("packageManager")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            if app_root.join("pnpm-lock.yaml").exists() {
-                Some("pnpm".to_string())
-            } else if app_root.join("package-lock.json").exists() {
-                Some("npm".to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "npm".to_string())
+async fn package_manager_from_project_state_or_lockfiles(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    app_root: &Path,
+) -> String {
+    if let Some(package_manager) = ctx
+        .run
+        .project_state_snapshot
+        .as_ref()
+        .map(|state| state.package_manager.clone())
+    {
+        return package_manager;
+    }
+    if workspace
+        .path_kind(ctx, &app_root.join("pnpm-lock.yaml"))
+        .await
+        .is_ok()
+    {
+        return "pnpm".to_string();
+    }
+    "npm".to_string()
 }
 
-fn project_key_source_files(
+async fn project_key_source_files(
+    workspace: &dyn WorkspaceBackend,
     ctx: &ToolContext,
     app_root_relative: &Path,
     project_state: Option<&Value>,
@@ -5765,17 +7515,16 @@ fn project_key_source_files(
             "src/components/ui/Button.astro",
         ]
     };
-    candidates
-        .iter()
-        .map(|relative| {
-            let path = app_root_relative.join(relative);
-            let absolute = ctx.workspace_root.join(&path);
-            json!({
-                "path": format!("/workspace/{}", path.to_string_lossy().replace('\\', "/")),
-                "exists": absolute.exists(),
-            })
-        })
-        .collect()
+    let mut files = Vec::with_capacity(candidates.len());
+    for relative in candidates {
+        let path = app_root_relative.join(relative);
+        let absolute = ctx.workspace_root.join(&path);
+        files.push(json!({
+            "path": format!("/workspace/{}", path.to_string_lossy().replace('\\', "/")),
+            "exists": workspace.path_kind(ctx, &absolute).await.is_ok(),
+        }));
+    }
+    files
 }
 
 fn normalize_workspace_relative_path(path: &str) -> Result<PathBuf, ToolError> {
@@ -5872,21 +7621,10 @@ fn is_forbidden_fumadocs_pages_router_path(path: &Path, ctx: &ToolContext) -> bo
 }
 
 fn is_fumadocs_docs_project(ctx: &ToolContext) -> bool {
-    let state = fs::read_to_string(ctx.workspace_root.join("state/project.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if state
+    ctx.run
+        .project_state_snapshot
         .as_ref()
-        .and_then(|value| value.get("templateKey").or_else(|| value.get("template")))
-        .and_then(Value::as_str)
-        == Some("fumadocs-docs")
-    {
-        return true;
-    }
-    let app_root = default_project_dir(ctx);
-    fs::read_to_string(app_root.join("package.json")).is_ok_and(|package_json| {
-        package_json.contains("\"fumadocs-ui\"") || package_json.contains("\"fumadocs-mdx\"")
-    })
+        .is_some_and(|state| state.template_key == "fumadocs-docs")
 }
 
 fn display_workspace_path(path: &Path, ctx: &ToolContext) -> String {
@@ -5949,12 +7687,15 @@ async fn record_chunk_write_health(
     write_workspace_json(workspace, ctx, "state/run-health.json", &health).await
 }
 
-fn record_read_path(ctx: &ToolContext, path: &Path, content: &str) -> Result<(), ToolError> {
+async fn record_read_path(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+    content: &str,
+) -> Result<(), ToolError> {
     let display_path = display_workspace_path(path, ctx);
-    let tracking_path = ctx.workspace_root.join("state/read-tracking.json");
-    let mut tracking = fs::read_to_string(&tracking_path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    let mut tracking = read_workspace_json(workspace, ctx, "state/read-tracking.json")
+        .await
         .unwrap_or_else(|| json!({ "paths": [] }));
     if !tracking.is_object() {
         tracking = json!({ "paths": [] });
@@ -5988,22 +7729,17 @@ fn record_read_path(ctx: &ToolContext, path: &Path, content: &str) -> Result<(),
             tracking["paths"] = json!([entry]);
         }
     }
-    if let Some(parent) = tracking_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| ToolError::Recoverable(error.to_string()))?;
-    }
-    fs::write(
-        tracking_path,
-        serde_json::to_string_pretty(&tracking)
-            .map_err(|error| ToolError::Recoverable(error.to_string()))?,
-    )
-    .map_err(|error| ToolError::Recoverable(error.to_string()))
+    write_workspace_json(workspace, ctx, "state/read-tracking.json", &tracking).await
 }
 
-fn read_tracking_entry(ctx: &ToolContext, path: &Path) -> Option<Value> {
+async fn read_tracking_entry(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+) -> Option<Value> {
     let display_path = display_workspace_path(path, ctx);
-    fs::read_to_string(ctx.workspace_root.join("state/read-tracking.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    read_workspace_json(workspace, ctx, "state/read-tracking.json")
+        .await
         .and_then(|tracking| tracking.get("paths").cloned())
         .and_then(|paths| paths.as_array().cloned())
         .and_then(|entries| {
@@ -6014,6 +7750,7 @@ fn read_tracking_entry(ctx: &ToolContext, path: &Path) -> Option<Value> {
         })
 }
 
+// remote-fs-boundary: allow-begin local-staged-write-cleanup
 pub fn cleanup_staged_writes_for_run(workspace_root: &Path, run_id: &str) {
     let root = workspace_root.join("outputs/staged-writes");
     let Ok(entries) = fs::read_dir(root) else {
@@ -6039,6 +7776,46 @@ pub fn cleanup_staged_writes_for_run(workspace_root: &Path, run_id: &str) {
             let _ = fs::remove_dir_all(path);
         }
     }
+}
+// remote-fs-boundary: allow-end local-staged-write-cleanup
+
+pub async fn cleanup_staged_writes_for_run_backend(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    run_id: &str,
+) -> io::Result<()> {
+    let root = ctx.workspace_root.join("outputs/staged-writes");
+    let entries = match workspace.list_dir(ctx, &root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if entry.kind != WorkspaceEntryKind::Dir {
+            continue;
+        }
+        let manifest = match workspace
+            .read_to_string(ctx, &entry.path.join("manifest.json"))
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let belongs_to_run = serde_json::from_str::<Value>(&manifest)
+            .ok()
+            .and_then(|manifest| {
+                manifest
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(|manifest_run_id| manifest_run_id == run_id)
+            })
+            .unwrap_or(false);
+        if belongs_to_run {
+            workspace.remove_dir_all(ctx, &entry.path).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn read_workspace_json(
@@ -6226,8 +8003,8 @@ fn package_install_permission(
     }
     for package in &packages {
         if let Some(local_path) = package.strip_prefix("file:") {
-            let resolved = resolve_path(local_path, &default_project_dir(ctx));
-            if let Err(error) = check_existing_path(&resolved, &ctx.workspace_root) {
+            let resolved = normalize_path(&resolve_path(local_path, &default_project_dir(ctx)));
+            if let Err(error) = check_context_workspace_path(&resolved, ctx) {
                 return deny(tool_name, format!("{error:?}"));
             }
         }
@@ -6255,14 +8032,15 @@ async fn run_package_install(
         .get("cwd")
         .and_then(Value::as_str)
         .map(|cwd| {
-            check_existing_path(&resolve_path(cwd, &ctx.workspace_root), &ctx.workspace_root)
+            check_context_workspace_path(&resolve_path(cwd, &ctx.workspace_root), &ctx)
                 .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
         })
         .transpose()?
         .unwrap_or_else(|| default_project_dir(&ctx));
     ensure_project_package_json(workspace, &ctx, &cwd).await?;
 
-    let package_manager = package_manager_from_input_or_project(&input, &ctx, &cwd)?;
+    let package_manager =
+        package_manager_from_input_or_project(workspace, &input, &ctx, &cwd).await?;
     let argv = package_install_argv(&package_manager, &mode, &packages, &registry);
     let timeout_ms = input
         .get("timeoutMs")
@@ -6869,15 +8647,12 @@ async fn apply_design_profile_initial_tokens(
         .get("tokenFile")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Recoverable("style contract missing tokenFile".to_string()))?;
-    let token_path = check_existing_path(
-        &resolve_path(token_file, &ctx.workspace_root),
-        &ctx.workspace_root,
-    )
-    .map_err(|error| {
-        ToolError::Recoverable(format!(
-            "design profile token initialization cannot read tokenFile: {error:?}"
-        ))
-    })?;
+    let token_path = resolve_path(token_file, &ctx.workspace_root);
+    if !token_path.starts_with(&ctx.workspace_root) {
+        return Err(ToolError::Recoverable(format!(
+            "design profile token initialization rejected tokenFile outside workspace: {token_file}"
+        )));
+    }
     let contract_tokens = contract
         .get("tokens")
         .and_then(Value::as_object)
@@ -6917,7 +8692,7 @@ async fn apply_design_profile_initial_tokens(
             .write_string(ctx, &token_path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(ctx, &token_path, &content)?;
+        record_read_path(workspace, ctx, &token_path, &content).await?;
     }
     Ok(changes)
 }
@@ -7027,7 +8802,102 @@ async fn verify_screenshot_artifact(
             }),
         ));
     }
+    if ctx.remote_workspace {
+        let png_hash = artifact.get("pngSha256").and_then(Value::as_str);
+        let document_hash = artifact.get("documentSha256").and_then(Value::as_str);
+        let screenshot_uri = artifact.get("runtimeScreenshotUri").and_then(Value::as_str);
+        let nonblank_ratio = artifact
+            .get("nonblankPixelRatio")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        if !png_hash.is_some_and(|hash| hash.len() == 64)
+            || !document_hash.is_some_and(|hash| hash.len() == 64)
+            || !screenshot_uri.is_some_and(|uri| uri.starts_with("runtime://screenshots/"))
+            || nonblank_ratio < 0.0005
+        {
+            return Err(typed_recoverable(
+                "preview.report_candidate requires Runtime-owned bitmap evidence".to_string(),
+                "preview.screenshot_evidence_invalid",
+                json!({
+                    "screenshotId": screenshot_id,
+                    "nonblankPixelRatio": nonblank_ratio,
+                    "suggestedAction": "Capture the Runtime proxy URL with browser.screenshot."
+                }),
+            ));
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod browser_worker_tests {
+    use super::*;
+    use crate::RuntimeStore;
+    use std::sync::Mutex as StdMutex;
+
+    static BROWSER_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[tokio::test]
+    async fn runtime_browser_worker_writes_real_nonblank_png_evidence() {
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        if !executable.is_file() {
+            return;
+        }
+        let _guard = BROWSER_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("RUNTIME_BROWSER_EXECUTABLE", executable);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let html = "<!doctype html><style>html,body{margin:0;height:100%}body{background:linear-gradient(90deg,#f00 50%,#00f 50%)}</style>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        html.len(),
+                        html
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "browser-project".to_string(),
+                AgentPhase::Review,
+                "review".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let storage = std::env::temp_dir().join(format!(
+            "runtime-browser-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut ctx = ToolContext::new(store, run, storage.join("workspace"));
+        ctx.runtime_storage_dir = storage;
+        let capture =
+            capture_runtime_screenshot(&ctx, "real-browser", &format!("http://{address}/"))
+                .await
+                .unwrap()
+                .unwrap();
+        unsafe {
+            std::env::remove_var("RUNTIME_BROWSER_EXECUTABLE");
+        }
+        server.abort();
+        assert_eq!((capture.width, capture.height), (1440, 900));
+        assert_eq!(capture.png_sha256.len(), 64);
+        assert!(capture.nonblank_pixel_ratio > 0.25);
+        assert!(capture.uri.starts_with("runtime://screenshots/"));
+    }
 }
 
 async fn write_fumadocs_template_files(
@@ -7891,7 +9761,8 @@ fn validate_package_manager(package_manager: &str) -> Result<(), ValidationError
     }
 }
 
-fn package_manager_from_input_or_project(
+async fn package_manager_from_input_or_project(
+    workspace: &dyn WorkspaceBackend,
     input: &Value,
     ctx: &ToolContext,
     cwd: &Path,
@@ -7901,25 +9772,31 @@ fn package_manager_from_input_or_project(
             .map_err(|error| ToolError::Recoverable(error.message))?;
         return Ok(package_manager.to_string());
     }
-    if let Some(package_manager) = project_state_string(ctx, "packageManager") {
+    if let Some(package_manager) = ctx
+        .run
+        .project_state_snapshot
+        .as_ref()
+        .map(|state| state.package_manager.clone())
+    {
         validate_package_manager(&package_manager)
             .map_err(|error| ToolError::Recoverable(error.message))?;
         return Ok(package_manager);
     }
-    if cwd.join("pnpm-lock.yaml").exists() {
+    if workspace
+        .path_kind(ctx, &cwd.join("pnpm-lock.yaml"))
+        .await
+        .is_ok()
+    {
         return Ok("pnpm".to_string());
     }
-    if cwd.join("package-lock.json").exists() {
+    if workspace
+        .path_kind(ctx, &cwd.join("package-lock.json"))
+        .await
+        .is_ok()
+    {
         return Ok("npm".to_string());
     }
     Ok("npm".to_string())
-}
-
-fn project_state_string(ctx: &ToolContext, key: &str) -> Option<String> {
-    fs::read_to_string(ctx.workspace_root.join("state/project.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.get(key).and_then(Value::as_str).map(str::to_string))
 }
 
 fn package_install_argv(

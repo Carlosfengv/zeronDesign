@@ -22,7 +22,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 const EMPTY_TURN_LIMIT: u32 = 3;
 const MAX_TURNS: u32 = 80;
@@ -758,8 +758,7 @@ impl AgentLoop {
         profile: &DesignProfile,
         capsule: &str,
     ) -> Result<()> {
-        let context_path = self.tool_executor.workspace_root().join("state/context.md");
-        let previous_context = fs::read_to_string(&context_path).ok();
+        let previous_context = self.read_workspace_file(run, "state/context.md").await?;
         let mut profile_context = render_design_profile_context(run, profile, capsule);
         if let Some(override_context) = self.design_profile_override_context(run).await {
             profile_context.push_str("\n");
@@ -831,6 +830,28 @@ impl AgentLoop {
                 .to_string()));
         }
         Ok(())
+    }
+
+    async fn read_workspace_file(&self, run: &AgentRun, path: &str) -> Result<Option<String>> {
+        let execution = self
+            .tool_executor
+            .execute(
+                self.store.clone(),
+                &run.id,
+                &format!("bootstrap:read:{path}"),
+                "fs.read",
+                json!({ "path": path }),
+            )
+            .await;
+        if execution.result.is_error {
+            return Ok(None);
+        }
+        Ok(execution
+            .result
+            .content
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 
     async fn execute_tools(&self, run_id: &str, calls: Vec<ToolCall>) -> Vec<ToolResultMessage> {
@@ -964,19 +985,23 @@ impl AgentLoop {
                 ),
             )
             .await;
-            self.record_tool_input_failure_health(json!({
-                "runId": run_id,
-                "tool": failure.tool_name,
-                "toolUseId": failure.tool_call_id,
-                "errorKind": "tool.input_json_parse_failed",
-                "rawLen": failure.raw_len,
-                "rawSha256": failure.raw_sha256,
-                "endsWithJsonClose": failure.ends_with_json_close,
-                "bracketBalance": failure.bracket_balance,
-                "quoteClosed": failure.quote_closed,
-                "likelyTruncated": failure.likely_truncated,
-                "createdAt": Utc::now(),
-            }));
+            self.record_tool_input_failure_health(
+                run_id,
+                json!({
+                    "runId": run_id,
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "errorKind": "tool.input_json_parse_failed",
+                    "rawLen": failure.raw_len,
+                    "rawSha256": failure.raw_sha256,
+                    "endsWithJsonClose": failure.ends_with_json_close,
+                    "bracketBalance": failure.bracket_balance,
+                    "quoteClosed": failure.quote_closed,
+                    "likelyTruncated": failure.likely_truncated,
+                    "createdAt": Utc::now(),
+                }),
+            )
+            .await;
             self.emit_metric(
                 run_id,
                 "tool_input_json_parse_failed",
@@ -1061,16 +1086,20 @@ impl AgentLoop {
                 ),
             )
             .await;
-            self.record_tool_input_failure_health(json!({
-                "runId": run_id,
-                "tool": failure.tool_name,
-                "toolUseId": failure.tool_call_id,
-                "errorKind": "tool.input_too_large",
-                "inputChars": failure.input_chars,
-                "maxInputChars": failure.max_input_chars,
-                "rawSha256": failure.raw_sha256,
-                "createdAt": Utc::now(),
-            }));
+            self.record_tool_input_failure_health(
+                run_id,
+                json!({
+                    "runId": run_id,
+                    "tool": failure.tool_name,
+                    "toolUseId": failure.tool_call_id,
+                    "errorKind": "tool.input_too_large",
+                    "inputChars": failure.input_chars,
+                    "maxInputChars": failure.max_input_chars,
+                    "rawSha256": failure.raw_sha256,
+                    "createdAt": Utc::now(),
+                }),
+            )
+            .await;
             self.emit_metric(
                 run_id,
                 "tool_input_too_large",
@@ -1133,14 +1162,15 @@ impl AgentLoop {
             .await;
     }
 
-    fn record_tool_input_failure_health(&self, entry: Value) {
-        let state_dir = self.tool_executor.workspace_root().join("state");
-        if !state_dir.is_dir() {
+    async fn record_tool_input_failure_health(&self, run_id: &str, entry: Value) {
+        let Some(run) = self.store.get_run(run_id).await else {
             return;
-        }
-        let path = state_dir.join("run-health.json");
-        let mut health = fs::read_to_string(&path)
+        };
+        let mut health = self
+            .read_workspace_file(&run, "state/run-health.json")
+            .await
             .ok()
+            .flatten()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}));
@@ -1163,10 +1193,19 @@ impl AgentLoop {
         let Ok(text) = serde_json::to_string_pretty(&health) else {
             return;
         };
-        let _ = fs::write(path, text);
+        let _ = self
+            .tool_executor
+            .execute(
+                self.store.clone(),
+                &run.id,
+                "bootstrap:state/run-health.json",
+                "fs.write",
+                json!({ "path": "state/run-health.json", "text": text }),
+            )
+            .await;
     }
 
-    fn record_tool_input_failure_health_from_metadata(
+    async fn record_tool_input_failure_health_from_metadata(
         &self,
         run_id: &str,
         tool_name: &str,
@@ -1211,7 +1250,7 @@ impl AgentLoop {
                 }
             }
         }
-        self.record_tool_input_failure_health(entry);
+        self.record_tool_input_failure_health(run_id, entry).await;
     }
 
     async fn record_tool_result(
@@ -1246,7 +1285,8 @@ impl AgentLoop {
                 &result.tool_name,
                 &result.tool_use_id,
                 metadata.as_ref(),
-            );
+            )
+            .await;
             if metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("errorKind"))
@@ -1461,10 +1501,12 @@ impl AgentLoop {
                 | AgentRunStatus::Failed
                 | AgentRunStatus::Cancelled
         ) {
-            tools::sandbox::cleanup_staged_writes_for_run(
-                &self.tool_executor.workspace_root(),
-                run_id,
-            );
+            if !self.tool_executor.is_remote_workspace() {
+                tools::sandbox::cleanup_staged_writes_for_run(
+                    self.tool_executor.workspace_root(),
+                    run_id,
+                );
+            }
         }
         self.store.update_run_status(run_id, status).await?;
         let _ = self
@@ -1629,20 +1671,23 @@ impl AgentLoop {
             .take(compacted_count)
             .cloned()
             .collect::<Vec<_>>();
-        let context_path = self.tool_executor.workspace_root().join("state/context.md");
-        if let Some(parent) = context_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let previous_context = fs::read_to_string(&context_path).ok();
-        fs::write(
-            &context_path,
+        let run = self
+            .store
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let previous_context = self.read_workspace_file(&run, "state/context.md").await?;
+        self.write_workspace_file(
+            &run,
+            "state/context.md",
             render_compacted_context(
                 run_id,
                 compacted_count,
                 previous_context.as_deref(),
                 &compacted,
             ),
-        )?;
+        )
+        .await?;
 
         let summary = json!({
             "role": "system",
@@ -1765,6 +1810,7 @@ pub fn status_string(status: AgentRunStatus) -> &'static str {
     match status {
         AgentRunStatus::Queued => "queued",
         AgentRunStatus::Running => "running",
+        AgentRunStatus::Validating => "validating",
         AgentRunStatus::NeedsUserInput => "needs_user_input",
         AgentRunStatus::Completed => "completed",
         AgentRunStatus::Partial => "partial",

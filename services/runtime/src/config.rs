@@ -72,6 +72,9 @@ pub struct RuntimeConfig {
     pub object_storage_url: String,
     pub runtime_storage_dir: PathBuf,
     pub workspace_root: PathBuf,
+    pub runtime_public_base_url: String,
+    pub workspace_channel_signing_key_file: Option<PathBuf>,
+    pub workspace_channel_token_ttl_seconds: u64,
     pub k8s_namespace: String,
     pub sandbox_backend_mode: SandboxBackendMode,
     pub policy_profile: RuntimePolicyProfile,
@@ -81,6 +84,9 @@ pub struct RuntimeConfig {
     pub internal_admin_token: Option<String>,
     pub model_streaming: bool,
     pub model_strict_tools: bool,
+    pub repository_commit: String,
+    pub repository_dirty: bool,
+    pub runtime_image_ref: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -119,6 +125,18 @@ impl RuntimeConfig {
             workspace_root: env::var("RUNTIME_WORKSPACE_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/workspace")),
+            runtime_public_base_url: env::var("RUNTIME_PUBLIC_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            workspace_channel_signing_key_file: env::var("WORKSPACE_CHANNEL_SIGNING_KEY_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from),
+            workspace_channel_token_ttl_seconds: env::var("WORKSPACE_CHANNEL_TOKEN_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60),
             k8s_namespace: env::var("K8S_NAMESPACE")
                 .unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
             sandbox_backend_mode: env::var("SANDBOX_BACKEND_MODE")
@@ -144,6 +162,10 @@ impl RuntimeConfig {
             model_strict_tools: env::var("MODEL_STRICT_TOOLS")
                 .ok()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            repository_commit: env::var("RUNTIME_REPOSITORY_COMMIT")
+                .unwrap_or_else(|_| "unknown".to_string()),
+            repository_dirty: truthy_env("RUNTIME_REPOSITORY_DIRTY"),
+            runtime_image_ref: secret_env("RUNTIME_IMAGE_REF"),
         }
     }
 
@@ -151,6 +173,25 @@ impl RuntimeConfig {
         format!("{}:{}", self.host, self.port)
             .parse()
             .expect("runtime host and port should form a socket address")
+    }
+
+    pub fn validate_startup(&self) -> Result<(), String> {
+        if self.sandbox_backend_mode == SandboxBackendMode::Kubernetes {
+            let key_file = self
+                .workspace_channel_signing_key_file
+                .as_ref()
+                .ok_or_else(|| {
+                    "WORKSPACE_CHANNEL_SIGNING_KEY_FILE is required for Kubernetes sandbox mode"
+                        .to_string()
+                })?;
+            if !key_file.is_file() {
+                return Err(format!(
+                    "workspace channel signing key does not exist: {}",
+                    key_file.display()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

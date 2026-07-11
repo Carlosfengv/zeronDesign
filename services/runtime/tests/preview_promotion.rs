@@ -7,7 +7,10 @@ use anydesign_runtime::{
         control_plane::control_plane_executor,
         streaming::{tool_result_error_text, StreamingToolExecutor},
     },
-    types::{AgentPhase, AgentRunStatus, PermissionMode, ProjectVersionStatus, TranscriptMode},
+    types::{
+        sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, ArtifactPublishStatus, PermissionMode,
+        ProjectVersionStatus, TranscriptMode,
+    },
 };
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, sync::Arc};
@@ -720,6 +723,312 @@ fn preview_promote_is_not_registered_as_model_tool() {
     assert!(!control_plane_executor().has_tool("preview.promote"));
 }
 
+#[tokio::test]
+async fn promotion_wal_recovers_current_run_publish_and_pending_outbox_once() {
+    let storage = unique_temp_dir("promotion-wal-recovery");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let version = store
+        .create_project_version_candidate(
+            "project-1",
+            &run_id,
+            "http://runtime/artifacts/project-1/current".to_string(),
+            Some("shot-wal".to_string()),
+            Some("runtime://source-snapshots/project-1/build-wal".to_string()),
+        )
+        .await;
+    let publish = store
+        .begin_artifact_publish(
+            "project-1",
+            &run_id,
+            "build-wal",
+            &version.id,
+            &"a".repeat(64),
+            "runtime://source-snapshots/project-1/build-wal",
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Staged,
+            Some(&"b".repeat(64)),
+            Some("runtime://artifacts/project-1/staged/version-wal"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Validating,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Promoting,
+            None,
+            None,
+            Some("runtime://artifacts/project-1/versions/version-wal"),
+            None,
+        )
+        .await
+        .unwrap();
+    let (_, outbox) = store
+        .commit_artifact_promotion_cas("project-1", &run_id, &version.id, &publish.id, None)
+        .await
+        .unwrap();
+    let (replayed_version, replayed_outbox) = store
+        .commit_artifact_promotion_cas("project-1", &run_id, &version.id, &publish.id, None)
+        .await
+        .unwrap();
+    assert_eq!(replayed_version.id, version.id);
+    assert_eq!(replayed_outbox.id, outbox.id);
+    assert!(store.events(&run_id).await.is_empty());
+    drop(store);
+
+    let restarted = RuntimeStore::with_checkpoint_dir(&storage);
+    assert_eq!(
+        restarted
+            .current_project_version("project-1")
+            .await
+            .unwrap()
+            .id,
+        version.id
+    );
+    assert_eq!(
+        restarted.get_run(&run_id).await.unwrap().output_version_id,
+        Some(version.id.clone())
+    );
+    assert_eq!(
+        restarted
+            .get_artifact_publish(&publish.id)
+            .await
+            .unwrap()
+            .status,
+        ArtifactPublishStatus::Promoted
+    );
+    assert_eq!(restarted.reconcile_artifact_promotions().await.unwrap(), 1);
+    assert_eq!(restarted.reconcile_artifact_promotions().await.unwrap(), 0);
+    let updated = restarted
+        .events(&run_id)
+        .await
+        .into_iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::PreviewUpdated { version_id, .. } if version_id == &version.id)
+        })
+        .count();
+    assert_eq!(updated, 1, "outbox {} must be delivered once", outbox.id);
+}
+
+#[tokio::test]
+async fn startup_reconcile_replays_promotion_after_immutable_bytes_before_cas() {
+    let storage = unique_temp_dir("promotion-before-cas-recovery");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run_id = create_run(&store, AgentPhase::Build).await;
+    let version = store
+        .create_project_version_candidate(
+            "project-1",
+            &run_id,
+            "http://runtime/artifacts/project-1/current".to_string(),
+            None,
+            Some("runtime://source-snapshots/project-1/build-before-cas".to_string()),
+        )
+        .await;
+    let publish = store
+        .begin_artifact_publish(
+            "project-1",
+            &run_id,
+            "build-before-cas",
+            &version.id,
+            &"e".repeat(64),
+            "runtime://source-snapshots/project-1/build-before-cas",
+            None,
+        )
+        .await
+        .unwrap();
+    for status in [
+        ArtifactPublishStatus::Staged,
+        ArtifactPublishStatus::Validating,
+    ] {
+        store
+            .transition_artifact_publish(
+                &publish.id,
+                status,
+                (status == ArtifactPublishStatus::Staged).then_some("hash"),
+                (status == ArtifactPublishStatus::Staged).then_some("runtime://staged"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .transition_artifact_publish(
+            &publish.id,
+            ArtifactPublishStatus::Promoting,
+            None,
+            None,
+            Some("runtime://artifacts/project-1/versions/version-before-cas"),
+            None,
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let restarted = RuntimeStore::with_checkpoint_dir(&storage);
+    assert_eq!(restarted.reconcile_artifact_promotions().await.unwrap(), 1);
+    assert_eq!(
+        restarted
+            .current_project_version("project-1")
+            .await
+            .unwrap()
+            .id,
+        version.id
+    );
+    assert_eq!(
+        restarted
+            .get_artifact_publish(&publish.id)
+            .await
+            .unwrap()
+            .status,
+        ArtifactPublishStatus::Promoted
+    );
+    assert_eq!(
+        restarted
+            .events(&run_id)
+            .await
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::PreviewUpdated { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn artifact_promotion_cas_prevents_concurrent_run_from_overwriting_current() {
+    let store = RuntimeStore::new();
+    let first_run = create_run(&store, AgentPhase::Build).await;
+    let second_run = store
+        .create_run(
+            "project-1".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await
+        .id;
+    let mut candidates = Vec::new();
+    for (run_id, build_id, marker) in [
+        (&first_run, "build-first", 'c'),
+        (&second_run, "build-second", 'd'),
+    ] {
+        let version = store
+            .create_project_version_candidate(
+                "project-1",
+                run_id,
+                format!("http://runtime/{build_id}"),
+                None,
+                Some(format!("runtime://source-snapshots/project-1/{build_id}")),
+            )
+            .await;
+        let publish = store
+            .begin_artifact_publish(
+                "project-1",
+                run_id,
+                build_id,
+                &version.id,
+                &marker.to_string().repeat(64),
+                &format!("runtime://source-snapshots/project-1/{build_id}"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::Staged,
+                Some(&marker.to_ascii_uppercase().to_string().repeat(64)),
+                Some(&format!(
+                    "runtime://artifacts/project-1/staged/{}",
+                    version.id
+                )),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::Validating,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::Promoting,
+                None,
+                None,
+                Some(&format!(
+                    "runtime://artifacts/project-1/versions/{}",
+                    version.id
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        candidates.push((run_id.clone(), version, publish));
+    }
+    store
+        .commit_artifact_promotion_cas(
+            "project-1",
+            &candidates[0].0,
+            &candidates[0].1.id,
+            &candidates[0].2.id,
+            None,
+        )
+        .await
+        .unwrap();
+    let conflict = store
+        .commit_artifact_promotion_cas(
+            "project-1",
+            &candidates[1].0,
+            &candidates[1].1.id,
+            &candidates[1].2.id,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("compare-and-swap failed"));
+    assert_eq!(
+        store.current_project_version("project-1").await.unwrap().id,
+        candidates[0].1.id
+    );
+    assert_eq!(
+        store
+            .get_project_version(&candidates[1].1.id)
+            .await
+            .unwrap()
+            .status,
+        ProjectVersionStatus::Candidate
+    );
+}
+
 async fn start_preview_server() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -753,6 +1062,25 @@ fn setup_passing_promotion_workspace(prefix: &str) -> PathBuf {
         "{}",
     )
     .unwrap();
+    let candidate_root = workspace.join("outputs/candidates/build-test");
+    fs::create_dir_all(&candidate_root).unwrap();
+    fs::write(candidate_root.join("index.html"), "candidate").unwrap();
+    let candidate_manifest = serde_json::to_string_pretty(&json!({
+        "schemaVersion": "candidate-manifest@1",
+        "buildId": "build-test",
+        "files": [{
+            "path": "index.html",
+            "bytes": 9,
+            "sha256": sha256_hex(b"candidate")
+        }]
+    }))
+    .unwrap();
+    fs::write(
+        candidate_root.join(".anydesign-candidate-manifest.json"),
+        &candidate_manifest,
+    )
+    .unwrap();
+    let candidate_manifest_hash = sha256_hex(candidate_manifest.as_bytes());
     fs::write(
         workspace.join("outputs/build/latest.json"),
         json!({
@@ -762,7 +1090,10 @@ fn setup_passing_promotion_workspace(prefix: &str) -> PathBuf {
             "cwd": "/workspace/project",
             "argv": ["npm", "run", "build"],
             "logPath": "/workspace/outputs/build/build.log",
-            "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test"
+            "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-test",
+            "candidateOutputPath": "/workspace/outputs/candidates/build-test",
+            "candidateManifestPath": "/workspace/outputs/candidates/build-test/.anydesign-candidate-manifest.json",
+            "candidateManifestHash": candidate_manifest_hash
         })
         .to_string(),
     )

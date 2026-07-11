@@ -29,7 +29,7 @@ fn sandbox_network_policy_defaults_to_deny_all_ingress_and_egress() {
 }
 
 #[test]
-fn sandbox_network_policy_only_allows_runtime_ingress_and_dns_egress() {
+fn sandbox_network_policy_allows_runtime_preview_and_internal_npm_proxy_only() {
     let docs = yaml_documents(NETWORK_POLICY_YAML);
 
     let runtime = named_doc(
@@ -45,6 +45,8 @@ fn sandbox_network_policy_only_allows_runtime_ingress_and_dns_egress() {
     let ingress = field(runtime_spec, "ingress").as_sequence().unwrap();
     assert_eq!(ingress.len(), 1);
     assert_yaml_contains(runtime, "anydesign-runtime");
+    assert_yaml_contains(runtime, "3001");
+    assert_yaml_contains(runtime, "4321");
     assert!(!yaml_contains(runtime, "database"));
     assert!(!yaml_contains(runtime, "postgres"));
 
@@ -62,16 +64,22 @@ fn sandbox_network_policy_only_allows_runtime_ingress_and_dns_egress() {
     assert!(!yaml_contains(dns, "0.0.0.0/0"));
     assert!(!yaml_contains(dns, "::/0"));
 
+    let npm = named_doc(
+        &docs,
+        "NetworkPolicy",
+        "anydesign-sandbox-allow-npm-proxy-egress",
+    );
+    assert_yaml_contains(npm, "anydesign-runtime");
+    assert_yaml_contains(npm, "anydesign-npm-proxy");
+    assert_yaml_contains(npm, "4873");
+
     for doc in docs
         .iter()
         .filter(|doc| field(doc, "kind").as_str() == Some("NetworkPolicy"))
     {
-        if let Some(egress) = field_optional(field(doc, "spec"), "egress") {
-            assert!(
-                yaml_contains(egress, "kube-dns"),
-                "egress policy must only target DNS: {doc:?}"
-            );
-        }
+        assert!(!yaml_contains(doc, "0.0.0.0/0"));
+        assert!(!yaml_contains(doc, "::/0"));
+        assert!(!yaml_contains(doc, "registry.npmjs.org"));
     }
 }
 
@@ -177,7 +185,8 @@ fn sandbox_template_uses_image_with_baked_bootstrap_assets() {
         "SandboxTemplate must not use the plain node image because bootstrap scripts must be baked into the sandbox image"
     );
     assert!(
-        ASTRO_SANDBOX_DOCKERFILE.contains("FROM node:22-bookworm")
+        ASTRO_SANDBOX_DOCKERFILE.contains("ARG SANDBOX_BASE_IMAGE=node:22-bookworm")
+            && ASTRO_SANDBOX_DOCKERFILE.contains("FROM ${SANDBOX_BASE_IMAGE}")
             && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh")
             && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-channel-server.js")
             && ASTRO_SANDBOX_DOCKERFILE.contains("/opt/anydesign/bootstrap"),

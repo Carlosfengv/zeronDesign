@@ -1,4 +1,5 @@
 use crate::{
+    channel_manager::ChannelManager,
     config::{RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     permission::{PermissionReason, PermissionResult, RuleSource},
@@ -24,6 +25,7 @@ use crate::{
         ReviewFindingEvidence, ReviewFindingSeverity, SandboxBinding, SandboxBindingStatus,
         SandboxChannelProtocol,
     },
+    workspace_auth::WorkspaceChannelJwtIssuer,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -37,17 +39,43 @@ pub fn control_plane_executor() -> ToolExecutor {
 
 pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor {
     let executor = match config.sandbox_backend_mode {
-        SandboxBackendMode::Kubernetes => control_plane_executor_with_backends(
-            sandbox_backend_for_config(config),
-            Arc::new(sandbox::SandboxChannelWorkspaceBackend::new()),
-            Arc::new(sandbox::SandboxChannelCommandBackend::new()),
-        ),
+        SandboxBackendMode::Kubernetes => {
+            let resolver: Arc<dyn sandbox::WorkspaceChannelEndpointResolver> = config
+                .workspace_channel_signing_key_file
+                .as_ref()
+                .map(|signing_key_file| {
+                    let issuer = WorkspaceChannelJwtIssuer::from_pkcs8_der_file(
+                        signing_key_file,
+                        config.workspace_channel_token_ttl_seconds,
+                    )
+                    .expect(
+                        "workspace channel signing key must be a readable Ed25519 PKCS#8 DER key",
+                    );
+                    Arc::new(sandbox::SandboxBindingEndpointResolver::with_token_issuer(
+                        issuer,
+                    )) as Arc<dyn sandbox::WorkspaceChannelEndpointResolver>
+                })
+                .unwrap_or_else(|| Arc::new(sandbox::SandboxBindingEndpointResolver::default()));
+            control_plane_executor_with_backends(
+                sandbox_backend_for_config(config),
+                Arc::new(
+                    sandbox::SandboxChannelWorkspaceBackend::new()
+                        .with_endpoint_resolver(resolver.clone()),
+                ),
+                Arc::new(
+                    sandbox::SandboxChannelCommandBackend::new().with_endpoint_resolver(resolver),
+                ),
+            )
+        }
         SandboxBackendMode::PhaseAContract => {
             control_plane_executor_with_sandbox_backend(sandbox_backend_for_config(config))
         }
     };
     executor
         .with_policy_profile_and_registry(config.policy_profile, config.npm_registry.clone())
+        .with_runtime_public_base_url(config.runtime_public_base_url.clone())
+        .with_remote_workspace(config.sandbox_backend_mode == SandboxBackendMode::Kubernetes)
+        .with_runtime_storage_dir(config.runtime_storage_dir.clone())
         .with_workspace_root(&config.workspace_root)
 }
 
@@ -209,6 +237,10 @@ impl SandboxBackend for PhaseAContractSandboxBackend {
             return Ok(binding);
         }
 
+        store.stop_preview_leases_for_binding(binding_id).await?;
+        ChannelManager::shared()
+            .release_binding(store, binding_id)
+            .await?;
         store
             .update_sandbox_binding_status(binding_id, SandboxBindingStatus::Deleted)
             .await
@@ -274,6 +306,10 @@ impl SandboxBackend for KubernetesSandboxBackend {
     }
 
     async fn release(&self, store: &RuntimeStore, binding_id: &str) -> Result<SandboxBinding> {
+        store.stop_preview_leases_for_binding(binding_id).await?;
+        ChannelManager::shared()
+            .release_binding(store, binding_id)
+            .await?;
         self.adapter(store.clone(), None).release(binding_id).await
     }
 }

@@ -79,8 +79,112 @@ pub async fn promote_preview(
     project_id: &str,
     run_id: &str,
     candidate_version_id: &str,
-    mut gate_report: PromotionGateReport,
+    gate_report: PromotionGateReport,
 ) -> Result<ProjectVersion> {
+    promote_preview_inner(
+        store,
+        project_id,
+        run_id,
+        candidate_version_id,
+        gate_report,
+        None,
+    )
+    .await
+}
+
+pub async fn promote_preview_cas(
+    store: &RuntimeStore,
+    project_id: &str,
+    run_id: &str,
+    candidate_version_id: &str,
+    gate_report: PromotionGateReport,
+    expected_current_version_id: Option<&str>,
+) -> Result<ProjectVersion> {
+    promote_preview_inner(
+        store,
+        project_id,
+        run_id,
+        candidate_version_id,
+        gate_report,
+        Some(expected_current_version_id),
+    )
+    .await
+}
+
+async fn promote_preview_inner(
+    store: &RuntimeStore,
+    project_id: &str,
+    run_id: &str,
+    candidate_version_id: &str,
+    gate_report: PromotionGateReport,
+    expected_current_version_id: Option<Option<&str>>,
+) -> Result<ProjectVersion> {
+    validate_preview_promotion(store, project_id, run_id, candidate_version_id, gate_report)
+        .await?;
+    let publish = store
+        .artifact_publish_for_version(project_id, run_id, candidate_version_id)
+        .await;
+    let version = if let Some(publish) = publish {
+        let expected = match expected_current_version_id {
+            Some(expected) => expected,
+            None => publish.expected_current_version_id.as_deref(),
+        };
+        let (version, outbox) = store
+            .commit_artifact_promotion_cas(
+                project_id,
+                run_id,
+                candidate_version_id,
+                &publish.id,
+                expected,
+            )
+            .await?;
+        store.dispatch_outbox_event(&outbox.id).await?;
+        version
+    } else {
+        let version = match expected_current_version_id {
+            Some(expected) => {
+                store
+                    .promote_project_version_cas(project_id, run_id, candidate_version_id, expected)
+                    .await?
+            }
+            None => {
+                store
+                    .promote_project_version(project_id, run_id, candidate_version_id)
+                    .await?
+            }
+        };
+        let _ = store
+            .append_event(AgentEvent::PreviewUpdated {
+                run_id: run_id.to_string(),
+                url: version.preview_url.clone(),
+                version_id: version.id.clone(),
+                screenshot_id: version.screenshot_id.clone(),
+                timestamp: Utc::now(),
+            })
+            .await;
+        version
+    };
+    store
+        .append_conversation_item(
+            project_id,
+            Some(run_id),
+            "preview_update",
+            None,
+            format!("Preview updated: {}", version.preview_url),
+            Some(serde_json::json!({ "versionId": version.id })),
+        )
+        .await;
+    save_promotion_checkpoint(store, project_id, run_id, &version).await?;
+    Ok(version)
+}
+
+pub async fn validate_preview_promotion(
+    store: &RuntimeStore,
+    project_id: &str,
+    run_id: &str,
+    candidate_version_id: &str,
+    mut gate_report: PromotionGateReport,
+) -> Result<()> {
     check_promotion_gate(&gate_report).map_err(|error| anyhow!(error.to_string()))?;
     let active_review_runs = store
         .active_review_or_repair_runs_for_candidate(run_id, candidate_version_id)
@@ -98,30 +202,7 @@ pub async fn promote_preview(
         .len() as u32;
     gate_report.blocking_findings = gate_report.blocking_findings.max(blocking_findings);
     check_promotion_gate(&gate_report).map_err(|error| anyhow!(error.to_string()))?;
-    let version = store
-        .promote_project_version(project_id, run_id, candidate_version_id)
-        .await?;
-    let _ = store
-        .append_event(AgentEvent::PreviewUpdated {
-            run_id: run_id.to_string(),
-            url: version.preview_url.clone(),
-            version_id: version.id.clone(),
-            screenshot_id: version.screenshot_id.clone(),
-            timestamp: Utc::now(),
-        })
-        .await;
-    store
-        .append_conversation_item(
-            project_id,
-            Some(run_id),
-            "preview_update",
-            None,
-            format!("Preview updated: {}", version.preview_url),
-            Some(serde_json::json!({ "versionId": version.id })),
-        )
-        .await;
-    save_promotion_checkpoint(store, project_id, run_id, &version).await?;
-    Ok(version)
+    Ok(())
 }
 
 async fn save_promotion_checkpoint(

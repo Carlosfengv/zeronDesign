@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -169,12 +169,17 @@ pub struct ToolContext {
     pub workspace_root: PathBuf,
     pub policy_profile: RuntimePolicyProfile,
     pub npm_registry: String,
+    pub runtime_public_base_url: String,
+    pub runtime_storage_dir: PathBuf,
+    pub allow_runtime_owned_writes: bool,
+    pub remote_workspace: bool,
 }
 
 impl ToolContext {
     pub fn new(store: RuntimeStore, run: AgentRun, workspace_root: PathBuf) -> Self {
         let should_avoid_permission_prompts =
             run.profile_snapshot.transcript_mode == TranscriptMode::Sidechain;
+        let runtime_storage_dir = workspace_root.join(".runtime-storage");
         Self {
             project_id: run.project_id.clone(),
             store,
@@ -183,6 +188,10 @@ impl ToolContext {
             workspace_root,
             policy_profile: RuntimePolicyProfile::Production,
             npm_registry: "https://registry.internal.example/npm/".to_string(),
+            runtime_public_base_url: "http://127.0.0.1:8080".to_string(),
+            runtime_storage_dir,
+            allow_runtime_owned_writes: false,
+            remote_workspace: false,
         }
     }
 }
@@ -333,6 +342,10 @@ pub struct ToolExecutor {
     workspace_root: Arc<PathBuf>,
     policy_profile: RuntimePolicyProfile,
     npm_registry: Arc<String>,
+    runtime_public_base_url: Arc<String>,
+    remote_workspace: bool,
+    runtime_storage_dir: Arc<PathBuf>,
+    runtime_storage_overridden: bool,
 }
 
 impl ToolExecutor {
@@ -352,12 +365,17 @@ impl ToolExecutor {
                 map.insert((*alias).to_string(), tool.clone());
             }
         }
+        let workspace_root = normalize_workspace_root(workspace_root.into());
         Self {
             tools: Arc::new(map),
             permission_engine: PermissionEngine::new(permission_rules),
-            workspace_root: Arc::new(normalize_workspace_root(workspace_root.into())),
+            runtime_storage_dir: Arc::new(workspace_root.join(".runtime-storage")),
+            runtime_storage_overridden: false,
+            workspace_root: Arc::new(workspace_root),
             policy_profile: RuntimePolicyProfile::Production,
             npm_registry: Arc::new("https://registry.internal.example/npm/".to_string()),
+            runtime_public_base_url: Arc::new("http://127.0.0.1:8080".to_string()),
+            remote_workspace: false,
         }
     }
 
@@ -372,23 +390,81 @@ impl ToolExecutor {
             workspace_root: self.workspace_root.clone(),
             policy_profile,
             npm_registry: Arc::new(npm_registry.into()),
+            runtime_public_base_url: self.runtime_public_base_url.clone(),
+            remote_workspace: self.remote_workspace,
+            runtime_storage_dir: self.runtime_storage_dir.clone(),
+            runtime_storage_overridden: self.runtime_storage_overridden,
         }
     }
 
     pub fn with_workspace_root(&self, workspace_root: impl AsRef<Path>) -> Self {
+        let workspace_root = normalize_workspace_root(workspace_root.as_ref().to_path_buf());
+        let runtime_storage_dir = if self.runtime_storage_overridden {
+            self.runtime_storage_dir.clone()
+        } else {
+            Arc::new(workspace_root.join(".runtime-storage"))
+        };
         Self {
             tools: self.tools.clone(),
             permission_engine: self.permission_engine.clone(),
-            workspace_root: Arc::new(normalize_workspace_root(
-                workspace_root.as_ref().to_path_buf(),
-            )),
+            workspace_root: Arc::new(workspace_root),
             policy_profile: self.policy_profile,
             npm_registry: self.npm_registry.clone(),
+            runtime_public_base_url: self.runtime_public_base_url.clone(),
+            remote_workspace: self.remote_workspace,
+            runtime_storage_dir,
+            runtime_storage_overridden: self.runtime_storage_overridden,
+        }
+    }
+
+    pub fn with_runtime_public_base_url(&self, base_url: impl Into<String>) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            permission_engine: self.permission_engine.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy_profile: self.policy_profile,
+            npm_registry: self.npm_registry.clone(),
+            runtime_public_base_url: Arc::new(base_url.into().trim_end_matches('/').to_string()),
+            remote_workspace: self.remote_workspace,
+            runtime_storage_dir: self.runtime_storage_dir.clone(),
+            runtime_storage_overridden: self.runtime_storage_overridden,
+        }
+    }
+
+    pub fn with_remote_workspace(&self, remote_workspace: bool) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            permission_engine: self.permission_engine.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy_profile: self.policy_profile,
+            npm_registry: self.npm_registry.clone(),
+            runtime_public_base_url: self.runtime_public_base_url.clone(),
+            remote_workspace,
+            runtime_storage_dir: self.runtime_storage_dir.clone(),
+            runtime_storage_overridden: self.runtime_storage_overridden,
+        }
+    }
+
+    pub fn with_runtime_storage_dir(&self, runtime_storage_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            permission_engine: self.permission_engine.clone(),
+            workspace_root: self.workspace_root.clone(),
+            policy_profile: self.policy_profile,
+            npm_registry: self.npm_registry.clone(),
+            runtime_public_base_url: self.runtime_public_base_url.clone(),
+            remote_workspace: self.remote_workspace,
+            runtime_storage_dir: Arc::new(runtime_storage_dir.into()),
+            runtime_storage_overridden: true,
         }
     }
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub fn is_remote_workspace(&self) -> bool {
+        self.remote_workspace
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -465,7 +541,8 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("run not found: {run_id}")),
             };
         };
-        let ctx = self.tool_context(store.clone(), run);
+        let mut ctx = self.tool_context(store.clone(), run);
+        ctx.allow_runtime_owned_writes = tool_use_id.starts_with("bootstrap:");
         let Some(tool) = self.get(tool_name) else {
             store
                 .append_audit_record(
@@ -481,6 +558,34 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("No such tool available: {tool_name}")),
             };
         };
+        if ctx.run.status == AgentRunStatus::Validating && candidate_freeze_blocks(tool.name()) {
+            let message = format!(
+                "{} is blocked because the current build candidate is frozen",
+                tool.name()
+            );
+            store
+                .append_audit_record(
+                    &ctx.project_id,
+                    &ctx.run.id,
+                    tool.name(),
+                    summarize_input(&input),
+                    "deny",
+                    "candidate freeze rejected mutation",
+                )
+                .await;
+            return ToolExecution {
+                result: ToolResult::typed_error(
+                    message,
+                    "project.candidate_frozen",
+                    true,
+                    json!({
+                        "runId": ctx.run.id,
+                        "tool": tool.name(),
+                        "suggestedAction": "Continue preview validation and promotion, or start an Edit/Repair run before mutating source."
+                    }),
+                ),
+            };
+        }
         if let Some(result) = reject_duplicate_promotion_after_run_output(&ctx, tool.name()) {
             store
                 .append_audit_record(
@@ -518,7 +623,7 @@ impl ToolExecutor {
             phase: ctx.run.phase,
             tool_name: tool.name().to_string(),
             input,
-            default_cwd: Some(default_tool_cwd(&ctx.workspace_root)),
+            default_cwd: Some(default_tool_cwd(&ctx.run)),
         });
         let input = match pre_tool_decision.rejection {
             Some(rejection) => {
@@ -631,7 +736,8 @@ impl ToolExecutor {
                             result,
                             tool.as_ref(),
                             tool_use_id,
-                            &ctx.workspace_root,
+                            &ctx.runtime_storage_dir,
+                            &ctx.run.id,
                         ),
                     },
                     Err(ToolError::Recoverable(message)) => ToolExecution {
@@ -777,6 +883,9 @@ impl ToolExecutor {
         let mut ctx = ToolContext::new(store, run, (*self.workspace_root).clone());
         ctx.policy_profile = self.policy_profile;
         ctx.npm_registry = (*self.npm_registry).clone();
+        ctx.runtime_public_base_url = (*self.runtime_public_base_url).clone();
+        ctx.remote_workspace = self.remote_workspace;
+        ctx.runtime_storage_dir = (*self.runtime_storage_dir).clone();
         ctx
     }
 
@@ -803,6 +912,25 @@ impl ToolExecutor {
             )
             .await;
     }
+}
+
+fn candidate_freeze_blocks(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "fs.write"
+            | "fs.write_chunk"
+            | "fs.commit_chunks"
+            | "fs.patch"
+            | "fs.multi_patch"
+            | "fs.delete"
+            | "project.init"
+            | "project.write_page"
+            | "project.ensure_dependencies"
+            | "project.build"
+            | "style.update_tokens"
+            | "package.install"
+            | "shell.run"
+    )
 }
 
 fn reject_duplicate_promotion_after_run_output(
@@ -866,19 +994,24 @@ fn typed_permission_denial_metadata(
         ));
     }
 
+    if message.contains("runtime-owned path cannot be mutated") {
+        return Some((
+            "path.runtime_owned".to_string(),
+            json!({
+                "tool": tool_name,
+                "receivedPath": input.get("path").and_then(Value::as_str).unwrap_or(""),
+                "suggestedAction": "Use the dedicated Runtime tool that owns this state."
+            }),
+        ));
+    }
+
     None
 }
 
-fn default_tool_cwd(workspace_root: &Path) -> String {
-    fs::read_to_string(workspace_root.join("state/project.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|state| {
-            state
-                .get("appRoot")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+fn default_tool_cwd(run: &AgentRun) -> String {
+    run.project_state_snapshot
+        .as_ref()
+        .map(|state| state.app_root.clone())
         .and_then(|app_root| {
             let app_root = app_root
                 .strip_prefix("/workspace/")
@@ -1102,7 +1235,21 @@ fn normalize_design_context_path(path: &str) -> String {
 }
 
 fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {
-    fs::canonicalize(&workspace_root).unwrap_or(workspace_root)
+    // remote-fs-boundary: allow-begin local-path-normalization
+    let mut normalized = PathBuf::new();
+    for component in workspace_root.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    let normalized = fs::canonicalize(&normalized).unwrap_or(normalized);
+    // remote-fs-boundary: allow-end local-path-normalization
+    normalized
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -1154,7 +1301,8 @@ fn truncate_large_result_if_needed(
     result: ToolResult,
     tool: &dyn Tool,
     tool_use_id: &str,
-    workspace_root: &Path,
+    runtime_storage_dir: &Path,
+    run_id: &str,
 ) -> ToolResult {
     if result.is_error {
         return result;
@@ -1167,21 +1315,33 @@ fn truncate_large_result_if_needed(
         return result;
     }
 
-    let artifact_dir = workspace_root.join("outputs/tool-results");
+    let safe_run_id = run_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    // remote-fs-boundary: allow-begin runtime-storage-tool-result
+    let artifact_dir = runtime_storage_dir.join("tool-results").join(&safe_run_id);
     let artifact_name = format!("{tool_use_id}.json");
     let artifact_path = artifact_dir.join(&artifact_name);
-    let workspace_path = format!("/workspace/outputs/tool-results/{artifact_name}");
+    let artifact_uri = format!("runtime://tool-results/{safe_run_id}/{artifact_name}");
     if let Err(error) = fs::create_dir_all(&artifact_dir)
         .and_then(|_| fs::write(&artifact_path, serialized.as_bytes()))
     {
         return ToolResult::error(format!("failed to persist oversized tool result: {error}"));
     }
 
+    // remote-fs-boundary: allow-end runtime-storage-tool-result
     let preview = serialized.chars().take(2000).collect::<String>();
     ToolResult {
         content: json!({
             "truncated": true,
-            "path": workspace_path,
+            "uri": artifact_uri,
             "preview": preview,
             "originalChars": serialized.chars().count(),
             "limitChars": limit,
@@ -1189,7 +1349,7 @@ fn truncate_large_result_if_needed(
         is_error: false,
         metadata: Some(json!({
             "truncated": true,
-            "fullResultPath": artifact_path.display().to_string(),
+            "fullResultUri": artifact_uri,
         })),
     }
 }

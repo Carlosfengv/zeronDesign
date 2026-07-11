@@ -462,7 +462,7 @@ async fn cancellation_after_wave_preserves_completed_result_and_interrupts_queue
 }
 
 #[tokio::test]
-async fn oversized_tool_result_is_truncated_and_written_to_workspace_artifact() {
+async fn oversized_tool_result_is_truncated_and_written_to_runtime_storage() {
     let workspace = unique_temp_dir("streaming-tool-result");
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
@@ -484,12 +484,17 @@ async fn oversized_tool_result_is_truncated_and_written_to_workspace_artifact() 
     let content = &results[0].result.content;
     assert_eq!(content["truncated"], true);
     assert_eq!(
-        content["path"],
-        "/workspace/outputs/tool-results/tool-big.json"
+        content["uri"],
+        format!("runtime://tool-results/{run_id}/tool-big.json")
     );
     assert!(content["preview"].as_str().unwrap().len() < 3000);
-    let artifact = fs::read_to_string(workspace.join("outputs/tool-results/tool-big.json"))
-        .expect("full result artifact should be written");
+    let artifact = fs::read_to_string(
+        workspace
+            .join(".runtime-storage/tool-results")
+            .join(&run_id)
+            .join("tool-big.json"),
+    )
+    .expect("full result artifact should be written");
     assert!(artifact.contains("\"keep\": \"metadata\""));
     assert!(artifact.contains(&"x".repeat(3000)));
 }

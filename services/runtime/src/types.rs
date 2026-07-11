@@ -41,6 +41,7 @@ pub enum AgentPhase {
 pub enum AgentRunStatus {
     Queued,
     Running,
+    Validating,
     NeedsUserInput,
     Completed,
     Partial,
@@ -239,10 +240,150 @@ pub struct AgentRun {
     pub finding_ids: Option<Vec<String>>,
     pub input_message_ids: Vec<String>,
     pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub project_state_snapshot: Option<ProjectRuntimeState>,
     pub profile_snapshot: RunProfileSnapshot,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRuntimeState {
+    pub project_id: String,
+    pub revision: u64,
+    pub app_root: String,
+    pub template_key: String,
+    pub template_version: String,
+    pub framework: String,
+    pub package_manager: String,
+    pub lockfile: String,
+    pub registry: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewLeaseStatus {
+    Active,
+    Stopped,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPublishStatus {
+    Staging,
+    Staged,
+    Validating,
+    Promoting,
+    Promoted,
+    Failed,
+    GarbageCollectable,
+    GarbageCollected,
+    ReconcileRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactPublishRecord {
+    pub id: String,
+    pub idempotency_key: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub build_id: String,
+    pub version_id: String,
+    pub sandbox_binding_id: Option<String>,
+    pub pod_uid: Option<String>,
+    pub candidate_manifest_hash: String,
+    pub artifact_manifest_hash: Option<String>,
+    pub source_snapshot_uri: String,
+    pub expected_current_version_id: Option<String>,
+    pub status: ArtifactPublishStatus,
+    pub revision: u64,
+    pub staged_uri: Option<String>,
+    pub immutable_artifact_uri: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub gc_after: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxDeliveryStatus {
+    Pending,
+    Delivered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOutboxEvent {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub event: AgentEvent,
+    pub status: OutboxDeliveryStatus,
+    pub delivery_attempts: u32,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewLeaseRecord {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub sandbox_binding_id: String,
+    pub sandbox_name: String,
+    pub pod_uid: String,
+    pub build_id: String,
+    pub candidate_manifest_hash: String,
+    pub status: PreviewLeaseStatus,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelLeaseTransport {
+    PortForward,
+    ServiceDns,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelLeaseStatus {
+    Acquiring,
+    Ready,
+    Stale,
+    Releasing,
+    Released,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLeaseRecord {
+    pub id: String,
+    pub owner_runtime_epoch: String,
+    pub sandbox_binding_id: String,
+    pub sandbox_uid: Option<String>,
+    pub pod_uid: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub transport: ChannelLeaseTransport,
+    pub target_port: u16,
+    pub local_port: Option<u16>,
+    pub service_endpoint: Option<String>,
+    pub child_pid: Option<u32>,
+    pub child_started_at: Option<String>,
+    pub status: ChannelLeaseStatus,
+    pub created_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1474,6 +1615,10 @@ pub struct SandboxBinding {
     pub workspace_pvc_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
     pub warm_pool_name: String,
     pub namespace: String,
     pub status: SandboxBindingStatus,

@@ -14,6 +14,9 @@ run_step() {
 run_step "cargo fmt" \
   cargo fmt --manifest-path services/runtime/Cargo.toml -- --check
 
+run_step "remote workspace filesystem boundary" \
+  services/runtime/scripts/check-remote-workspace-fs-boundary.sh
+
 run_step "runtime agent hooks" \
   cargo test --manifest-path services/runtime/Cargo.toml agent_hooks -- --nocapture
 

@@ -99,6 +99,14 @@ pub trait SandboxKubeClient: Send + Sync {
         let _ = (namespace, claim_name);
         Ok(None)
     }
+    async fn sandbox_runtime_identity(
+        &self,
+        namespace: &str,
+        sandbox_name: &str,
+    ) -> Result<SandboxRuntimeIdentity> {
+        let _ = (namespace, sandbox_name);
+        Ok(SandboxRuntimeIdentity::default())
+    }
     async fn delete_claim(&self, namespace: &str, claim_name: &str) -> Result<()>;
 }
 
@@ -134,6 +142,16 @@ where
         (**self).claim_sandbox_name(namespace, claim_name).await
     }
 
+    async fn sandbox_runtime_identity(
+        &self,
+        namespace: &str,
+        sandbox_name: &str,
+    ) -> Result<SandboxRuntimeIdentity> {
+        (**self)
+            .sandbox_runtime_identity(namespace, sandbox_name)
+            .await
+    }
+
     async fn delete_claim(&self, namespace: &str, claim_name: &str) -> Result<()> {
         (**self).delete_claim(namespace, claim_name).await
     }
@@ -144,6 +162,12 @@ pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub status_success: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxRuntimeIdentity {
+    pub sandbox_uid: Option<String>,
+    pub pod_uid: Option<String>,
 }
 
 #[async_trait]
@@ -311,6 +335,48 @@ where
             ));
         }
         parse_claim_sandbox_name_from_json(&output.stdout)
+    }
+
+    async fn sandbox_runtime_identity(
+        &self,
+        namespace: &str,
+        sandbox_name: &str,
+    ) -> Result<SandboxRuntimeIdentity> {
+        let get_uid = |resource: &str| {
+            vec![
+                "get".to_string(),
+                resource.to_string(),
+                sandbox_name.to_string(),
+                "-n".to_string(),
+                namespace.to_string(),
+                "-o".to_string(),
+                "json".to_string(),
+            ]
+        };
+        let sandbox = self
+            .runner
+            .run(&self.kubectl, &get_uid("sandbox"), None)
+            .await?;
+        if !sandbox.status_success {
+            return Err(anyhow!(
+                "kubectl get Sandbox identity failed: {}",
+                sandbox.stderr
+            ));
+        }
+        let pod = self
+            .runner
+            .run(&self.kubectl, &get_uid("pod"), None)
+            .await?;
+        if !pod.status_success {
+            return Err(anyhow!(
+                "kubectl get Sandbox pod UID failed: {}",
+                pod.stderr
+            ));
+        }
+        Ok(SandboxRuntimeIdentity {
+            sandbox_uid: parse_metadata_uid(&sandbox.stdout)?,
+            pod_uid: parse_metadata_uid(&pod.stdout)?,
+        })
     }
 
     async fn delete_claim(&self, namespace: &str, claim_name: &str) -> Result<()> {
@@ -541,6 +607,15 @@ pub fn parse_claim_sandbox_name_from_json(value: &str) -> Result<Option<String>>
         .map(ToString::to_string))
 }
 
+pub fn parse_metadata_uid(value: &str) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_str(value)?;
+    Ok(value
+        .pointer("/metadata/uid")
+        .and_then(|uid| uid.as_str())
+        .filter(|uid| !uid.trim().is_empty())
+        .map(ToString::to_string))
+}
+
 #[derive(Debug, Clone)]
 pub struct SandboxAdapterConfig {
     pub namespace: String,
@@ -569,6 +644,8 @@ pub struct SandboxChannel {
     pub namespace: String,
     pub protocol: SandboxChannelProtocol,
     pub endpoint: String,
+    pub sandbox_uid: Option<String>,
+    pub pod_uid: Option<String>,
 }
 
 pub struct SandboxAdapter<C> {
@@ -643,12 +720,18 @@ where
                         &sandbox_name,
                     )
                     .await?;
+                let runtime_identity = self
+                    .client
+                    .sandbox_runtime_identity(&binding.namespace, &sandbox_name)
+                    .await?;
                 return self
                     .store
-                    .update_sandbox_binding_runtime_identity(
+                    .update_sandbox_binding_runtime_identity_with_uids(
                         binding_id,
                         sandbox_name,
                         channel_service_name,
+                        runtime_identity.sandbox_uid,
+                        runtime_identity.pod_uid,
                     )
                     .await;
             }
@@ -779,6 +862,8 @@ pub fn sandbox_channel_from_binding(binding: &SandboxBinding) -> Result<SandboxC
             &binding.namespace,
             binding.channel_protocol,
         ),
+        sandbox_uid: binding.sandbox_uid.clone(),
+        pod_uid: binding.pod_uid.clone(),
     })
 }
 

@@ -11,6 +11,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = RuntimeConfig::from_env();
+    config.validate_startup().map_err(anyhow::Error::msg)?;
     let listener = TcpListener::bind(config.bind_addr()).await?;
     let app = http_api::recovered_router(config).await?;
     axum::serve(listener, app).await?;

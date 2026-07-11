@@ -1,5 +1,7 @@
 pub mod agent_hooks;
 pub mod agent_loop;
+pub mod artifact_publisher;
+pub mod channel_manager;
 pub mod config;
 pub mod conversation;
 pub mod http_api;
@@ -13,6 +15,7 @@ pub mod repair_loop;
 pub mod sandbox_adapter;
 pub mod tools;
 pub mod types;
+pub mod workspace_auth;
 
 pub use config::RuntimeConfig;
 pub use conversation::RuntimeStore;
