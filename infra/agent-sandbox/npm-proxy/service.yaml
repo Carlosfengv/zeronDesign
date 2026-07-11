@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anydesign-npm-proxy
+  namespace: anydesign-runtime
+  labels:
+    app.kubernetes.io/name: anydesign-npm-proxy
+spec:
+  selector:
+    app.kubernetes.io/name: anydesign-npm-proxy
+  ports:
+    - name: npm
+      port: 4873
+      targetPort: npm

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anydesign-npm-proxy-config
+  namespace: anydesign-runtime
+data:
+  config.yaml: |
+    storage: /verdaccio/storage
+    auth:
+      htpasswd:
+        file: /verdaccio/conf/htpasswd
+        max_users: -1
+    uplinks:
+      npmjs:
+        url: https://registry.npmjs.org/
+        timeout: 30s
+        max_fails: 3
+        fail_timeout: 10m
+    packages:
+      "@*/*":
+        access: $all
+        publish: $authenticated
+        proxy: npmjs
+      "**":
+        access: $all
+        publish: $authenticated
+        proxy: npmjs
+    server:
+      keepAliveTimeout: 60
+    logs:
+      type: stdout
+      format: json
+      level: http

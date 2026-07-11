@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anydesign-npm-proxy
+  namespace: anydesign-runtime
+  labels:
+    app.kubernetes.io/name: anydesign-npm-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anydesign-npm-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anydesign-npm-proxy
+    spec:
+      containers:
+        - name: verdaccio
+          image: verdaccio/verdaccio:6.1.6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: npm
+              containerPort: 4873
+          readinessProbe:
+            httpGet:
+              path: /-/ping
+              port: npm
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /verdaccio/conf/config.yaml
+              subPath: config.yaml
+            - name: storage
+              mountPath: /verdaccio/storage
+      volumes:
+        - name: config
+          configMap:
+            name: anydesign-npm-proxy-config
+        - name: storage
+          emptyDir: {}
