@@ -27,17 +27,10 @@ PUSH_IMAGE=0 bash infra/agent-sandbox/astro-website/publish-image.sh
 
 ## Run the gated K8s E2E
 
-Prerequisites:
-
-- Current `kubectl` context points at the development cluster.
-- agent-sandbox CRDs are installed. The Phase A contract is pinned to `kubernetes-sigs/agent-sandbox` `v0.5.0`:
-
-```bash
-bash infra/agent-sandbox/install-controller.sh
-```
-
-- The GHCR image above is pushed and pullable.
-- `anydesign-sandboxes` and `anydesign-runtime` can be created or already exist.
+Prerequisites are Docker Desktop, `k3d`, `kubectl`, OpenSSL, Node.js, Rust, and a
+Runtime-owned Chromium executable. The runner creates/selects the dedicated
+`zerondesign-e2e` cluster and installs the pinned agent-sandbox `v0.5.0`
+controller when its CRDs are absent.
 
 Run:
 
@@ -45,17 +38,54 @@ Run:
 bash infra/agent-sandbox/run-k8s-e2e.sh
 ```
 
-The script applies the runtime RBAC, network policy, Astro `SandboxTemplate`, and `SandboxWarmPool`, then runs:
+Useful local overrides:
 
 ```bash
-RUN_AGENT_SANDBOX_E2E=1 cargo test --manifest-path services/runtime/Cargo.toml --test k8s_sandbox_e2e -- --nocapture
+ANYDESIGN_E2E_CLUSTER=zerondesign-e2e \
+RUNTIME_BROWSER_EXECUTABLE="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+SANDBOX_BASE_IMAGE=ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0 \
+bash infra/agent-sandbox/run-k8s-e2e.sh
 ```
 
-If the controller release uses a custom Service name for the workspace channel, override discovery with:
+`SANDBOX_BASE_IMAGE` is an offline/local bootstrap override. The default remains
+`node:22-bookworm`.
+
+The runner builds the current checkout, adds a worktree content fingerprint when
+the tree is dirty, imports the image into k3d, and rejects Pod/image config digest
+mismatches. It deploys Astro and Fumadocs warm pools, the internal npm proxy, and
+the deny-by-default NetworkPolicy.
+
+Two gates then run:
+
+- authenticated channel smoke with two concurrent claims, process leases, and
+  binary archive export;
+- Website and Docs Public Runtime API fixture lifecycle with Runtime proxy,
+  real Chromium PNG evidence, artifact CAS promotion, Sandbox release, and
+  post-release artifact access.
+
+Evidence is written under `services/runtime/target/e2e-evidence/` and is checked
+for required fields, cross-project screenshot identity, event order, and
+secret-like values. Fixture evidence does not replace the separately approved
+real-provider release gate.
+
+## Run the deployed Runtime RC fixture gate
+
+After the sandbox gate has bootstrapped the dedicated cluster, build and deploy
+the Runtime OCI image and drive Website plus Docs through the cluster service:
 
 ```bash
-ANYDESIGN_E2E_SANDBOX_SERVICE=<service-name> bash infra/agent-sandbox/run-k8s-e2e.sh
+bash infra/agent-sandbox/run-runtime-rc-gate.sh
 ```
+
+The runner vendors locked Rust dependencies into the ignored Runtime `target`
+directory, builds offline in Docker, imports the image into k3d, deploys the
+Runtime and deterministic HTTP model gateway, then cross-checks `/version`, Pod
+image ref, and container imageID. Evidence is written to
+`services/runtime/target/e2e-evidence/runtime-rc-*.json`.
+
+`RUNTIME_RC_REUSE_IMAGE=<ref>` may be used only to rerun the HTTP fixture driver
+against an already-built image; the same commit, image ref, and imageID checks
+still apply.
 
 The workspace boundary for one generated work is the checked-out `SandboxClaim` plus its PVC-backed `/workspace` volume. The `SandboxTemplate` carries a `volumeClaimTemplates` entry named `workspace`; runtime labels each claim/pod with `anydesign.dev/workspace-pvc=<workspacePvcName>` for traceability.
 
