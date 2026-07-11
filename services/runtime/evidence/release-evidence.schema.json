@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerondesign.local/schemas/release-evidence.schema.json",
+  "title": "ZeronDesign Runtime release evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "releaseEligible",
+    "recordedAt",
+    "repository",
+    "cluster",
+    "images",
+    "transport",
+    "auth",
+    "provider",
+    "fixture",
+    "projects",
+    "recoveryScenarios",
+    "networkChecks",
+    "secretScan",
+    "result"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "release-evidence@1" },
+    "releaseEligible": { "type": "boolean" },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "repository": {
+      "type": "object",
+      "required": ["commit", "dirty", "lockHash"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/nonEmpty" },
+        "dirty": { "type": "boolean" },
+        "lockHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "required": ["name", "kubeContext", "createdAt", "nodeUid"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmpty" },
+        "kubeContext": { "$ref": "#/$defs/nonEmpty" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "nodeUid": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "images": {
+      "type": "object",
+      "required": ["runtime", "sandbox", "controller", "npmProxy", "dockerfileFrontend"],
+      "properties": {
+        "runtime": { "$ref": "#/$defs/runtimeImage" },
+        "sandbox": { "$ref": "#/$defs/image" },
+        "controller": { "$ref": "#/$defs/digestRef" },
+        "npmProxy": { "$ref": "#/$defs/digestRef" },
+        "dockerfileFrontend": { "$ref": "#/$defs/digestRef" }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "required": ["mode", "mtlsVerified", "rotationWindowVerified", "runtimeSanHash", "sandboxSanHash", "runtimeCertSerialHash", "sandboxCertSerialHash", "runtimeCertExpiresAt", "sandboxCertExpiresAt"],
+      "properties": {
+        "mode": { "enum": ["mtls", "debug-loopback"] },
+        "mtlsVerified": { "type": "boolean" },
+        "rotationWindowVerified": { "const": true },
+        "runtimeSanHash": { "$ref": "#/$defs/sha256" },
+        "sandboxSanHash": { "$ref": "#/$defs/sha256" },
+        "runtimeCertSerialHash": { "$ref": "#/$defs/sha256" },
+        "sandboxCertSerialHash": { "$ref": "#/$defs/sha256" },
+        "runtimeCertExpiresAt": { "type": "string", "format": "date-time" },
+        "sandboxCertExpiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "required": ["principalMode", "projectOwnershipVerified", "channelJwtVerified"],
+      "properties": {
+        "principalMode": { "enum": ["required", "disabled"] },
+        "projectOwnershipVerified": { "type": "boolean" },
+        "channelJwtVerified": { "type": "boolean" }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "required": ["mode", "model", "approvalReference", "credentialPresent"],
+      "properties": {
+        "mode": { "enum": ["fixture", "real-audit", "approved-real"] },
+        "model": { "$ref": "#/$defs/nonEmpty" },
+        "approvalReference": { "type": ["string", "null"] },
+        "credentialPresent": { "type": "boolean" }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "required": ["deployed", "concurrent", "projects"],
+      "properties": {
+        "deployed": { "const": true },
+        "concurrent": { "const": true },
+        "projects": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/project" }
+        }
+      }
+    },
+    "projects": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/project" }
+    },
+    "recoveryScenarios": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["scenario", "injectionPoint", "result", "orphanCount"],
+        "properties": {
+          "scenario": { "$ref": "#/$defs/nonEmpty" },
+          "injectionPoint": { "$ref": "#/$defs/nonEmpty" },
+          "result": { "const": "pass" },
+          "orphanCount": { "const": 0 }
+        }
+      }
+    },
+    "networkChecks": {
+      "type": "object",
+      "required": ["directRegistryDenied", "npmProxyInstallPassed"],
+      "properties": {
+        "directRegistryDenied": { "type": "boolean" },
+        "npmProxyInstallPassed": { "type": "boolean" }
+      }
+    },
+    "secretScan": {
+      "type": "object",
+      "required": ["patternSet", "filesScanned", "matches"],
+      "properties": {
+        "patternSet": { "const": "runtime-credentials@1" },
+        "filesScanned": { "type": "integer", "minimum": 1 },
+        "matches": { "type": "array", "maxItems": 0 }
+      }
+    },
+    "result": { "enum": ["pass", "fail"] }
+  },
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "digestRef": { "type": "string", "pattern": "@sha256:[a-f0-9]{64}$" },
+    "image": {
+      "type": "object",
+      "required": ["ref", "configDigest"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/nonEmpty" },
+        "configDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
+    "runtimeImage": {
+      "allOf": [
+        { "$ref": "#/$defs/image" },
+        {
+          "type": "object",
+          "required": ["manifestDigest", "reportedCommit"],
+          "properties": {
+            "manifestDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "reportedCommit": { "$ref": "#/$defs/nonEmpty" }
+          }
+        }
+      ]
+    },
+    "project": {
+      "type": "object",
+      "required": [
+        "kind", "projectId", "buildRunId", "editRunId", "bindingId", "podUid",
+        "buildId", "candidateManifestHash", "sourceSnapshotUri", "previewLeaseId",
+        "screenshotId", "nonblankPixelRatio", "versionBeforeCas", "versionAfterCas",
+        "artifactManifestHash", "artifactUrl", "events", "recoverableToolFailureCount",
+        "terminalToolFailureCount", "artifactAssertions", "cancelCleanup", "dependencyEvidence", "sandboxReleasedAt",
+        "artifactHttpStatusAfterRelease"
+      ],
+      "properties": {
+        "kind": { "enum": ["website", "docs"] },
+        "projectId": { "$ref": "#/$defs/nonEmpty" },
+        "buildRunId": { "$ref": "#/$defs/nonEmpty" },
+        "editRunId": { "$ref": "#/$defs/nonEmpty" },
+        "bindingId": { "$ref": "#/$defs/nonEmpty" },
+        "podUid": { "$ref": "#/$defs/nonEmpty" },
+        "buildId": { "$ref": "#/$defs/nonEmpty" },
+        "candidateManifestHash": { "$ref": "#/$defs/sha256" },
+        "sourceSnapshotUri": { "$ref": "#/$defs/nonEmpty" },
+        "previewLeaseId": { "$ref": "#/$defs/nonEmpty" },
+        "screenshotId": { "$ref": "#/$defs/nonEmpty" },
+        "nonblankPixelRatio": { "type": "number", "exclusiveMinimum": 0 },
+        "versionBeforeCas": { "type": ["string", "null"] },
+        "versionAfterCas": { "$ref": "#/$defs/nonEmpty" },
+        "artifactManifestHash": { "$ref": "#/$defs/sha256" },
+        "artifactUrl": { "$ref": "#/$defs/nonEmpty" },
+        "artifactAssertions": {
+          "type": "object",
+          "required": ["content", "computedStyle"],
+          "properties": {
+            "content": {
+              "type": "object",
+              "required": ["expectedTextSha256", "documentSha256", "matched"],
+              "properties": {
+                "expectedTextSha256": { "$ref": "#/$defs/sha256" },
+                "documentSha256": { "$ref": "#/$defs/sha256" },
+                "matched": { "const": true }
+              }
+            },
+            "computedStyle": {
+              "type": "object",
+              "required": ["selector", "display", "color", "fontFamily", "passed"],
+              "properties": {
+                "selector": { "const": "body" },
+                "display": { "$ref": "#/$defs/nonEmpty" },
+                "color": { "$ref": "#/$defs/nonEmpty" },
+                "fontFamily": { "$ref": "#/$defs/nonEmpty" },
+                "passed": { "const": true }
+              }
+            }
+          }
+        },
+        "cancelCleanup": {
+          "type": "object",
+          "required": ["runId", "runStatus", "previewHttpStatusAfterCancel", "passed"],
+          "properties": {
+            "runId": { "$ref": "#/$defs/nonEmpty" },
+            "runStatus": { "const": "cancelled" },
+            "previewHttpStatusAfterCancel": { "const": 404 },
+            "passed": { "const": true }
+          }
+        },
+        "dependencyEvidence": {
+          "type": "object",
+          "required": ["podUid", "pod", "podIp", "nodeModulesPresent", "lockfileSha256", "tarballRequestCount", "passed"],
+          "properties": {
+            "podUid": { "$ref": "#/$defs/nonEmpty" },
+            "pod": { "$ref": "#/$defs/nonEmpty" },
+            "podIp": { "$ref": "#/$defs/nonEmpty" },
+            "nodeModulesPresent": { "const": true },
+            "lockfileSha256": { "$ref": "#/$defs/sha256" },
+            "tarballRequestCount": { "type": "integer", "minimum": 1 },
+            "passed": { "const": true }
+          }
+        },
+        "events": {
+          "type": "object",
+          "required": ["previewUpdated", "runCompleted", "sequenceValid"],
+          "properties": {
+            "previewUpdated": { "$ref": "#/$defs/nonEmpty" },
+            "runCompleted": { "$ref": "#/$defs/nonEmpty" },
+            "sequenceValid": { "type": "boolean" }
+          }
+        },
+        "recoverableToolFailureCount": { "type": "integer", "minimum": 0 },
+        "terminalToolFailureCount": { "const": 0 },
+        "sandboxReleasedAt": { "type": "string", "format": "date-time" },
+        "artifactHttpStatusAfterRelease": { "const": 200 }
+      }
+    }
+  }
+}

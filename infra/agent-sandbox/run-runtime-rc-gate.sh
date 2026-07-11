@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -9,6 +9,76 @@ cluster_name="${ANYDESIGN_E2E_CLUSTER:-zerondesign-e2e}"
 runtime_port="${RUNTIME_RC_PORT:-18080}"
 cd "${ROOT_DIR}"
 
+rc_mode="${RUNTIME_RC_MODE:-audit}"
+if [[ "${rc_mode}" != "audit" && "${rc_mode}" != "release" ]]; then
+  printf 'RUNTIME_RC_MODE must be audit or release\n' >&2
+  exit 2
+fi
+provider_mode="${RUNTIME_RC_PROVIDER_MODE:-fixture}"
+if [[ "${provider_mode}" != "fixture" && "${provider_mode}" != "deepseek" ]]; then
+  printf 'RUNTIME_RC_PROVIDER_MODE must be fixture or deepseek\n' >&2
+  exit 2
+fi
+project_filter="${RUNTIME_RC_PROJECT_FILTER:-all}"
+if [[ "${project_filter}" != "all" && "${project_filter}" != "website" && "${project_filter}" != "docs" ]]; then
+  printf 'RUNTIME_RC_PROJECT_FILTER must be all, website, or docs\n' >&2
+  exit 2
+fi
+if [[ "${rc_mode}" == "release" && "${project_filter}" != "all" ]]; then
+  printf 'release mode requires RUNTIME_RC_PROJECT_FILTER=all\n' >&2
+  exit 2
+fi
+if [[ "${provider_mode}" == "deepseek" && -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  printf 'DEEPSEEK_API_KEY is required for the DeepSeek provider gate\n' >&2
+  exit 2
+fi
+if [[ "${rc_mode}" == "release" && "${provider_mode}" != "deepseek" ]]; then
+  printf 'release mode requires RUNTIME_RC_PROVIDER_MODE=deepseek\n' >&2
+  exit 2
+fi
+if [[ "${rc_mode}" == "release" && -z "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
+  printf 'release mode requires RUNTIME_PROVIDER_APPROVAL_ID\n' >&2
+  exit 2
+fi
+if [[ "${RUNTIME_RC_SKIP_PREFLIGHT:-0}" == "1" ]]; then
+  if [[ "${rc_mode}" == "release" ]]; then
+    printf 'RUNTIME_RC_SKIP_PREFLIGHT is not allowed in release mode\n' >&2
+    exit 2
+  fi
+  printf 'Skipping preflight in audit mode by explicit request\n'
+else
+  if [[ "${rc_mode}" == "release" ]]; then
+    PREFLIGHT_PREFETCH_IMAGES=1 bash infra/agent-sandbox/preflight-runtime-rc.sh
+  else
+    bash infra/agent-sandbox/preflight-runtime-rc.sh
+  fi
+fi
+
+git_sha="$(git rev-parse --short=12 HEAD)"
+git_full_sha="$(git rev-parse HEAD)"
+dirty_count="$(git status --porcelain | wc -l | tr -d ' ')"
+if [[ "${rc_mode}" == "release" && "${dirty_count}" != "0" ]]; then
+  printf 'release mode requires a clean worktree; dirty files=%s\n' "${dirty_count}" >&2
+  exit 2
+fi
+evidence_dir="${RUNTIME_RC_EVIDENCE_DIR:-services/runtime/target/e2e-evidence/${cluster_name}}"
+mkdir -p "${evidence_dir}"
+cluster_exists=false
+if "${K3D}" cluster list --no-headers 2>/dev/null | awk '{print $1}' | rg -Fxq "${cluster_name}"; then
+  cluster_exists=true
+fi
+if [[ "${rc_mode}" == "release" && "${cluster_exists}" == "true" ]]; then
+  printf 'release mode requires a new cluster; k3d cluster already exists: %s\n' \
+    "${cluster_name}" >&2
+  exit 2
+fi
+if [[ "${cluster_exists}" == "false" ]]; then
+  ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+    E2E_EVIDENCE_DIR="${evidence_dir}" \
+    bash infra/agent-sandbox/run-k8s-e2e.sh
+else
+  "${KUBECTL}" config use-context "k3d-${cluster_name}" >/dev/null
+fi
 context="$(${KUBECTL} config current-context)"
 if [[ "${context}" != "k3d-${cluster_name}" ]]; then
   printf 'RC gate requires context k3d-%s; got %s\n' "${cluster_name}" "${context}" >&2
@@ -19,9 +89,24 @@ for required in \
   deployment/anydesign-npm-proxy; do
   "${KUBECTL}" get "${required}" -n anydesign-runtime >/dev/null
 done
+existing_rc_claims="$(${KUBECTL} get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
+  | rg '/project-rc-' || true)"
+if [[ -n "${existing_rc_claims}" ]]; then
+  if [[ "${rc_mode}" == "release" ]]; then
+    printf 'release mode requires zero pre-existing RC SandboxClaims:\n%s\n' "${existing_rc_claims}" >&2
+    exit 2
+  fi
+  printf '%s\n' "${existing_rc_claims}" \
+    | xargs "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null
+fi
+channel_evidence="${RUNTIME_RC_CHANNEL_EVIDENCE:-${evidence_dir}/k3d-channel.json}"
+if [[ ! -s "${channel_evidence}" ]]; then
+  printf 'workspace channel evidence is required: %s\n' "${channel_evidence}" >&2
+  exit 2
+fi
 
-git_sha="$(git rev-parse --short=12 HEAD)"
-dirty_count="$(git status --porcelain | wc -l | tr -d ' ')"
+lock_hash="$(shasum -a 256 infra/agent-sandbox/images.lock.json | awk '{print $1}')"
+build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 image_tag="${git_sha}"
 dirty_flag=false
 if [[ "${dirty_count}" != "0" ]]; then
@@ -35,8 +120,56 @@ if [[ "${dirty_count}" != "0" ]]; then
   dirty_flag=true
 fi
 runtime_image="anydesign/runtime:${image_tag}"
+admin_token="$(openssl rand -hex 32)"
+principal_id="rc-harness-principal"
+principal_key_dir="$(mktemp -d)"
+principal_private_key="${principal_key_dir}/private.pem"
+principal_public_key="${principal_key_dir}/public.der"
+port_forward_pid=""
+gate_id="$(date +%s)"
+provider_secret_created=false
+provider_secret_file=""
+gate_work_dir="$(mktemp -d)"
+active_recovery_evidence="${evidence_dir}/active-recovery.json"
+rm -f "${active_recovery_evidence}"
+cleanup() {
+  if [[ -n "${port_forward_pid}" ]]; then
+    kill "${port_forward_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${provider_secret_created}" == "true" ]]; then
+    "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+      DEEPSEEK_API_KEY- AGENT_MODEL- MODEL_STREAMING- \
+      MODEL_PROVIDER=internal_gateway >/dev/null 2>&1 || true
+    "${KUBECTL}" delete secret anydesign-runtime-provider -n anydesign-runtime \
+      --ignore-not-found=true >/dev/null 2>&1 || true
+    "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime \
+      --timeout=120s >/dev/null 2>&1 || true
+  fi
+  [[ -z "${provider_secret_file}" ]] || rm -f "${provider_secret_file}"
+  if [[ -n "${gate_id}" ]]; then
+    "${KUBECTL}" get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
+      | rg "/project-rc-(website|docs)-${gate_id}-" \
+      | xargs -r "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null 2>&1 || true
+  fi
+  rm -rf "${principal_key_dir}"
+  rm -rf "${gate_work_dir}"
+}
+report_error() {
+  local status=$?
+  printf 'Runtime RC gate failed: status=%s line=%s command=%s\n' \
+    "${status}" "${BASH_LINENO[0]:-unknown}" "${BASH_COMMAND:-unknown}" >&2
+  return "${status}"
+}
+trap report_error ERR
+trap cleanup EXIT
+openssl genpkey -algorithm ED25519 -out "${principal_private_key}" 2>/dev/null
+openssl pkey -in "${principal_private_key}" -pubout -outform DER -out "${principal_public_key}" 2>/dev/null
 
 if [[ -n "${RUNTIME_RC_REUSE_IMAGE:-}" ]]; then
+  if [[ "${rc_mode}" == "release" ]]; then
+    printf 'RUNTIME_RC_REUSE_IMAGE is not allowed in release mode\n' >&2
+    exit 2
+  fi
   runtime_image="${RUNTIME_RC_REUSE_IMAGE}"
   docker image inspect "${runtime_image}" >/dev/null
 else
@@ -55,13 +188,28 @@ else
     --build-arg "REPOSITORY_COMMIT=${git_sha}" \
     --build-arg "REPOSITORY_DIRTY=${dirty_flag}" \
     --build-arg "RUNTIME_IMAGE_REF=${runtime_image}" \
+    --build-arg "IMAGE_LOCK_HASH=${lock_hash}" \
+    --build-arg "BUILD_TIMESTAMP=${build_timestamp}" \
     -t "${runtime_image}" \
     .
 fi
-expected_image_id="sha256:$(docker image save "${runtime_image}" \
-  | tar -xOf - manifest.json \
+runtime_image_archive="${gate_work_dir}/runtime-image.tar"
+docker image save -o "${runtime_image_archive}" "${runtime_image}"
+expected_image_id="sha256:$(tar -xOf "${runtime_image_archive}" manifest.json \
   | node -e 'const fs=require("fs");const m=JSON.parse(fs.readFileSync(0,"utf8"));process.stdout.write(m[0].Config.split("/").pop())')"
+runtime_manifest_digest="$(tar -xOf "${runtime_image_archive}" index.json \
+  | node -e 'const fs=require("fs");const i=JSON.parse(fs.readFileSync(0,"utf8"));const d=i.manifests?.[0]?.digest;if(!/^sha256:[a-f0-9]{64}$/.test(d||""))process.exit(2);process.stdout.write(d)')"
+rm -f "${runtime_image_archive}"
 "${K3D}" image import --cluster "${cluster_name}" "${runtime_image}"
+
+"${KUBECTL}" create secret generic anydesign-runtime-internal-admin \
+  -n anydesign-runtime \
+  --from-literal="token=${admin_token}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+"${KUBECTL}" create secret generic anydesign-runtime-public-principal \
+  -n anydesign-runtime \
+  --from-file="public.der=${principal_public_key}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
 
 "${KUBECTL}" create configmap fixture-model-gateway \
   -n anydesign-runtime \
@@ -70,12 +218,51 @@ expected_image_id="sha256:$(docker image save "${runtime_image}" \
 "${KUBECTL}" apply -f infra/agent-sandbox/runtime/fixture-model-gateway.yaml
 sed "s|image: anydesign/runtime:dev|image: ${runtime_image}|" \
   infra/agent-sandbox/runtime/deployment.yaml | "${KUBECTL}" apply -f -
+configure_deepseek_provider() {
+  provider_secret_file="$(mktemp)"
+  chmod 600 "${provider_secret_file}"
+  printf 'DEEPSEEK_API_KEY=%s\n' "${DEEPSEEK_API_KEY}" >"${provider_secret_file}"
+  "${KUBECTL}" create secret generic anydesign-runtime-provider \
+    -n anydesign-runtime \
+    --from-env-file="${provider_secret_file}" \
+    --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+  "${KUBECTL}" label secret anydesign-runtime-provider -n anydesign-runtime \
+    "anydesign.io/rc-gate-id=${gate_id}" --overwrite >/dev/null
+  provider_secret_created=true
+  rm -f "${provider_secret_file}"
+  provider_secret_file=""
+  "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+    --from=secret/anydesign-runtime-provider >/dev/null
+  "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+    MODEL_PROVIDER=deepseek AGENT_MODEL="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}" \
+    MODEL_STREAMING=true \
+    MODEL_REQUEST_TIMEOUT_SECONDS="${RUNTIME_RC_MODEL_REQUEST_TIMEOUT_SECONDS:-600}" >/dev/null
+}
+active_provider_mode="fixture"
+if [[ "${provider_mode}" == "deepseek" && "${project_filter}" != "all" ]]; then
+  configure_deepseek_provider
+  active_provider_mode="deepseek"
+fi
 "${KUBECTL}" rollout restart deployment/fixture-model-gateway -n anydesign-runtime
-"${KUBECTL}" rollout status deployment/fixture-model-gateway -n anydesign-runtime --timeout=180s
+"${KUBECTL}" rollout restart deployment/anydesign-runtime -n anydesign-runtime
+"${KUBECTL}" rollout status deployment/fixture-model-gateway -n anydesign-runtime --timeout=600s
 "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime --timeout=300s
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  runtime_pods_json="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime -o json)"
+  runtime_pod_count="$(node -e '
+const pods=JSON.parse(process.argv[1]).items.filter(p=>!p.metadata.deletionTimestamp&&p.status.phase==="Running"&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));
+process.stdout.write(String(pods.length));
+' "${runtime_pods_json}")"
+  [[ "${runtime_pod_count}" == "1" ]] && break
+  sleep 2
+done
+[[ "${runtime_pod_count}" == "1" ]] || { printf 'Runtime rollout left multiple serving Pods\n' >&2; exit 3; }
 
-runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime \
-  -o jsonpath='{.items[0].metadata.name}')"
+runtime_pod="$(node -e '
+const pods=JSON.parse(process.argv[1]).items.filter(p=>!p.metadata.deletionTimestamp&&p.status.phase==="Running"&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));
+if(pods.length!==1)process.exit(1);process.stdout.write(pods[0].metadata.name);
+' "${runtime_pods_json}")"
 pod_image="$(${KUBECTL} get pod "${runtime_pod}" -n anydesign-runtime \
   -o jsonpath='{.spec.containers[0].image}')"
 pod_image_id="$(${KUBECTL} get pod "${runtime_pod}" -n anydesign-runtime \
@@ -86,18 +273,34 @@ if [[ "${pod_image}" != "${runtime_image}" || "${pod_image_id}" != "${expected_i
   exit 3
 fi
 
-"${KUBECTL}" port-forward -n anydesign-runtime service/anydesign-runtime \
-  "${runtime_port}:8080" >/tmp/anydesign-runtime-rc-port-forward.log 2>&1 &
-port_forward_pid=$!
-cleanup() {
-  kill "${port_forward_pid}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
 base_url="http://127.0.0.1:${runtime_port}"
-for _ in $(seq 1 60); do
-  curl --fail --silent "${base_url}/health" >/dev/null 2>&1 && break
-  sleep 1
-done
+start_runtime_port_forward() {
+  "${KUBECTL}" port-forward -n anydesign-runtime service/anydesign-runtime \
+    "${runtime_port}:8080" >/tmp/anydesign-runtime-rc-port-forward.log 2>&1 &
+  port_forward_pid=$!
+  for _ in $(seq 1 60); do
+    if curl --fail --silent "${base_url}/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "${port_forward_pid}" >/dev/null 2>&1; then
+      cat /tmp/anydesign-runtime-rc-port-forward.log >&2
+      return 1
+    fi
+    sleep 1
+  done
+  printf 'Runtime port-forward did not become ready\n' >&2
+  return 1
+}
+
+stop_runtime_port_forward() {
+  if [[ -n "${port_forward_pid}" ]]; then
+    kill "${port_forward_pid}" >/dev/null 2>&1 || true
+    wait "${port_forward_pid}" >/dev/null 2>&1 || true
+    port_forward_pid=""
+  fi
+}
+
+start_runtime_port_forward
 version_json="$(curl --fail --silent "${base_url}/version")"
 node -e '
 const v=JSON.parse(process.argv[1]);
@@ -106,66 +309,518 @@ if(v.repositoryCommit!==process.argv[2]||v.imageRef!==process.argv[3]) {
 }
 ' "${version_json}" "${git_sha}" "${runtime_image}"
 
+issue_principal_token() {
+  local project_id="$1"
+  node -e '
+const crypto=require("crypto");
+const fs=require("fs");
+const key=crypto.createPrivateKey(fs.readFileSync(process.argv[1]));
+const publicDer=crypto.createPublicKey(key).export({type:"spki",format:"der"});
+const kid=`ed25519-${crypto.createHash("sha256").update(publicDer).digest("hex").slice(0,16)}`;
+const now=Math.floor(Date.now()/1000);
+const encode=value=>Buffer.from(JSON.stringify(value)).toString("base64url");
+const header=encode({alg:"EdDSA",typ:"JWT",kid});
+const payload=encode({iss:"anydesign-bff",aud:"anydesign-runtime-public",sub:process.argv[3],jti:crypto.randomBytes(16).toString("hex"),iat:now,exp:now+120,projectId:process.argv[2],operations:["preview.read"]});
+const input=`${header}.${payload}`;
+process.stdout.write(`${input}.${crypto.sign(null,Buffer.from(input),key).toString("base64url")}`);
+' "${principal_private_key}" "${project_id}" "${principal_id}"
+}
+
+inject_active_preview_recovery() {
+  local project_id="$1"
+  local runtime_state="$2"
+  local lease_id="$3"
+  local binding_id preview_url preview_prefix principal_token
+  local old_runtime_pod old_runtime_uid new_runtime_uid recovered_state recovered_status
+  local killed_port_forward_pid reconnect_status
+  binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${runtime_state}")"
+  preview_url="${base_url}/previews/${lease_id}/"
+  preview_prefix="/projects/${project_id}/previews/${lease_id}"
+  principal_token="$(issue_principal_token "${project_id}")"
+  recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  [[ "${recovered_status}" == "200" ]] || {
+    printf 'active Preview is unavailable before Runtime restart: %s\n' "${recovered_status}" >&2
+    return 1
+  }
+  old_runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime \
+    -o jsonpath='{.items[0].metadata.name}')"
+  old_runtime_uid="$(${KUBECTL} get pod "${old_runtime_pod}" -n anydesign-runtime \
+    -o jsonpath='{.metadata.uid}')"
+  "${KUBECTL}" rollout restart deployment/anydesign-runtime -n anydesign-runtime >/dev/null
+  "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime --timeout=300s >/dev/null
+  stop_runtime_port_forward
+  start_runtime_port_forward
+  runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime -o json \
+    | node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(0,"utf8")).items.find(p=>!p.metadata.deletionTimestamp&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));if(!p)process.exit(2);process.stdout.write(p.metadata.name)')"
+  new_runtime_uid="$(${KUBECTL} get pod "${runtime_pod}" -n anydesign-runtime \
+    -o jsonpath='{.metadata.uid}')"
+  [[ "${new_runtime_uid}" != "${old_runtime_uid}" ]] || {
+    printf 'Runtime restart did not replace the serving Pod\n' >&2
+    return 1
+  }
+  recovered_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+  node -e '
+const before=JSON.parse(process.argv[1]);
+const after=JSON.parse(process.argv[2]);
+if(after.sandboxBindingId!==process.argv[3]||after.currentVersionId!==before.currentVersionId)process.exit(2);
+' "${runtime_state}" "${recovered_state}" "${binding_id}" "${lease_id}"
+  principal_token="$(issue_principal_token "${project_id}")"
+  recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  [[ "${recovered_status}" == "200" ]] || {
+    printf 'active Preview did not recover after Runtime restart: %s\n' "${recovered_status}" >&2
+    return 1
+  }
+
+  killed_port_forward_pid="${port_forward_pid}"
+  stop_runtime_port_forward
+  if kill -0 "${killed_port_forward_pid}" >/dev/null 2>&1; then
+    printf 'killed Runtime port-forward process is still active\n' >&2
+    return 1
+  fi
+  start_runtime_port_forward
+  principal_token="$(issue_principal_token "${project_id}")"
+  reconnect_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  [[ "${reconnect_status}" == "200" ]] || {
+    printf 'active Preview did not recover after port-forward replacement: %s\n' \
+      "${reconnect_status}" >&2
+    return 1
+  }
+  node -e '
+const fs=require("fs");
+fs.writeFileSync(process.argv[1],JSON.stringify({
+  runtimeRestart:{scenario:"runtime-restart",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,oldPodUid:process.argv[2],newPodUid:process.argv[3],bindingId:process.argv[4],previewLeaseId:process.argv[5]},
+  portForwardKill:{scenario:"port-forward-kill",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,killedPid:Number(process.argv[6]),reconnectedHttpStatus:Number(process.argv[7])}
+},null,2)+"\n");
+' "${active_recovery_evidence}" "${old_runtime_uid}" "${new_runtime_uid}" \
+    "${binding_id}" "${lease_id}" "${killed_port_forward_pid}" "${reconnect_status}"
+}
+
+capture_dependency_workspace_evidence() {
+  local project_json="$1"
+  local pod_uid pods_json record project_pod project_ip lock_hash request_count proxy_logs_file
+  pod_uid="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).podUid)' "${project_json}")"
+  pods_json="$(${KUBECTL} get pods -n anydesign-sandboxes -o json)"
+  record="$(node -e '
+const pods=JSON.parse(process.argv[1]).items;
+const pod=pods.find(item=>item.metadata.uid===process.argv[2]&&!item.metadata.deletionTimestamp);
+if(!pod||pod.status.phase!=="Running")process.exit(2);
+process.stdout.write(`${pod.metadata.name}\t${pod.status.podIP||""}`);
+' "${pods_json}" "${pod_uid}")"
+  IFS=$'\t' read -r project_pod project_ip <<<"${record}"
+  lock_hash="$(${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- sh -lc '
+test -d /workspace/project/node_modules || exit 10
+for file in /workspace/project/package-lock.json /workspace/project/pnpm-lock.yaml; do
+  if [ -f "$file" ]; then sha256sum "$file" | awk "{print \$1}"; exit 0; fi
+done
+exit 11
+')"
+  proxy_logs_file="$(mktemp)"
+  ${KUBECTL} logs -n anydesign-runtime deployment/anydesign-npm-proxy --since=30m >"${proxy_logs_file}"
+  request_count="$(rg -F "\"remoteAddress\":\"${project_ip}\"" "${proxy_logs_file}" \
+    | rg -c '/[^" ]+\.tgz' || true)"
+  rm -f "${proxy_logs_file}"
+  [[ "${request_count:-0}" -ge 1 ]] || {
+    printf 'Verdaccio has no tarball request from project Pod %s (%s)\n' \
+      "${project_pod}" "${project_ip}" >&2
+    return 1
+  }
+  node -e '
+process.stdout.write(JSON.stringify({
+  podUid:process.argv[1],pod:process.argv[2],podIp:process.argv[3],nodeModulesPresent:true,
+  lockfileSha256:process.argv[4],tarballRequestCount:Number(process.argv[5]),passed:true
+}));
+' "${pod_uid}" "${project_pod}" "${project_ip}" "${lock_hash}" "${request_count}"
+}
+
 run_fixture() {
+  set -e
   local project_id="$1"
   local kind="$2"
   local expected_text="$3"
+  local output_file="$4"
+  local inject_recovery="${5:-false}"
   local brief_payload brief_run conversation brief_id build_payload build_run events artifact_url
+  local build_state base_version_id binding_id edit_payload edit_run release_data project_evidence artifact_status artifact_assertions dependency_evidence
+  local edit_response edit_status
+  local build_preview_lease_id
+  local principal_token wrong_project_token anonymous_status cross_project_status preview_url preview_prefix owner_status
+  local cancel_probe_payload cancel_probe_run cancel_probe_response cancelled_preview_status
+  local stage_timeout brief_wait_timeout brief_text edit_text confirmation_ready
+  stage_timeout=240
+  brief_wait_timeout=120
+  brief_text="Create a ${kind} RC fixture"
+  edit_text="Apply the deterministic deployed RC edit."
+  if [[ "${active_provider_mode}" == "deepseek" ]]; then
+    stage_timeout="${RUNTIME_RC_REAL_STAGE_TIMEOUT_SECONDS:-1800}"
+    brief_wait_timeout="${RUNTIME_RC_REAL_BRIEF_WAIT_SECONDS:-720}"
+    brief_text="Create a polished but compact ${kind} using the initialized Runtime template. The final edited artifact must contain the exact text ${expected_text}. Use only Runtime tools, build, open the preview, take a screenshot, report the candidate, and complete the run. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    edit_text="Edit the current ${kind} so the served artifact visibly contains the exact text ${expected_text}. Rebuild, start and inspect preview, take a nonblank screenshot, promote the candidate, then complete. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    if [[ "${kind}" == "docs" ]]; then
+      brief_text="Create a minimal Docs artifact from the initialized Fumadocs template. Keep existing structure and change only the smallest existing source needed. Do not create a full documentation set and do not submit any write over 2000 characters. The final edited artifact must contain the exact text ${expected_text}. Use fs.patch or fs.multi_patch after fs.read, then publish and complete."
+      edit_text="Make one minimal patch to the existing Docs source so the served artifact contains the exact text ${expected_text}. Do not rewrite whole files and do not submit any write over 2000 characters. Rebuild with preview.publish, verify the text, then complete."
+    fi
+  fi
+  curl --fail --silent -X PUT \
+    -H 'content-type: application/json' \
+    -H 'x-anydesign-internal: true' \
+    -H "x-runtime-admin-token: ${admin_token}" \
+    -d "{\"ownerPrincipalId\":\"${principal_id}\"}" \
+    "${base_url}/internal/projects/${project_id}/access" >/dev/null
   brief_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
-    -d "{\"projectId\":\"${project_id}\",\"phase\":\"brief\",\"agentProfile\":\"brief\",\"inputContext\":{\"contentSources\":[{\"id\":\"source-1\",\"kind\":\"prompt\",\"text\":\"Create a ${kind} RC fixture\",\"readable\":true}]}}" \
+    -d "$(node -e 'process.stdout.write(JSON.stringify({projectId:process.argv[1],phase:"brief",agentProfile:"brief",inputContext:{contentSources:[{id:"source-1",kind:"prompt",text:process.argv[2],readable:true}]}}))' "${project_id}" "${brief_text}")" \
     "${base_url}/runs")"
   brief_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${brief_payload}")"
-  for _ in $(seq 1 120); do
+  confirmation_ready=false
+  for _ in $(seq 1 "${brief_wait_timeout}"); do
     conversation="$(curl --fail --silent "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
-    if [[ "${conversation}" == *"confirmation_requested"* || "${conversation}" == *"Confirm this deterministic"* ]]; then
+    if [[ "${conversation}" == *'"briefId"'* || "${conversation}" == *'"kind":"approval_request"'* || "${conversation}" == *"Requested brief confirmation"* || "${conversation}" == *"confirmation_requested"* || "${conversation}" == *"Confirm this deterministic"* ]]; then
+      confirmation_ready=true
       break
     fi
     sleep 1
   done
+  if [[ "${confirmation_ready}" != "true" ]]; then
+    printf 'Brief confirmation did not become visible: project=%s run=%s conversation=%s\n' \
+      "${project_id}" "${brief_run}" "${conversation}" >&2
+    exit 4
+  fi
   curl --fail --silent \
     -H 'content-type: application/json' \
     -d '{"userMessage":"confirm"}' \
     "${base_url}/runs/${brief_run}/continue" >/dev/null
-  conversation="$(curl --fail --silent "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
-  brief_id="$(node -e '
+  brief_id=""
+  for _ in $(seq 1 120); do
+    conversation="$(curl --fail --silent "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
+    brief_id="$(node -e '
 const c=JSON.parse(process.argv[1]);
 const item=[...c.items].reverse().find(x=>x.metadata&&x.metadata.briefId);
-if(!item) throw new Error("briefId missing from conversation");
-process.stdout.write(item.metadata.briefId);
+process.stdout.write(item?.metadata?.briefId||"");
 ' "${conversation}")"
+    [[ -z "${brief_id}" ]] || break
+    sleep 1
+  done
+  if [[ -z "${brief_id}" ]]; then
+    printf 'briefId did not become visible: project=%s run=%s conversation=%s\n' \
+      "${project_id}" "${brief_run}" "${conversation}" >&2
+    exit 4
+  fi
   build_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
     -d "{\"projectId\":\"${project_id}\",\"phase\":\"build\",\"agentProfile\":\"build\",\"inputContext\":{\"briefId\":\"${brief_id}\"}}" \
     "${base_url}/runs")"
   build_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${build_payload}")"
-  events="$(curl --fail --silent --max-time 240 "${base_url}/runs/${build_run}/events")"
+  events="$(curl --fail --silent --max-time "${stage_timeout}" "${base_url}/runs/${build_run}/events")"
   if [[ "${events}" != *'"type":"run.completed"'* || "${events}" != *'"status":"completed"'* ]]; then
     printf 'Build did not complete: project=%s run=%s\n%s\n' "${project_id}" "${build_run}" "${events}" >&2
     exit 4
   fi
+  build_preview_lease_id="$(node -e '
+for(const line of process.argv[1].split(/\r?\n/)){
+  if(!line.startsWith("data: "))continue;
+  try{const event=JSON.parse(line.slice(6));if(event.type==="preview.updated"){
+    const match=new URL(event.url).pathname.match(/^\/previews\/([^/]+)\/?$/);
+    if(match){process.stdout.write(match[1]);process.exit(0);}
+  }}catch{}
+}
+process.exit(2);
+' "${events}")"
+  build_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+  base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
+  binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
+  if [[ "${inject_recovery}" == "true" && "${kind}" == "website" && ! -s "${active_recovery_evidence}" ]]; then
+    inject_active_preview_recovery "${project_id}" "${build_state}" "${build_preview_lease_id}"
+    build_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+    base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
+    binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
+  fi
+  edit_response="$(curl --silent --show-error --write-out $'\n%{http_code}' \
+    -H 'content-type: application/json' \
+    -d "{\"projectId\":\"${project_id}\",\"phase\":\"edit\",\"agentProfile\":\"edit\",\"inputContext\":{\"baseVersionId\":\"${base_version_id}\",\"sandboxBindingId\":\"${binding_id}\"}}" \
+    "${base_url}/runs")"
+  edit_status="${edit_response##*$'\n'}"
+  edit_payload="${edit_response%$'\n'*}"
+  if [[ "${edit_status}" != "200" ]]; then
+    printf 'Edit start failed: project=%s status=%s body=%s\n' \
+      "${project_id}" "${edit_status}" "${edit_payload}" >&2
+    exit 4
+  fi
+  edit_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${edit_payload}")"
+  curl --fail --silent \
+    -H 'content-type: application/json' \
+    -d "$(node -e 'process.stdout.write(JSON.stringify({userMessage:process.argv[1]}))' "${edit_text}")" \
+    "${base_url}/runs/${edit_run}/continue" >/dev/null
+  events="$(curl --fail --silent --max-time "${stage_timeout}" "${base_url}/runs/${edit_run}/events")"
+  if [[ "${events}" != *'"type":"run.completed"'* || "${events}" != *'"status":"completed"'* ]]; then
+    printf 'Edit did not complete cleanly: project=%s run=%s\n%s\n' "${project_id}" "${edit_run}" "${events}" >&2
+    exit 4
+  fi
   artifact_url="${base_url}/artifacts/${project_id}/current/"
-  curl --fail --silent "${artifact_url}" | rg -F "${expected_text}" >/dev/null
-  printf '{"projectId":"%s","briefRunId":"%s","briefId":"%s","buildRunId":"%s","artifactUrl":"%s"}' \
-    "${project_id}" "${brief_run}" "${brief_id}" "${build_run}" "${artifact_url}"
+  artifact_assertions="$(node -e 'process.stdout.write(JSON.stringify({url:process.argv[1],expectedText:process.argv[2]}))' \
+    "${artifact_url}" "${expected_text}" \
+    | node services/runtime/scripts/assert-artifact-render.mjs)"
+  project_evidence="$(curl --fail --silent \
+    -H 'x-anydesign-internal: true' \
+    -H "x-runtime-admin-token: ${admin_token}" \
+    "${base_url}/internal/projects/${project_id}/release-evidence")"
+  node -e '
+const evidence=JSON.parse(process.argv[1]);
+if(evidence.terminalToolFailureCount!==0) throw new Error(`terminal tool failures: ${evidence.terminalToolFailureCount}`);
+' "${project_evidence}"
+  dependency_evidence="$(capture_dependency_workspace_evidence "${project_evidence}")"
+  project_evidence="$(node -e '
+const evidence=JSON.parse(process.argv[1]);
+evidence.dependencyEvidence=JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify(evidence));
+' "${project_evidence}" "${dependency_evidence}")"
+  principal_token="$(issue_principal_token "${project_id}")"
+  wrong_project_token="$(issue_principal_token "wrong-${project_id}")"
+  preview_url="${base_url}/previews/$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).previewLeaseId)' "${project_evidence}")/"
+  preview_prefix="/projects/${project_id}/previews/$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).previewLeaseId)' "${project_evidence}")"
+  anonymous_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "${preview_url}")"
+  cross_project_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${wrong_project_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  owner_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  if [[ "${anonymous_status}" != "401" || "${cross_project_status}" != "403" || "${owner_status}" != "200" ]]; then
+    printf 'Public principal gate failed: anonymous=%s crossProject=%s owner=%s\n' \
+      "${anonymous_status}" "${cross_project_status}" "${owner_status}" >&2
+    exit 5
+  fi
+  cancel_probe_payload="$(curl --fail --silent \
+    -H 'content-type: application/json' \
+    -d "$(node -e '
+process.stdout.write(JSON.stringify({
+  projectId:process.argv[1],phase:"edit",agentProfile:"edit",
+  inputContext:{baseVersionId:process.argv[2],sandboxBindingId:process.argv[3]}
+}));
+' "${project_id}" "$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).versionAfterCas)' "${project_evidence}")" "${binding_id}")" \
+    "${base_url}/runs")"
+  cancel_probe_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${cancel_probe_payload}")"
+  cancel_probe_response="$(curl --fail --silent -X POST \
+    "${base_url}/runs/${cancel_probe_run}/cancel")"
+  node -e '
+const response=JSON.parse(process.argv[1]);
+if(response.runId!==process.argv[2]||response.status!=="cancelled")process.exit(2);
+' "${cancel_probe_response}" "${cancel_probe_run}"
+  principal_token="$(issue_principal_token "${project_id}")"
+  cancelled_preview_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" \
+    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  [[ "${cancelled_preview_status}" == "404" ]] || {
+    printf 'cancelled run left Preview lease accessible: %s\n' "${cancelled_preview_status}" >&2
+    exit 5
+  }
+  project_evidence="$(node -e '
+const evidence=JSON.parse(process.argv[1]);
+evidence.cancelCleanup={runId:process.argv[2],runStatus:"cancelled",previewHttpStatusAfterCancel:Number(process.argv[3]),passed:true};
+process.stdout.write(JSON.stringify(evidence));
+' "${project_evidence}" "${cancel_probe_run}" "${cancelled_preview_status}")"
+  release_data="$(curl --fail --silent -X POST \
+    -H 'x-anydesign-internal: true' \
+    -H "x-runtime-admin-token: ${admin_token}" \
+    "${base_url}/internal/projects/${project_id}/release-sandbox")"
+  artifact_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "${artifact_url}")"
+  node -e '
+const evidence=JSON.parse(process.argv[1]);
+const released=JSON.parse(process.argv[2]);
+evidence.kind=process.argv[3];
+evidence.artifactUrl=new URL(evidence.artifactUrl,process.argv[4]).toString();
+evidence.sandboxReleasedAt=released.releasedAt;
+evidence.artifactHttpStatusAfterRelease=Number(process.argv[5]);
+evidence.artifactAssertions=JSON.parse(process.argv[6]);
+process.stdout.write(JSON.stringify(evidence));
+' "${project_evidence}" "${release_data}" "${kind}" "${base_url}" "${artifact_status}" "${artifact_assertions}" \
+    >"${output_file}"
 }
 
-gate_id="$(date +%s)"
-website="$(run_fixture "rc-website-${gate_id}" website 'RC Website')"
-docs="$(run_fixture "rc-docs-${gate_id}" docs 'RC Docs')"
-mkdir -p services/runtime/target/e2e-evidence
-evidence="services/runtime/target/e2e-evidence/runtime-rc-${image_tag}.json"
+write_real_project_evidence() {
+  local kind="$1"
+  local project_json="$2"
+  node -e '
+const fs=require("fs");
+fs.writeFileSync(process.argv[1],JSON.stringify({
+  schemaVersion:"real-provider-project-evidence@1",
+  recordedAt:new Date().toISOString(),
+  provider:{mode:process.argv[3],model:process.argv[4],credentialPresent:true},
+  project:JSON.parse(process.argv[2]),
+},null,2)+"\n");
+' "${evidence_dir}/real-provider-${kind}.json" "${project_json}" \
+    "$([[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]] && printf approved-real || printf real-audit)" \
+    "${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
+}
+
+website=""
+docs=""
+if [[ "${project_filter}" != "all" ]]; then
+  if [[ "${project_filter}" == "website" ]]; then
+    website_file="${gate_work_dir}/website.json"
+    run_fixture "rc-website-${gate_id}" website 'RC Website Edited' "${website_file}" false
+    website="$(cat "${website_file}")"
+    write_real_project_evidence website "${website}"
+  else
+    docs_file="${gate_work_dir}/docs.json"
+    run_fixture "rc-docs-${gate_id}" docs 'RC Docs Edited' "${docs_file}" false
+    docs="$(cat "${docs_file}")"
+    write_real_project_evidence docs "${docs}"
+  fi
+  printf 'Partial real-provider audit passed for project filter %s\n' "${project_filter}"
+  exit 0
+fi
+
+fixture_website_file="${gate_work_dir}/fixture-website.json"
+fixture_docs_file="${gate_work_dir}/fixture-docs.json"
+fixture_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+run_fixture "rc-website-${gate_id}-fixture" website 'RC Website Edited' \
+  "${fixture_website_file}" false &
+fixture_website_pid=$!
+run_fixture "rc-docs-${gate_id}-fixture" docs 'RC Docs Edited' \
+  "${fixture_docs_file}" false &
+fixture_docs_pid=$!
+wait "${fixture_website_pid}"
+wait "${fixture_docs_pid}"
+fixture_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fixture_website="$(cat "${fixture_website_file}")"
+fixture_docs="$(cat "${fixture_docs_file}")"
+fixture_evidence="${evidence_dir}/deployed-fixture.json"
+node -e '
+const fs=require("fs");
+const projects=process.argv.slice(2,4).map(JSON.parse);
+if(projects[0].podUid===projects[1].podUid||projects[0].artifactManifestHash===projects[1].artifactManifestHash)process.exit(2);
+fs.writeFileSync(process.argv[1],JSON.stringify({
+  schemaVersion:"deployed-fixture-evidence@1",provider:{mode:"fixture",model:"deterministic-tool-sequence"},
+  execution:{mode:"concurrent",startedAt:process.argv[4],finishedAt:process.argv[5],passed:true},projects
+},null,2)+"\n");
+' "${fixture_evidence}" "${fixture_website}" "${fixture_docs}" "${fixture_started_at}" "${fixture_finished_at}"
+
+recovery_probe_file="${gate_work_dir}/recovery-probe.json"
+run_fixture "rc-website-${gate_id}-recovery" website 'RC Website Edited' \
+  "${recovery_probe_file}" true
+
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  configure_deepseek_provider
+  active_provider_mode="deepseek"
+  "${KUBECTL}" rollout restart deployment/anydesign-runtime -n anydesign-runtime >/dev/null
+  "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime --timeout=300s >/dev/null
+  stop_runtime_port_forward
+  start_runtime_port_forward
+  runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime -o json \
+    | node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(0,"utf8")).items.find(p=>!p.metadata.deletionTimestamp&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));if(!p)process.exit(2);process.stdout.write(p.metadata.name)')"
+  website_file="${gate_work_dir}/website.json"
+  docs_file="${gate_work_dir}/docs.json"
+  run_fixture "rc-website-${gate_id}-real" website 'RC Website Edited' "${website_file}" false
+  website="$(cat "${website_file}")"
+  write_real_project_evidence website "${website}"
+  run_fixture "rc-docs-${gate_id}-real" docs 'RC Docs Edited' "${docs_file}" false
+  docs="$(cat "${docs_file}")"
+  write_real_project_evidence docs "${docs}"
+else
+  website_file="${fixture_website_file}"
+  docs_file="${fixture_docs_file}"
+  website="${fixture_website}"
+  docs="${fixture_docs}"
+fi
+
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  provider_model="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
+fi
+if [[ -z "${website}" || -z "${docs}" ]]; then
+  printf 'Website and Docs project evidence is required\n' >&2
+  exit 6
+fi
+
+evidence="${evidence_dir}/runtime-rc-${image_tag}.json"
+provider_evidence_mode="fixture"
+provider_model="deterministic-tool-sequence"
+provider_credential_present=false
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  provider_model="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
+  provider_credential_present=true
+  if [[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
+    provider_evidence_mode="approved-real"
+  else
+    provider_evidence_mode="real-audit"
+  fi
+fi
 node -e '
 const fs=require("fs");
 const payload={
   recordedAt:new Date().toISOString(),
+  repository:{commit:process.argv[8],dirty:process.argv[9]==="true",lockHash:process.argv[10]},
+  cluster:JSON.parse(process.argv[11]),
+  images:{runtime:{ref:process.argv[4],configDigest:process.argv[5],manifestDigest:process.argv[22],reportedCommit:JSON.parse(process.argv[2]).repositoryCommit}},
+  transport:JSON.parse(fs.readFileSync(process.argv[21],"utf8")).transport,
+  auth:{principalMode:process.argv[14],projectOwnershipVerified:process.argv[15]==="true",channelJwtVerified:true},
+  provider:{mode:process.argv[16],model:process.argv[17],approvalReference:process.argv[18]||null,credentialPresent:process.argv[19]==="true"},
   runtimeVersion:JSON.parse(process.argv[2]),
   runtimePod:process.argv[3],
   runtimeImage:process.argv[4],
   runtimeImageId:process.argv[5],
-  website:JSON.parse(process.argv[6]),
-  docs:JSON.parse(process.argv[7]),
+  runtimeManifestDigest:process.argv[22],
+  fixture:JSON.parse(fs.readFileSync(process.argv[20],"utf8")),
+  projects:[JSON.parse(process.argv[6]),JSON.parse(process.argv[7])],
 };
 fs.writeFileSync(process.argv[1],JSON.stringify(payload,null,2)+"\n");
-' "${evidence}" "${version_json}" "${runtime_pod}" "${runtime_image}" "${pod_image_id}" "${website}" "${docs}"
+' "${evidence}" "${version_json}" "${runtime_pod}" "${runtime_image}" "${pod_image_id}" "${website}" "${docs}" \
+  "${git_sha}" "${dirty_flag}" "${lock_hash}" \
+  "$(node -e '
+const {execFileSync}=require("child_process");
+const cluster=JSON.parse(execFileSync(process.argv[1],["get","node","-o","json"],{encoding:"utf8"}));
+const node=cluster.items[0];
+process.stdout.write(JSON.stringify({name:process.argv[2],kubeContext:process.argv[3],createdAt:node.metadata.creationTimestamp,nodeUid:node.metadata.uid}));
+' "${KUBECTL}" "${cluster_name}" "${context}")" \
+  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime' | shasum -a 256 | awk '{print $1}')" \
+  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
+  "required" "true" "${provider_evidence_mode}" "${provider_model}" \
+  "${RUNTIME_PROVIDER_APPROVAL_ID:-}" "${provider_credential_present}" "${fixture_evidence}" \
+  "${channel_evidence}" "${runtime_manifest_digest}"
 printf 'Runtime RC gate passed: %s\n' "${evidence}"
+
+npm_evidence="${evidence_dir}/npm-proxy.json"
+recovery_evidence="${evidence_dir}/recovery.json"
+ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+  NPM_PROXY_EVIDENCE_PATH="${npm_evidence}" \
+  NPM_PROXY_PROJECT_EVIDENCE_FILE="${evidence}" \
+  bash infra/agent-sandbox/run-npm-proxy-gate.sh
+ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+  RECOVERY_EVIDENCE_PATH="${recovery_evidence}" \
+  ACTIVE_RECOVERY_EVIDENCE_PATH="${active_recovery_evidence}" \
+  RECOVERY_RUNTIME_EVIDENCE_FILE="${evidence}" \
+  bash infra/agent-sandbox/run-runtime-recovery-gate.sh
+
+release_evidence="${evidence_dir}/release-evidence.json"
+aggregate_args=(
+  --runtime "${evidence}"
+  --channel "${channel_evidence}"
+  --npm "${npm_evidence}"
+  --recovery "${recovery_evidence}"
+  --lock infra/agent-sandbox/images.lock.json
+  --out "${release_evidence}"
+  --mode "${rc_mode}"
+)
+if [[ -n "${RUNTIME_RC_PROVIDER_EVIDENCE:-}" ]]; then
+  aggregate_args+=(--provider "${RUNTIME_RC_PROVIDER_EVIDENCE}")
+fi
+if [[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
+  aggregate_args+=(--approval-reference "${RUNTIME_PROVIDER_APPROVAL_ID}")
+fi
+node services/runtime/scripts/aggregate-release-evidence.mjs "${aggregate_args[@]}"
+if [[ "${rc_mode}" == "release" ]]; then
+  node services/runtime/scripts/validate-release-evidence.mjs "${release_evidence}"
+  release_evidence_absolute="$(cd "$(dirname "${release_evidence}")" && pwd)/$(basename "${release_evidence}")"
+  printf 'RC_RELEASE_ELIGIBLE=true\n'
+  printf 'RC_EVIDENCE_SUMMARY=%s\n' "${release_evidence_absolute}"
+  printf 'RC_COMMIT=%s\n' "${git_full_sha}"
+  printf 'RC_RUNTIME_IMAGE=%s@%s\n' "${runtime_image}" "${runtime_manifest_digest}"
+else
+  printf 'RC audit complete; strict release validation intentionally not asserted: %s\n' \
+    "${release_evidence}"
+fi
