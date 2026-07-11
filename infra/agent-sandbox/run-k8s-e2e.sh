@@ -8,8 +8,29 @@ K3D="${K3D:-k3d}"
 cd "${ROOT_DIR}"
 
 cluster_name="${ANYDESIGN_E2E_CLUSTER:-zerondesign-e2e}"
+lock_file="infra/agent-sandbox/images.lock.json"
+locked_image() {
+  node -e '
+const fs=require("fs");
+const lock=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+const image=lock.images?.[process.argv[2]];
+if(!image?.ref||!/^sha256:[a-f0-9]{64}$/.test(image.digest||""))process.exit(2);
+process.stdout.write(`${image.ref}@${image.digest}`);
+' "${lock_file}" "$1"
+}
+k3s_image="${K3S_IMAGE:-$(locked_image k3s)}"
+sandbox_base_image="${SANDBOX_BASE_IMAGE:-$(locked_image sandboxNode)}"
+controller_image="$(locked_image agentSandboxController)"
+npm_proxy_image="$(locked_image npmProxy)"
 if ! "${K3D}" cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "${cluster_name}"; then
-  "${K3D}" cluster create "${cluster_name}" --servers 1 --agents 0 --wait
+  "${K3D}" cluster create "${cluster_name}" \
+    --image "${k3s_image}" \
+    --servers 1 \
+    --agents 0 \
+    --no-lb \
+    --k3s-arg '--disable=traefik@server:*' \
+    --k3s-arg '--disable=metrics-server@server:*' \
+    --wait
 fi
 "${KUBECTL}" config use-context "k3d-${cluster_name}" >/dev/null
 context="$(${KUBECTL} config current-context 2>/dev/null || true)"
@@ -18,6 +39,48 @@ if [[ "${context}" != "k3d-${cluster_name}" ]]; then
     "${cluster_name}" "${context:-<none>}" >&2
   exit 2
 fi
+local_path_found=false
+for _ in $(seq 1 120); do
+  if "${KUBECTL}" get deployment/local-path-provisioner -n kube-system >/dev/null 2>&1; then
+    local_path_found=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${local_path_found}" != "true" ]]; then
+  printf 'local-path-provisioner deployment did not appear\n' >&2
+  exit 3
+fi
+"${KUBECTL}" rollout status deployment/local-path-provisioner \
+  -n kube-system \
+  --timeout=300s >/dev/null
+assert_deployment_digest() {
+  local namespace="$1"
+  local deployment="$2"
+  local selector="$3"
+  local expected_image="$4"
+  local expected_digest spec_image pod_image_id
+  expected_digest="${expected_image##*@}"
+  spec_image="$("${KUBECTL}" get deployment "${deployment}" -n "${namespace}" \
+    -o 'jsonpath={.spec.template.spec.containers[0].image}')"
+  pod_image_id="$("${KUBECTL}" get pods -n "${namespace}" -l "${selector}" \
+    -o 'jsonpath={.items[0].status.containerStatuses[0].imageID}')"
+  if [[ "${spec_image}" != *"@${expected_digest}" && "${pod_image_id}" != *"@${expected_digest}" ]]; then
+    printf 'deployment image digest mismatch: namespace=%s deployment=%s expected=%s spec=%s imageID=%s\n' \
+      "${namespace}" "${deployment}" "${expected_digest}" "${spec_image}" "${pod_image_id}" >&2
+    exit 3
+  fi
+  if [[ "${pod_image_id}" != *"@${expected_digest}" ]]; then
+    printf 'deployment runtime imageID mismatch: namespace=%s deployment=%s expected=%s imageID=%s\n' \
+      "${namespace}" "${deployment}" "${expected_digest}" "${pod_image_id}" >&2
+    exit 3
+  fi
+}
+assert_deployment_digest \
+  kube-system \
+  local-path-provisioner \
+  app=local-path-provisioner \
+  "$(locked_image localPathProvisioner)"
 git_sha="$(git rev-parse --short=12 HEAD)"
 dirty="$(git status --porcelain | wc -l | tr -d ' ')"
 image_tag="${git_sha}"
@@ -31,7 +94,6 @@ if [[ "${dirty}" != "0" ]]; then
   image_tag="${git_sha}-dirty-${worktree_fingerprint}"
 fi
 sandbox_image="anydesign/astro-website-sandbox:${image_tag}"
-sandbox_base_image="${SANDBOX_BASE_IMAGE:-node:22-bookworm}"
 
 docker build \
   -f infra/agent-sandbox/astro-website/Dockerfile \
@@ -61,8 +123,14 @@ done
 if (( ${#missing_crds[@]} > 0 )); then
   printf 'Installing the pinned agent-sandbox controller; missing CRDs:\n'
   printf '  - %s\n' "${missing_crds[@]}"
-  bash infra/agent-sandbox/install-controller.sh
+  AGENT_SANDBOX_CONTROLLER_IMAGE="${controller_image}" \
+    bash infra/agent-sandbox/install-controller.sh
 fi
+assert_deployment_digest \
+  agent-sandbox-system \
+  agent-sandbox-controller \
+  app=agent-sandbox-controller \
+  "${controller_image}"
 
 "${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml
 
@@ -80,6 +148,17 @@ verifier_config_map="anydesign-workspace-channel-verifier"
 private_key_file="${key_dir}/private.der"
 public_key_file="${key_dir}/public.der"
 previous_public_key_file="${key_dir}/previous-public.der"
+channel_ca_key_file="${key_dir}/channel-ca.key"
+channel_ca_file="${key_dir}/channel-ca.crt"
+previous_channel_ca_key_file="${key_dir}/previous-channel-ca.key"
+previous_channel_ca_file="${key_dir}/previous-channel-ca.crt"
+channel_ca_bundle_file="${key_dir}/channel-ca-bundle.crt"
+runtime_tls_key_file="${key_dir}/runtime-tls.key"
+runtime_tls_csr_file="${key_dir}/runtime-tls.csr"
+runtime_tls_cert_file="${key_dir}/runtime-tls.crt"
+sandbox_tls_key_file="${key_dir}/sandbox-tls.key"
+sandbox_tls_csr_file="${key_dir}/sandbox-tls.csr"
+sandbox_tls_cert_file="${key_dir}/sandbox-tls.crt"
 
 if "${KUBECTL}" get secret "${signer_secret}" -n anydesign-runtime >/dev/null 2>&1; then
   "${KUBECTL}" get secret "${signer_secret}" \
@@ -119,6 +198,62 @@ fi
   -o yaml \
   | "${KUBECTL}" apply -f -
 
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 2 \
+  -subj "/CN=AnyDesign RC Workspace Channel CA" \
+  -keyout "${channel_ca_key_file}" \
+  -out "${channel_ca_file}" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 2 \
+  -subj "/CN=AnyDesign RC Previous Workspace Channel CA" \
+  -keyout "${previous_channel_ca_key_file}" \
+  -out "${previous_channel_ca_file}" >/dev/null 2>&1
+cat "${channel_ca_file}" "${previous_channel_ca_file}" >"${channel_ca_bundle_file}"
+openssl req -newkey rsa:2048 -nodes \
+  -subj "/CN=anydesign-runtime" \
+  -keyout "${runtime_tls_key_file}" \
+  -out "${runtime_tls_csr_file}" >/dev/null 2>&1
+cat >"${key_dir}/runtime-tls.ext" <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=clientAuth
+subjectAltName=URI:spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime
+EOF
+openssl x509 -req -sha256 -days 2 \
+  -in "${runtime_tls_csr_file}" \
+  -CA "${channel_ca_file}" \
+  -CAkey "${channel_ca_key_file}" \
+  -CAcreateserial \
+  -extfile "${key_dir}/runtime-tls.ext" \
+  -out "${runtime_tls_cert_file}" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+  -subj "/CN=workspace-channel.anydesign-sandboxes.svc.cluster.local" \
+  -keyout "${sandbox_tls_key_file}" \
+  -out "${sandbox_tls_csr_file}" >/dev/null 2>&1
+cat >"${key_dir}/sandbox-tls.ext" <<'EOF'
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:*.anydesign-sandboxes.svc.cluster.local,DNS:*.anydesign-sandboxes.svc,IP:127.0.0.1,URI:spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox
+EOF
+openssl x509 -req -sha256 -days 2 \
+  -in "${sandbox_tls_csr_file}" \
+  -CA "${channel_ca_file}" \
+  -CAkey "${channel_ca_key_file}" \
+  -CAcreateserial \
+  -extfile "${key_dir}/sandbox-tls.ext" \
+  -out "${sandbox_tls_cert_file}" >/dev/null 2>&1
+"${KUBECTL}" create secret generic anydesign-runtime-channel-client \
+  -n anydesign-runtime \
+  --from-file="ca.crt=${channel_ca_bundle_file}" \
+  --from-file="tls.crt=${runtime_tls_cert_file}" \
+  --from-file="tls.key=${runtime_tls_key_file}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f -
+"${KUBECTL}" create secret generic anydesign-sandbox-channel-server \
+  -n anydesign-sandboxes \
+  --from-file="ca.crt=${channel_ca_bundle_file}" \
+  --from-file="tls.crt=${sandbox_tls_cert_file}" \
+  --from-file="tls.key=${sandbox_tls_key_file}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f -
+
 "${KUBECTL}" apply -f infra/agent-sandbox/network/default-deny.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/config-map.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/deployment.yaml
@@ -134,7 +269,12 @@ sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image:
 
 "${KUBECTL}" rollout status deployment/anydesign-npm-proxy \
   -n anydesign-runtime \
-  --timeout=180s
+  --timeout=600s
+assert_deployment_digest \
+  anydesign-runtime \
+  anydesign-npm-proxy \
+  app.kubernetes.io/name=anydesign-npm-proxy \
+  "${npm_proxy_image}"
 
 if [[ "${ANYDESIGN_E2E_RESET_WARM_POOL:-1}" == "1" ]]; then
   "${KUBECTL}" delete sandboxes.agents.x-k8s.io \
@@ -231,10 +371,17 @@ mkdir -p "${evidence_dir}"
 evidence_path="${evidence_dir}/k3d-channel-${git_sha}.json"
 public_runtime_evidence_path="${evidence_dir}/public-runtime-fixture-${git_sha}.json"
 
+cargo test --manifest-path services/runtime/Cargo.toml \
+  --test workspace_channel_mtls -- --nocapture
+
 RUN_AGENT_SANDBOX_E2E=1 \
 ANYDESIGN_E2E_SKIP_APPLY=1 \
 KUBECTL="${KUBECTL}" \
 WORKSPACE_CHANNEL_SIGNING_KEY_FILE="${private_key_file}" \
+WORKSPACE_CHANNEL_TLS_MODE=required \
+WORKSPACE_CHANNEL_CA_FILE="${channel_ca_bundle_file}" \
+WORKSPACE_CHANNEL_CLIENT_CERT_FILE="${runtime_tls_cert_file}" \
+WORKSPACE_CHANNEL_CLIENT_KEY_FILE="${runtime_tls_key_file}" \
 E2E_REPOSITORY_COMMIT="${git_sha}" \
 E2E_REPOSITORY_DIRTY_FILES="${dirty}" \
 E2E_K3D_CLUSTER="${cluster_name}" \
@@ -242,6 +389,30 @@ E2E_SANDBOX_IMAGE="${pod_image}" \
 E2E_SANDBOX_IMAGE_ID="${pod_image_id}" \
 E2E_EVIDENCE_PATH="${evidence_path}" \
 cargo test --manifest-path services/runtime/Cargo.toml --test k8s_sandbox_e2e -- --nocapture
+
+runtime_cert_serial_hash="$(openssl x509 -in "${runtime_tls_cert_file}" -noout -serial \
+  | cut -d= -f2 | shasum -a 256 | awk '{print $1}')"
+sandbox_cert_serial_hash="$(openssl x509 -in "${sandbox_tls_cert_file}" -noout -serial \
+  | cut -d= -f2 | shasum -a 256 | awk '{print $1}')"
+runtime_cert_expires_at="$(openssl x509 -in "${runtime_tls_cert_file}" -noout -enddate \
+  | cut -d= -f2- | node -e 'const fs=require("fs");const d=new Date(fs.readFileSync(0,"utf8").trim());if(Number.isNaN(d.valueOf()))process.exit(2);process.stdout.write(d.toISOString())')"
+sandbox_cert_expires_at="$(openssl x509 -in "${sandbox_tls_cert_file}" -noout -enddate \
+  | cut -d= -f2- | node -e 'const fs=require("fs");const d=new Date(fs.readFileSync(0,"utf8").trim());if(Number.isNaN(d.valueOf()))process.exit(2);process.stdout.write(d.toISOString())')"
+node -e '
+const fs=require("fs");
+const evidence=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+evidence.transport={
+  mode:"mtls",mtlsVerified:true,rotationWindowVerified:true,
+  runtimeSanHash:process.argv[2],sandboxSanHash:process.argv[3],
+  runtimeCertSerialHash:process.argv[4],sandboxCertSerialHash:process.argv[5],
+  runtimeCertExpiresAt:process.argv[6],sandboxCertExpiresAt:process.argv[7]
+};
+fs.writeFileSync(process.argv[1],JSON.stringify(evidence,null,2)+"\n");
+' "${evidence_path}" \
+  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime' | shasum -a 256 | awk '{print $1}')" \
+  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
+  "${runtime_cert_serial_hash}" "${sandbox_cert_serial_hash}" \
+  "${runtime_cert_expires_at}" "${sandbox_cert_expires_at}"
 
 browser_executable="${RUNTIME_BROWSER_EXECUTABLE:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 if [[ ! -x "${browser_executable}" ]]; then
@@ -252,6 +423,10 @@ fi
 RUN_PUBLIC_RUNTIME_K8S_E2E=1 \
 KUBECTL="${KUBECTL}" \
 WORKSPACE_CHANNEL_SIGNING_KEY_FILE="${private_key_file}" \
+WORKSPACE_CHANNEL_TLS_MODE=required \
+WORKSPACE_CHANNEL_CA_FILE="${channel_ca_bundle_file}" \
+WORKSPACE_CHANNEL_CLIENT_CERT_FILE="${runtime_tls_cert_file}" \
+WORKSPACE_CHANNEL_CLIENT_KEY_FILE="${runtime_tls_key_file}" \
 RUNTIME_BROWSER_EXECUTABLE="${browser_executable}" \
 SANDBOX_CHANNEL_TRANSPORT=port_forward \
 E2E_REPOSITORY_COMMIT="${git_sha}" \
@@ -264,6 +439,8 @@ cargo test --manifest-path services/runtime/Cargo.toml --test k8s_public_runtime
 
 test -s "${evidence_path}"
 test -s "${public_runtime_evidence_path}"
+cp "${evidence_path}" "${evidence_dir}/k3d-channel.json"
+cp "${public_runtime_evidence_path}" "${evidence_dir}/public-runtime-fixture.json"
 node -e '
 const fs = require("fs");
 const evidence = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -285,9 +462,10 @@ const evidence = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 if (evidence.provider?.mode !== "fixture") process.exit(2);
 if (!Array.isArray(evidence.projects) || evidence.projects.length !== 2) process.exit(3);
 for (const project of evidence.projects) {
-  for (const key of ["kind", "projectId", "runId", "sandboxBindingId", "podUid", "versionId", "buildId", "candidateManifestHash", "sourceSnapshotUri", "previewLeaseId", "artifactManifestHash", "artifactUri", "artifactUrl", "sandboxReleasedAt"]) {
+  for (const key of ["kind", "projectId", "buildRunId", "editRunId", "sandboxBindingId", "podUid", "currentVersionAfterCas", "buildId", "candidateManifestHash", "sourceSnapshotUri", "previewLeaseId", "artifactManifestHash", "artifactUri", "artifactUrl", "sandboxReleasedAt"]) {
     if (typeof project[key] !== "string" || project[key].length === 0) process.exit(4);
   }
+  if (project.buildRunId === project.editRunId || project.currentVersionAfterCas !== project.versionAfterCas || project.versionBeforeCas === project.versionAfterCas) process.exit(4);
   if (project.artifactHttpStatusAfterRelease !== 200) process.exit(5);
   if (project.previewLeaseStatusAfterRelease !== "stopped") process.exit(6);
   if (project.screenshot?.pngSha256?.length !== 64 || project.screenshot?.documentSha256?.length !== 64 || project.screenshot?.nonblankPixelRatio <= 0.0005) process.exit(7);

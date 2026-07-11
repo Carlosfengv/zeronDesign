@@ -6,6 +6,8 @@ metadata:
 spec:
   podTemplate:
     spec:
+      serviceAccountName: anydesign-sandbox
+      dnsPolicy: ClusterFirst
       containers:
         - name: astro-website
           image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0
@@ -16,6 +18,16 @@ spec:
               value: "4321"
             - name: WORKSPACE_CHANNEL_AUTH_MODE
               value: required
+            - name: WORKSPACE_CHANNEL_TLS_MODE
+              value: required
+            - name: WORKSPACE_CHANNEL_CA_FILE
+              value: /var/run/anydesign/workspace-channel-tls/ca.crt
+            - name: WORKSPACE_CHANNEL_CERT_FILE
+              value: /var/run/anydesign/workspace-channel-tls/tls.crt
+            - name: WORKSPACE_CHANNEL_KEY_FILE
+              value: /var/run/anydesign/workspace-channel-tls/tls.key
+            - name: WORKSPACE_CHANNEL_RUNTIME_SAN
+              value: spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime
             - name: WORKSPACE_CHANNEL_PUBLIC_KEY_FILES
               value: /var/run/anydesign/workspace-channel/current.der,/var/run/anydesign/workspace-channel/previous.der
             - name: POD_NAME
@@ -41,10 +53,16 @@ spec:
             - name: workspace-channel-verifier
               mountPath: /var/run/anydesign/workspace-channel
               readOnly: true
+            - name: workspace-channel-tls
+              mountPath: /var/run/anydesign/workspace-channel-tls
+              readOnly: true
       volumes:
         - name: workspace-channel-verifier
           configMap:
             name: anydesign-workspace-channel-verifier
+        - name: workspace-channel-tls
+          secret:
+            secretName: anydesign-sandbox-channel-server
       restartPolicy: OnFailure
   service: true
   volumeClaimTemplates:

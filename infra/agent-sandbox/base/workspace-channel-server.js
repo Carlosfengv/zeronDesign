@@ -6,12 +6,20 @@ const { spawn } = require("child_process");
 const { once } = require("events");
 const fs = require("fs");
 const http = require("http");
+const https = require("https");
 const path = require("path");
 
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT || "/workspace");
 const PORT = Number(process.env.WORKSPACE_CHANNEL_PORT || process.env.PORT || 80);
 const HOST = process.env.WORKSPACE_CHANNEL_HOST || "0.0.0.0";
 const AUTH_MODE = process.env.WORKSPACE_CHANNEL_AUTH_MODE || "disabled";
+const TLS_MODE = process.env.WORKSPACE_CHANNEL_TLS_MODE || "debug-loopback";
+const TLS_CA_FILE = process.env.WORKSPACE_CHANNEL_CA_FILE || "/tls/ca.crt";
+const TLS_CERT_FILE = process.env.WORKSPACE_CHANNEL_CERT_FILE || "/tls/tls.crt";
+const TLS_KEY_FILE = process.env.WORKSPACE_CHANNEL_KEY_FILE || "/tls/tls.key";
+const EXPECTED_RUNTIME_SAN =
+  process.env.WORKSPACE_CHANNEL_RUNTIME_SAN ||
+  "spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime";
 const PUBLIC_KEY_FILE =
   process.env.WORKSPACE_CHANNEL_PUBLIC_KEY_FILE ||
   "/var/run/anydesign/workspace-channel/public.der";
@@ -200,6 +208,27 @@ function authenticateUpgrade(request) {
   consumedTokenIds.set(tokenIdHash, claims.exp);
   persistConsumedTokenId(tokenIdHash, claims.exp);
   return claims;
+}
+
+function authenticateTlsPeer(request) {
+  if (TLS_MODE === "debug-loopback") return null;
+  if (TLS_MODE !== "required") {
+    throw authError("invalid workspace channel TLS mode", 500);
+  }
+  if (!request.socket.authorized) {
+    throw authError("workspace channel client certificate is not authorized");
+  }
+  const certificate = request.socket.getPeerCertificate(false);
+  const alternativeNames = String(certificate.subjectaltname || "")
+    .split(",")
+    .map((value) => value.trim());
+  if (!alternativeNames.includes(`URI:${EXPECTED_RUNTIME_SAN}`)) {
+    throw authError("workspace channel client SPIFFE SAN mismatch", 403);
+  }
+  return String(certificate.fingerprint256 || "")
+    .replaceAll(":", "")
+    .toLowerCase()
+    .slice(0, 12);
 }
 
 function requiredOperation(op) {
@@ -540,20 +569,44 @@ function runProcess(argv, cwd, timeoutMs) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let exitCode = null;
+    let settled = false;
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
     });
 
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => {
-        if (!child.killed) {
-          child.kill("SIGKILL");
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+    const signalProcessGroup = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== "ESRCH") {
+          child.kill(signal);
         }
-      }, 1000).unref();
+      }
+    };
+    const result = () => ({
+      status: exitCode,
+      success: !timedOut && exitCode === 0,
+      stdout,
+      stderr: timedOut
+        ? `${stderr}${stderr.endsWith("\n") || stderr.length === 0 ? "" : "\n"}process.exec timed out`
+        : stderr,
+    });
+
+    const timeout = setTimeout(async () => {
+      timedOut = true;
+      signalProcessGroup("SIGTERM");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 1000));
+      signalProcessGroup("SIGKILL");
+      finish(() => resolve(result()));
     }, timeoutMs);
     timeout.unref();
 
@@ -565,18 +618,14 @@ function runProcess(argv, cwd, timeoutMs) {
     });
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      finish(() => reject(error));
     });
     child.on("close", (code) => {
-      clearTimeout(timeout);
-      resolve({
-        status: code,
-        success: !timedOut && code === 0,
-        stdout,
-        stderr: timedOut
-          ? `${stderr}${stderr.endsWith("\n") || stderr.length === 0 ? "" : "\n"}process.exec timed out`
-          : stderr,
-      });
+      exitCode = code;
+      if (!timedOut) {
+        clearTimeout(timeout);
+        finish(() => resolve(result()));
+      }
     });
   });
 }
@@ -706,7 +755,9 @@ async function collectArchiveFiles(root, excludedFiles) {
   while (stack.length > 0) {
     const directory = stack.pop();
     const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
+    entries.sort((left, right) =>
+      Buffer.compare(Buffer.from(left.name), Buffer.from(right.name)),
+    );
     for (const entry of entries.reverse()) {
       const file = path.join(directory, entry.name);
       const relative = path.relative(root, file).split(path.sep).join("/");
@@ -733,7 +784,9 @@ async function collectArchiveFiles(root, excludedFiles) {
       });
     }
   }
-  files.sort((left, right) => left.path.localeCompare(right.path));
+  files.sort((left, right) =>
+    Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+  );
   return { files, totalBytes };
 }
 
@@ -806,10 +859,28 @@ async function streamArchive(socket, request) {
   }
 }
 
-const server = http.createServer((_request, response) => {
+const requestHandler = (_request, response) => {
   response.writeHead(404);
   response.end("workspace channel websocket endpoint is /workspace\n");
-});
+};
+const server =
+  TLS_MODE === "required"
+    ? https.createServer(
+        {
+          ca: fs.readFileSync(TLS_CA_FILE),
+          cert: fs.readFileSync(TLS_CERT_FILE),
+          key: fs.readFileSync(TLS_KEY_FILE),
+          requestCert: true,
+          rejectUnauthorized: true,
+          minVersion: "TLSv1.3",
+        },
+        requestHandler,
+      )
+    : TLS_MODE === "debug-loopback"
+      ? http.createServer(requestHandler)
+      : (() => {
+          throw new Error("invalid WORKSPACE_CHANNEL_TLS_MODE");
+        })();
 
 server.on("upgrade", (request, socket) => {
   if (!request.url || !request.url.startsWith("/workspace")) {
@@ -825,7 +896,11 @@ server.on("upgrade", (request, socket) => {
 
   let claims;
   try {
+    const fingerprint = authenticateTlsPeer(request);
     claims = authenticateUpgrade(request);
+    if (fingerprint) {
+      console.log(`workspace channel mTLS client fingerprint=${fingerprint}`);
+    }
   } catch (error) {
     const statusCode =
       error && typeof error === "object" && Number.isInteger(error.statusCode)
@@ -879,5 +954,6 @@ server.on("upgrade", (request, socket) => {
 server.listen(PORT, HOST, () => {
   const address = server.address();
   const actualPort = typeof address === "object" && address ? address.port : PORT;
-  console.log(`workspace channel listening on ws://${HOST}:${actualPort}/workspace`);
+  const scheme = TLS_MODE === "required" ? "wss" : "ws";
+  console.log(`workspace channel listening on ${scheme}://${HOST}:${actualPort}/workspace`);
 });

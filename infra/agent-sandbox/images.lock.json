@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "anydesign-runtime-images@1",
+  "images": {
+    "dockerfileFrontend": {
+      "ref": "docker.io/docker/dockerfile:1.7",
+      "digest": "sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
+    },
+    "rustBuilder": {
+      "ref": "docker.io/library/rust:1.94-bookworm",
+      "digest": "sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55"
+    },
+    "debianRuntime": {
+      "ref": "docker.io/library/debian:bookworm-slim",
+      "digest": "sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+    },
+    "sandboxNode": {
+      "ref": "docker.io/library/node:22-bookworm",
+      "digest": "sha256:a25c9934ff6382cd4f08b6bc26c82bf4ea69b1e6f8dabfb2ead457374127c365"
+    },
+    "k3s": {
+      "ref": "docker.io/rancher/k3s:v1.31.5-k3s1",
+      "digest": "sha256:53cf744fe2fabf140cee240d2db70d13a4f2d98f1a13c98f58f457f423096917"
+    },
+    "k3dTools": {
+      "ref": "ghcr.io/k3d-io/k3d-tools:5.8.3",
+      "digest": "sha256:c5ceb2b9e8ff2cf55917b0bee8bc9c54fe1483a16366b734117e2cfac1417bed"
+    },
+    "k3dProxy": {
+      "ref": "ghcr.io/k3d-io/k3d-proxy:5.8.3",
+      "digest": "sha256:d43e6ffd27c216d0b21815c1226c8aeac2e07086ac5a988eb39bd7e308f6e370"
+    },
+    "agentSandboxController": {
+      "ref": "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0",
+      "digest": "sha256:e99cac42f10cac69cab09a91e59f982c9d525b2933a5f5b7dfd52dae09340aa2"
+    },
+    "npmProxy": {
+      "ref": "docker.io/verdaccio/verdaccio:6.1.6",
+      "digest": "sha256:44af8dec4b8bfb9b940263f56ee5f371484515e4397eea56ab9c942500ab9dfa"
+    },
+    "localPathProvisioner": {
+      "ref": "docker.io/rancher/local-path-provisioner:v0.0.30",
+      "digest": "sha256:9b914881170048f80ae9302f36e5b99b4a6b18af73a38adc1c66d12f65d360be"
+    }
+  }
+}

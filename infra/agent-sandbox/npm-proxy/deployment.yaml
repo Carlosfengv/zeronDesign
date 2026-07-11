@@ -17,8 +17,11 @@ spec:
     spec:
       containers:
         - name: verdaccio
-          image: verdaccio/verdaccio:6.1.6
+          image: verdaccio/verdaccio:6.1.6@sha256:44af8dec4b8bfb9b940263f56ee5f371484515e4397eea56ab9c942500ab9dfa
           imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=768
           ports:
             - name: npm
               containerPort: 4873
@@ -31,10 +34,10 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 256Mi
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
           volumeMounts:
             - name: config
               mountPath: /verdaccio/conf/config.yaml

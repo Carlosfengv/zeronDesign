@@ -1,5 +1,6 @@
-# syntax=docker/dockerfile:1.7
-ARG RUST_IMAGE=rust:1.94-bookworm
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+ARG RUST_IMAGE=docker.io/library/rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+ARG DEBIAN_IMAGE=docker.io/library/debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
 COPY services/runtime/Cargo.toml services/runtime/Cargo.lock ./
@@ -10,7 +11,7 @@ RUN mkdir -p .cargo \
     && printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml \
     && cargo build --release --locked --offline
 
-FROM debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -21,9 +22,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 ARG REPOSITORY_COMMIT=unknown
 ARG REPOSITORY_DIRTY=false
 ARG RUNTIME_IMAGE_REF
+ARG IMAGE_LOCK_HASH=unknown
+ARG BUILD_TIMESTAMP=unknown
 LABEL org.opencontainers.image.source="https://github.com/carlosfengv/zeronDesign" \
       org.opencontainers.image.revision="${REPOSITORY_COMMIT}" \
-      io.zerondesign.repository-dirty="${REPOSITORY_DIRTY}"
+      org.opencontainers.image.created="${BUILD_TIMESTAMP}" \
+      io.zerondesign.repository-dirty="${REPOSITORY_DIRTY}" \
+      io.zerondesign.image-lock-hash="${IMAGE_LOCK_HASH}"
 COPY --from=builder /build/target/release/anydesign-runtime /usr/local/bin/anydesign-runtime
 ENV RUNTIME_REPOSITORY_COMMIT=${REPOSITORY_COMMIT} \
     RUNTIME_REPOSITORY_DIRTY=${REPOSITORY_DIRTY} \

@@ -40,12 +40,25 @@ spec:
           env:
             - name: MODEL_PROVIDER
               value: internal_gateway
+            - name: MODEL_REQUEST_TIMEOUT_SECONDS
+              value: "180"
             - name: MODEL_GATEWAY_URL
               value: http://fixture-model-gateway.anydesign-runtime.svc.cluster.local:9000
             - name: SANDBOX_BACKEND_MODE
               value: kubernetes
             - name: RUNTIME_POLICY_PROFILE
-              value: local-e2e
+              value: production
+            - name: PUBLIC_PRINCIPAL_AUTH_MODE
+              value: required
+            - name: PUBLIC_PRINCIPAL_PUBLIC_KEY_FILES
+              value: /var/run/anydesign/public-principal/public.der
+            - name: PUBLIC_PRINCIPAL_MAX_TTL_SECONDS
+              value: "120"
+            - name: RUNTIME_INTERNAL_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-internal-admin
+                  key: token
             - name: K8S_NAMESPACE
               value: anydesign-sandboxes
             - name: RUNTIME_PUBLIC_BASE_URL
@@ -54,6 +67,16 @@ spec:
               value: /var/lib/anydesign-runtime/data
             - name: WORKSPACE_CHANNEL_SIGNING_KEY_FILE
               value: /var/run/anydesign/signer/private.der
+            - name: WORKSPACE_CHANNEL_TLS_MODE
+              value: required
+            - name: WORKSPACE_CHANNEL_CA_FILE
+              value: /var/run/anydesign/workspace-channel-tls/ca.crt
+            - name: WORKSPACE_CHANNEL_CLIENT_CERT_FILE
+              value: /var/run/anydesign/workspace-channel-tls/tls.crt
+            - name: WORKSPACE_CHANNEL_CLIENT_KEY_FILE
+              value: /var/run/anydesign/workspace-channel-tls/tls.key
+            - name: WORKSPACE_CHANNEL_SERVER_SAN
+              value: spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox
             - name: RUNTIME_NPM_REGISTRY
               value: http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/
           readinessProbe:
@@ -73,6 +96,12 @@ spec:
             - name: signer
               mountPath: /var/run/anydesign/signer
               readOnly: true
+            - name: workspace-channel-tls
+              mountPath: /var/run/anydesign/workspace-channel-tls
+              readOnly: true
+            - name: public-principal
+              mountPath: /var/run/anydesign/public-principal
+              readOnly: true
       volumes:
         - name: storage
           persistentVolumeClaim:
@@ -80,6 +109,12 @@ spec:
         - name: signer
           secret:
             secretName: anydesign-workspace-channel-signer
+        - name: workspace-channel-tls
+          secret:
+            secretName: anydesign-runtime-channel-client
+        - name: public-principal
+          secret:
+            secretName: anydesign-runtime-public-principal
 ---
 apiVersion: v1
 kind: Service
