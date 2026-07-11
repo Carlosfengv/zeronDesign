@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: anydesign-runtime-storage
+  namespace: anydesign-runtime
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anydesign-runtime
+  namespace: anydesign-runtime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anydesign-runtime
+  template:
+    metadata:
+      labels:
+        app: anydesign-runtime
+    spec:
+      serviceAccountName: anydesign-runtime
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runtime
+          image: anydesign/runtime:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MODEL_PROVIDER
+              value: internal_gateway
+            - name: MODEL_GATEWAY_URL
+              value: http://fixture-model-gateway.anydesign-runtime.svc.cluster.local:9000
+            - name: SANDBOX_BACKEND_MODE
+              value: kubernetes
+            - name: RUNTIME_POLICY_PROFILE
+              value: local-e2e
+            - name: K8S_NAMESPACE
+              value: anydesign-sandboxes
+            - name: RUNTIME_PUBLIC_BASE_URL
+              value: http://anydesign-runtime.anydesign-runtime.svc.cluster.local:8080
+            - name: RUNTIME_STORAGE_DIR
+              value: /var/lib/anydesign-runtime/data
+            - name: WORKSPACE_CHANNEL_SIGNING_KEY_FILE
+              value: /var/run/anydesign/signer/private.der
+            - name: RUNTIME_NPM_REGISTRY
+              value: http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/anydesign-runtime/data
+            - name: signer
+              mountPath: /var/run/anydesign/signer
+              readOnly: true
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: anydesign-runtime-storage
+        - name: signer
+          secret:
+            secretName: anydesign-workspace-channel-signer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anydesign-runtime
+  namespace: anydesign-runtime
+spec:
+  selector:
+    app: anydesign-runtime
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
