@@ -6,9 +6,12 @@ function tool(id, name, input = {}) {
   return { id, name, input };
 }
 
+function projectId(body) {
+  return String(body.projectId || body.systemPrompt?.match(/^Project:\s*(.+)$/m)?.[1] || "");
+}
+
 function briefResponse(body, state) {
-  const serialized = JSON.stringify(body).toLowerCase();
-  const docs = serialized.includes("docs") || serialized.includes("documentation");
+  const docs = projectId(body).toLowerCase().includes("docs");
   if (state.turn++ === 0) {
     return {
       type: "tool_calls",
@@ -41,12 +44,9 @@ function briefResponse(body, state) {
 }
 
 function buildResponse(body, state) {
-  const serialized = JSON.stringify(body).toLowerCase();
-  state.docs ||= serialized.includes('"projecttype":"docs"')
-    || serialized.includes('\\"projecttype\\":\\"docs\\"')
-    || serialized.includes("project type: docs")
-    || serialized.includes("create a docs rc fixture");
-  if (state.turn++ === 0) {
+  state.docs ||= projectId(body).toLowerCase().includes("docs");
+  const turn = state.turn++;
+  if (turn === 0) {
     return {
       type: "tool_calls",
       toolCalls: [
@@ -73,7 +73,24 @@ function buildResponse(body, state) {
       text: "---\ntitle: Overview\n---\n\n# RC Docs Overview",
     }));
   }
-  calls.push(
+  if (turn === 1) {
+    return { type: "tool_calls", toolCalls: calls };
+  }
+  if (turn === 2) {
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        tool("fixture-dependency", "project.ensure_dependencies", {
+          mode: "add",
+          packages: ["is-number@7.0.0"],
+          cwd: "project",
+        }),
+      ],
+    };
+  }
+  return {
+    type: "tool_calls",
+    toolCalls: [
     tool("fixture-build", "project.build", { cwd: "project" }),
     tool("fixture-preview", "preview.start"),
     tool("fixture-open", "browser.open", { url: "http://127.0.0.1:4321" }),
@@ -86,8 +103,34 @@ function buildResponse(body, state) {
       status: "completed",
       summary: `${docs ? "Docs" : "Website"} deployed Runtime RC gate complete`,
     }),
-  );
-  return { type: "tool_calls", toolCalls: calls };
+    ],
+  };
+}
+
+function editResponse(body, state) {
+  state.docs ||= projectId(body).toLowerCase().includes("docs");
+  const docs = state.docs;
+  const buildScript = docs
+    ? "const fs=require('fs');fs.mkdirSync('out',{recursive:true});fs.writeFileSync('out/index.html','<!doctype html><style>body{font:40px sans-serif;background:#fff;color:#111}</style><h1>RC Docs Edited</h1><a href=\"/docs\">Overview</a>');fs.writeFileSync('out/docs.html','<h1>RC Docs Overview Edited</h1>');"
+    : "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:48px sans-serif;background:#fff;color:#111}</style><h1>RC Website Edited</h1>');";
+  return {
+    type: "tool_calls",
+    toolCalls: [
+      tool("fixture-edit-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
+      tool("fixture-edit-build", "project.build", { cwd: "project" }),
+      tool("fixture-edit-preview", "preview.start"),
+      tool("fixture-edit-open", "browser.open", { url: "http://127.0.0.1:4321" }),
+      tool("fixture-edit-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" }),
+      tool("fixture-edit-promote", "preview.report_candidate", {
+        url: "http://127.0.0.1:4321",
+        screenshotId: docs ? "rc-docs-edit" : "rc-website-edit",
+      }),
+      tool("fixture-edit-complete", "run.complete", {
+        status: "completed",
+        summary: `${docs ? "Docs" : "Website"} deployed Runtime RC edit complete`,
+      }),
+    ],
+  };
 }
 
 http.createServer((request, response) => {
@@ -102,7 +145,11 @@ http.createServer((request, response) => {
     try {
       const body = JSON.parse(raw);
       const state = runs.get(body.runId) || { turn: 0, docs: false };
-      const payload = body.phase === "brief" ? briefResponse(body, state) : buildResponse(body, state);
+      const payload = body.phase === "brief"
+        ? briefResponse(body, state)
+        : body.phase === "edit"
+          ? editResponse(body, state)
+          : buildResponse(body, state);
       runs.set(body.runId, state);
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(payload));
