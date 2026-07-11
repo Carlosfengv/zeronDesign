@@ -5701,8 +5701,10 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
         store: store.clone(),
         model: Arc::new(model),
     });
+    let project_filter = std::env::var("REAL_PROVIDER_PROJECT_FILTER").ok();
 
-    run_real_provider_lifecycle_project(
+    if project_filter.as_deref() != Some("docs") {
+        run_real_provider_lifecycle_project(
         app.clone(),
         &store,
         &workspace,
@@ -5725,9 +5727,11 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
         "project/dist/index.html",
         "TESTXXX",
     )
-    .await;
+        .await;
+    }
 
-    run_real_provider_lifecycle_project(
+    if project_filter.as_deref() != Some("website") {
+        run_real_provider_lifecycle_project(
         app,
         &store,
         &workspace,
@@ -5750,7 +5754,8 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
         "project/out/docs.html",
         "Edited docs title",
     )
-    .await;
+        .await;
+    }
 }
 
 async fn run_real_provider_lifecycle_project(

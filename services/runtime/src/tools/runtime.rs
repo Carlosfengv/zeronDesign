@@ -558,7 +558,10 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("No such tool available: {tool_name}")),
             };
         };
-        if ctx.run.status == AgentRunStatus::Validating && candidate_freeze_blocks(tool.name()) {
+        if ctx.run.status == AgentRunStatus::Validating
+            && candidate_freeze_blocks(tool.name())
+            && !ctx.allow_runtime_owned_writes
+        {
             let message = format!(
                 "{} is blocked because the current build candidate is frozen",
                 tool.name()

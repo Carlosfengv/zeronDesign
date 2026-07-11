@@ -3030,7 +3030,7 @@ async fn successful_project_build_freezes_candidate_and_rejects_source_mutation(
 
     let mutation = executor
         .execute_calls(
-            store,
+            store.clone(),
             &run_id,
             vec![ToolCall::new(
                 "tool-write-after-build",
@@ -3042,6 +3042,23 @@ async fn successful_project_build_freezes_candidate_and_rejects_source_mutation(
     assert!(mutation[0].result.is_error);
     assert_error_kind(&mutation[0].result, "project.candidate_frozen");
     assert!(!workspace.join("project/after-build.txt").exists());
+
+    let runtime_state_write = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "bootstrap:state/context.md",
+                "fs.write",
+                json!({ "path": "state/context.md", "text": "runtime checkpoint" }),
+            )],
+        )
+        .await;
+    assert!(!runtime_state_write[0].result.is_error);
+    assert_eq!(
+        fs::read_to_string(workspace.join("state/context.md")).unwrap(),
+        "runtime checkpoint"
+    );
 }
 
 #[tokio::test]
