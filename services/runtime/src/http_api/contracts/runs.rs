@@ -29,11 +29,33 @@ pub struct StartRunInputContext {
     pub finding_ids: Vec<String>,
 }
 
+impl From<StartRunRequest> for crate::run_lifecycle::StartRunCommand {
+    fn from(request: StartRunRequest) -> Self {
+        Self {
+            project_id: request.project_id,
+            phase: request.phase,
+            agent_profile: request.agent_profile,
+            input_context: crate::run_lifecycle::StartRunContext {
+                content_sources: request.input_context.content_sources,
+                brief_id: request.input_context.brief_id,
+                base_version_id: request.input_context.base_version_id,
+                sandbox_binding_id: request.input_context.sandbox_binding_id,
+                parent_run_id: request.input_context.parent_run_id,
+                design_profile_id: request.input_context.design_profile_id,
+                design_fidelity_mode: request.input_context.design_fidelity_mode,
+                workspace_id: request.input_context.workspace_id,
+                organization_id: request.input_context.organization_id,
+                finding_ids: request.input_context.finding_ids,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct StartRunResponse {
     #[serde(rename = "runId")]
     pub run_id: String,
-    pub status: &'static str,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]

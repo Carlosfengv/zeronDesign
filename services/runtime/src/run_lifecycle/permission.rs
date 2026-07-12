@@ -84,7 +84,8 @@ impl RunLifecycleService {
                         "permission resolved by API",
                     )
                     .await;
-                self.launch_session(permission.run_id.clone());
+                self.launch_session(permission.run_id.clone())
+                    .map_err(internal)?;
                 "running"
             }
             PermissionDecision::Ask => {

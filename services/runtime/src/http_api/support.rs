@@ -1,47 +1,5 @@
 use super::*;
 
-pub(in crate::http_api) fn validate_start_run_request(
-    request: &StartRunRequest,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    validate_required_string("projectId", &request.project_id)?;
-    validate_required_string("agentProfile", &request.agent_profile)?;
-    for source in &request.input_context.content_sources {
-        validate_required_string("contentSources[].id", &source.id)?;
-        validate_required_string("contentSources[].kind", &source.kind)?;
-    }
-    validate_optional_string("briefId", request.input_context.brief_id.as_deref())?;
-    validate_optional_string(
-        "baseVersionId",
-        request.input_context.base_version_id.as_deref(),
-    )?;
-    validate_optional_string(
-        "sandboxBindingId",
-        request.input_context.sandbox_binding_id.as_deref(),
-    )?;
-    validate_optional_string(
-        "parentRunId",
-        request.input_context.parent_run_id.as_deref(),
-    )?;
-    validate_optional_string(
-        "designProfileId",
-        request.input_context.design_profile_id.as_deref(),
-    )?;
-    if let Some(mode) = request.input_context.design_fidelity_mode.as_deref() {
-        if !matches!(mode, "profile_only" | "source_fallback") {
-            return Err(bad_request(
-                "designFidelityMode must be profile_only or source_fallback".to_string(),
-            ));
-        }
-    }
-    validate_optional_string("workspaceId", request.input_context.workspace_id.as_deref())?;
-    validate_optional_string(
-        "organizationId",
-        request.input_context.organization_id.as_deref(),
-    )?;
-    validate_string_list("findingIds", &request.input_context.finding_ids)?;
-    Ok(())
-}
-
 pub(in crate::http_api) fn validate_create_design_profile_request(
     request: &CreateDesignProfileRequest,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -124,11 +82,6 @@ pub(in crate::http_api) fn last_event_sequence(last_event_id: Option<&str>, run_
     sequence.parse::<usize>().unwrap_or(0)
 }
 
-pub(crate) fn spawn_session(state: AppState, run_id: String) {
-    RuntimeSessionLauncher::new(state.config, state.store, state.model, state.supervisor)
-        .launch(run_id);
-}
-
 pub(in crate::http_api) fn run_lifecycle_service(state: &AppState) -> RunLifecycleService {
     RunLifecycleService::new(
         state.config.clone(),
@@ -139,6 +92,10 @@ pub(in crate::http_api) fn run_lifecycle_service(state: &AppState) -> RunLifecyc
             state.model.clone(),
             state.supervisor.clone(),
         )),
+        Arc::new(RuntimeBuildSandboxProvisioner::new(
+            sandbox_backend_for_config(&state.config),
+        )),
+        Arc::new(RuntimeEditWorkspaceRestorer),
     )
 }
 

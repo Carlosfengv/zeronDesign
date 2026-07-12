@@ -73,7 +73,7 @@ impl RunLifecycleService {
             })
             .await
             .map_err(internal)?;
-        self.launch_session(run_id.to_string());
+        self.launch_session(run_id.to_string()).map_err(internal)?;
         Ok(outcome(run_id, "running"))
     }
 

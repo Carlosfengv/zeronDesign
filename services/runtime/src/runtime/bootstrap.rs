@@ -10,6 +10,8 @@ use crate::{
         WorkRuntimeController,
     },
     recovery::{recover_interrupted_runs, RecoveryOutcome},
+    run_lifecycle::RunSessionLauncher,
+    runtime::RuntimeSessionLauncher,
     templates::BuiltInTemplateRegistry,
     tools::{
         runtime::ToolContext,
@@ -57,7 +59,13 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
     let outcomes = recover_interrupted_runs(&state.store).await?;
     for outcome in outcomes {
         if let RecoveryOutcome::Resumed { run_id, .. } = outcome {
-            http_api::spawn_supervised_session(state.clone(), run_id);
+            RuntimeSessionLauncher::new(
+                state.config.clone(),
+                state.store.clone(),
+                state.model.clone(),
+                state.supervisor.clone(),
+            )
+            .launch(run_id)?;
         }
     }
     Ok(state)
