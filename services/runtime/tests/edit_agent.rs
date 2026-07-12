@@ -16,6 +16,7 @@ use tower::ServiceExt;
 
 fn app(store: RuntimeStore, responses: Vec<ModelResponse>) -> Router {
     http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(responses)),

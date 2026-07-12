@@ -24,3 +24,27 @@ async fn health_returns_ready_when_config_loads() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["status"], "ready");
 }
+
+#[tokio::test]
+async fn health_returns_unavailable_after_fatal_supervised_task() {
+    let state = http_api::app_state(RuntimeConfig::from_env());
+    state
+        .supervisor
+        .spawn("test/fatal", true, async { anyhow::bail!("boom") })
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    let response = http_api::router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "not_ready");
+}

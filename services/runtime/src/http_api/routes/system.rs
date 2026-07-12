@@ -1,5 +1,5 @@
 use super::super::{AppState, HealthResponse, VersionResponse};
-use axum::{extract::State, response::Html, routing::get, Json, Router};
+use axum::{extract::State, http::StatusCode, response::Html, routing::get, Json, Router};
 
 pub(in crate::http_api) fn router() -> Router<AppState> {
     Router::new()
@@ -45,8 +45,17 @@ async fn root(State(state): State<AppState>) -> Html<String> {
     ))
 }
 
-async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ready" })
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    if state.supervisor.readiness().is_ready() {
+        (StatusCode::OK, Json(HealthResponse { status: "ready" }))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "not_ready",
+            }),
+        )
+    }
 }
 
 async fn version(State(state): State<AppState>) -> Json<VersionResponse> {

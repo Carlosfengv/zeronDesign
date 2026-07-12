@@ -17,10 +17,7 @@ pub(in crate::http_api) fn project_workspace_root(
     config.workspace_root.join(safe)
 }
 
-pub(in crate::http_api) fn effective_workspace_root(
-    config: &RuntimeConfig,
-    project_id: &str,
-) -> PathBuf {
+pub(crate) fn effective_workspace_root(config: &RuntimeConfig, project_id: &str) -> PathBuf {
     match config.sandbox_backend_mode {
         SandboxBackendMode::PhaseAContract => project_workspace_root(config, project_id),
         SandboxBackendMode::Kubernetes => config.workspace_root.clone(),

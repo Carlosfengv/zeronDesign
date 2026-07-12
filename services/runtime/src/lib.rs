@@ -14,6 +14,7 @@ pub mod public_principal;
 pub mod query_session;
 pub mod recovery;
 pub mod repair_loop;
+pub mod runtime;
 pub mod sandbox_adapter;
 pub mod sandbox_profiles;
 pub mod templates;
