@@ -641,38 +641,6 @@ fn is_mutable_phase(phase: AgentPhase) -> bool {
     )
 }
 
-pub(in crate::http_api) fn is_brief_confirmation_message(message: &str) -> bool {
-    let normalized = message.trim().to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "confirm"
-            | "confirmed"
-            | "approve"
-            | "approved"
-            | "yes"
-            | "ok"
-            | "确认"
-            | "确认 brief"
-            | "确认brief"
-            | "同意"
-            | "可以"
-            | "开始生成"
-    ) {
-        return true;
-    }
-
-    let confirmation_prefixes = ["确认", "同意", "可以", "批准", "开始"];
-    confirmation_prefixes
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix))
-        || normalized.contains("开始生成")
-        || normalized.contains("开始构建")
-        || normalized.contains("开始创建")
-        || (normalized.contains("confirm") && normalized.contains("brief"))
-        || (normalized.contains("approve") && normalized.contains("brief"))
-        || (normalized.contains("start") && normalized.contains("build"))
-}
-
 async fn maybe_provision_build_sandbox(
     state: &AppState,
     run: AgentRun,
