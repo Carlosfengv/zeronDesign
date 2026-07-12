@@ -313,7 +313,7 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
     assert!(package_json.contains("@tailwindcss/postcss"));
     assert!(package_json.contains(r#""typescript": "5.9.3""#));
     let next_config = fs::read_to_string(workspace.join("project/next.config.mjs")).unwrap();
-    assert!(next_config.contains("assetPrefix: '/artifacts/docs-project/current'"));
+    assert!(!next_config.contains("assetPrefix"));
     let postcss_config = fs::read_to_string(workspace.join("project/postcss.config.mjs")).unwrap();
     assert!(postcss_config.contains("@tailwindcss/postcss"));
     let source_config = fs::read_to_string(workspace.join("project/source.config.ts")).unwrap();

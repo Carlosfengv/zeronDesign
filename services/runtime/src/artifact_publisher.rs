@@ -1,4 +1,11 @@
-use crate::types::{sha256_hex, ArtifactPublishRecord, ArtifactPublishStatus};
+use crate::{
+    artifact_manifest::{
+        manifest_file, ArtifactDeliverySpec, ArtifactManifest, ArtifactManifestFile,
+        ARTIFACT_MANIFEST_FILE,
+    },
+    templates::TemplateSpec,
+    types::{sha256_hex, ArtifactPublishRecord, ArtifactPublishStatus},
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -47,6 +54,15 @@ pub struct FileArtifactPublisher {
 }
 
 const SOURCE_SNAPSHOT_MANIFEST: &str = ".anydesign-source-snapshot-manifest.json";
+
+struct StagedManifestContext<'a> {
+    project_id: &'a str,
+    version_id: &'a str,
+    candidate_manifest_hash: &'a str,
+    template_id: &'a str,
+    template_version: &'a str,
+    delivery: ArtifactDeliverySpec,
+}
 
 impl FileArtifactPublisher {
     pub fn new(runtime_storage_dir: impl Into<PathBuf>) -> Self {
@@ -231,6 +247,7 @@ impl FileArtifactPublisher {
         version_id: &str,
         candidate_manifest_hash: &str,
         source_root: &Path,
+        template: &TemplateSpec,
     ) -> Result<StagedArtifact> {
         validate_manifest_hash(candidate_manifest_hash)?;
         let staged_root = self.staged_root(project_id, version_id);
@@ -266,18 +283,19 @@ impl FileArtifactPublisher {
             }
             fs::copy(&source, &output)?;
             let bytes = fs::metadata(&source)?.len();
-            manifest_files.push(serde_json::json!({
-                "path": normalized_relative_path(&relative)?,
-                "bytes": bytes,
-                "sha256": sha256_file(&source)?,
-            }));
+            manifest_files.push(manifest_file(&relative, bytes, sha256_file(&source)?)?);
         }
         write_staged_manifest(
             &temporary_root,
             &staged_root,
-            project_id,
-            version_id,
-            candidate_manifest_hash,
+            StagedManifestContext {
+                project_id,
+                version_id,
+                candidate_manifest_hash,
+                template_id: template.id.as_str(),
+                template_version: template.version.as_str(),
+                delivery: template.artifact_delivery,
+            },
             manifest_files,
         )
     }
@@ -326,42 +344,25 @@ impl ArtifactPublisher for FileArtifactPublisher {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&output, &file.bytes)?;
-            manifest_files.push(serde_json::json!({
-                "path": file.path.to_string_lossy().replace('\\', "/"),
-                "bytes": file.bytes.len(),
-                "sha256": sha256_hex(&file.bytes),
-            }));
+            manifest_files.push(manifest_file(
+                &file.path,
+                file.bytes.len() as u64,
+                sha256_hex(&file.bytes),
+            )?);
         }
-        manifest_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-        let manifest = serde_json::json!({
-            "schemaVersion": "artifact-manifest@1",
-            "projectId": project_id,
-            "versionId": version_id,
-            "candidateManifestHash": candidate_manifest_hash,
-            "files": manifest_files,
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
-        let artifact_manifest_hash = sha256_hex(&manifest_bytes);
-        fs::write(
-            temporary_root.join(".anydesign-artifact-manifest.json"),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
-        if staged_root.exists() {
-            fs::remove_dir_all(&staged_root)?;
-        }
-        fs::rename(&temporary_root, &staged_root)?;
-        Ok(StagedArtifact {
-            project_id: project_id.to_string(),
-            version_id: version_id.to_string(),
-            candidate_manifest_hash: candidate_manifest_hash.to_string(),
-            artifact_manifest_hash,
-            staged_uri: format!(
-                "runtime://artifacts/{}/staged/{}",
-                safe_segment(project_id),
-                safe_segment(version_id)
-            ),
-            file_count: manifest["files"].as_array().map_or(0, Vec::len),
-        })
+        write_staged_manifest(
+            &temporary_root,
+            &staged_root,
+            StagedManifestContext {
+                project_id,
+                version_id,
+                candidate_manifest_hash,
+                template_id: "generic-static",
+                template_version: "generic-static@1",
+                delivery: ArtifactDeliverySpec::HOST_ROOT,
+            },
+            manifest_files,
+        )
     }
 
     async fn promote(&self, staged: &StagedArtifact) -> Result<String> {
@@ -418,23 +419,21 @@ fn validate_manifest_hash(candidate_manifest_hash: &str) -> Result<()> {
 fn write_staged_manifest(
     temporary_root: &Path,
     staged_root: &Path,
-    project_id: &str,
-    version_id: &str,
-    candidate_manifest_hash: &str,
-    mut manifest_files: Vec<serde_json::Value>,
+    context: StagedManifestContext<'_>,
+    manifest_files: Vec<ArtifactManifestFile>,
 ) -> Result<StagedArtifact> {
-    manifest_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-    let manifest = serde_json::json!({
-        "schemaVersion": "artifact-manifest@1",
-        "projectId": project_id,
-        "versionId": version_id,
-        "candidateManifestHash": candidate_manifest_hash,
-        "files": manifest_files,
-    });
-    let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let artifact_manifest_hash = sha256_hex(&manifest_bytes);
+    let manifest = ArtifactManifest::build(
+        context.project_id,
+        context.version_id,
+        context.candidate_manifest_hash,
+        context.template_id,
+        context.template_version,
+        context.delivery,
+        manifest_files,
+    )?;
+    let artifact_manifest_hash = manifest.sha256()?;
     fs::write(
-        temporary_root.join(".anydesign-artifact-manifest.json"),
+        temporary_root.join(ARTIFACT_MANIFEST_FILE),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     if staged_root.exists() {
@@ -442,16 +441,16 @@ fn write_staged_manifest(
     }
     fs::rename(temporary_root, staged_root)?;
     Ok(StagedArtifact {
-        project_id: project_id.to_string(),
-        version_id: version_id.to_string(),
-        candidate_manifest_hash: candidate_manifest_hash.to_string(),
+        project_id: context.project_id.to_string(),
+        version_id: context.version_id.to_string(),
+        candidate_manifest_hash: context.candidate_manifest_hash.to_string(),
         artifact_manifest_hash,
         staged_uri: format!(
             "runtime://artifacts/{}/staged/{}",
-            safe_segment(project_id),
-            safe_segment(version_id)
+            safe_segment(context.project_id),
+            safe_segment(context.version_id)
         ),
-        file_count: manifest["files"].as_array().map_or(0, Vec::len),
+        file_count: manifest.files.len(),
     })
 }
 
@@ -516,9 +515,9 @@ fn read_canonical_json(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn artifact_manifest_hash_at(root: &Path) -> Result<String> {
-    Ok(sha256_hex(&read_canonical_json(
-        &root.join(".anydesign-artifact-manifest.json"),
-    )?))
+    let manifest: ArtifactManifest =
+        serde_json::from_slice(&fs::read(root.join(ARTIFACT_MANIFEST_FILE))?)?;
+    manifest.sha256()
 }
 
 #[cfg(test)]

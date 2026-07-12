@@ -7,6 +7,7 @@ use super::{
     StyleTokenSpec, TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateId,
     TemplateOperationError, TemplateOperations, TemplateSpec, TemplateVersion, TemplateWriteMode,
 };
+use crate::artifact_manifest::ArtifactDeliverySpec;
 use serde_json::Value;
 
 macro_rules! asset {
@@ -346,6 +347,7 @@ pub fn spec() -> TemplateSpec {
             command: "serve out --listen 3000",
             screenshot_id: "shot-fumadocs-home",
         },
+        artifact_delivery: ArtifactDeliverySpec::HOST_ROOT,
         capabilities: TemplateCapabilities {
             structured_page_write: false,
             mdx_document_write: true,
