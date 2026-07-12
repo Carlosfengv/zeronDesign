@@ -5,6 +5,7 @@ pub mod artifact_publisher;
 pub mod channel_manager;
 pub mod config;
 pub mod conversation;
+pub mod design_profile;
 pub mod http_api;
 pub mod model_gateway;
 pub mod permission;

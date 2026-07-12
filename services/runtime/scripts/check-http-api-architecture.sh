@@ -7,6 +7,7 @@ FACADE="$HTTP_DIR/mod.rs"
 HTTP_TEST_ROOT="$ROOT/services/runtime/tests/http_api.rs"
 HTTP_TEST_DIR="$ROOT/services/runtime/tests/http_api"
 RUN_LIFECYCLE_DIR="$ROOT/services/runtime/src/run_lifecycle"
+DESIGN_PROFILE_DIR="$ROOT/services/runtime/src/design_profile"
 status=0
 
 fail() {
@@ -63,6 +64,17 @@ for mutation_route in cancel continue_run permission start; do
     fail "HTTP-009: Run mutation route adapter exceeds 50 lines: ${route_module#$ROOT/} ($lines)"
   fi
 done
+
+if grep -RInE --include='*.rs' 'axum|RuntimeStore|HeaderMap|StatusCode|Router' "$DESIGN_PROFILE_DIR"; then
+  fail "PROFILE-001: pure DesignProfile parser/validation modules depend on transport or RuntimeStore"
+fi
+
+while IFS= read -r profile_module; do
+  lines="$(wc -l < "$profile_module" | tr -d ' ')"
+  if (( lines > 800 )); then
+    fail "PROFILE-002/SIZE-001: DesignProfile module exceeds 800 lines: ${profile_module#$ROOT/} ($lines)"
+  fi
+done < <(find "$DESIGN_PROFILE_DIR" -type f -name '*.rs' | sort)
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
   'astro-website|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \
