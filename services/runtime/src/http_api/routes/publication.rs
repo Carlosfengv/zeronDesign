@@ -22,11 +22,19 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
 
 async fn publish_work(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<PublishWorkRequest>,
 ) -> Result<(StatusCode, Json<PublicationOperationResponse>), (StatusCode, Json<ErrorResponse>)> {
-    authorize_publication(&state, &headers, &project_id, PUBLICATION_WRITE_OPERATION).await?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
     validate_release_target(
         &state,
         &project_id,
@@ -57,11 +65,19 @@ async fn publish_work(
 
 async fn rollback_work(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<PublishWorkRequest>,
 ) -> Result<(StatusCode, Json<PublicationOperationResponse>), (StatusCode, Json<ErrorResponse>)> {
-    authorize_publication(&state, &headers, &project_id, PUBLICATION_WRITE_OPERATION).await?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
     validate_release_target(
         &state,
         &project_id,
@@ -90,11 +106,19 @@ async fn rollback_work(
 
 async fn unpublish_work(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<UnpublishWorkRequest>,
 ) -> Result<(StatusCode, Json<PublicationOperationResponse>), (StatusCode, Json<ErrorResponse>)> {
-    authorize_publication(&state, &headers, &project_id, PUBLICATION_WRITE_OPERATION).await?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
     validate_existing_publication_precondition(
         &headers,
         request.expected_current_release_id.as_deref(),
@@ -131,10 +155,18 @@ async fn commit_publication_intent(
 
 async fn deployment_state(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Json<DeploymentStateResponse>), (StatusCode, Json<ErrorResponse>)> {
-    authorize_publication(&state, &headers, &project_id, PUBLICATION_READ_OPERATION).await?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_READ_OPERATION,
+    )
+    .await?;
     let runtime = state
         .store
         .publication_store()
@@ -165,10 +197,18 @@ async fn deployment_state(
 
 async fn work_releases(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<WorkReleaseListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    authorize_publication(&state, &headers, &project_id, PUBLICATION_READ_OPERATION).await?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_READ_OPERATION,
+    )
+    .await?;
     Ok(Json(WorkReleaseListResponse {
         releases: state
             .store
@@ -180,6 +220,7 @@ async fn work_releases(
 
 async fn publication_operation(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(operation_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<PublicationOperationResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -190,6 +231,7 @@ async fn publication_operation(
         .ok_or_else(|| not_found(format!("publication operation not found: {operation_id}")))?;
     authorize_publication(
         &state,
+        &authorization,
         &headers,
         &operation.project_id,
         PUBLICATION_READ_OPERATION,
