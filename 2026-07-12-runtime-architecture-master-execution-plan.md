@@ -102,8 +102,8 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | Goal | 状态 | PR | 合并 commit | 验收证据 |
 |---|---|---|---|---|
 | G0 | complete | [PR-01](https://github.com/Carlosfengv/zeronDesign/pull/1) | `8f1527f` | `services/runtime/evidence/http-contract-baseline.md` |
-| G1 | in_progress | PR-02 | 待填写 | `services/runtime/evidence/http-api-split-g1.md` |
-| G2 | pending | PR-04 | 待填写 | 待填写 |
+| G1 | complete | [PR-02](https://github.com/Carlosfengv/zeronDesign/pull/2) | `eb5834e` | `services/runtime/evidence/http-api-split-g1.md` |
+| G2 | in_progress | PR-03 | 待填写 | 待填写 |
 | G3 | pending | PR-05 | 待填写 | 待填写 |
 | G4 | pending | PR-06 | 待填写 | 待填写 |
 | G5 | pending | PR-07 | 待填写 | 待填写 |

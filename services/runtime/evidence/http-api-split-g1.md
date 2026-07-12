@@ -49,4 +49,5 @@ The split preserves `pub mod http_api`, `AppState`, `router`, `router_with_state
 - No Store state transition or public payload field was intentionally changed.
 - The user-owned untracked architecture/product document was not staged.
 
-G1 remains `in_progress` until PR-02 passes remote checks and is merged to `main`.
+PR-02 passed the remote `architecture-contracts` check and was merged to `main` as
+`eb5834e`.
