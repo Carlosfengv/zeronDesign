@@ -4,6 +4,7 @@ use crate::{
     authorization::ApplicationAuthorizationPolicy,
     design_profile_service::DesignProfileService,
     preview_access::PreviewAccessService,
+    release_evidence::ReleaseEvidenceService,
     runtime_storage::{FileArtifactStore, FileRuntimeEvidenceStore, RuntimeEvidenceStore},
 };
 
@@ -17,6 +18,7 @@ pub(super) fn router_with_services(state: AppState) -> Router {
     let runtime_evidence: Arc<dyn RuntimeEvidenceStore> = Arc::new(FileRuntimeEvidenceStore::new(
         &state.config.runtime_storage_dir,
     ));
+    let release_evidence = ReleaseEvidenceService::new(state.store.clone(), runtime_evidence);
     let authorization = ApplicationAuthorizationPolicy::new(state.store.clone());
     let preview_access = PreviewAccessService::new(state.store.clone(), authorization.clone());
     Router::new()
@@ -32,7 +34,7 @@ pub(super) fn router_with_services(state: AppState) -> Router {
         .merge(routes::internal::router())
         .layer(Extension(preview_access))
         .layer(Extension(authorization))
-        .layer(Extension(runtime_evidence))
+        .layer(Extension(release_evidence))
         .layer(Extension(artifact_access))
         .layer(Extension(run_lifecycle))
         .layer(Extension(design_profiles))

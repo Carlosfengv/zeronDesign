@@ -21,6 +21,7 @@ pub mod publication;
 pub mod query_session;
 pub mod recovery;
 pub mod release;
+pub mod release_evidence;
 pub mod repair_loop;
 pub mod run_lifecycle;
 pub mod runtime;

@@ -12,6 +12,7 @@ DESIGN_PROFILE_SERVICE_DIR="$ROOT/services/runtime/src/design_profile_service"
 ARTIFACT_ACCESS="$ROOT/services/runtime/src/artifact_access.rs"
 AUTHORIZATION_POLICY="$ROOT/services/runtime/src/authorization.rs"
 PREVIEW_ACCESS="$ROOT/services/runtime/src/preview_access.rs"
+RELEASE_EVIDENCE_SERVICE="$ROOT/services/runtime/src/release_evidence.rs"
 status=0
 
 fail() {
@@ -121,6 +122,22 @@ fi
 if grep -nE 'get_project_access|owner_principal_id|principal\.project_id' \
   "$HTTP_DIR/auth/publication.rs" "$HTTP_DIR/auth/candidate_preview.rs"; then
   fail "AUTH-003: HTTP auth adapters must delegate project ownership to the application authorization policy"
+fi
+
+if grep -nE '^async fn|state\.store|\.store\.' "$HTTP_DIR/routes/internal.rs" || \
+  grep -nE 'state\.store|\.store\.|RuntimeEvidenceStore' \
+    "$HTTP_DIR/routes/internal/release_evidence.rs"; then
+  fail "INTERNAL-001: Internal facade and Release Evidence route must delegate to use-case modules and service"
+fi
+
+for internal_use_case in template_build preview_promotion project_access release_evidence sandbox_release; do
+  if [[ ! -f "$HTTP_DIR/routes/internal/$internal_use_case.rs" ]]; then
+    fail "INTERNAL-002: Internal use case route module is missing: $internal_use_case"
+  fi
+done
+
+if grep -nE 'axum|HeaderMap|StatusCode|Router|std::fs|tokio::fs' "$RELEASE_EVIDENCE_SERVICE"; then
+  fail "INTERNAL-003: ReleaseEvidence application service depends on HTTP or direct filesystem APIs"
 fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
