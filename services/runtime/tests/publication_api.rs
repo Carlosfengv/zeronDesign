@@ -1,6 +1,9 @@
 use anydesign_runtime::{
     config::{PublicPrincipalAuthMode, RuntimePolicyProfile, SandboxBackendMode},
     http_api,
+    public_principal::{
+        PublicPrincipalClaims, PublicPrincipalJwtIssuer, PUBLICATION_WRITE_OPERATION,
+    },
     publication::{PublishOperationStatus, WorkRuntimeStatus},
     release::{PackagingScanEvidence, ReleasePackagingInput, RuntimeProfile, WorkRelease},
     types::{sha256_hex, AgentPhase},
@@ -10,6 +13,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -249,5 +253,87 @@ async fn publication_mutation_requires_idempotency_and_validated_release() {
         .unwrap()
         .status()
         .is_client_error());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn publication_write_requires_scoped_owner_principal_when_auth_is_enabled() {
+    let root = root("authorization");
+    let signing_key = SigningKey::from_bytes(&[5_u8; 32]);
+    let public_key_path = root.join("publication-public.der");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        &public_key_path,
+        signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut config = config(&root);
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+    config.public_principal_public_key_files = vec![public_key_path];
+    config.public_principal_issuer = "anydesign-bff".into();
+    config.public_principal_audience = "anydesign-runtime-public".into();
+    let state = http_api::app_state(config);
+    state
+        .store
+        .upsert_project_access("publication-project", "owner-1".into(), None, None)
+        .await
+        .unwrap();
+    let release = seed_validated_release(&state).await;
+    let issuer = PublicPrincipalJwtIssuer::from_signing_key(
+        signing_key,
+        "anydesign-bff",
+        "anydesign-runtime-public",
+        60,
+    );
+    let token = issuer
+        .issue(PublicPrincipalClaims {
+            iss: String::new(),
+            aud: String::new(),
+            sub: "owner-1".into(),
+            jti: "publication-owner-jti-0001".into(),
+            exp: 0,
+            iat: 0,
+            project_id: "publication-project".into(),
+            operations: vec![PUBLICATION_WRITE_OPERATION.into()],
+        })
+        .unwrap();
+    let body = serde_json::to_vec(&json!({
+        "releaseId": release.id,
+        "expectedGeneration": 0
+    }))
+    .unwrap();
+    let app = http_api::router_with_state(state);
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/publication-project/publish")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "authorized-publish")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/publication-project/publish")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "authorized-publish")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::ACCEPTED);
     std::fs::remove_dir_all(root).unwrap();
 }

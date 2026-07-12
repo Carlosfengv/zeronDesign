@@ -109,7 +109,9 @@ impl PublicationIntent {
             return Err("publication intent field exceeds its length limit".to_string());
         }
         if self.expected_generation.is_none() {
-            return Err("publication expectedGeneration is required for compare-and-swap".to_string());
+            return Err(
+                "publication expectedGeneration is required for compare-and-swap".to_string(),
+            );
         }
         match self.kind {
             PublishOperationKind::Publish
@@ -124,12 +126,16 @@ impl PublicationIntent {
             }
             PublishOperationKind::Unpublish => {}
         }
-        if matches!(self.kind, PublishOperationKind::Update | PublishOperationKind::Rollback)
-            && self.expected_current_release_id.as_deref().is_none_or(str::is_empty)
+        if matches!(
+            self.kind,
+            PublishOperationKind::Update | PublishOperationKind::Rollback
+        ) && self
+            .expected_current_release_id
+            .as_deref()
+            .is_none_or(str::is_empty)
         {
             return Err(
-                "update or rollback requires expectedCurrentReleaseId compare-and-swap"
-                    .to_string(),
+                "update or rollback requires expectedCurrentReleaseId compare-and-swap".to_string(),
             );
         }
         Ok(())

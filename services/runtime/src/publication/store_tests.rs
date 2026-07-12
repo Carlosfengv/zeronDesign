@@ -57,6 +57,29 @@ fn operation_runtime_and_outbox_recover_atomically_from_journal() {
 }
 
 #[test]
+fn truncated_uncommitted_tail_never_creates_partial_publication_state() {
+    let root = root("truncated-tail");
+    let store = PublicationStore::open(&root).unwrap();
+    let (operation, runtime) = store.commit_intent(&publish("key-truncated")).unwrap();
+    drop(store);
+    fs::remove_file(root.join(CHECKPOINT_FILE)).unwrap();
+    let mut journal = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(JOURNAL_FILE))
+        .unwrap();
+    journal
+        .write_all(b"{\"sequence\":2,\"operation\":")
+        .unwrap();
+    journal.sync_all().unwrap();
+    drop(journal);
+    let recovered = PublicationStore::open(&root).unwrap();
+    assert_eq!(recovered.operation(&operation.id), Some(operation));
+    assert_eq!(recovered.runtime(&runtime.project_id), Some(runtime));
+    assert_eq!(recovered.pending_outbox().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn desired_generation_compare_and_set_serializes_concurrent_requests() {
     let root = root("cas");
     let store = Arc::new(PublicationStore::open(&root).unwrap());
