@@ -15,6 +15,22 @@ pub enum WorkRuntimeBackendMode {
     Kubernetes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRuntimeExposureMode {
+    ClusterOnly,
+    Ingress,
+}
+
+impl WorkRuntimeExposureMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "ingress" | "public" => Self::Ingress,
+            _ => Self::ClusterOnly,
+        }
+    }
+}
+
 impl WorkRuntimeBackendMode {
     fn from_env_value(value: &str) -> Self {
         match value {
@@ -136,6 +152,14 @@ pub struct RuntimeConfig {
     pub public_principal_max_ttl_seconds: u64,
     pub k8s_namespace: String,
     pub work_runtime_backend_mode: WorkRuntimeBackendMode,
+    pub work_runtime_exposure_mode: WorkRuntimeExposureMode,
+    pub work_runtime_prober_image: Option<String>,
+    pub works_base_domain: Option<String>,
+    pub works_ingress_class: Option<String>,
+    pub works_tls_secret_name: Option<String>,
+    pub works_probe_scheme: String,
+    pub works_probe_resolve: Option<SocketAddr>,
+    pub works_probe_ca_file: Option<PathBuf>,
     pub sandbox_backend_mode: SandboxBackendMode,
     pub policy_profile: RuntimePolicyProfile,
     pub npm_registry: String,
@@ -248,6 +272,25 @@ impl RuntimeConfig {
                 .ok()
                 .map(|value| WorkRuntimeBackendMode::from_env_value(&value))
                 .unwrap_or(WorkRuntimeBackendMode::ControlPlaneOnly),
+            work_runtime_exposure_mode: env::var("WORK_RUNTIME_EXPOSURE")
+                .ok()
+                .map(|value| WorkRuntimeExposureMode::from_env_value(&value))
+                .unwrap_or(WorkRuntimeExposureMode::ClusterOnly),
+            work_runtime_prober_image: optional_string_env("WORK_RUNTIME_PROBER_IMAGE"),
+            works_base_domain: optional_string_env("WORKS_BASE_DOMAIN"),
+            works_ingress_class: optional_string_env("WORKS_INGRESS_CLASS"),
+            works_tls_secret_name: optional_string_env("WORKS_TLS_SECRET_NAME"),
+            works_probe_scheme: env::var("WORKS_PROBE_SCHEME")
+                .unwrap_or_else(|_| "https".to_string()),
+            works_probe_resolve: env::var("WORKS_PROBE_RESOLVE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse()
+                        .expect("WORKS_PROBE_RESOLVE must be a socket address")
+                }),
+            works_probe_ca_file: optional_path_env("WORKS_PROBE_CA_FILE"),
             sandbox_backend_mode: env::var("SANDBOX_BACKEND_MODE")
                 .ok()
                 .map(|value| SandboxBackendMode::from_env_value(&value))
@@ -293,6 +336,35 @@ impl RuntimeConfig {
     }
 
     pub fn validate_startup(&self) -> Result<(), String> {
+        if self.work_runtime_backend_mode == WorkRuntimeBackendMode::Kubernetes {
+            let prober = self.work_runtime_prober_image.as_deref().ok_or_else(|| {
+                "WORK_RUNTIME_PROBER_IMAGE is required for Kubernetes work runtime".to_string()
+            })?;
+            if !is_digest_pinned_image(prober) {
+                return Err("WORK_RUNTIME_PROBER_IMAGE must be sha256-pinned".to_string());
+            }
+            if self.work_runtime_exposure_mode == WorkRuntimeExposureMode::Ingress {
+                for (name, value) in [
+                    ("WORKS_BASE_DOMAIN", &self.works_base_domain),
+                    ("WORKS_INGRESS_CLASS", &self.works_ingress_class),
+                    ("WORKS_TLS_SECRET_NAME", &self.works_tls_secret_name),
+                ] {
+                    if value.as_deref().is_none_or(str::is_empty) {
+                        return Err(format!("{name} is required for Ingress exposure"));
+                    }
+                }
+                if self.works_probe_scheme != "https" {
+                    return Err("WORKS_PROBE_SCHEME must be https".to_string());
+                }
+                if self
+                    .works_probe_ca_file
+                    .as_ref()
+                    .is_some_and(|path| !path.is_file())
+                {
+                    return Err("WORKS_PROBE_CA_FILE does not exist".to_string());
+                }
+            }
+        }
         if self.policy_profile == RuntimePolicyProfile::Production
             && self.npm_registry.contains("registry.npmjs.org")
         {
@@ -384,6 +456,10 @@ fn secret_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
+fn optional_string_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
 fn optional_path_env(name: &str) -> Option<PathBuf> {
     secret_env(name).map(PathBuf::from)
 }
@@ -392,6 +468,16 @@ fn truthy_env(name: &str) -> bool {
     env::var(name)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn is_digest_pinned_image(image: &str) -> bool {
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn agent_model_from_env(provider: ModelProvider) -> String {
@@ -458,6 +544,32 @@ mod tests {
         let mut config = phase_a_config();
         config.policy_profile = RuntimePolicyProfile::LocalE2e;
         config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn kubernetes_work_runtime_requires_pinned_prober_and_complete_ingress_contract() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.work_runtime_backend_mode = WorkRuntimeBackendMode::Kubernetes;
+        config.work_runtime_prober_image = Some("release-prober:latest".into());
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("sha256-pinned"));
+        config.work_runtime_prober_image = Some(format!(
+            "registry.example/release-prober@sha256:{}",
+            "a".repeat(64)
+        ));
+        config.work_runtime_exposure_mode = WorkRuntimeExposureMode::Ingress;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("WORKS_BASE_DOMAIN"));
+        config.works_base_domain = Some("works.example.test".into());
+        config.works_ingress_class = Some("nginx".into());
+        config.works_tls_secret_name = Some("works-wildcard-tls".into());
         config.validate_startup().unwrap();
     }
 }

@@ -1,7 +1,8 @@
 use super::{
-    DesiredWorkRuntime, KubernetesResourceIdentity, ObservedWorkRuntime,
+    DesiredUnpublishRuntime, DesiredWorkRuntime, KubernetesResourceIdentity, ObservedWorkRuntime,
     PublicationReconcileDisposition, WorkRuntimeBackend, FIELD_MANAGER,
 };
+use crate::{config::WorkRuntimeExposureMode, RuntimeConfig};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use k8s_openapi::api::{
@@ -17,6 +18,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+#[path = "kubernetes_ingress.rs"]
+mod ingress;
+pub use ingress::KubernetesIngressExposure;
+
 const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
@@ -24,21 +29,34 @@ pub struct KubernetesWorkRuntimeBackend {
     client: Client,
     timeout: Duration,
     prober_image: String,
+    exposure: Option<KubernetesIngressExposure>,
 }
 
 impl KubernetesWorkRuntimeBackend {
     pub async fn try_default() -> Result<Self> {
-        let prober_image = std::env::var("WORK_RUNTIME_PROBER_IMAGE")
+        Self::from_runtime_config(&RuntimeConfig::from_env()).await
+    }
+
+    pub async fn from_runtime_config(config: &RuntimeConfig) -> Result<Self> {
+        let prober_image = config
+            .work_runtime_prober_image
+            .clone()
             .context("WORK_RUNTIME_PROBER_IMAGE is required for Kubernetes publication")?;
         if !is_digest_pinned_image(&prober_image) {
             bail!("WORK_RUNTIME_PROBER_IMAGE must be sha256-pinned");
         }
+        let exposure = if config.work_runtime_exposure_mode == WorkRuntimeExposureMode::Ingress {
+            Some(KubernetesIngressExposure::from_runtime_config(config)?)
+        } else {
+            None
+        };
         Ok(Self {
             client: Client::try_default()
                 .await
                 .context("load Kubernetes client configuration")?,
             timeout: APPLY_TIMEOUT,
             prober_image,
+            exposure,
         })
     }
 
@@ -50,7 +68,20 @@ impl KubernetesWorkRuntimeBackend {
             client,
             timeout,
             prober_image,
+            exposure: None,
         })
+    }
+
+    pub fn new_with_ingress(
+        client: Client,
+        timeout: Duration,
+        prober_image: String,
+        exposure: KubernetesIngressExposure,
+    ) -> Result<Self> {
+        let mut backend = Self::new(client, timeout, prober_image)?;
+        exposure.validate()?;
+        backend.exposure = Some(exposure);
+        Ok(backend)
     }
 
     async fn assert_namespace(&self, desired: &DesiredWorkRuntime) -> Result<()> {
@@ -68,6 +99,13 @@ impl KubernetesWorkRuntimeBackend {
 
     async fn apply_network_policy(&self, desired: &DesiredWorkRuntime) -> Result<()> {
         let policies: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), &desired.namespace);
+        assert_expected_identity(
+            &policies,
+            &desired.network_policy_name,
+            None,
+            &desired.owner_record_id,
+        )
+        .await?;
         let policy = object::<NetworkPolicy>(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -79,10 +117,23 @@ impl KubernetesWorkRuntimeBackend {
             "spec": {
                 "podSelector": {"matchLabels": {"anydesign.dev/work": desired.work_name}},
                 "policyTypes": ["Ingress", "Egress"],
-                "ingress": [{
-                    "from": [{"podSelector": {"matchLabels": {"anydesign.dev/role": "release-prober"}}}],
-                    "ports": [{"protocol": "TCP", "port": desired.container_port}]
-                }],
+                "ingress": [
+                    {
+                        "from": [{"podSelector": {"matchLabels": {"anydesign.dev/role": "release-prober"}}}],
+                        "ports": [{"protocol": "TCP", "port": desired.container_port}]
+                    },
+                    {
+                        "from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "anydesign-ingress"}}}],
+                        "ports": [{"protocol": "TCP", "port": desired.container_port}]
+                    },
+                    {
+                        "from": [{
+                            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                            "podSelector": {"matchLabels": {"app.kubernetes.io/name": "traefik"}}
+                        }],
+                        "ports": [{"protocol": "TCP", "port": desired.container_port}]
+                    }
+                ],
                 "egress": []
             }
         }))?;
@@ -99,10 +150,11 @@ impl KubernetesWorkRuntimeBackend {
 
     async fn apply_deployment(&self, desired: &DesiredWorkRuntime) -> Result<Deployment> {
         let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), &desired.namespace);
-        assert_expected_uid(
+        assert_expected_identity(
             &deployments,
             &desired.deployment_name,
             desired.expected_deployment_uid.as_deref(),
+            &desired.owner_record_id,
         )
         .await?;
         let deployment = object::<Deployment>(json!({
@@ -188,7 +240,7 @@ impl KubernetesWorkRuntimeBackend {
         expected_resource_version: Option<&str>,
     ) -> Result<Service> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), &desired.namespace);
-        assert_expected_uid(&services, name, expected_uid).await?;
+        assert_expected_identity(&services, name, expected_uid, &desired.owner_record_id).await?;
         let mut metadata = json!({
             "name": name,
             "namespace": desired.namespace,
@@ -340,14 +392,31 @@ impl WorkRuntimeBackend for KubernetesWorkRuntimeBackend {
                 desired.expected_service_resource_version.as_deref(),
             )
             .await?;
-        Ok(PublicationReconcileDisposition::Applied(
+        let ingress = if let Some(exposure) = &self.exposure {
+            let ingress = self.apply_ingress(desired, exposure).await?;
+            self.verify_external_release(desired, exposure).await?;
+            Some(identity(&ingress)?)
+        } else {
+            None
+        };
+        Ok(PublicationReconcileDisposition::Applied(Box::new(
             ObservedWorkRuntime {
                 deployment: identity(&deployment)?,
                 service: identity(&service)?,
+                ingress,
                 ready: true,
                 release_identity_verified: true,
+                external_release_identity_verified: self.exposure.is_some(),
             },
-        ))
+        )))
+    }
+
+    async fn unpublish(
+        &self,
+        desired: &DesiredUnpublishRuntime,
+    ) -> Result<PublicationReconcileDisposition> {
+        self.delete_published_resources(desired).await?;
+        Ok(PublicationReconcileDisposition::Unpublished)
     }
 }
 
@@ -370,18 +439,72 @@ fn trust_annotations(desired: &DesiredWorkRuntime) -> Value {
     })
 }
 
-async fn assert_expected_uid<K>(api: &Api<K>, name: &str, expected: Option<&str>) -> Result<()>
+async fn assert_expected_identity<K>(
+    api: &Api<K>,
+    name: &str,
+    expected_uid: Option<&str>,
+    expected_owner_record_id: &str,
+) -> Result<()>
 where
     K: Clone + DeserializeOwned + std::fmt::Debug + Resource<DynamicType = ()>,
 {
-    let Some(expected) = expected else {
+    let current = api
+        .get_opt(name)
+        .await
+        .with_context(|| format!("read Kubernetes resource identity {name} before mutation"))?;
+    match (expected_uid, current) {
+        (Some(expected), Some(current)) if current.meta().uid.as_deref() == Some(expected) => {
+            Ok(())
+        }
+        (Some(_), _) => bail!("Kubernetes resource UID drift detected for {name}"),
+        (None, None) => Ok(()),
+        (None, Some(current)) => {
+            let labels = current.meta().labels.as_ref();
+            if labels
+                .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+                .map(String::as_str)
+                != Some(FIELD_MANAGER)
+                || labels
+                    .and_then(|labels| labels.get("anydesign.dev/owner-record-id"))
+                    .map(String::as_str)
+                    != Some(expected_owner_record_id)
+            {
+                bail!("refusing to adopt pre-existing Kubernetes resource {name}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn assert_delete_identity<K>(
+    api: &Api<K>,
+    name: &str,
+    expected_uid: Option<&str>,
+    expected_owner_record_id: &str,
+) -> Result<()>
+where
+    K: Clone + DeserializeOwned + std::fmt::Debug + Resource<DynamicType = ()>,
+{
+    let Some(current) = api.get_opt(name).await? else {
         return Ok(());
     };
-    let current = api.get(name).await.with_context(|| {
-        format!("read previously observed Kubernetes resource {name} before apply")
-    })?;
-    if current.meta().uid.as_deref() != Some(expected) {
-        bail!("Kubernetes resource UID drift detected for {name}");
+    if let Some(expected) = expected_uid {
+        if current.meta().uid.as_deref() != Some(expected) {
+            bail!("Kubernetes resource UID drift detected for {name}");
+        }
+        return Ok(());
+    }
+    let labels = current.meta().labels.as_ref();
+    if labels
+        .and_then(|labels| labels.get("app.kubernetes.io/managed-by"))
+        .map(String::as_str)
+        != Some(FIELD_MANAGER)
+        || labels
+            .and_then(|labels| labels.get("anydesign.dev/owner-record-id"))
+            .map(String::as_str)
+            != Some(expected_owner_record_id)
+    {
+        bail!("refusing to delete pre-existing Kubernetes resource {name}");
     }
     Ok(())
 }
@@ -425,6 +548,17 @@ where
             bail!("Kubernetes resource {name} was not deleted before timeout");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<()>
+where
+    K: Clone + DeserializeOwned + std::fmt::Debug + Resource<DynamicType = ()>,
+{
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 

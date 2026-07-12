@@ -144,6 +144,7 @@ function build(request) {
   const result = run("docker", [
     "buildx", "build", "--builder", builderName, "--platform", "linux/arm64",
     "--build-arg", `BASE_IMAGE=${staticWebBaseImage(request.baseImageDigest)}`,
+    "--build-arg", `RELEASE_ID=${safeId(request.releaseId)}`,
     "--output", `type=oci,dest=${archive}`,
     "--metadata-file", buildMetadata,
     "--provenance=false", "--sbom=false", context,
@@ -187,6 +188,7 @@ function push({ request, image: built }) {
   const result = run("docker", [
     "buildx", "build", "--builder", builderName, "--platform", "linux/arm64",
     "--build-arg", `BASE_IMAGE=${staticWebBaseImage(request.baseImageDigest)}`,
+    "--build-arg", `RELEASE_ID=${safeId(request.releaseId)}`,
     "--output", `type=image,name=${destination},push=true,oci-mediatypes=true`,
     "--metadata-file", metadataPath,
     "--provenance=false", "--sbom=false", context,

@@ -24,8 +24,10 @@ pub struct DesiredWorkRuntime {
     pub stable_service_name: String,
     pub probe_service_name: String,
     pub network_policy_name: String,
+    pub host_slug: String,
     pub release_id: String,
     pub desired_generation: u64,
+    pub owner_record_id: String,
     pub runtime_profile_id: String,
     pub image: String,
     pub image_digest: String,
@@ -37,6 +39,7 @@ pub struct DesiredWorkRuntime {
     pub expected_deployment_uid: Option<String>,
     pub expected_service_uid: Option<String>,
     pub expected_service_resource_version: Option<String>,
+    pub expected_ingress_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,8 +65,52 @@ pub struct KubernetesResourceIdentity {
 pub struct ObservedWorkRuntime {
     pub deployment: KubernetesResourceIdentity,
     pub service: KubernetesResourceIdentity,
+    pub ingress: Option<KubernetesResourceIdentity>,
     pub ready: bool,
     pub release_identity_verified: bool,
+    pub external_release_identity_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesiredUnpublishRuntime {
+    pub namespace: String,
+    pub project_id: String,
+    pub work_name: String,
+    pub service_name: String,
+    pub ingress_name: String,
+    pub network_policy_name: String,
+    pub host_slug: String,
+    pub desired_generation: u64,
+    pub owner_record_id: String,
+    pub expected_service_uid: Option<String>,
+    pub expected_ingress_uid: Option<String>,
+}
+
+impl DesiredUnpublishRuntime {
+    pub fn from_state(runtime: &WorkRuntimeState) -> Result<Self> {
+        if runtime.desired_publication != PublicationDesiredState::Unpublished
+            || runtime.desired_release_id.is_some()
+        {
+            bail!("work runtime is not desired Unpublished");
+        }
+        Ok(Self {
+            namespace: WORKS_NAMESPACE.into(),
+            project_id: runtime.project_id.clone(),
+            work_name: runtime.service_name.clone(),
+            service_name: runtime.service_name.clone(),
+            ingress_name: runtime.ingress_name.clone(),
+            network_policy_name: runtime.service_name.clone(),
+            host_slug: runtime.host_slug.clone(),
+            desired_generation: runtime.desired_generation,
+            owner_record_id: format!(
+                "project-{}",
+                &sha256_hex(runtime.project_id.as_bytes())[..20]
+            ),
+            expected_service_uid: runtime.service_uid.clone(),
+            expected_ingress_uid: runtime.ingress_uid.clone(),
+        })
+    }
 }
 
 impl DesiredWorkRuntime {
@@ -155,8 +202,13 @@ impl DesiredWorkRuntime {
             stable_service_name: runtime.service_name.clone(),
             probe_service_name: format!("{}-probe-{release_key}", runtime.service_name),
             network_policy_name: runtime.service_name.clone(),
+            host_slug: runtime.host_slug.clone(),
             release_id: release.id.clone(),
             desired_generation: runtime.desired_generation,
+            owner_record_id: format!(
+                "project-{}",
+                &sha256_hex(runtime.project_id.as_bytes())[..20]
+            ),
             runtime_profile_id: STATIC_WEB_PROFILE_ID.into(),
             image,
             image_digest,
@@ -171,6 +223,7 @@ impl DesiredWorkRuntime {
             .flatten(),
             expected_service_uid: runtime.service_uid.clone(),
             expected_service_resource_version: runtime.service_resource_version.clone(),
+            expected_ingress_uid: runtime.ingress_uid.clone(),
         })
     }
 }
@@ -199,7 +252,8 @@ fn is_sha256_digest(value: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationReconcileDisposition {
-    Applied(ObservedWorkRuntime),
+    Applied(Box<ObservedWorkRuntime>),
+    Unpublished,
     Deferred,
 }
 
@@ -209,6 +263,11 @@ pub trait WorkRuntimeBackend: Send + Sync {
         &self,
         desired: &DesiredWorkRuntime,
     ) -> Result<PublicationReconcileDisposition>;
+
+    async fn unpublish(
+        &self,
+        desired: &DesiredUnpublishRuntime,
+    ) -> Result<PublicationReconcileDisposition>;
 }
 
 pub struct ControlPlaneOnlyBackend;
@@ -216,6 +275,13 @@ pub struct ControlPlaneOnlyBackend;
 #[async_trait]
 impl WorkRuntimeBackend for ControlPlaneOnlyBackend {
     async fn reconcile(&self, _: &DesiredWorkRuntime) -> Result<PublicationReconcileDisposition> {
+        Ok(PublicationReconcileDisposition::Deferred)
+    }
+
+    async fn unpublish(
+        &self,
+        _: &DesiredUnpublishRuntime,
+    ) -> Result<PublicationReconcileDisposition> {
         Ok(PublicationReconcileDisposition::Deferred)
     }
 }
@@ -312,7 +378,6 @@ mod tests {
             .values()
             .any(|value| value == "future-template"));
         assert!(desired.image.contains("@sha256:"));
-
         let mut unsigned = packaging;
         unsigned.signature_digest = None;
         assert!(DesiredWorkRuntime::from_records(&runtime, &release, &unsigned).is_err());

@@ -5,12 +5,12 @@ mod model;
 mod store;
 
 pub use backend::{
-    ControlPlaneOnlyBackend, DesiredWorkRuntime, KubernetesResourceIdentity, ObservedWorkRuntime,
-    PublicationReconcileDisposition, ReleaseTrustEvidence, WorkRuntimeBackend, FIELD_MANAGER,
-    WORKS_NAMESPACE,
+    ControlPlaneOnlyBackend, DesiredUnpublishRuntime, DesiredWorkRuntime,
+    KubernetesResourceIdentity, ObservedWorkRuntime, PublicationReconcileDisposition,
+    ReleaseTrustEvidence, WorkRuntimeBackend, FIELD_MANAGER, WORKS_NAMESPACE,
 };
 pub use controller::WorkRuntimeController;
-pub use kubernetes::KubernetesWorkRuntimeBackend;
+pub use kubernetes::{KubernetesIngressExposure, KubernetesWorkRuntimeBackend};
 pub use model::{
     PublicationDesiredState, PublicationIntent, PublicationOutboxEvent, PublicationOutboxStatus,
     PublishCheckpoint, PublishOperation, PublishOperationKind, PublishOperationStatus,

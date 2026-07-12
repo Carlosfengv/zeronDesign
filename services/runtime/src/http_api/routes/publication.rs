@@ -39,6 +39,7 @@ async fn publish_work(
     } else {
         PublishOperationKind::Publish
     };
+    validate_publication_precondition(&headers, request.expected_current_release_id.as_deref())?;
     commit_publication_intent(
         &state,
         PublicationIntent {
@@ -68,6 +69,10 @@ async fn rollback_work(
         &request.runtime_profile_id,
     )
     .await?;
+    validate_existing_publication_precondition(
+        &headers,
+        request.expected_current_release_id.as_deref(),
+    )?;
     commit_publication_intent(
         &state,
         PublicationIntent {
@@ -90,6 +95,10 @@ async fn unpublish_work(
     Json(request): Json<UnpublishWorkRequest>,
 ) -> Result<(StatusCode, Json<PublicationOperationResponse>), (StatusCode, Json<ErrorResponse>)> {
     authorize_publication(&state, &headers, &project_id, PUBLICATION_WRITE_OPERATION).await?;
+    validate_existing_publication_precondition(
+        &headers,
+        request.expected_current_release_id.as_deref(),
+    )?;
     commit_publication_intent(
         &state,
         PublicationIntent {
@@ -124,14 +133,34 @@ async fn deployment_state(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<DeploymentStateResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(HeaderMap, Json<DeploymentStateResponse>), (StatusCode, Json<ErrorResponse>)> {
     authorize_publication(&state, &headers, &project_id, PUBLICATION_READ_OPERATION).await?;
     let runtime = state
         .store
         .publication_store()
         .runtime(&project_id)
         .ok_or_else(|| not_found(format!("deployment state not found: {project_id}")))?;
-    Ok(Json(DeploymentStateResponse { runtime }))
+    let mut response_headers = HeaderMap::new();
+    if let Some(release_id) = &runtime.current_release_id {
+        response_headers.insert(
+            "etag",
+            format!("\"{release_id}\"")
+                .parse::<axum::http::HeaderValue>()
+                .map_err(|error| internal_error(anyhow::anyhow!(error)))?,
+        );
+    }
+    let public_url = state
+        .config
+        .works_base_domain
+        .as_ref()
+        .map(|domain| format!("https://{}.{}", runtime.host_slug, domain));
+    Ok((
+        response_headers,
+        Json(DeploymentStateResponse {
+            runtime,
+            public_url,
+        }),
+    ))
 }
 
 async fn work_releases(
@@ -213,6 +242,67 @@ fn idempotency_key(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Erro
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| bad_request("Idempotency-Key header is required".to_string()))
+}
+
+fn validate_publication_precondition(
+    headers: &HeaderMap,
+    expected_current_release_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let if_match = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok());
+    let if_none_match = headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok());
+    if if_match.is_some() && if_none_match.is_some() {
+        return Err(bad_request(
+            "If-Match and If-None-Match cannot be sent together".to_string(),
+        ));
+    }
+    match expected_current_release_id {
+        None if if_none_match == Some("*") => Ok(()),
+        None if if_none_match.is_none() => Err(precondition_error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "If-None-Match: * is required for initial Publish",
+        )),
+        None => Err(precondition_error(
+            StatusCode::PRECONDITION_FAILED,
+            "If-None-Match must be * for initial Publish",
+        )),
+        Some(expected) if if_match == Some(format!("\"{expected}\"").as_str()) => Ok(()),
+        Some(_) if if_match.is_none() => Err(precondition_error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "quoted If-Match is required",
+        )),
+        Some(_) => Err(precondition_error(
+            StatusCode::PRECONDITION_FAILED,
+            "quoted If-Match must equal expectedCurrentReleaseId",
+        )),
+    }
+}
+
+fn precondition_error(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.to_string(),
+        }),
+    )
+}
+
+fn validate_existing_publication_precondition(
+    headers: &HeaderMap,
+    expected_current_release_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if expected_current_release_id.is_none() {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(ErrorResponse {
+                error: "expectedCurrentReleaseId and If-Match are required".to_string(),
+            }),
+        ));
+    }
+    validate_publication_precondition(headers, expected_current_release_id)
 }
 
 fn publication_store_error(error: PublicationStoreError) -> (StatusCode, Json<ErrorResponse>) {

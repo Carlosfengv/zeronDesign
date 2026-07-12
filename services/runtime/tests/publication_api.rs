@@ -121,7 +121,8 @@ async fn response_json(response: axum::response::Response) -> Value {
 #[tokio::test]
 async fn publication_routes_are_idempotent_persistent_and_queryable() {
     let root = root("lifecycle");
-    let config = config(&root);
+    let mut config = config(&root);
+    config.works_base_domain = Some("works.example.test".into());
     let state = http_api::app_state(config.clone());
     let release = seed_validated_release(&state).await;
     let app = http_api::router_with_state(state.clone());
@@ -136,6 +137,7 @@ async fn publication_routes_are_idempotent_persistent_and_queryable() {
             .uri("/projects/publication-project/publish")
             .header("content-type", "application/json")
             .header("idempotency-key", "publish-request-1")
+            .header("if-none-match", "*")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };
@@ -158,6 +160,7 @@ async fn publication_routes_are_idempotent_persistent_and_queryable() {
                 .uri("/projects/publication-project/publish")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "publish-request-1")
+                .header("if-none-match", "*")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "releaseId": release.id,
@@ -185,6 +188,10 @@ async fn publication_routes_are_idempotent_persistent_and_queryable() {
     assert_eq!(deployment.status(), StatusCode::OK);
     let deployment = response_json(deployment).await;
     assert_eq!(deployment["runtime"]["desiredGeneration"], 1);
+    assert!(deployment["publicUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with(".works.example.test"));
     assert_eq!(
         deployment["runtime"]["status"],
         serde_json::to_value(WorkRuntimeStatus::Publishing).unwrap()
@@ -225,6 +232,50 @@ async fn publication_mutation_requires_idempotency_and_validated_release() {
     let state = http_api::app_state(config(&root));
     let release = seed_validated_release(&state).await;
     let app = http_api::router_with_state(state);
+    let missing_precondition = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/publication-project/publish")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "missing-precondition")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "releaseId": release.id,
+                        "expectedGeneration": 0
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_precondition.status(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    let stale_precondition = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/publication-project/publish")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "stale-precondition")
+                .header("if-none-match", "\"already-published\"")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "releaseId": release.id,
+                        "expectedGeneration": 0
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_precondition.status(), StatusCode::PRECONDITION_FAILED);
     let missing_key = app
         .clone()
         .oneshot(
@@ -232,6 +283,7 @@ async fn publication_mutation_requires_idempotency_and_validated_release() {
                 .method("POST")
                 .uri("/projects/publication-project/publish")
                 .header("content-type", "application/json")
+                .header("if-none-match", "*")
                 .body(Body::from(
                     serde_json::to_vec(&json!({ "releaseId": release.id })).unwrap(),
                 ))
@@ -329,6 +381,7 @@ async fn publication_write_requires_scoped_owner_principal_when_auth_is_enabled(
                 .header("content-type", "application/json")
                 .header("idempotency-key", "authorized-publish")
                 .header("authorization", format!("Bearer {token}"))
+                .header("if-none-match", "*")
                 .body(Body::from(body))
                 .unwrap(),
         )
