@@ -1,4 +1,6 @@
 use anydesign_runtime::{
+    artifact_manifest::{ArtifactManifest, ArtifactResolver, ARTIFACT_MANIFEST_FILE},
+    artifact_publisher::{ArtifactPublisher, FileArtifactPublisher},
     conversation::RuntimeStore,
     model_gateway::ToolCall,
     project::{
@@ -196,6 +198,54 @@ fn third_template_registers_through_spec_and_operations_without_generic_dispatch
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn third_template_publishes_through_the_generic_artifact_contract() {
+    let built_in = BuiltInTemplateRegistry::built_in();
+    let mut third = (*built_in.default_template().unwrap()).clone();
+    third.id = TemplateId::parse("third-template").unwrap();
+    third.version = TemplateVersion::parse("third-template@1").unwrap();
+    third.manifest_sha256 =
+        ManifestHash::parse("2222222222222222222222222222222222222222222222222222222222222222")
+            .unwrap();
+    third.operations = &THIRD_TEMPLATE_OPERATIONS;
+    let registry = BuiltInTemplateRegistry::new([third]).unwrap();
+    let resolved = registry
+        .current(&TemplateId::parse("third-template").unwrap())
+        .unwrap();
+
+    let workspace = unique_temp_dir("third-artifact");
+    let output = workspace.join("output");
+    let storage = workspace.join("runtime");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("index.html"), "<h1>Third artifact</h1>").unwrap();
+    let publisher = FileArtifactPublisher::new(&storage);
+    let staged = publisher
+        .stage_directory(
+            "third-project",
+            "third-version",
+            &"a".repeat(64),
+            &output,
+            &resolved,
+        )
+        .await
+        .unwrap();
+    publisher.promote(&staged).await.unwrap();
+
+    let immutable = FileArtifactPublisher::version_root(&storage, "third-project", "third-version");
+    let manifest: ArtifactManifest =
+        serde_json::from_slice(&fs::read(immutable.join(ARTIFACT_MANIFEST_FILE)).unwrap()).unwrap();
+    assert_eq!(manifest.template_id, "third-template");
+    assert_eq!(manifest.mounts[0].url_prefix, "/");
+    let artifact = ArtifactResolver::load(&immutable, &staged.artifact_manifest_hash)
+        .unwrap()
+        .unwrap()
+        .resolve("")
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.bytes, b"<h1>Third artifact</h1>");
+    fs::remove_dir_all(workspace).unwrap();
 }
 
 #[test]

@@ -1,5 +1,6 @@
 pub mod agent_hooks;
 pub mod agent_loop;
+pub mod artifact_manifest;
 pub mod artifact_publisher;
 pub mod channel_manager;
 pub mod config;

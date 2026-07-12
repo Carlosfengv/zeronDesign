@@ -487,12 +487,14 @@ async fn report_preview_candidate(
         )
         .await
         .map_err(|error| ToolError::Terminal(format!("artifact export failed: {error}")))?;
+    let template = resolve_project_template_spec(ctx)?;
     let staged_artifact = match publisher
         .stage_directory(
             &ctx.project_id,
             &candidate.id,
             candidate_manifest_hash,
             &export_receipt.target_root,
+            &template,
         )
         .await
     {

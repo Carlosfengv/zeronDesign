@@ -2,6 +2,7 @@ use super::{
     FrameworkId, ManifestHash, SandboxExecutionProfileRef, TemplateId, TemplateOperations,
     TemplateVersion,
 };
+use crate::artifact_manifest::ArtifactDeliverySpec;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +136,7 @@ pub struct TemplateSpec {
     pub inspection_files: &'static [&'static str],
     pub build: BuildSpec,
     pub preview: PreviewSpec,
+    pub artifact_delivery: ArtifactDeliverySpec,
     pub capabilities: TemplateCapabilities,
     pub mutation_policy: MutationPolicySpec,
     pub style: StyleContractSpec,
@@ -156,6 +158,7 @@ impl std::fmt::Debug for TemplateSpec {
             .field("inspection_files", &self.inspection_files)
             .field("build", &self.build)
             .field("preview", &self.preview)
+            .field("artifact_delivery", &self.artifact_delivery)
             .field("capabilities", &self.capabilities)
             .field("mutation_policy", &self.mutation_policy)
             .field("style", &self.style)
@@ -177,6 +180,7 @@ impl PartialEq for TemplateSpec {
             && self.inspection_files == other.inspection_files
             && self.build == other.build
             && self.preview == other.preview
+            && self.artifact_delivery == other.artifact_delivery
             && self.capabilities == other.capabilities
             && self.mutation_policy == other.mutation_policy
             && self.style == other.style

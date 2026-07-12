@@ -7,6 +7,7 @@ use super::{
     TemplateFile, TemplateFileRole, TemplateId, TemplateOperationError, TemplateOperations,
     TemplateSpec, TemplateVersion, TemplateWriteMode,
 };
+use crate::artifact_manifest::ArtifactDeliverySpec;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
@@ -236,6 +237,7 @@ pub fn spec() -> TemplateSpec {
             command: "astro preview",
             screenshot_id: "shot-astro-home",
         },
+        artifact_delivery: ArtifactDeliverySpec::HOST_ROOT,
         capabilities: TemplateCapabilities {
             structured_page_write: true,
             mdx_document_write: false,
