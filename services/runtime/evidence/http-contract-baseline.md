@@ -59,5 +59,5 @@ five additions freeze:
 | Remote workspace FS boundary gate | passed | `remote workspace filesystem boundary check passed` |
 | Real Fumadocs production build | passed | `fumadocs_docs_real_next_build_smoke ... ok` |
 
-All G0 technical gates are green. The execution tracker remains `in_progress` until the G0 commits
-are reviewed and merged according to PR-01.
+All G0 technical gates are green. PR-01 passed the remote `architecture-contracts` check and was
+merged to `main` as `8f1527f66d6709e454d99da81e4a782c4674bb0a`.
