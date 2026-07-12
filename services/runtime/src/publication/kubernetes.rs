@@ -1,6 +1,6 @@
 use super::{
     DesiredUnpublishRuntime, DesiredWorkRuntime, KubernetesResourceIdentity, ObservedWorkRuntime,
-    PublicationReconcileDisposition, WorkRuntimeBackend, FIELD_MANAGER,
+    PublicationReconcileDisposition, PublishCheckpoint, WorkRuntimeBackend, FIELD_MANAGER,
 };
 use crate::{config::WorkRuntimeExposureMode, RuntimeConfig};
 use anyhow::{bail, Context, Result};
@@ -21,6 +21,8 @@ use std::time::Duration;
 #[path = "kubernetes_ingress.rs"]
 mod ingress;
 pub use ingress::KubernetesIngressExposure;
+#[path = "kubernetes_switch.rs"]
+mod switch;
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -82,6 +84,22 @@ impl KubernetesWorkRuntimeBackend {
         exposure.validate()?;
         backend.exposure = Some(exposure);
         Ok(backend)
+    }
+
+    async fn restore_previous_release(
+        &self,
+        desired: &DesiredWorkRuntime,
+        current_release_id: &str,
+    ) -> Result<()> {
+        self.switch_stable_service(desired, &desired.release_id, current_release_id)
+            .await?;
+        self.wait_endpoint_slice_release(desired, current_release_id)
+            .await?;
+        if let Some(exposure) = &self.exposure {
+            self.verify_external_release_id(desired, exposure, current_release_id)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn assert_namespace(&self, desired: &DesiredWorkRuntime) -> Result<()> {
@@ -384,20 +402,79 @@ impl WorkRuntimeBackend for KubernetesWorkRuntimeBackend {
         self.apply_deployment(desired).await?;
         let deployment = self.wait_ready(desired).await?;
         self.probe_release(desired).await?;
-        let service = self
-            .apply_service(
-                desired,
-                &desired.stable_service_name,
-                desired.expected_service_uid.as_deref(),
-                desired.expected_service_resource_version.as_deref(),
-            )
-            .await?;
-        let ingress = if let Some(exposure) = &self.exposure {
-            let ingress = self.apply_ingress(desired, exposure).await?;
-            self.verify_external_release(desired, exposure).await?;
-            Some(identity(&ingress)?)
+        let switching_from = desired
+            .current_release_id
+            .as_deref()
+            .filter(|current| *current != desired.release_id);
+        let (service, ingress) = if let Some(current_release_id) = switching_from {
+            let ingress = if let Some(exposure) = &self.exposure {
+                Some(self.apply_ingress(desired, exposure).await?)
+            } else {
+                None
+            };
+            let service = self
+                .switch_stable_service(desired, current_release_id, &desired.release_id)
+                .await?;
+            if let Err(switch_error) = self
+                .wait_endpoint_slice_release(desired, &desired.release_id)
+                .await
+            {
+                return match self
+                    .restore_previous_release(desired, current_release_id)
+                    .await
+                {
+                    Ok(()) => Err(switch_error)
+                        .context("green switch failed and stable Service was restored to blue"),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "green switch failed: {switch_error}; selector rollback also failed: {rollback_error}"
+                    )),
+                };
+            }
+            let ingress = ingress.map(|ingress| identity(&ingress)).transpose()?;
+            if desired.reconcile_checkpoint != PublishCheckpoint::TrafficSwitched {
+                return Ok(PublicationReconcileDisposition::TrafficSwitched(Box::new(
+                    ObservedWorkRuntime {
+                        deployment: identity(&deployment)?,
+                        service: identity(&service)?,
+                        ingress,
+                        ready: true,
+                        release_identity_verified: true,
+                        external_release_identity_verified: false,
+                    },
+                )));
+            }
+            if let Some(exposure) = &self.exposure {
+                if let Err(switch_error) = self.verify_external_release(desired, exposure).await {
+                    return match self
+                        .restore_previous_release(desired, current_release_id)
+                        .await
+                    {
+                        Ok(()) => Err(switch_error)
+                            .context("green external probe failed and stable Service was restored to blue"),
+                        Err(rollback_error) => Err(anyhow::anyhow!(
+                            "green external probe failed: {switch_error}; selector rollback also failed: {rollback_error}"
+                        )),
+                    };
+                }
+            }
+            (service, ingress)
         } else {
-            None
+            let service = self
+                .apply_service(
+                    desired,
+                    &desired.stable_service_name,
+                    desired.expected_service_uid.as_deref(),
+                    desired.expected_service_resource_version.as_deref(),
+                )
+                .await?;
+            let ingress = if let Some(exposure) = &self.exposure {
+                let ingress = self.apply_ingress(desired, exposure).await?;
+                self.verify_external_release(desired, exposure).await?;
+                Some(identity(&ingress)?)
+            } else {
+                None
+            };
+            (service, ingress)
         };
         Ok(PublicationReconcileDisposition::Applied(Box::new(
             ObservedWorkRuntime {

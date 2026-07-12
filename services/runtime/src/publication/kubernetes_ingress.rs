@@ -156,6 +156,16 @@ impl KubernetesWorkRuntimeBackend {
         desired: &DesiredWorkRuntime,
         exposure: &KubernetesIngressExposure,
     ) -> Result<()> {
+        self.verify_external_release_id(desired, exposure, &desired.release_id)
+            .await
+    }
+
+    pub(super) async fn verify_external_release_id(
+        &self,
+        desired: &DesiredWorkRuntime,
+        exposure: &KubernetesIngressExposure,
+        release_id: &str,
+    ) -> Result<()> {
         let host = exposure.host(&desired.host_slug);
         let client = exposure.client_for(&host)?;
         let url = format!(
@@ -171,8 +181,8 @@ impl KubernetesWorkRuntimeBackend {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
                 if response.status().is_success()
-                    && release_header.as_deref() == Some(desired.release_id.as_str())
-                    && response.text().await?.contains(&desired.release_id)
+                    && release_header.as_deref() == Some(release_id)
+                    && response.text().await?.contains(release_id)
                 {
                     return Ok(());
                 }
