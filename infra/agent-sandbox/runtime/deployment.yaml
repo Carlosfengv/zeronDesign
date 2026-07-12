@@ -61,6 +61,10 @@ spec:
                   key: token
             - name: K8S_NAMESPACE
               value: anydesign-sandboxes
+            - name: RUNTIME_EXECUTION_PROFILE_READINESS_MODE
+              value: kubernetes
+            - name: RUNTIME_EXECUTION_PROFILE_READINESS_TTL_SECONDS
+              value: "15"
             - name: RUNTIME_PUBLIC_BASE_URL
               value: http://anydesign-runtime.anydesign-runtime.svc.cluster.local:8080
             - name: RUNTIME_STORAGE_DIR
