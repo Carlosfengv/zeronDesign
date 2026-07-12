@@ -43,6 +43,8 @@ jobs:
         run: bash services/runtime/scripts/check-artifact-manifest-architecture.sh
       - name: Enforce release packaging trust boundaries
         run: bash services/runtime/scripts/check-release-packaging-architecture.sh
+      - name: Enforce publication control-plane boundaries
+        run: bash services/runtime/scripts/check-publication-control-plane-architecture.sh
       - name: Verify sandbox tool contract
         run: cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_contract_baseline
       - name: Verify template registry contract

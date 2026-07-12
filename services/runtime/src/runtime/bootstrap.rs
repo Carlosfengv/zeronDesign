@@ -5,6 +5,7 @@ use crate::{
     config::SandboxBackendMode,
     http_api::{self, AppState},
     project::{audit_project_template_compatibility, ProjectInitWorkspaceTransaction},
+    publication::{ControlPlaneOnlyBackend, WorkRuntimeController},
     recovery::{recover_interrupted_runs, RecoveryOutcome},
     templates::BuiltInTemplateRegistry,
     tools::{
@@ -14,7 +15,7 @@ use crate::{
     RuntimeConfig,
 };
 use chrono::Utc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
 pub struct RecoveredRuntime {
@@ -32,6 +33,16 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
     audit_persisted_template_compatibility(&state).await?;
     state.store.reconcile_artifact_promotions().await?;
     garbage_collect_artifacts(&state).await?;
+    state
+        .store
+        .publication_store()
+        .replay_nonterminal_outbox()?;
+    WorkRuntimeController::new(
+        state.store.publication_store(),
+        Arc::new(ControlPlaneOnlyBackend),
+        Duration::from_secs(5),
+    )
+    .spawn(&state.supervisor)?;
     let outcomes = recover_interrupted_runs(&state.store).await?;
     for outcome in outcomes {
         if let RecoveryOutcome::Resumed { run_id, .. } = outcome {
@@ -234,6 +245,12 @@ mod tests {
         let runtime = TestRuntimeBuilder::recover(config).await.unwrap();
         assert!(runtime.supervisor.readiness().is_ready());
         assert!(runtime.state.supervisor.readiness().is_ready());
+        assert!(runtime
+            .supervisor
+            .readiness()
+            .active_tasks
+            .contains(&"controller/work-runtime".to_string()));
+        runtime.supervisor.shutdown(Duration::from_secs(1)).await;
         let _ = fs::remove_dir_all(root);
     }
 }

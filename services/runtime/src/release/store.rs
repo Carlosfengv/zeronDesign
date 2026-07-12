@@ -73,6 +73,7 @@ struct ReleaseEvent {
     packaging: ReleasePackagingRecord,
 }
 
+#[derive(Debug)]
 pub struct ReleaseStore {
     root: PathBuf,
     state: Mutex<ReleaseState>,
@@ -426,6 +427,17 @@ impl ReleaseStore {
 
     pub fn release(&self, release_id: &str) -> Option<WorkRelease> {
         self.state.lock().unwrap().releases.get(release_id).cloned()
+    }
+
+    pub fn releases_for_project(&self, project_id: &str) -> Vec<WorkRelease> {
+        self.state
+            .lock()
+            .unwrap()
+            .releases
+            .values()
+            .filter(|release| release.project_id == project_id)
+            .cloned()
+            .collect()
     }
 
     pub fn packaging(&self, packaging_id: &str) -> Option<ReleasePackagingRecord> {

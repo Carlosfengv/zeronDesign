@@ -1,5 +1,7 @@
 use crate::{
     profiles::policy,
+    publication::PublicationStore,
+    release::ReleaseStore,
     repair_loop::RepairAttempt,
     types::{
         sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus,
@@ -67,6 +69,8 @@ pub struct RuntimeStore {
     design_source_artifact_log_path: Arc<PathBuf>,
     design_source_blob_dir: Arc<PathBuf>,
     audit_log_path: Arc<PathBuf>,
+    publication_store: Arc<PublicationStore>,
+    release_store: Arc<ReleaseStore>,
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +339,14 @@ impl Default for RuntimeStore {
     fn default() -> Self {
         let storage_root = default_storage_root();
         let next_id = initial_id_counter(&[&storage_root]);
+        let publication_store = Arc::new(
+            PublicationStore::open(storage_root.join("publication"))
+                .expect("publication store should open"),
+        );
+        let release_store = Arc::new(
+            ReleaseStore::open(storage_root.join("work-releases"))
+                .expect("release store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -373,6 +385,8 @@ impl Default for RuntimeStore {
             ),
             design_source_blob_dir: Arc::new(storage_root.join("design-source-artifacts")),
             audit_log_path: Arc::new(storage_root.join("audit-log.jsonl")),
+            publication_store,
+            release_store,
         }
     }
 }
@@ -385,6 +399,14 @@ impl RuntimeStore {
     pub fn with_checkpoint_dir(checkpoint_dir: impl Into<PathBuf>) -> Self {
         let checkpoint_dir = checkpoint_dir.into();
         let next_id = initial_id_counter(&[&checkpoint_dir]);
+        let publication_store = Arc::new(
+            PublicationStore::open(checkpoint_dir.join("publication"))
+                .expect("publication store should open"),
+        );
+        let release_store = Arc::new(
+            ReleaseStore::open(checkpoint_dir.join("work-releases"))
+                .expect("release store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -423,6 +445,8 @@ impl RuntimeStore {
             design_source_blob_dir: Arc::new(checkpoint_dir.join("design-source-artifacts")),
             audit_log_path: Arc::new(checkpoint_dir.join("audit-log.jsonl")),
             checkpoint_dir: Arc::new(checkpoint_dir),
+            publication_store,
+            release_store,
         }
     }
 
@@ -433,6 +457,14 @@ impl RuntimeStore {
         let checkpoint_dir = checkpoint_dir.into();
         let run_log_dir = run_log_dir.into();
         let next_id = initial_id_counter(&[&checkpoint_dir, &run_log_dir]);
+        let publication_store = Arc::new(
+            PublicationStore::open(run_log_dir.join("publication"))
+                .expect("publication store should open"),
+        );
+        let release_store = Arc::new(
+            ReleaseStore::open(run_log_dir.join("work-releases"))
+                .expect("release store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -471,7 +503,17 @@ impl RuntimeStore {
             ),
             design_source_blob_dir: Arc::new(run_log_dir.join("design-source-artifacts")),
             run_log_dir: Arc::new(run_log_dir),
+            publication_store,
+            release_store,
         }
+    }
+
+    pub fn publication_store(&self) -> Arc<PublicationStore> {
+        Arc::clone(&self.publication_store)
+    }
+
+    pub fn release_store(&self) -> Arc<ReleaseStore> {
+        Arc::clone(&self.release_store)
     }
 
     pub fn next_id(&self, prefix: &str) -> String {

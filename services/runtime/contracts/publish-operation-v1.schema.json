@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anydesign.dev/contracts/publish-operation-v1.schema.json",
+  "title": "PublishOperation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "idempotencyKeyHash", "requestHash", "projectId", "releaseId", "expectedCurrentReleaseId", "desiredGeneration", "kind", "status", "checkpoint", "lastError", "createdAt", "updatedAt"],
+  "properties": {
+    "schemaVersion": { "const": "publish-operation@1" },
+    "id": { "type": "string", "pattern": "^operation-[0-9a-f]{32}$" },
+    "idempotencyKeyHash": { "$ref": "#/$defs/sha256" },
+    "requestHash": { "$ref": "#/$defs/sha256" },
+    "projectId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "releaseId": { "type": ["string", "null"] },
+    "expectedCurrentReleaseId": { "type": ["string", "null"] },
+    "desiredGeneration": { "type": "integer", "minimum": 1 },
+    "kind": { "enum": ["publish", "update", "rollback", "unpublish"] },
+    "status": { "enum": ["requested", "packaging", "release_validated", "desired_state_committed", "reconciling", "workload_ready", "traffic_switched", "external_probe_passed", "completed", "failed", "cancelled", "reconcile_required"] },
+    "checkpoint": { "enum": ["requested", "packaging", "release_validated", "desired_state_committed", "reconciling", "workload_ready", "traffic_switched", "external_probe_passed", "completed"] },
+    "lastError": { "type": ["string", "null"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

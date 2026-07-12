@@ -12,6 +12,7 @@ pub mod preview;
 pub mod profiles;
 pub mod project;
 pub mod public_principal;
+pub mod publication;
 pub mod query_session;
 pub mod recovery;
 pub mod release;
