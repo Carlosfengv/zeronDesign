@@ -48,3 +48,16 @@ Run `infra/public-runtime/run-g6-k3d-e2e.sh` for the real dual-work gate. The
 gate uses a dedicated k3d cluster and Registry, verifies cross-work traffic is
 denied, exercises controller restart and UID drift, and fails if any Ingress is
 present.
+
+For public G7 exposure, set `WORK_RUNTIME_EXPOSURE=ingress` together with
+`WORKS_BASE_DOMAIN`, `WORKS_INGRESS_CLASS`, and `WORKS_TLS_SECRET_NAME`.
+External verification always uses HTTPS. `WORKS_PROBE_RESOLVE` and
+`WORKS_PROBE_CA_FILE` are optional deployment/test routing inputs; production
+normally relies on public DNS and the system trust store. The Runtime identity
+may create/read/delete Ingress objects but still cannot read the wildcard TLS
+Secret.
+
+Run `infra/public-runtime/run-g7-k3d-e2e.sh` for the real TLS lifecycle gate.
+It verifies host collision rejection, external release headers, security
+headers, ordered Unpublish, complete workload teardown, and Republish using the
+same random host identity.

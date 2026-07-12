@@ -44,7 +44,7 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         match state.config.work_runtime_backend_mode {
             WorkRuntimeBackendMode::ControlPlaneOnly => Arc::new(ControlPlaneOnlyBackend),
             WorkRuntimeBackendMode::Kubernetes => {
-                Arc::new(KubernetesWorkRuntimeBackend::try_default().await?)
+                Arc::new(KubernetesWorkRuntimeBackend::from_runtime_config(&state.config).await?)
             }
         };
     WorkRuntimeController::new(

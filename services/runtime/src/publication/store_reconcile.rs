@@ -31,6 +31,12 @@ impl PublicationStore {
                 "workload readiness and release identity evidence are required".to_string(),
             ));
         }
+        if observed.ingress.is_some() != observed.external_release_identity_verified {
+            return Err(PublicationStoreError::InvalidTransition(
+                "Ingress identity and external release probe evidence must advance together"
+                    .to_string(),
+            ));
+        }
         self.update_outbox(outbox_id, |operation, runtime, outbox| {
             if operation.desired_generation != runtime.desired_generation
                 || operation.desired_generation != outbox.desired_generation
@@ -59,16 +65,25 @@ impl PublicationStore {
                 Some(observed.deployment.resource_version.clone());
             runtime.service_uid = Some(observed.service.uid.clone());
             runtime.service_resource_version = Some(observed.service.resource_version.clone());
+            if let Some(ingress) = &observed.ingress {
+                runtime.ingress_uid = Some(ingress.uid.clone());
+                runtime.ingress_resource_version = Some(ingress.resource_version.clone());
+            }
             runtime.observed_generation = runtime.desired_generation;
             runtime.last_error = None;
-            if !matches!(runtime.status, WorkRuntimeStatus::Published) {
+            if observed.external_release_identity_verified {
+                runtime.status = WorkRuntimeStatus::Published;
+            } else if !matches!(runtime.status, WorkRuntimeStatus::Published) {
                 runtime.status = if runtime.previous_release_id.is_some() {
                     WorkRuntimeStatus::Updating
                 } else {
                     WorkRuntimeStatus::Publishing
                 };
             }
-            if !matches!(
+            if observed.external_release_identity_verified {
+                operation.status = PublishOperationStatus::Completed;
+                operation.checkpoint = PublishCheckpoint::Completed;
+            } else if !matches!(
                 operation.status,
                 PublishOperationStatus::TrafficSwitched
                     | PublishOperationStatus::ExternalProbePassed
@@ -81,6 +96,43 @@ impl PublicationStore {
             outbox.status = PublicationOutboxStatus::Delivered;
             outbox.last_error = None;
             outbox.delivered_at = Some(Utc::now());
+            outbox.next_attempt_at = Utc::now();
+            Ok(())
+        })
+        .map(|(operation, runtime, _)| (operation, runtime))
+    }
+
+    pub fn record_unpublished(
+        &self,
+        outbox_id: &str,
+    ) -> Result<(PublishOperation, WorkRuntimeState), PublicationStoreError> {
+        self.update_outbox(outbox_id, |operation, runtime, outbox| {
+            if runtime.desired_publication != PublicationDesiredState::Unpublished
+                || runtime.desired_release_id.is_some()
+                || operation.desired_generation != runtime.desired_generation
+                || outbox.desired_generation != runtime.desired_generation
+            {
+                return Err(PublicationStoreError::Conflict(
+                    "stale or invalid Unpublish result cannot be committed".to_string(),
+                ));
+            }
+            runtime.previous_release_id = runtime.current_release_id.take();
+            runtime.previous_deployment_name = runtime.current_deployment_name.take();
+            runtime.deployment_uid = None;
+            runtime.deployment_resource_version = None;
+            runtime.service_uid = None;
+            runtime.service_resource_version = None;
+            runtime.ingress_uid = None;
+            runtime.ingress_resource_version = None;
+            runtime.observed_generation = runtime.desired_generation;
+            runtime.status = WorkRuntimeStatus::Unpublished;
+            runtime.last_error = None;
+            operation.status = PublishOperationStatus::Completed;
+            operation.checkpoint = PublishCheckpoint::Completed;
+            operation.last_error = None;
+            outbox.status = PublicationOutboxStatus::Delivered;
+            outbox.delivered_at = Some(Utc::now());
+            outbox.last_error = None;
             outbox.next_attempt_at = Utc::now();
             Ok(())
         })
@@ -200,9 +252,22 @@ mod tests {
                 uid: "service-uid".into(),
                 resource_version: "12".into(),
             },
+            ingress: None,
             ready: true,
             release_identity_verified: true,
+            external_release_identity_verified: false,
         }
+    }
+
+    fn externally_observed() -> ObservedWorkRuntime {
+        let mut value = observed();
+        value.ingress = Some(KubernetesResourceIdentity {
+            name: "work-a".into(),
+            uid: "ingress-uid".into(),
+            resource_version: "13".into(),
+        });
+        value.external_release_identity_verified = true;
+        value
     }
 
     #[test]
@@ -241,5 +306,42 @@ mod tests {
             .unwrap()
             .deployment_uid
             .is_none());
+    }
+
+    #[test]
+    fn external_probe_completes_publish_and_unpublish_preserves_host_and_release_history() {
+        let (store, publish_outbox_id) = store_with_intent();
+        let (_, published) = store
+            .record_workload_ready(&publish_outbox_id, &externally_observed())
+            .unwrap();
+        assert_eq!(published.status, WorkRuntimeStatus::Published);
+        assert_eq!(published.ingress_uid.as_deref(), Some("ingress-uid"));
+        let host_slug = published.host_slug.clone();
+        let (operation, _) = store
+            .commit_intent(&PublicationIntent {
+                project_id: "project-observed".into(),
+                kind: PublishOperationKind::Unpublish,
+                release_id: None,
+                expected_current_release_id: Some("release-observed".into()),
+                expected_generation: Some(1),
+                runtime_profile_id: "static-web-v1".into(),
+                idempotency_key: "unpublish-observed-key".into(),
+            })
+            .unwrap();
+        let unpublish_outbox = store
+            .pending_outbox()
+            .into_iter()
+            .find(|event| event.operation_id == operation.id)
+            .unwrap();
+        let (operation, unpublished) = store.record_unpublished(&unpublish_outbox.id).unwrap();
+        assert_eq!(operation.status, PublishOperationStatus::Completed);
+        assert_eq!(unpublished.status, WorkRuntimeStatus::Unpublished);
+        assert_eq!(unpublished.host_slug, host_slug);
+        assert_eq!(
+            unpublished.last_successful_release_id.as_deref(),
+            Some("release-observed")
+        );
+        assert!(unpublished.current_release_id.is_none());
+        assert!(unpublished.ingress_uid.is_none());
     }
 }

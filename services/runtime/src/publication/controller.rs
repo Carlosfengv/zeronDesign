@@ -1,5 +1,6 @@
 use super::{
-    DesiredWorkRuntime, PublicationReconcileDisposition, PublicationStore, WorkRuntimeBackend,
+    DesiredUnpublishRuntime, DesiredWorkRuntime, PublicationDesiredState,
+    PublicationReconcileDisposition, PublicationStore, WorkRuntimeBackend,
 };
 use crate::{
     release::ReleaseStore,
@@ -80,26 +81,39 @@ where
                 continue;
             };
             let result = async {
-                let release_id = runtime
-                    .desired_release_id
-                    .as_deref()
-                    .context("Published runtime is missing desired release")?;
-                let release = self
-                    .release_store
-                    .release(release_id)
-                    .context("desired WorkRelease does not exist")?;
-                let packaging = self
-                    .release_store
-                    .packaging_for_release(release_id)
-                    .context("desired WorkRelease packaging evidence does not exist")?;
-                let desired = DesiredWorkRuntime::from_records(&runtime, &release, &packaging)?;
-                self.backend.reconcile(&desired).await
+                match runtime.desired_publication {
+                    PublicationDesiredState::Published => {
+                        let release_id = runtime
+                            .desired_release_id
+                            .as_deref()
+                            .context("Published runtime is missing desired release")?;
+                        let release = self
+                            .release_store
+                            .release(release_id)
+                            .context("desired WorkRelease does not exist")?;
+                        let packaging = self
+                            .release_store
+                            .packaging_for_release(release_id)
+                            .context("desired WorkRelease packaging evidence does not exist")?;
+                        let desired =
+                            DesiredWorkRuntime::from_records(&runtime, &release, &packaging)?;
+                        self.backend.reconcile(&desired).await
+                    }
+                    PublicationDesiredState::Unpublished => {
+                        let desired = DesiredUnpublishRuntime::from_state(&runtime)?;
+                        self.backend.unpublish(&desired).await
+                    }
+                }
             }
             .await;
             match result {
                 Ok(PublicationReconcileDisposition::Applied(observed)) => {
                     self.publication_store
-                        .record_workload_ready(&event.id, &observed)?;
+                        .record_workload_ready(&event.id, observed.as_ref())?;
+                    reconciled += 1;
+                }
+                Ok(PublicationReconcileDisposition::Unpublished) => {
+                    self.publication_store.record_unpublished(&event.id)?;
                     reconciled += 1;
                 }
                 Ok(PublicationReconcileDisposition::Deferred) => {

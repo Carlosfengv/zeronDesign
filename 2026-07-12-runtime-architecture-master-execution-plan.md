@@ -107,8 +107,8 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | G3 | complete | [PR-04](https://github.com/Carlosfengv/zeronDesign/pull/4) | `788c1e8` | `services/runtime/evidence/artifact-manifest-g3.md` |
 | G4 | complete | [PR-05](https://github.com/Carlosfengv/zeronDesign/pull/5) | `ca62ec1` | `services/runtime/evidence/work-release-packaging-g4.md` |
 | G5 | complete | [PR-06](https://github.com/Carlosfengv/zeronDesign/pull/6) | `13f10f5` | `services/runtime/evidence/publication-control-plane-g5.md` |
-| G6 | in_progress | PR-07 | 待填写 | `services/runtime/evidence/work-runtime-kubernetes-g6.md` |
-| G7 | pending | PR-08 | 待填写 | 待填写 |
+| G6 | complete | [PR-07](https://github.com/Carlosfengv/zeronDesign/pull/7) | `aad4022` | `services/runtime/evidence/work-runtime-kubernetes-g6.md` |
+| G7 | in_progress | PR-08 | 待填写 | `services/runtime/evidence/publish-ingress-g7.md` |
 | G8 | pending | PR-09 | 待填写 | 待填写 |
 | G9 | pending | PR-10+ | 待填写 | 待填写 |
 

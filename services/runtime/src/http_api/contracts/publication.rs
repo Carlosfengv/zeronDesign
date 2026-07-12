@@ -33,6 +33,7 @@ pub struct PublicationOperationResponse {
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentStateResponse {
     pub runtime: crate::publication::WorkRuntimeState,
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
