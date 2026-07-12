@@ -1,9 +1,11 @@
 ---
 date: 2026-07-12
-status: proposed-execution-master-v1
+status: complete-execution-master-v1
 type: master-execution-plan
 topic: runtime-http-template-published-work-critical-path
 based_on_commit: 96f9f92c4abdee469f7bd943aa317e8091f482f8
+verified_commit: e953a350b45db98347c17fe9bde036fd0225597f
+completed_on: 2026-07-12
 source_plans:
   - ./2026-07-12-runtime-http-api-architecture-split-plan.md
   - ./2026-07-12-generic-template-artifact-sandbox-ingress-plan.md
@@ -110,7 +112,7 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | G6 | complete | [PR-07](https://github.com/Carlosfengv/zeronDesign/pull/7) | `aad4022` | `services/runtime/evidence/work-runtime-kubernetes-g6.md` |
 | G7 | complete | [PR-08](https://github.com/Carlosfengv/zeronDesign/pull/8) | `c0bff9f` | `services/runtime/evidence/publish-ingress-g7.md` |
 | G8 | complete | [PR-09](https://github.com/Carlosfengv/zeronDesign/pull/9) | `5e38242` | `services/runtime/evidence/blue-green-rollback-gc-g8.md` |
-| G9 | in_progress | PR-10+ | 待填写 | `services/runtime/evidence/http-api-test-split-g9a.md`, `services/runtime/evidence/run-lifecycle-mutations-g9b1.md`, `services/runtime/evidence/run-lifecycle-start-g9b2.md`, `services/runtime/evidence/design-profile-pure-domain-g9c1.md`, `services/runtime/evidence/design-profile-service-g9c2.md`, `services/runtime/evidence/artifact-runtime-storage-boundary-g9d1.md`, `services/runtime/evidence/preview-authorization-boundary-g9d2.md`, `services/runtime/evidence/internal-release-evidence-boundary-g9d3.md` |
+| G9 | complete | [PR-10](https://github.com/Carlosfengv/zeronDesign/pull/10)–[PR-17](https://github.com/Carlosfengv/zeronDesign/pull/17) | `3a04b7f`…`e953a35` | `services/runtime/evidence/http-api-test-split-g9a.md`, `services/runtime/evidence/run-lifecycle-mutations-g9b1.md`, `services/runtime/evidence/run-lifecycle-start-g9b2.md`, `services/runtime/evidence/design-profile-pure-domain-g9c1.md`, `services/runtime/evidence/design-profile-service-g9c2.md`, `services/runtime/evidence/artifact-runtime-storage-boundary-g9d1.md`, `services/runtime/evidence/preview-authorization-boundary-g9d2.md`, `services/runtime/evidence/internal-release-evidence-boundary-g9d3.md`, `services/runtime/evidence/runtime-architecture-final-audit.md` |
 
 状态只使用：`pending`、`in_progress`、`blocked`、`complete`。不得仅因代码已写完就标记
 `complete`；对应测试、架构门禁、真实环境证据和 PR 合并必须全部完成。
@@ -829,7 +831,23 @@ startedAt/completedAt
 12. HTTP、Sandbox、Artifact、Published Runtime 和真实 Kubernetes gates 全绿。
 13. StatefulSet/SSR/custom domain 等后续能力没有被冒充为本轮完成项。
 
-## 19. 推荐启动方式
+## 19. 最终完成记录
+
+本计划已在合并提交 `e953a350b45db98347c17fe9bde036fd0225597f` 上完成最终审计。审计使用
+`repositoryDirty=false` 的独立 worktree，避免将用户未跟踪文档纳入构建或证据。
+
+完成结论：
+
+- G0–G9 全部为 `complete`；
+- HTTP、SSE、Artifact、Sandbox、Published Runtime 契约未发生未声明变化；
+- Astro、Fumadocs 与 synthetic third template 继续通过通用 Template/Artifact contract；
+- 每作品 Deployment、Service、Ingress、稳定 host、Publish/Unpublish、Blue/Green、Rollback 已通过真实 k3d gate；
+- Authoring Sandbox release 后 website/docs 两个 promoted Artifact 均保持 HTTP `200`；
+- StatefulSet、SSR、custom domain 仍是明确后续项，不属于本轮完成范围。
+
+最终证据见 `services/runtime/evidence/runtime-architecture-final-audit.md`。
+
+## 20. 推荐启动方式
 
 立即执行顺序：
 
