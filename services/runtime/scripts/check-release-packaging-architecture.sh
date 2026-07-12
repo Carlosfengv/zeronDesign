@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 RELEASE_DIR="$ROOT/services/runtime/src/release"
 CONTRACT_DIR="$ROOT/services/runtime/contracts"
 SANDBOX_DIR="$ROOT/services/runtime/src/tools/sandbox"
+PUBLISHED_RUNTIME_DIR="$ROOT/infra/published-runtime"
 status=0
 
 fail() {
@@ -18,7 +19,7 @@ for required in runtime-manifest-v1.schema.json work-release-v1.schema.json rele
   fi
 done
 
-for required in manifest.rs model.rs store.rs packager.rs; do
+for required in manifest.rs model.rs store.rs packager.rs process_backend.rs; do
   if [[ ! -f "$RELEASE_DIR/$required" ]]; then
     fail "REL-002: missing release domain module: $required"
   fi
@@ -33,6 +34,26 @@ done < <(find "$RELEASE_DIR" -type f -name '*.rs' -print)
 
 if grep -RInE --include='*.rs' 'axum|Ingress|Deployment|StatefulSet|kube::|k8s_openapi' "$RELEASE_DIR"; then
   fail "REL-004: packaging domain must not create HTTP or Published Kubernetes resources"
+fi
+
+for required in images.lock.json static-web/Dockerfile static-web/nginx.conf; do
+  if [[ ! -f "$PUBLISHED_RUNTIME_DIR/$required" ]]; then
+    fail "REL-008: missing trusted published runtime input: $required"
+  fi
+done
+
+if ! grep -Eq 'env_clear\(\)' "$RELEASE_DIR/process_backend.rs" \
+  || ! grep -Eq 'verify_program\(\)' "$RELEASE_DIR/process_backend.rs"; then
+  fail "REL-009: process backend must clear inherited environment and hash-check its helper"
+fi
+
+if grep -Eq '(eval\(|execSync|shell:[[:space:]]*true)' "$ROOT/services/runtime/scripts/release-packaging-backend.mjs"; then
+  fail "REL-010: packaging helper must not execute shell fragments"
+fi
+
+if ! grep -Eq 'USER 101:101' "$PUBLISHED_RUNTIME_DIR/static-web/Dockerfile" \
+  || ! grep -Eq 'location \^~ /\.anydesign/' "$PUBLISHED_RUNTIME_DIR/static-web/nginx.conf"; then
+  fail "REL-011: published runtime must run non-root and deny internal metadata"
 fi
 
 if grep -RInE --include='*.rs' 'WORK_RELEASE_REGISTRY|registry[_ -]?(password|token|credential)|docker[[:space:]]+push|cosign[[:space:]]+sign' "$SANDBOX_DIR"; then

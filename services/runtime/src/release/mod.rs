@@ -1,6 +1,7 @@
 mod manifest;
 mod model;
 mod packager;
+mod process_backend;
 mod store;
 
 pub use manifest::{
@@ -16,4 +17,5 @@ pub use packager::{
     BuiltReleaseImage, PackagingEvidence, ReleaseImageBuildRequest, ReleasePackager,
     ReleaseSignatureEvidence, TrustedReleasePackagingBackend,
 };
+pub use process_backend::ProcessReleasePackagingBackend;
 pub use store::{ReleaseStore, ReleaseStoreError};

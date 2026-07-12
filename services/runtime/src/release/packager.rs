@@ -5,9 +5,11 @@ use super::{
 use crate::artifact_manifest::ArtifactResolver;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseImageBuildRequest {
     pub release_id: String,
     pub project_id: String,
@@ -21,7 +23,8 @@ pub struct ReleaseImageBuildRequest {
     pub packager_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuiltReleaseImage {
     pub digest: String,
     pub layout_uri: String,
@@ -29,13 +32,15 @@ pub struct BuiltReleaseImage {
     pub runtime_manifest_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackagingEvidence {
     pub sbom_digest: String,
     pub provenance_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseSignatureEvidence {
     pub identity: String,
     pub signature_digest: String,
