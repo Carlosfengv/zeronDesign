@@ -12,6 +12,7 @@ const DESIGN_PROFILES_ROUTES_SOURCE: &str =
 const INTERNAL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/internal.rs");
 const PROJECTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/projects.rs");
 const PREVIEWS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/previews.rs");
+const PUBLICATION_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/publication.rs");
 const RUN_EVENTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/run_events.rs");
 const RUN_START_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/start.rs");
 const RUN_CONTINUE_ROUTES_SOURCE: &str =
@@ -163,6 +164,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
     actual.extend(declared_routes("internal", INTERNAL_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PROJECTS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PREVIEWS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", PUBLICATION_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_EVENTS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_START_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_CONTINUE_ROUTES_SOURCE));

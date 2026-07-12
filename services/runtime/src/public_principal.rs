@@ -9,6 +9,13 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io, path::Path};
 
 pub const PREVIEW_READ_OPERATION: &str = "preview.read";
+pub const PUBLICATION_READ_OPERATION: &str = "publication.read";
+pub const PUBLICATION_WRITE_OPERATION: &str = "publication.write";
+const PUBLIC_PRINCIPAL_OPERATIONS: &[&str] = &[
+    PREVIEW_READ_OPERATION,
+    PUBLICATION_READ_OPERATION,
+    PUBLICATION_WRITE_OPERATION,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -150,7 +157,7 @@ impl PublicPrincipalVerifier {
             || claims
                 .operations
                 .iter()
-                .any(|operation| operation != PREVIEW_READ_OPERATION)
+                .any(|operation| !PUBLIC_PRINCIPAL_OPERATIONS.contains(&operation.as_str()))
         {
             return Err(PublicPrincipalError::InvalidScope);
         }
@@ -213,7 +220,11 @@ impl PublicPrincipalJwtIssuer {
         if claims.sub.trim().is_empty()
             || claims.project_id.trim().is_empty()
             || claims.jti.len() < 16
-            || claims.operations != [PREVIEW_READ_OPERATION.to_string()]
+            || claims.operations.is_empty()
+            || claims
+                .operations
+                .iter()
+                .any(|operation| !PUBLIC_PRINCIPAL_OPERATIONS.contains(&operation.as_str()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -290,6 +301,53 @@ mod tests {
             .unwrap();
         assert_eq!(principal.principal_id, "user-1");
         assert_eq!(principal.project_id, "project-1");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn publication_scope_is_explicit_and_cannot_authorize_preview() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_der = signing_key.verifying_key().to_public_key_der().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "anydesign-publication-principal-{}.der",
+            std::process::id()
+        ));
+        fs::write(&path, public_der.as_bytes()).unwrap();
+        let issuer = PublicPrincipalJwtIssuer::from_signing_key(
+            signing_key,
+            "anydesign-bff",
+            "anydesign-runtime-public",
+            60,
+        );
+        let token = issuer
+            .issue(PublicPrincipalClaims {
+                iss: String::new(),
+                aud: String::new(),
+                sub: "publisher-1".into(),
+                jti: "publication-jti-000001".into(),
+                exp: 0,
+                iat: 0,
+                project_id: "project-1".into(),
+                operations: vec![PUBLICATION_WRITE_OPERATION.into()],
+            })
+            .unwrap();
+        let verifier = PublicPrincipalVerifier::from_public_key_files(
+            &[path.as_path()],
+            "anydesign-bff",
+            "anydesign-runtime-public",
+            60,
+        )
+        .unwrap();
+        assert!(verifier
+            .verify_bearer(
+                Some(&format!("Bearer {token}")),
+                PUBLICATION_WRITE_OPERATION,
+            )
+            .is_ok());
+        assert_eq!(
+            verifier.verify_bearer(Some(&format!("Bearer {token}")), PREVIEW_READ_OPERATION),
+            Err(PublicPrincipalError::InvalidScope)
+        );
         let _ = fs::remove_file(path);
     }
 }

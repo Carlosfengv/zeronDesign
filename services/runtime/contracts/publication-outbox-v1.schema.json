@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anydesign.dev/contracts/publication-outbox-v1.schema.json",
+  "title": "PublicationOutboxEvent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "projectId", "operationId", "desiredGeneration", "status", "attempts", "lastError", "nextAttemptAt", "createdAt", "updatedAt", "deliveredAt"],
+  "properties": {
+    "schemaVersion": { "const": "publication-outbox@1" },
+    "id": { "type": "string", "minLength": 1 },
+    "projectId": { "type": "string", "minLength": 1 },
+    "operationId": { "type": "string", "pattern": "^operation-[0-9a-f]{32}$" },
+    "desiredGeneration": { "type": "integer", "minimum": 1 },
+    "status": { "enum": ["pending", "delivered"] },
+    "attempts": { "type": "integer", "minimum": 0 },
+    "lastError": { "type": ["string", "null"] },
+    "nextAttemptAt": { "type": "string", "format": "date-time" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "deliveredAt": { "type": ["string", "null"], "format": "date-time" }
+  }
+}

@@ -5,6 +5,7 @@ mod design_sources;
 mod internal;
 mod previews;
 mod projects;
+mod publication;
 mod run_events;
 mod runs;
 mod system;
