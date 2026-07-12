@@ -237,6 +237,35 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
     assert!(!audit_json.contains(&wrong_owner_token));
     assert!(audit_json.contains(&sha256_hex(b"principal-preview-owner")));
 
+    let mismatched_manifest_lease = store
+        .create_preview_lease(
+            &run.id,
+            "build-preview-proxy".to_string(),
+            "c".repeat(64),
+            900,
+        )
+        .await
+        .unwrap();
+    let mismatched_manifest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/previews/{}/", mismatched_manifest_lease.id))
+                .header("authorization", format!("Bearer {owner_token}"))
+                .header(
+                    "x-anydesign-preview-prefix",
+                    format!(
+                        "/projects/preview-project/previews/{}",
+                        mismatched_manifest_lease.id
+                    ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatched_manifest.status(), StatusCode::CONFLICT);
+
     store
         .update_sandbox_binding_runtime_identity_with_uids(
             &binding.id,

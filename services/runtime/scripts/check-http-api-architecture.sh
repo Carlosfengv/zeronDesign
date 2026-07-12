@@ -10,6 +10,8 @@ RUN_LIFECYCLE_DIR="$ROOT/services/runtime/src/run_lifecycle"
 DESIGN_PROFILE_DIR="$ROOT/services/runtime/src/design_profile"
 DESIGN_PROFILE_SERVICE_DIR="$ROOT/services/runtime/src/design_profile_service"
 ARTIFACT_ACCESS="$ROOT/services/runtime/src/artifact_access.rs"
+AUTHORIZATION_POLICY="$ROOT/services/runtime/src/authorization.rs"
+PREVIEW_ACCESS="$ROOT/services/runtime/src/preview_access.rs"
 status=0
 
 fail() {
@@ -104,6 +106,21 @@ fi
 if grep -nE 'state\.store|\.store\.|ArtifactResolver|FileArtifactPublisher|std::fs|tokio::fs' \
   "$HTTP_DIR/routes/artifacts.rs"; then
   fail "STORAGE-003: Artifact HTTP route bypasses ArtifactAccessService or presenter"
+fi
+
+if grep -nE 'axum|HeaderMap|AUTHORIZATION|Bearer|std::fs|tokio::fs' \
+  "$AUTHORIZATION_POLICY" "$PREVIEW_ACCESS"; then
+  fail "AUTH-001: application authorization and PreviewAccess must not depend on HTTP, raw credentials, or filesystem APIs"
+fi
+
+if grep -nE 'get_preview_lease|get_sandbox_binding|ChannelManager|PreviewLeaseStatus' \
+  "$HTTP_DIR/routes/previews.rs"; then
+  fail "AUTH-002: Preview HTTP routes must delegate lease and sandbox authorization to PreviewAccessService"
+fi
+
+if grep -nE 'get_project_access|owner_principal_id|principal\.project_id' \
+  "$HTTP_DIR/auth/publication.rs" "$HTTP_DIR/auth/candidate_preview.rs"; then
+  fail "AUTH-003: HTTP auth adapters must delegate project ownership to the application authorization policy"
 fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \

@@ -2,6 +2,7 @@ use super::super::*;
 
 pub(in crate::http_api) async fn authorize_publication(
     state: &AppState,
+    policy: &ApplicationAuthorizationPolicy,
     headers: &HeaderMap,
     project_id: &str,
     required_operation: &str,
@@ -34,17 +35,16 @@ pub(in crate::http_api) async fn authorize_publication(
                 }),
             )
         })?;
-    if principal.project_id != project_id {
-        return Err(forbidden("public_auth.project_forbidden".to_string()));
-    }
-    let access = state
-        .store
-        .get_project_access(project_id)
+    let principal: crate::authorization::AuthenticatedPrincipal = principal.into();
+    policy
+        .authorize_project_owner(&principal, project_id)
         .await
-        .ok_or_else(|| forbidden("public_auth.project_forbidden".to_string()))?;
-    if access.owner_principal_id != principal.principal_id {
-        return Err(forbidden("public_auth.project_forbidden".to_string()));
-    }
+        .map_err(|error| match error {
+            AuthorizationPolicyError::Forbidden => {
+                forbidden("public_auth.project_forbidden".to_string())
+            }
+            AuthorizationPolicyError::Conflict(message) => conflict_error(anyhow::anyhow!(message)),
+        })?;
     state
         .store
         .append_audit_record(

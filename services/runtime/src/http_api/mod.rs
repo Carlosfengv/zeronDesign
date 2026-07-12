@@ -1,5 +1,7 @@
 mod artifact_presenter;
 mod auth;
+mod candidate_preview_proxy;
+mod composition;
 mod contracts;
 mod error;
 mod profile_support;
@@ -11,6 +13,7 @@ pub use crate::runtime::recover_startup_runs;
 pub use crate::runtime::RuntimeSupervisor;
 use artifact_presenter::*;
 use auth::*;
+use candidate_preview_proxy::*;
 pub use contracts::*;
 use error::*;
 use profile_support::*;
@@ -28,12 +31,13 @@ use routes::artifacts::artifact_project_id_from_referer;
 
 use crate::{
     artifact_access::ArtifactAccessService,
-    channel_manager::ChannelManager,
+    authorization::{ApplicationAuthorizationPolicy, AuthorizationPolicyError},
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     design_profile_service::DesignProfileService,
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
+    preview_access::{PreviewAccessContext, PreviewAccessError, PreviewAccessService},
     profiles::build::{run_template_build, TemplateBuildRequest},
     project::resolve_built_in_template_for_init,
     public_principal::{
@@ -44,7 +48,7 @@ use crate::{
     runtime::{
         RuntimeBuildSandboxProvisioner, RuntimeEditWorkspaceRestorer, RuntimeSessionLauncher,
     },
-    runtime_storage::{FileArtifactStore, FileRuntimeEvidenceStore, RuntimeEvidenceStore},
+    runtime_storage::RuntimeEvidenceStore,
     tools::{
         control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
@@ -53,8 +57,8 @@ use crate::{
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRun, Brief, ConversationItem, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignProfileFidelityReport,
-        DesignProfileValidationIssue, DesignSourceArtifact, PreviewLeaseStatus,
-        ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
+        DesignProfileValidationIssue, DesignSourceArtifact, ProjectAccessRecord,
+        DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use axum::{
@@ -112,35 +116,11 @@ pub fn router(config: RuntimeConfig) -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
-    let design_profiles = DesignProfileService::new(state.store.clone());
-    let run_lifecycle = run_lifecycle_service(&state, design_profiles.clone());
-    let artifact_access = ArtifactAccessService::new(
-        state.store.clone(),
-        Arc::new(FileArtifactStore::new(&state.config.runtime_storage_dir)),
-    );
-    let runtime_evidence: Arc<dyn RuntimeEvidenceStore> = Arc::new(FileRuntimeEvidenceStore::new(
-        &state.config.runtime_storage_dir,
-    ));
-    Router::new()
-        .merge(routes::system::router())
-        .merge(routes::runs::router())
-        .merge(routes::run_events::router())
-        .merge(routes::design_sources::router())
-        .merge(routes::design_profiles::router())
-        .merge(routes::projects::router())
-        .merge(routes::previews::router())
-        .merge(routes::publication::router())
-        .merge(routes::artifacts::router())
-        .merge(routes::internal::router())
-        .layer(Extension(runtime_evidence))
-        .layer(Extension(artifact_access))
-        .layer(Extension(run_lifecycle))
-        .layer(Extension(design_profiles))
-        .with_state(state)
+    composition::router_with_services(state)
 }
 
 pub fn capture_router_with_state(state: AppState) -> Router {
-    routes::capture::router().with_state(state)
+    composition::capture_router_with_services(state)
 }
 
 #[cfg(test)]
