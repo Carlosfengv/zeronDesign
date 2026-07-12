@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: anydesign-works
+  labels:
+    anydesign.dev/purpose: published-works
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: anydesign-release-prober
+  namespace: anydesign-works
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: anydesign-work-runtime-controller
+  namespace: anydesign-works
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "services/proxy", "pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: anydesign-work-runtime-controller
+  namespace: anydesign-works
+subjects:
+  - kind: ServiceAccount
+    name: anydesign-runtime
+    namespace: anydesign-runtime
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: anydesign-work-runtime-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: anydesign-work-runtime-namespace-reader
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["anydesign-works"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: anydesign-work-runtime-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: anydesign-runtime
+    namespace: anydesign-runtime
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: anydesign-work-runtime-namespace-reader
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: anydesign-works
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: release-prober-egress
+  namespace: anydesign-works
+spec:
+  podSelector:
+    matchLabels:
+      anydesign.dev/role: release-prober
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: anydesign-work-runtime-controller
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: published-works-quota
+  namespace: anydesign-works
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "16"
+    limits.memory: 16Gi
+    pods: "100"
+    services: "100"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: anydesign-published-work-baseline
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  validations:
+    - expression: >-
+        object.metadata.namespace != 'anydesign-works' ||
+        (object.metadata.labels['app.kubernetes.io/managed-by'] == 'anydesign-work-runtime-controller' &&
+         object.spec.template.spec.automountServiceAccountToken == false &&
+         object.spec.template.spec.containers.all(c, c.image.matches('^.+@sha256:[a-f0-9]{64}$')) &&
+         'anydesign.dev/signature-digest' in object.metadata.annotations &&
+         'anydesign.dev/provenance-digest' in object.metadata.annotations &&
+         'anydesign.dev/scan-report-digest' in object.metadata.annotations)
+      message: Published Deployments must be controller-owned, digest-pinned, tokenless, and carry trust evidence.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: anydesign-published-work-baseline
+spec:
+  policyName: anydesign-published-work-baseline
+  validationActions: [Deny]

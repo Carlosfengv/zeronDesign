@@ -1,11 +1,16 @@
+mod backend;
 mod controller;
+mod kubernetes;
 mod model;
 mod store;
 
-pub use controller::{
-    ControlPlaneOnlyBackend, PublicationReconcileDisposition, WorkRuntimeBackend,
-    WorkRuntimeController,
+pub use backend::{
+    ControlPlaneOnlyBackend, DesiredWorkRuntime, KubernetesResourceIdentity, ObservedWorkRuntime,
+    PublicationReconcileDisposition, ReleaseTrustEvidence, WorkRuntimeBackend, FIELD_MANAGER,
+    WORKS_NAMESPACE,
 };
+pub use controller::WorkRuntimeController;
+pub use kubernetes::KubernetesWorkRuntimeBackend;
 pub use model::{
     PublicationDesiredState, PublicationIntent, PublicationOutboxEvent, PublicationOutboxStatus,
     PublishCheckpoint, PublishOperation, PublishOperationKind, PublishOperationStatus,

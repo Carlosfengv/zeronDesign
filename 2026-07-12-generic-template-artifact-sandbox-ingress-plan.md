@@ -1091,6 +1091,9 @@ Runtime 启动后扫描非稳定状态：
 - K8s resource 存在但 RuntimeStore 无 owner record。
 
 默认策略为 fail closed：Ingress 漂移时先关闭外部路由，再 reconcile；不能默默接受人工修改成为新权威。
+同名资源 UID 改变时，Controller 只能进入 `ReconcileRequired`。恢复必须由受权运维动作携带 RuntimeStore
+中最后可信 UID 做 CAS 确认；确认后清除旧 identity、删除非受信替代对象并由 Controller 重建。禁止仅凭
+“名称相同”自动接管新对象。
 
 ### 9.4 Release 与 Registry GC
 
@@ -1144,6 +1147,15 @@ Published work -> Runtime/Sandbox/other work: denied
 
 Release Prober 使用独立 ServiceAccount/Pod label，只能执行 GET/HEAD 健康和 release identity 探测，
 不得获得 Publish、RuntimeStore 或 Kubernetes mutation 权限。Probe Service 永不创建 Ingress。
+Prober image 必须来自平台批准仓库并使用 digest pin；临时 Pod 必须
+`automountServiceAccountToken=false`、`restartPolicy=Never`，探测终态后删除 Pod 和 probe Service。
+不得使用 Runtime Controller 的 Kubernetes API proxy 代替该网络身份，否则 NetworkPolicy 与最小权限
+边界没有被真实验证。
+
+Native ValidatingAdmissionPolicy 可以强制 controller ownership、digest pin、Pod security 和 trust evidence
+字段存在，但不能把“存在 signature annotation”冒充为 Registry signature 的密码学验证。生产环境仍必须
+通过批准的 image verification admission provider 验证签名主体与 image digest；该 provider 未安装或不可用时
+Published workload fail closed。
 
 Service 始终是 ClusterIP。禁止 NodePort、LoadBalancer、ExternalName 和 hostNetwork。
 

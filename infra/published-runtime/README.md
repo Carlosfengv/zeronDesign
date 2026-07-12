@@ -29,3 +29,22 @@ The local builder must be a named `docker-container` instance created with the
 digest-pinned BuildKit image and `buildkitd.local.toml`. The in-container
 Registry alias is used only to cross the Docker Desktop VM boundary; persisted
 release references retain the caller-visible Registry host.
+
+## G6 Kubernetes runtime
+
+`infra/public-runtime/base.yaml` establishes the shared `anydesign-works`
+namespace, controller RBAC, Pod Security enforcement, quota, default-deny
+networking, isolated Release Prober policy, and the native admission baseline.
+It intentionally contains no Ingress.
+
+Runtime enables the production adapter only when
+`WORK_RUNTIME_BACKEND=kubernetes`. `WORK_RUNTIME_PROBER_IMAGE` is then required
+and must be an immutable `repository@sha256:...` reference to the approved
+probe image. The Prober Pod receives no service-account token or Kubernetes
+mutation permission and is deleted with its release-specific ClusterIP Service
+after the health and release-identity checks complete.
+
+Run `infra/public-runtime/run-g6-k3d-e2e.sh` for the real dual-work gate. The
+gate uses a dedicated k3d cluster and Registry, verifies cross-work traffic is
+denied, exercises controller restart and UID drift, and fails if any Ingress is
+present.

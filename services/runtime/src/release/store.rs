@@ -449,6 +449,16 @@ impl ReleaseStore {
             .cloned()
     }
 
+    pub fn packaging_for_release(&self, release_id: &str) -> Option<ReleasePackagingRecord> {
+        self.state
+            .lock()
+            .unwrap()
+            .packagings
+            .values()
+            .find(|packaging| packaging.release_id == release_id)
+            .cloned()
+    }
+
     pub fn recoverable_packagings(&self) -> Vec<ReleasePackagingRecord> {
         self.state
             .lock()
