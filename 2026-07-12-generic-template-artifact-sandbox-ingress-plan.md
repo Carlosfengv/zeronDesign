@@ -940,6 +940,10 @@ GET  /projects/{project_id}/releases
 GET  /operations/{operation_id}
 ```
 
+`deployment-state` 在 Ingress exposure 启用时返回基于持久化 host slug 计算的 `publicUrl`；已发布版本还应
+返回 quoted current release `ETag`，供后续 Update/Unpublish 的 `If-Match` 使用。`publicUrl` 在
+Unpublished 时仍可作为保留地址展示，但不得暗示当前可访问。
+
 Publish request：
 
 ```json
