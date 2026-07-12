@@ -5,6 +5,7 @@ name: Runtime Sandbox Architecture
     paths:
       - "services/runtime/**"
       - "infra/agent-sandbox/**"
+      - "infra/public-runtime/**"
       - ".github/workflows/runtime-sandbox-architecture.yml"
   push:
     branches:
@@ -12,6 +13,7 @@ name: Runtime Sandbox Architecture
     paths:
       - "services/runtime/**"
       - "infra/agent-sandbox/**"
+      - "infra/public-runtime/**"
       - ".github/workflows/runtime-sandbox-architecture.yml"
 
 permissions:

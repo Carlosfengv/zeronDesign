@@ -13,12 +13,12 @@ fail() {
   status=1
 }
 
-for required in model.rs store.rs controller.rs; do
+for required in backend.rs model.rs store.rs store_reconcile.rs controller.rs kubernetes.rs; do
   [[ -f "$PUBLICATION_DIR/$required" ]] \
     || fail "PUB-001: missing publication control-plane module: $required"
 done
 
-for file in "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/controller.rs"; do
+for file in "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$PUBLICATION_DIR/kubernetes.rs"; do
   lines="$(wc -l < "$file" | tr -d ' ')"
   (( lines <= 700 )) \
     || fail "PUB-009: publication production module exceeds 700 lines: ${file#"$ROOT/"} ($lines)"
@@ -32,8 +32,25 @@ done
 [[ -f "$ROUTE_FILE" && -f "$CONTRACT_FILE" ]] \
   || fail "PUB-003: publication HTTP routes and contracts must be isolated modules"
 
-if grep -RInE --include='*.rs' 'kube::|k8s_openapi|kubectl|Command::new\("(docker|helm|kubectl)"\)' "$PUBLICATION_DIR" "$ROUTE_FILE"; then
-  fail "PUB-004: G5 publication control plane must not create Kubernetes or container resources"
+if grep -InE 'kube::|k8s_openapi|kubectl|Command::new\("(docker|helm|kubectl)"\)' \
+  "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" \
+  "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$ROUTE_FILE"; then
+  fail "PUB-004: publication application modules must not depend on Kubernetes or container implementations"
+fi
+
+if ! grep -Eq 'Client::try_default' "$PUBLICATION_DIR/kubernetes.rs" \
+  || grep -Eq 'Command::new\("kubectl"\)|kubectl' "$PUBLICATION_DIR/kubernetes.rs"; then
+  fail "PUB-010: production Kubernetes adapter must use the Kubernetes API without kubectl subprocesses"
+fi
+
+if ! grep -Eq 'PatchParams::apply\(FIELD_MANAGER\)' "$PUBLICATION_DIR/kubernetes.rs" \
+  || ! grep -Eq 'expected_service_resource_version' "$PUBLICATION_DIR/backend.rs"; then
+  fail "PUB-011: Kubernetes resources require fixed server-side apply ownership and CAS identity"
+fi
+
+if rg -n '"kind"[[:space:]]*:[[:space:]]*"Ingress"|Api<Ingress>|networking::v1::Ingress' \
+  "$PUBLICATION_DIR/kubernetes.rs" >/dev/null; then
+  fail "PUB-012: G6 Kubernetes adapter must not create Published Ingress"
 fi
 
 if ! grep -Eq 'struct PublicationCommit' "$PUBLICATION_DIR/store.rs" \
