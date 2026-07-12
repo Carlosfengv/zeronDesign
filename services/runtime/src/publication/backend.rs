@@ -1,4 +1,4 @@
-use super::{PublicationDesiredState, WorkRuntimeState};
+use super::{PublicationDesiredState, PublishCheckpoint, WorkRuntimeState};
 use crate::{
     release::{
         ReleasePackagingRecord, ReleasePackagingStatus, WorkRelease, WorkReleaseStatus,
@@ -26,6 +26,9 @@ pub struct DesiredWorkRuntime {
     pub network_policy_name: String,
     pub host_slug: String,
     pub release_id: String,
+    pub current_release_id: Option<String>,
+    pub current_deployment_name: Option<String>,
+    pub reconcile_checkpoint: PublishCheckpoint,
     pub desired_generation: u64,
     pub owner_record_id: String,
     pub runtime_profile_id: String,
@@ -118,6 +121,7 @@ impl DesiredWorkRuntime {
         runtime: &WorkRuntimeState,
         release: &WorkRelease,
         packaging: &ReleasePackagingRecord,
+        reconcile_checkpoint: PublishCheckpoint,
     ) -> Result<Self> {
         if runtime.desired_publication != PublicationDesiredState::Published {
             bail!("work runtime is not desired Published");
@@ -204,6 +208,9 @@ impl DesiredWorkRuntime {
             network_policy_name: runtime.service_name.clone(),
             host_slug: runtime.host_slug.clone(),
             release_id: release.id.clone(),
+            current_release_id: runtime.current_release_id.clone(),
+            current_deployment_name: runtime.current_deployment_name.clone(),
+            reconcile_checkpoint,
             desired_generation: runtime.desired_generation,
             owner_record_id: format!(
                 "project-{}",
@@ -253,6 +260,7 @@ fn is_sha256_digest(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicationReconcileDisposition {
     Applied(Box<ObservedWorkRuntime>),
+    TrafficSwitched(Box<ObservedWorkRuntime>),
     Unpublished,
     Deferred,
 }
@@ -371,7 +379,13 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let desired = DesiredWorkRuntime::from_records(&runtime, &release, &packaging).unwrap();
+        let desired = DesiredWorkRuntime::from_records(
+            &runtime,
+            &release,
+            &packaging,
+            PublishCheckpoint::DesiredStateCommitted,
+        )
+        .unwrap();
         assert_eq!(desired.runtime_profile_id, STATIC_WEB_PROFILE_ID);
         assert!(!desired
             .labels
@@ -380,6 +394,12 @@ mod tests {
         assert!(desired.image.contains("@sha256:"));
         let mut unsigned = packaging;
         unsigned.signature_digest = None;
-        assert!(DesiredWorkRuntime::from_records(&runtime, &release, &unsigned).is_err());
+        assert!(DesiredWorkRuntime::from_records(
+            &runtime,
+            &release,
+            &unsigned,
+            PublishCheckpoint::DesiredStateCommitted,
+        )
+        .is_err());
     }
 }

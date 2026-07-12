@@ -241,6 +241,32 @@ impl PublicationStore {
             .collect()
     }
 
+    pub fn protected_release_ids(&self) -> std::collections::BTreeSet<String> {
+        let snapshot = self.state.lock().unwrap();
+        let mut protected = std::collections::BTreeSet::new();
+        for runtime in snapshot.runtimes.values() {
+            protected.extend(
+                [
+                    runtime.desired_release_id.as_ref(),
+                    runtime.current_release_id.as_ref(),
+                    runtime.previous_release_id.as_ref(),
+                    runtime.last_successful_release_id.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
+        }
+        protected.extend(
+            snapshot
+                .operations
+                .values()
+                .filter(|operation| !operation.status.is_terminal())
+                .filter_map(|operation| operation.release_id.clone()),
+        );
+        protected
+    }
+
     pub fn replay_nonterminal_outbox(&self) -> Result<usize, PublicationStoreError> {
         let candidates = {
             let snapshot = self.state.lock().unwrap();

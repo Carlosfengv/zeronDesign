@@ -3,6 +3,7 @@ mod manifest;
 mod model;
 mod packager;
 mod process_backend;
+mod protection;
 mod store;
 
 pub use garbage_collector::{ReleaseGarbageCollector, TrustedReleaseGarbageCollectionBackend};
@@ -21,4 +22,5 @@ pub use packager::{
     ReleaseSignatureEvidence, TrustedReleasePackagingBackend,
 };
 pub use process_backend::ProcessReleasePackagingBackend;
+pub use protection::{ReleaseProtectionSet, ReleaseProtectionSource};
 pub use store::{ReleaseStore, ReleaseStoreError};

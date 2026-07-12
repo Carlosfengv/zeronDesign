@@ -102,6 +102,50 @@ impl PublicationStore {
         .map(|(operation, runtime, _)| (operation, runtime))
     }
 
+    pub fn record_traffic_switched(
+        &self,
+        outbox_id: &str,
+        observed: &ObservedWorkRuntime,
+    ) -> Result<(PublishOperation, WorkRuntimeState), PublicationStoreError> {
+        if !observed.ready
+            || !observed.release_identity_verified
+            || observed.external_release_identity_verified
+        {
+            return Err(PublicationStoreError::InvalidTransition(
+                "traffic switch requires ready target and internal identity evidence before external verification"
+                    .to_string(),
+            ));
+        }
+        self.update_outbox(outbox_id, |operation, runtime, outbox| {
+            if operation.desired_generation != runtime.desired_generation
+                || operation.desired_generation != outbox.desired_generation
+                || runtime.current_release_id == runtime.desired_release_id
+            {
+                return Err(PublicationStoreError::Conflict(
+                    "stale or non-switch reconcile result cannot record traffic checkpoint"
+                        .to_string(),
+                ));
+            }
+            runtime.service_uid = Some(observed.service.uid.clone());
+            runtime.service_resource_version = Some(observed.service.resource_version.clone());
+            if let Some(ingress) = &observed.ingress {
+                runtime.ingress_uid = Some(ingress.uid.clone());
+                runtime.ingress_resource_version = Some(ingress.resource_version.clone());
+            }
+            runtime.status = WorkRuntimeStatus::Updating;
+            runtime.last_error = None;
+            operation.status = PublishOperationStatus::TrafficSwitched;
+            operation.checkpoint = PublishCheckpoint::TrafficSwitched;
+            operation.last_error = None;
+            outbox.status = PublicationOutboxStatus::Pending;
+            outbox.delivered_at = None;
+            outbox.last_error = None;
+            outbox.next_attempt_at = Utc::now();
+            Ok(())
+        })
+        .map(|(operation, runtime, _)| (operation, runtime))
+    }
+
     pub fn record_unpublished(
         &self,
         outbox_id: &str,
@@ -316,6 +360,7 @@ mod tests {
             .unwrap();
         assert_eq!(published.status, WorkRuntimeStatus::Published);
         assert_eq!(published.ingress_uid.as_deref(), Some("ingress-uid"));
+        assert!(store.protected_release_ids().contains("release-observed"));
         let host_slug = published.host_slug.clone();
         let (operation, _) = store
             .commit_intent(&PublicationIntent {
@@ -343,5 +388,56 @@ mod tests {
         );
         assert!(unpublished.current_release_id.is_none());
         assert!(unpublished.ingress_uid.is_none());
+        assert!(store.protected_release_ids().contains("release-observed"));
+    }
+
+    #[test]
+    fn traffic_switch_checkpoint_keeps_blue_current_until_external_probe() {
+        let (store, publish_outbox_id) = store_with_intent();
+        store
+            .record_workload_ready(&publish_outbox_id, &externally_observed())
+            .unwrap();
+        let (update, _) = store
+            .commit_intent(&PublicationIntent {
+                project_id: "project-observed".into(),
+                kind: PublishOperationKind::Update,
+                release_id: Some("release-green".into()),
+                expected_current_release_id: Some("release-observed".into()),
+                expected_generation: Some(1),
+                runtime_profile_id: "static-web-v1".into(),
+                idempotency_key: "update-green".into(),
+            })
+            .unwrap();
+        let outbox = store
+            .pending_outbox()
+            .into_iter()
+            .find(|event| event.operation_id == update.id)
+            .unwrap();
+        let (operation, switched) = store
+            .record_traffic_switched(&outbox.id, &observed())
+            .unwrap();
+        assert_eq!(operation.status, PublishOperationStatus::TrafficSwitched);
+        assert_eq!(operation.checkpoint, PublishCheckpoint::TrafficSwitched);
+        assert_eq!(
+            switched.current_release_id.as_deref(),
+            Some("release-observed")
+        );
+        assert_eq!(
+            switched.desired_release_id.as_deref(),
+            Some("release-green")
+        );
+        assert_eq!(store.pending_outbox().len(), 1);
+
+        let (_, completed) = store
+            .record_workload_ready(&outbox.id, &externally_observed())
+            .unwrap();
+        assert_eq!(
+            completed.current_release_id.as_deref(),
+            Some("release-green")
+        );
+        assert_eq!(
+            completed.previous_release_id.as_deref(),
+            Some("release-observed")
+        );
     }
 }

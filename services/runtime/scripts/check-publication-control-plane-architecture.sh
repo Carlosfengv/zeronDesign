@@ -13,12 +13,12 @@ fail() {
   status=1
 }
 
-for required in backend.rs model.rs store.rs store_reconcile.rs controller.rs kubernetes.rs kubernetes_ingress.rs; do
+for required in backend.rs model.rs store.rs store_reconcile.rs controller.rs kubernetes.rs kubernetes_ingress.rs kubernetes_switch.rs kubernetes_release_protection.rs; do
   [[ -f "$PUBLICATION_DIR/$required" ]] \
     || fail "PUB-001: missing publication control-plane module: $required"
 done
 
-for file in "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$PUBLICATION_DIR/kubernetes.rs" "$PUBLICATION_DIR/kubernetes_ingress.rs"; do
+for file in "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$PUBLICATION_DIR/kubernetes.rs" "$PUBLICATION_DIR/kubernetes_ingress.rs" "$PUBLICATION_DIR/kubernetes_switch.rs" "$PUBLICATION_DIR/kubernetes_release_protection.rs"; do
   lines="$(wc -l < "$file" | tr -d ' ')"
   (( lines <= 700 )) \
     || fail "PUB-009: publication production module exceeds 700 lines: ${file#"$ROOT/"} ($lines)"
@@ -53,6 +53,14 @@ if ! grep -Eq 'WorkRuntimeExposureMode::Ingress' "$ROOT/services/runtime/src/con
   || ! grep -Eq 'verify_external_release' "$PUBLICATION_DIR/kubernetes_ingress.rs" \
   || ! grep -Eq 'verify_external_closed' "$PUBLICATION_DIR/kubernetes_ingress.rs"; then
   fail "PUB-012: G7 requires explicit Ingress exposure, external identity probe, and route-closed verification"
+fi
+
+if ! grep -Eq 'resourceVersion' "$PUBLICATION_DIR/kubernetes_switch.rs" \
+  || ! grep -Eq 'EndpointSlice' "$PUBLICATION_DIR/kubernetes_switch.rs" \
+  || ! grep -Eq 'switch_stable_service' "$PUBLICATION_DIR/kubernetes.rs" \
+  || ! grep -Eq 'KubernetesReleaseProtectionSource' "$PUBLICATION_DIR/kubernetes_release_protection.rs" \
+  || ! grep -Eq 'protected_release_ids' "$PUBLICATION_DIR/store.rs"; then
+  fail "PUB-013: G8 requires selector CAS, EndpointSlice convergence, rollback, and live release GC protection"
 fi
 
 if ! grep -Eq 'struct PublicationCommit' "$PUBLICATION_DIR/store.rs" \

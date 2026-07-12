@@ -95,8 +95,16 @@ where
                             .release_store
                             .packaging_for_release(release_id)
                             .context("desired WorkRelease packaging evidence does not exist")?;
-                        let desired =
-                            DesiredWorkRuntime::from_records(&runtime, &release, &packaging)?;
+                        let operation = self
+                            .publication_store
+                            .operation(&event.operation_id)
+                            .context("publication operation does not exist")?;
+                        let desired = DesiredWorkRuntime::from_records(
+                            &runtime,
+                            &release,
+                            &packaging,
+                            operation.checkpoint,
+                        )?;
                         self.backend.reconcile(&desired).await
                     }
                     PublicationDesiredState::Unpublished => {
@@ -110,6 +118,11 @@ where
                 Ok(PublicationReconcileDisposition::Applied(observed)) => {
                     self.publication_store
                         .record_workload_ready(&event.id, observed.as_ref())?;
+                    reconciled += 1;
+                }
+                Ok(PublicationReconcileDisposition::TrafficSwitched(observed)) => {
+                    self.publication_store
+                        .record_traffic_switched(&event.id, observed.as_ref())?;
                     reconciled += 1;
                 }
                 Ok(PublicationReconcileDisposition::Unpublished) => {

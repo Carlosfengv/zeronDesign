@@ -19,7 +19,7 @@ for required in runtime-manifest-v1.schema.json work-release-v1.schema.json rele
   fi
 done
 
-for required in manifest.rs model.rs store.rs packager.rs process_backend.rs garbage_collector.rs; do
+for required in manifest.rs model.rs store.rs packager.rs process_backend.rs garbage_collector.rs protection.rs; do
   if [[ ! -f "$RELEASE_DIR/$required" ]]; then
     fail "REL-002: missing release domain module: $required"
   fi
@@ -71,6 +71,15 @@ fi
 
 if ! grep -Eq 'ArtifactResolver::load_for_version' "$RELEASE_DIR/packager.rs"; then
   fail "REL-007: packaging must revalidate immutable Artifact bytes"
+fi
+
+if ! grep -Eq 'ReleaseProtectionSource' "$RELEASE_DIR/garbage_collector.rs" \
+  || ! grep -Eq 'protection\.snapshot\(\)' "$RELEASE_DIR/garbage_collector.rs"; then
+  fail "REL-013: Registry GC must fail closed behind a runtime and live-workload protection snapshot"
+fi
+
+if ! grep -Eq '~\*text/html "no-store"' "$PUBLISHED_RUNTIME_DIR/static-web/nginx.conf"; then
+  fail "REL-014: Published HTML must be no-store during bounded blue/green switches"
 fi
 
 if [[ "$status" -ne 0 ]]; then

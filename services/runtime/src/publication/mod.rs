@@ -1,6 +1,7 @@
 mod backend;
 mod controller;
 mod kubernetes;
+mod kubernetes_release_protection;
 mod model;
 mod store;
 
@@ -11,6 +12,7 @@ pub use backend::{
 };
 pub use controller::WorkRuntimeController;
 pub use kubernetes::{KubernetesIngressExposure, KubernetesWorkRuntimeBackend};
+pub use kubernetes_release_protection::KubernetesReleaseProtectionSource;
 pub use model::{
     PublicationDesiredState, PublicationIntent, PublicationOutboxEvent, PublicationOutboxStatus,
     PublishCheckpoint, PublishOperation, PublishOperationKind, PublishOperationStatus,
