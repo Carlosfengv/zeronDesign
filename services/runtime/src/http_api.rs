@@ -7,9 +7,14 @@ use crate::{
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
     profiles::edit::{self, EditIntent},
+    project::{
+        audit_project_template_compatibility, resolve_built_in_template_for_init,
+        ProjectInitWorkspaceTransaction,
+    },
     public_principal::{PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION},
     query_session::QuerySession,
     recovery::{recover_interrupted_runs, RecoveryOutcome},
+    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
         control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
         runtime::ToolContext,
@@ -89,6 +94,8 @@ pub fn app_state(config: RuntimeConfig) -> AppState {
 
 pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
     ChannelManager::shared().reconcile(&state.store).await?;
+    recover_project_init_transactions(&state).await?;
+    audit_persisted_template_compatibility(&state).await?;
     state.store.reconcile_artifact_promotions().await?;
     garbage_collect_artifacts(&state).await?;
     let outcomes = recover_interrupted_runs(&state.store).await?;
@@ -98,6 +105,48 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         }
     }
     Ok(state)
+}
+
+async fn audit_persisted_template_compatibility(state: &AppState) -> anyhow::Result<()> {
+    let states = state.store.list_project_runtime_states().await?;
+    let issues =
+        audit_project_template_compatibility(&states, &BuiltInTemplateRegistry::built_in());
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let summary = issues
+        .iter()
+        .map(|issue| {
+            format!(
+                "{} [{}]: {}",
+                issue.project_id, issue.error_kind, issue.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::bail!("persisted project template compatibility audit failed: {summary}")
+}
+
+async fn recover_project_init_transactions(state: &AppState) -> anyhow::Result<()> {
+    for run in state.store.runs_requiring_recovery().await {
+        let workspace_root = effective_workspace_root(&state.config, &run.project_id);
+        let mut ctx = ToolContext::new(state.store.clone(), run, workspace_root);
+        ctx.remote_workspace = state.config.sandbox_backend_mode == SandboxBackendMode::Kubernetes;
+        ctx.runtime_storage_dir = state.config.runtime_storage_dir.clone();
+        ctx.runtime_public_base_url = state.config.runtime_public_base_url.clone();
+        match state.config.sandbox_backend_mode {
+            SandboxBackendMode::PhaseAContract => {
+                ProjectInitWorkspaceTransaction::recover_pending(&LocalWorkspaceBackend, &ctx)
+                    .await?;
+            }
+            SandboxBackendMode::Kubernetes => {
+                let backend = SandboxChannelWorkspaceBackend::from_runtime_config(&state.config)
+                    .map_err(anyhow::Error::new)?;
+                ProjectInitWorkspaceTransaction::recover_pending(&backend, &ctx).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn garbage_collect_artifacts(state: &AppState) -> anyhow::Result<()> {
@@ -1061,6 +1110,9 @@ async fn create_design_profile(
         updated_at: now,
     };
     normalize_design_profile_component_roles(&mut profile.components)?;
+    validate_design_profile_template_availability(&profile)
+        .await
+        .map_err(|error| conflict_error(anyhow::anyhow!(error)))?;
     validate_design_profile_source_reference(&state.store, &profile).await?;
     let profile = state
         .store
@@ -1319,6 +1371,9 @@ async fn activate_design_profile(
             })),
         ));
     }
+    validate_design_profile_template_availability(&profile)
+        .await
+        .map_err(|error| error_response_as_value(conflict_error(anyhow::anyhow!(error))))?;
     validate_design_profile_source_reference(&state.store, &profile)
         .await
         .map_err(error_response_as_value)?;
@@ -1486,11 +1541,9 @@ async fn design_profile_fidelity_report(
         schema_version: profile.schema_version,
         surface: surface.to_string(),
         template: template.to_string(),
-        style_contract_version: if matches!(template, "astro-website" | "fumadocs-docs") {
-            "runtime-style-contract@p3".to_string()
-        } else {
-            "runtime-style-contract@p2".to_string()
-        },
+        style_contract_version: registered_template_spec(template)
+            .map(|spec| spec.style.version.to_string())
+            .unwrap_or_else(|| "runtime-style-contract@p2".to_string()),
         effective_profile_hash: effective.effective_profile_hash,
         source_integrity,
         source_hash_matches,
@@ -1593,6 +1646,9 @@ async fn update_design_profile(
         updated_at: now,
     };
     normalize_design_profile_component_roles(&mut profile.components)?;
+    validate_design_profile_template_availability(&profile)
+        .await
+        .map_err(|error| conflict_error(anyhow::anyhow!(error)))?;
     validate_design_profile_source_reference(&state.store, &profile).await?;
     let profile = state
         .store
@@ -1699,6 +1755,15 @@ async fn bind_project_design_profile(
                 error: "draft design profile cannot be bound to a project".to_string(),
             }),
         ));
+    }
+    if let Some(profile) = state
+        .store
+        .get_design_profile(&request.design_profile_id)
+        .await
+    {
+        validate_design_profile_template_availability(&profile)
+            .await
+            .map_err(|error| conflict_error(anyhow::anyhow!(error)))?;
     }
     let profile = state
         .store
@@ -2271,7 +2336,7 @@ async fn validate_build_confirmed_brief(
             "Build run requires a confirmed briefId before generation"
         ))
     })?;
-    store
+    let brief = store
         .get_brief(brief_id)
         .await
         .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
@@ -2279,6 +2344,28 @@ async fn validate_build_confirmed_brief(
         return Err(conflict_error(anyhow::anyhow!(
             "Build run requires a confirmed brief: {brief_id}"
         )));
+    }
+    resolve_built_in_template_for_init(&brief.recommended_template)
+        .await
+        .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
+    Ok(())
+}
+
+async fn validate_design_profile_template_availability(
+    profile: &DesignProfile,
+) -> Result<(), String> {
+    let allowed_templates = profile
+        .technical
+        .get("allowedTemplates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "technical.allowedTemplates is required".to_string())?;
+    for template in allowed_templates {
+        let template = template
+            .as_str()
+            .ok_or_else(|| "technical.allowedTemplates must contain strings".to_string())?;
+        resolve_built_in_template_for_init(template)
+            .await
+            .map_err(|error| format!("{}: {error}", error.error_kind()))?;
     }
     Ok(())
 }
@@ -3293,20 +3380,16 @@ async fn internal_template_build(
     let project_id = request.project_id.clone();
     let workspace_root = project_workspace_root(&state.config, &project_id);
     let template = request.template.clone();
+    let template_spec = resolve_built_in_template_for_init(&template)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
     let content_hierarchy = if request.content_hierarchy.is_empty() {
-        vec![match template.as_str() {
-            "fumadocs-docs" => "AnyDesign Runtime Docs".to_string(),
-            _ => "AnyDesign Runtime Website".to_string(),
-        }]
+        vec![template_spec.default_title.to_string()]
     } else {
         request.content_hierarchy
     };
     let brief = Brief {
-        project_type: if template == "fumadocs-docs" {
-            "docs".to_string()
-        } else {
-            "website".to_string()
-        },
+        project_type: template_spec.surface.to_string(),
         audience: request.audience,
         content_hierarchy,
         page_structure: if request.page_structure.is_null() {
@@ -3998,49 +4081,32 @@ fn signature_rule_applies_to_surface(rule: &Value, surface: &str) -> bool {
 }
 
 fn unsupported_extended_tokens_for_template(mapping: &Value, template: &str) -> Vec<String> {
-    let supported: &[&str] = match template {
-        "astro-website" => &[
-            "font.display",
-            "font.mono",
-            "type.display.size",
-            "type.display.lineHeight",
-            "type.display.letterSpacing",
-            "type.body.letterSpacing",
-            "spacing.pageGutter",
-            "spacing.section",
-            "spacing.cardPadding",
-            "radius.input",
-            "radius.badge",
-            "radius.largeCard",
-            "gradient.display",
-            "gradient.ambient",
-            "shadow.cardStrong",
-        ],
-        "fumadocs-docs" => &[
-            "font.display",
-            "font.mono",
-            "type.display.letterSpacing",
-            "type.body.letterSpacing",
-            "spacing.pageGutter",
-            "spacing.section",
-            "radius.input",
-            "radius.badge",
-            "gradient.display",
-        ],
-        _ => &[],
-    };
+    let supported = registered_template_spec(template)
+        .map(|spec| {
+            spec.style
+                .tokens
+                .iter()
+                .map(|token| token.name)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut unsupported = mapping
         .as_object()
         .map(|tokens| {
             tokens
                 .keys()
-                .filter(|token| !supported.contains(&token.as_str()))
+                .filter(|token| !supported.contains(token.as_str()))
                 .cloned()
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     unsupported.sort();
     unsupported
+}
+
+fn registered_template_spec(template: &str) -> Option<Arc<crate::templates::TemplateSpec>> {
+    let id = TemplateId::parse(template).ok()?;
+    BuiltInTemplateRegistry::built_in().current(&id).ok()
 }
 
 struct ParsedDesignProfileSource {
@@ -4304,16 +4370,13 @@ async fn design_profile_execution_target(
         .get_brief(brief_id)
         .await
         .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
-    let surface = match brief.recommended_template.as_str() {
-        "astro-website" | "nextjs-website" => "website",
-        "fumadocs-docs" | "docusaurus-docs" => "docs",
-        template => {
-            return Err(bad_request(format!(
-                "unsupported brief template for DesignProfile: {template}"
-            )))
-        }
-    };
-    Ok(Some((surface.to_string(), brief.recommended_template)))
+    let template = resolve_built_in_template_for_init(&brief.recommended_template)
+        .await
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Some((
+        template.surface.to_string(),
+        brief.recommended_template,
+    )))
 }
 
 async fn design_profile_prebuild_failure(
@@ -4805,6 +4868,128 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // remote-fs-boundary: allow-begin startup-recovery-test-fixture
+    #[tokio::test]
+    async fn startup_recovery_completes_committed_project_init_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-project-init-startup-recovery-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.runtime_storage_dir = root.join("runtime");
+        config.workspace_root = root.join("workspaces");
+        let store = RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir);
+        let run = store
+            .create_run(
+                "startup-recovery-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let workspace_root = project_workspace_root(&config, &run.project_id);
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let ctx = ToolContext::new(store, run.clone(), workspace_root.clone());
+        let mut transaction = ProjectInitWorkspaceTransaction::begin(
+            &LocalWorkspaceBackend,
+            &ctx,
+            &workspace_root.join("project"),
+            "astro-website",
+        )
+        .await
+        .unwrap();
+        transaction
+            .mark_workspace_committed(serde_json::json!({
+                "projectId": run.project_id,
+                "runId": run.id,
+                "appRoot": "project",
+                "templateKey": "astro-website",
+                "templateVersion": "astro-website@runtime-p3",
+                "templateManifestSha256": "7374f4f493c49752bbcbdad49992b02d089f79c1f01784c42fa7224668136e3f",
+                "framework": "astro",
+                "sandboxExecutionProfileId": "astro-website",
+                "sandboxExecutionProfileVersion": "0.1.0",
+                "packageManager": "npm",
+                "lockfile": "package-lock.json",
+                "registry": "https://registry.npmjs.org/"
+            }))
+            .await
+            .unwrap();
+        drop(ctx);
+
+        let recovered = recover_startup_runs(AppState {
+            store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
+            model: Arc::new(crate::model_gateway::EmptyModelClient),
+            config: config.clone(),
+        })
+        .await
+        .unwrap();
+        let state = recovered
+            .store
+            .get_project_runtime_state("startup-recovery-project")
+            .await
+            .unwrap();
+        assert_eq!(state.template_key, "astro-website");
+        assert!(!workspace_root
+            .join("state/project-init-transactions/startup-recovery-project/journal.json")
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    // remote-fs-boundary: allow-end startup-recovery-test-fixture
+
+    // remote-fs-boundary: allow-begin startup-template-audit-test-fixture
+    #[tokio::test]
+    async fn startup_rejects_persisted_project_with_missing_historical_template_spec() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-template-compatibility-audit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.runtime_storage_dir = root.join("runtime");
+        config.workspace_root = root.join("workspaces");
+        let store = RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir);
+        store
+            .upsert_project_runtime_state_with_template_identity(
+                "incompatible-project",
+                "project".to_string(),
+                "astro-website".to_string(),
+                "astro-website@runtime-p3".to_string(),
+                Some(
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                ),
+                "astro".to_string(),
+                Some("astro-website".to_string()),
+                Some("0.1.0".to_string()),
+                "npm".to_string(),
+                "package-lock.json".to_string(),
+                "https://registry.npmjs.org/".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let error = match recover_startup_runs(AppState {
+            store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
+            model: Arc::new(crate::model_gateway::EmptyModelClient),
+            config,
+        })
+        .await
+        {
+            Ok(_) => panic!("startup must reject incompatible persisted template identity"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("persisted project template compatibility audit failed"));
+        assert!(error.to_string().contains("template.version_incompatible"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    // remote-fs-boundary: allow-end startup-template-audit-test-fixture
 
     #[test]
     fn artifact_project_id_from_referer_extracts_current_artifact_project() {

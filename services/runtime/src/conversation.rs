@@ -3534,6 +3534,25 @@ impl RuntimeStore {
         Some(state)
     }
 
+    pub async fn list_project_runtime_states(&self) -> Result<Vec<ProjectRuntimeState>> {
+        let mut states = self
+            .read_project_runtime_states()?
+            .into_iter()
+            .map(|state| (state.project_id.clone(), state))
+            .collect::<HashMap<_, _>>();
+        states.extend(
+            self.inner
+                .read()
+                .await
+                .project_runtime_states
+                .iter()
+                .map(|(project_id, state)| (project_id.clone(), state.clone())),
+        );
+        let mut states = states.into_values().collect::<Vec<_>>();
+        states.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        Ok(states)
+    }
+
     fn project_access_log_path(&self) -> PathBuf {
         (*self.project_access_log_path).clone()
     }
@@ -3624,6 +3643,37 @@ impl RuntimeStore {
         lockfile: String,
         registry: String,
     ) -> Result<ProjectRuntimeState> {
+        self.upsert_project_runtime_state_with_template_identity(
+            project_id,
+            app_root,
+            template_key,
+            template_version,
+            None,
+            framework,
+            None,
+            None,
+            package_manager,
+            lockfile,
+            registry,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_project_runtime_state_with_template_identity(
+        &self,
+        project_id: &str,
+        app_root: String,
+        template_key: String,
+        template_version: String,
+        template_manifest_sha256: Option<String>,
+        framework: String,
+        sandbox_execution_profile_id: Option<String>,
+        sandbox_execution_profile_version: Option<String>,
+        package_manager: String,
+        lockfile: String,
+        registry: String,
+    ) -> Result<ProjectRuntimeState> {
         let revision = self
             .get_project_runtime_state(project_id)
             .await
@@ -3635,7 +3685,10 @@ impl RuntimeStore {
             app_root,
             template_key,
             template_version,
+            template_manifest_sha256,
             framework,
+            sandbox_execution_profile_id,
+            sandbox_execution_profile_version,
             package_manager,
             lockfile,
             registry,

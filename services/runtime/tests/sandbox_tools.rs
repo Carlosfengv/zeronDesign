@@ -2,6 +2,7 @@ use anydesign_runtime::{
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::ToolCall,
+    project::{ProjectInitRecoveryOutcome, ProjectInitWorkspaceTransaction},
     tools::{
         control_plane::control_plane_executor,
         runtime::ToolContext,
@@ -2120,7 +2121,7 @@ async fn fumadocs_docs_real_next_build_smoke() {
     assert!(latest_build["sourceSnapshotUri"]
         .as_str()
         .unwrap()
-        .starts_with("file:///workspace/outputs/build/source-snapshots/build-"));
+        .starts_with("runtime://source-snapshots/project-1/build-"));
 
     assert!(project_root.join("out/docs.html").exists());
     assert!(project_root.join("out/docs/runtime-flow.html").exists());
@@ -4185,6 +4186,112 @@ async fn workspace_channel_server_script_copies_directory_snapshots() {
     assert!(!target
         .join("node_modules/ignored-package/index.js")
         .exists());
+}
+
+#[tokio::test]
+async fn websocket_workspace_channel_recovers_committed_project_init_transaction() {
+    let workspace = setup_workspace();
+    let port = free_tcp_port();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/agent-sandbox/base/workspace-channel-server.js");
+    let mut child = Command::new("node")
+        .arg(script)
+        .env("WORKSPACE_ROOT", &workspace)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("node must start workspace-channel-server.js");
+    wait_for_tcp_port(port).await;
+
+    let backend = JsonWorkspaceChannelBackend::new(
+        WebSocketWorkspaceChannelTransport::new(format!("ws://127.0.0.1:{port}/workspace"))
+            .with_timeout(Duration::from_secs(2)),
+        &workspace,
+    );
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let run = store.get_run(&run_id).await.unwrap();
+    let ctx = ToolContext::new(store.clone(), run, workspace.clone());
+    let mut transaction = ProjectInitWorkspaceTransaction::begin(
+        &backend,
+        &ctx,
+        &workspace.join("project"),
+        "astro-website",
+    )
+    .await
+    .unwrap();
+    transaction
+        .mark_workspace_committed(json!({
+            "projectId": ctx.project_id,
+            "runId": ctx.run.id,
+            "appRoot": "project",
+            "templateKey": "astro-website",
+            "templateVersion": "astro-website@runtime-p3",
+            "templateManifestSha256": "7374f4f493c49752bbcbdad49992b02d089f79c1f01784c42fa7224668136e3f",
+            "framework": "astro",
+            "sandboxExecutionProfileId": "astro-website",
+            "sandboxExecutionProfileVersion": "0.1.0",
+            "packageManager": "npm",
+            "lockfile": "package-lock.json",
+            "registry": ctx.npm_registry,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        ProjectInitWorkspaceTransaction::recover_pending(&backend, &ctx)
+            .await
+            .unwrap(),
+        ProjectInitRecoveryOutcome::CompletedCommitted
+    );
+    assert_eq!(
+        store
+            .get_project_runtime_state(&ctx.project_id)
+            .await
+            .unwrap()
+            .template_key,
+        "astro-website"
+    );
+    assert!(!ProjectInitWorkspaceTransaction::journal_path_for(&ctx).exists());
+
+    backend
+        .write_string(&ctx, &workspace.join("project/original.txt"), "original")
+        .await
+        .unwrap();
+    let _prepared = ProjectInitWorkspaceTransaction::begin(
+        &backend,
+        &ctx,
+        &workspace.join("project"),
+        "astro-website",
+    )
+    .await
+    .unwrap();
+    backend
+        .remove_dir_all(&ctx, &workspace.join("project"))
+        .await
+        .unwrap();
+    backend
+        .write_string(&ctx, &workspace.join("project/partial.txt"), "partial")
+        .await
+        .unwrap();
+    assert_eq!(
+        ProjectInitWorkspaceTransaction::recover_pending(&backend, &ctx)
+            .await
+            .unwrap(),
+        ProjectInitRecoveryOutcome::RolledBackPrepared
+    );
+    assert_eq!(
+        backend
+            .read_to_string(&ctx, &workspace.join("project/original.txt"))
+            .await
+            .unwrap(),
+        "original"
+    );
+    assert!(backend
+        .path_kind(&ctx, &workspace.join("project/partial.txt"))
+        .await
+        .is_err());
+    child.kill().await.ok();
 }
 
 #[tokio::test]

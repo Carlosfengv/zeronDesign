@@ -3,13 +3,15 @@ use crate::{
     config::{RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     permission::{PermissionReason, PermissionResult, RuleSource},
+    project::resolve_built_in_template_for_init,
     repair_loop::{
         normalize_error_key, record_repair_attempt, RepairActionSignature, RepairLoopDecision,
         RepairLoopStopReason,
     },
     sandbox_adapter::{
-        sandbox_channel_from_binding, sandbox_claim_name, warm_pool_name, workspace_pvc_name,
-        KubectlSandboxClient, SandboxAdapter, SandboxAdapterConfig, SandboxKubeClient,
+        resolve_warm_pool_name, sandbox_channel_from_binding, sandbox_claim_name,
+        workspace_pvc_name, KubectlSandboxClient, SandboxAdapter, SandboxAdapterConfig,
+        SandboxKubeClient,
     },
     tools::{
         brief, content, mcp, run,
@@ -205,7 +207,7 @@ impl SandboxBackend for PhaseAContractSandboxBackend {
                 claim_name.clone(),
                 claim_name.clone(),
                 workspace_pvc_name(&claim_name),
-                warm_pool_name(template_key),
+                resolve_warm_pool_name(template_key)?,
                 self.namespace.clone(),
                 self.channel_protocol,
             )
@@ -474,8 +476,8 @@ impl Tool for BriefWriteDraftTool {
                 "visualDirection": string_schema("Visual direction"),
                 "recommendedTemplate": {
                     "type": "string",
-                    "enum": ["astro-website", "fumadocs-docs"],
-                    "description": "Template key. Use astro-website for website projects and fumadocs-docs for docs projects."
+                    "pattern": "^[a-z][a-z0-9.-]{0,63}$",
+                    "description": "Registered template id selected for this project."
                 },
                 "assumptions": { "type": "array", "items": { "type": "string" } },
                 "missingInformation": { "type": "array", "items": { "type": "string" } }
@@ -514,6 +516,14 @@ impl Tool for BriefWriteDraftTool {
         brief.validate_for_runtime().map_err(|error| {
             ValidationError::new(format!("brief.write_draft validation failed: {error}"))
         })?;
+        resolve_built_in_template_for_init(&brief.recommended_template)
+            .await
+            .map_err(|error| {
+                ValidationError::with_kind(
+                    format!("brief.write_draft validation failed: {error}"),
+                    error.error_kind(),
+                )
+            })?;
         Ok(input)
     }
 

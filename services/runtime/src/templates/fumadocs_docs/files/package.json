@@ -1,0 +1,30 @@
+{
+  "dependencies": {
+    "fumadocs-core": "^16.10.7",
+    "fumadocs-mdx": "^15.0.13",
+    "fumadocs-ui": "^16.10.7",
+    "next": "^16.2.10",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "serve": "^14.2.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.2",
+    "@types/mdx": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.3.2",
+    "typescript": "5.9.3"
+  },
+  "name": "anydesign-docs",
+  "packageManager": "npm@10.9.0",
+  "private": true,
+  "scripts": {
+    "build": "next build --webpack",
+    "dev": "next dev --hostname 0.0.0.0",
+    "preview": "serve out --listen 3000"
+  },
+  "type": "module",
+  "version": "0.0.0"
+}

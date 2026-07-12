@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+@import './tokens.css';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+body {
+  background: var(--runtime-bg);
+  color: var(--runtime-text);
+  font-family: var(--runtime-font-sans);
+  letter-spacing: var(--runtime-type-body-tracking);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--runtime-font-display);
+  letter-spacing: var(--runtime-type-display-tracking);
+}
+
+:root {
+  --fd-primary: var(--runtime-primary);
+  --fd-background: var(--runtime-bg);
+  --fd-foreground: var(--runtime-text);
+  --fd-muted-foreground: var(--runtime-muted);
+  --fd-border: var(--runtime-border);
+}
+
+.runtime-button {
+  border-radius: var(--runtime-radius-control);
+  background: var(--runtime-action);
+  color: var(--runtime-action-contrast);
+}

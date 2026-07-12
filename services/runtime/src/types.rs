@@ -1,3 +1,4 @@
+use crate::templates::TemplateId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -256,7 +257,13 @@ pub struct ProjectRuntimeState {
     pub app_root: String,
     pub template_key: String,
     pub template_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_manifest_sha256: Option<String>,
     pub framework: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_execution_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_execution_profile_version: Option<String>,
     pub package_manager: String,
     pub lockfile: String,
     pub registry: String,
@@ -628,15 +635,12 @@ impl DesignProfile {
         if allowed_templates.is_empty() {
             return Err("technical.allowedTemplates must not be empty".to_string());
         }
-        if !allowed_templates.iter().any(|template| {
-            matches!(
-                template.as_str(),
-                Some("astro-website" | "fumadocs-docs" | "nextjs-website" | "docusaurus-docs")
-            )
+        if !allowed_templates.iter().all(|template| {
+            template
+                .as_str()
+                .is_some_and(|template| TemplateId::parse(template).is_ok())
         }) {
-            return Err(
-                "technical.allowedTemplates must include a runtime supported template".to_string(),
-            );
+            return Err("technical.allowedTemplates must contain valid template ids".to_string());
         }
         match object_string(&self.governance, "conflictBehavior") {
             Some("prefer-user" | "ask" | "block") => {}
@@ -676,16 +680,6 @@ impl DesignProfile {
     ) -> Result<EffectiveDesignProfile, String> {
         if !matches!(surface, "website" | "docs") {
             return Err("surface must be website or docs".to_string());
-        }
-        let template_surface = match template {
-            "astro-website" | "nextjs-website" => "website",
-            "fumadocs-docs" | "docusaurus-docs" => "docs",
-            _ => return Err(format!("unsupported design profile template: {template}")),
-        };
-        if template_surface != surface {
-            return Err(format!(
-                "template {template} does not belong to surface {surface}"
-            ));
         }
         let allowed = self
             .technical
@@ -1292,12 +1286,8 @@ impl Brief {
         if self.visual_direction.trim().is_empty() {
             return Err("visualDirection is required".to_string());
         }
-        if !matches!(
-            self.recommended_template.as_str(),
-            "astro-website" | "fumadocs-docs" | "nextjs-website" | "docusaurus-docs"
-        ) {
-            return Err("recommendedTemplate is not supported".to_string());
-        }
+        TemplateId::parse(&self.recommended_template)
+            .map_err(|_| "recommendedTemplate must be a valid template id".to_string())?;
         if !self.page_structure.is_array() {
             return Err("pageStructure must be an array".to_string());
         }

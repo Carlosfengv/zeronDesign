@@ -1,5 +1,7 @@
 use crate::{
     conversation::RuntimeStore,
+    sandbox_profiles::{BuiltInSandboxExecutionProfileRegistry, SandboxExecutionProfileRegistry},
+    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     types::{SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol},
 };
 use anyhow::{anyhow, Result};
@@ -669,7 +671,7 @@ where
     pub async fn claim(&self, template_key: &str, project_id: &str) -> Result<SandboxBinding> {
         let short_id = self.store.next_id("sandbox");
         let claim_name = sandbox_claim_name(project_id, &short_id);
-        let warm_pool_name = warm_pool_name(template_key);
+        let warm_pool_name = resolve_warm_pool_name(template_key)?;
         let manifest = SandboxClaimManifest::new(
             claim_name.clone(),
             self.config.namespace.clone(),
@@ -781,7 +783,19 @@ where
 }
 
 pub fn warm_pool_name(template_key: &str) -> String {
-    format!("anydesign-{}-pool", sanitize_k8s_name(template_key))
+    resolve_warm_pool_name(template_key)
+        .unwrap_or_else(|error| panic!("cannot resolve warm pool for {template_key}: {error}"))
+}
+
+pub fn resolve_warm_pool_name(template_key: &str) -> Result<String> {
+    let id = TemplateId::parse(template_key).map_err(|error| anyhow!(error))?;
+    let template = BuiltInTemplateRegistry::built_in()
+        .current(&id)
+        .map_err(|error| anyhow!(error))?;
+    let profile = BuiltInSandboxExecutionProfileRegistry::built_in()
+        .resolve(&template.sandbox_execution_profile)
+        .map_err(|error| anyhow!(error))?;
+    Ok(profile.warm_pool_name.clone())
 }
 
 pub fn sandbox_claim_name(project_id: &str, short_id: &str) -> String {
