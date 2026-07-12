@@ -24,7 +24,7 @@ else
   if (( facade_lines > 300 )); then
     fail "HTTP-001/SIZE-001: HTTP facade exceeds 300 lines: $facade_lines"
   fi
-  if rg -n '\.route\(' "$FACADE"; then
+  if grep -nE '\.route\(' "$FACADE"; then
     fail "HTTP-002: HTTP facade must compose sub-routers instead of registering routes directly"
   fi
 fi
@@ -36,12 +36,13 @@ while IFS= read -r module; do
   fi
 done < <(find "$HTTP_DIR" -type f -name '*.rs' ! -path "$FACADE" | sort)
 
-if rg -n 'axum|RuntimeStore|WorkspaceBackend|StatusCode|Router' "$HTTP_DIR/contracts" --glob '*.rs'; then
+if grep -RInE --include='*.rs' 'axum|RuntimeStore|WorkspaceBackend|StatusCode|Router' "$HTTP_DIR/contracts"; then
   fail "HTTP-003: HTTP contracts depend on transport, store, or workspace implementation types"
 fi
 
-if rg -n -i 'astro-website|fumadocs-docs|docusaurus|template\s*==|match\s+template' \
-  "$HTTP_DIR/routes" --glob '*.rs' --glob '!artifacts.rs'; then
+if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
+  'astro-website|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \
+  "$HTTP_DIR/routes"; then
   fail "HTTP-004: route handlers contain concrete template or framework dispatch"
 fi
 
@@ -54,7 +55,7 @@ done
 if [[ ! -f "$HTTP_TEST_ROOT" ]] || (( $(wc -l < "$HTTP_TEST_ROOT") > 100 )); then
   fail "HTTP-006: HTTP integration crate root must exist and remain below 100 lines"
 fi
-if rg -n '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" >/dev/null; then
+if grep -nE '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" >/dev/null; then
   fail "HTTP-006: HTTP integration crate root must not contain test bodies"
 fi
 while IFS= read -r test_module; do
@@ -64,7 +65,7 @@ while IFS= read -r test_module; do
   fi
 done < <(find "$HTTP_TEST_DIR" -type f -name '*.rs' | sort)
 
-test_count="$(rg -n '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" "$HTTP_TEST_DIR" -g '*.rs' | wc -l | tr -d ' ')"
+test_count="$(grep -RhcE --include='*.rs' '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" "$HTTP_TEST_DIR" | awk '{ total += $1 } END { print total + 0 }')"
 if (( test_count < 86 )); then
   fail "HTTP-008: Cargo-discovered HTTP test inventory fell below the frozen 86-test baseline: $test_count"
 fi
