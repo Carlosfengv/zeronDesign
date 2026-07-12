@@ -1,6 +1,6 @@
 use super::*;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs, path::Path};
 
 const HTTP_API_SOURCE: &str = include_str!("../../src/http_api/mod.rs");
 const ARTIFACTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/artifacts.rs");
@@ -9,7 +9,6 @@ const DESIGN_SOURCES_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/design_sources.rs");
 const DESIGN_PROFILES_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/design_profiles.rs");
-const INTERNAL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/internal.rs");
 const PROJECTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/projects.rs");
 const PREVIEWS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/previews.rs");
 const PUBLICATION_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/publication.rs");
@@ -138,6 +137,20 @@ fn declared_routes(surface: &str, source: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn declared_routes_in_dir(surface: &str, root: &Path) -> BTreeSet<String> {
+    let mut routes = BTreeSet::new();
+    for entry in fs::read_dir(root).expect("route source directory must be readable") {
+        let path = entry.expect("route source entry must be readable").path();
+        if path.is_dir() {
+            routes.extend(declared_routes_in_dir(surface, &path));
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            let source = fs::read_to_string(&path).expect("route source must be readable");
+            routes.extend(declared_routes(surface, &source));
+        }
+    }
+    routes
+}
+
 #[test]
 fn executable_route_manifest_matches_every_router_declaration() {
     let manifest = manifest();
@@ -161,7 +174,12 @@ fn executable_route_manifest_matches_every_router_declaration() {
     actual.extend(declared_routes("public", ARTIFACTS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_PROFILES_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_SOURCES_ROUTES_SOURCE));
-    actual.extend(declared_routes("internal", INTERNAL_ROUTES_SOURCE));
+    actual.extend(declared_routes_in_dir(
+        "internal",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/http_api/routes/internal")
+            .as_path(),
+    ));
     actual.extend(declared_routes("public", PROJECTS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PREVIEWS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PUBLICATION_ROUTES_SOURCE));
@@ -190,7 +208,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
 fn route_manifest_metadata_is_complete_and_fail_closed() {
     let manifest = manifest();
     assert_eq!(manifest.schema_version, "runtime-http-routes@1");
-    assert_eq!(manifest.source, "src/http_api/{mod.rs,routes/*.rs}");
+    assert_eq!(manifest.source, "src/http_api/{mod.rs,routes/**/*.rs}");
     assert_eq!(manifest.baseline_test_count, 70);
     assert_eq!(manifest.baseline_commit.len(), 40);
     assert!(manifest.routes.len() >= 40);
