@@ -18,6 +18,12 @@ for required in model.rs store.rs controller.rs; do
     || fail "PUB-001: missing publication control-plane module: $required"
 done
 
+for file in "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/controller.rs"; do
+  lines="$(wc -l < "$file" | tr -d ' ')"
+  (( lines <= 700 )) \
+    || fail "PUB-009: publication production module exceeds 700 lines: ${file#"$ROOT/"} ($lines)"
+done
+
 for required in publish-operation-v1.schema.json work-runtime-state-v1.schema.json publication-outbox-v1.schema.json; do
   [[ -f "$SCHEMA_DIR/$required" ]] \
     || fail "PUB-002: missing frozen publication contract: $required"
