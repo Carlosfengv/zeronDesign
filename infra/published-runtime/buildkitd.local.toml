@@ -1,0 +1,4 @@
+# G4 local acceptance only. Production must use its authenticated TLS Registry.
+[registry."host.docker.internal:5001"]
+  http = true
+  insecure = true

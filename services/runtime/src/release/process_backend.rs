@@ -1,6 +1,7 @@
 use super::{
-    BuiltReleaseImage, PackagingEvidence, PackagingScanEvidence, ReleaseImageBuildRequest,
-    ReleaseSignatureEvidence, TrustedReleasePackagingBackend,
+    BuiltReleaseImage, PackagingEvidence, PackagingScanEvidence, ReleaseGarbageCollectionEvidence,
+    ReleaseImageBuildRequest, ReleasePackagingRecord, ReleaseSignatureEvidence,
+    TrustedReleaseGarbageCollectionBackend, TrustedReleasePackagingBackend, WorkRelease,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -36,6 +37,21 @@ pub struct ProcessReleasePackagingBackend {
     expected_sha256: String,
     environment: BTreeMap<String, String>,
     deadline: Duration,
+}
+
+#[async_trait]
+impl TrustedReleaseGarbageCollectionBackend for ProcessReleasePackagingBackend {
+    async fn garbage_collect(
+        &self,
+        release: &WorkRelease,
+        packaging: &ReleasePackagingRecord,
+    ) -> Result<ReleaseGarbageCollectionEvidence> {
+        self.call(
+            "garbageCollect",
+            &serde_json::json!({"release": release, "packaging": packaging}),
+        )
+        .await
+    }
 }
 
 impl ProcessReleasePackagingBackend {

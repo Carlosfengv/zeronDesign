@@ -19,7 +19,7 @@ use std::{
 };
 
 const BASE_IMAGE_DIGEST: &str =
-    "sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1";
+    "sha256:53cadfbebeffa241f12333cf8a63f3c6553eedad8b9f8296de89e32c566a5caa";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,7 +57,8 @@ async fn main() -> Result<()> {
         runtime_profile_id: profile.id.clone(),
         base_image_digest: profile.base_image_digest.clone(),
         packager_version: profile.packager_version.clone(),
-        registry_repository: "localhost:5001/anydesign/work-releases".to_string(),
+        registry_repository: env::var("ANYDESIGN_RELEASE_REPOSITORY")
+            .unwrap_or_else(|_| "localhost:5001/anydesign/work-releases".to_string()),
         scan_policy_version: profile.scan_policy_version.clone(),
     };
     let (_, packaging) = store.prepare(&input)?;

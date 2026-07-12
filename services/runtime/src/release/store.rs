@@ -371,6 +371,59 @@ impl ReleaseStore {
         .map(|(_, packaging)| packaging)
     }
 
+    pub fn mark_failed_garbage_collectable(
+        &self,
+        packaging_id: &str,
+        expected_image_digest: &str,
+    ) -> Result<(WorkRelease, ReleasePackagingRecord), ReleaseStoreError> {
+        validate_digest(expected_image_digest, "garbage collection image digest")
+            .map_err(ReleaseStoreError::InvalidInput)?;
+        self.update(packaging_id, |release, packaging| {
+            if release.status == WorkReleaseStatus::GarbageCollectable
+                && packaging.pushed_image_digest.as_deref() == Some(expected_image_digest)
+            {
+                return Ok(());
+            }
+            if release.status != WorkReleaseStatus::Failed
+                || packaging.status != ReleasePackagingStatus::Failed
+                || packaging.pushed_image_digest.as_deref() != Some(expected_image_digest)
+            {
+                return Err(ReleaseStoreError::InvalidTransition(
+                    "only a failed, digest-matched release may become garbage collectable"
+                        .to_string(),
+                ));
+            }
+            release.status = WorkReleaseStatus::GarbageCollectable;
+            Ok(())
+        })
+    }
+
+    pub fn record_garbage_collected(
+        &self,
+        packaging_id: &str,
+        expected_image_digest: &str,
+    ) -> Result<(WorkRelease, ReleasePackagingRecord), ReleaseStoreError> {
+        validate_digest(expected_image_digest, "garbage collection image digest")
+            .map_err(ReleaseStoreError::InvalidInput)?;
+        self.update(packaging_id, |release, packaging| {
+            if release.status == WorkReleaseStatus::GarbageCollected
+                && packaging.pushed_image_digest.as_deref() == Some(expected_image_digest)
+            {
+                return Ok(());
+            }
+            if release.status != WorkReleaseStatus::GarbageCollectable
+                || packaging.status != ReleasePackagingStatus::Failed
+                || packaging.pushed_image_digest.as_deref() != Some(expected_image_digest)
+            {
+                return Err(ReleaseStoreError::InvalidTransition(
+                    "garbage collection completion requires a failed authorized digest".to_string(),
+                ));
+            }
+            release.status = WorkReleaseStatus::GarbageCollected;
+            Ok(())
+        })
+    }
+
     pub fn release(&self, release_id: &str) -> Option<WorkRelease> {
         self.state.lock().unwrap().releases.get(release_id).cloned()
     }
@@ -671,6 +724,48 @@ mod tests {
         store.begin_build(&packaging.id).unwrap();
         store.record_built(&packaging.id, &digest('a')).unwrap();
         assert!(store.record_pushed(&packaging.id, &digest('b')).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn garbage_collection_is_limited_to_failed_digest_matched_releases() {
+        let root = root("garbage-collection");
+        let store = ReleaseStore::open(&root).unwrap();
+        let (_, packaging) = store.prepare(&input()).unwrap();
+        store.begin_build(&packaging.id).unwrap();
+        store.record_built(&packaging.id, &digest('a')).unwrap();
+        store.record_pushed(&packaging.id, &digest('a')).unwrap();
+        assert!(store
+            .mark_failed_garbage_collectable(&packaging.id, &digest('a'))
+            .is_err());
+        store.begin_scan(&packaging.id).unwrap();
+        store
+            .record_scan(
+                &packaging.id,
+                &digest('1'),
+                &digest('2'),
+                PackagingScanEvidence {
+                    policy_version: "scan@1".to_string(),
+                    passed: false,
+                    critical_vulnerabilities: 1,
+                    high_vulnerabilities: 0,
+                    secret_findings: 0,
+                    report_digest: digest('3'),
+                },
+            )
+            .unwrap();
+        assert!(store
+            .mark_failed_garbage_collectable(&packaging.id, &digest('b'))
+            .is_err());
+        let (release, _) = store
+            .mark_failed_garbage_collectable(&packaging.id, &digest('a'))
+            .unwrap();
+        assert_eq!(release.status, WorkReleaseStatus::GarbageCollectable);
+        let (release, packaging) = store
+            .record_garbage_collected(&packaging.id, &digest('a'))
+            .unwrap();
+        assert_eq!(release.status, WorkReleaseStatus::GarbageCollected);
+        assert_eq!(packaging.pushed_image_digest, Some(digest('a')));
         fs::remove_dir_all(root).unwrap();
     }
 

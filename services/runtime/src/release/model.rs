@@ -39,6 +39,13 @@ pub struct PackagingScanEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReleaseGarbageCollectionEvidence {
+    pub registry_manifest_deleted: bool,
+    pub packaging_evidence_deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleasePackagingInput {
     pub project_id: String,
     pub version_id: String,

@@ -19,7 +19,7 @@ for required in runtime-manifest-v1.schema.json work-release-v1.schema.json rele
   fi
 done
 
-for required in manifest.rs model.rs store.rs packager.rs process_backend.rs; do
+for required in manifest.rs model.rs store.rs packager.rs process_backend.rs garbage_collector.rs; do
   if [[ ! -f "$RELEASE_DIR/$required" ]]; then
     fail "REL-002: missing release domain module: $required"
   fi
@@ -36,7 +36,7 @@ if grep -RInE --include='*.rs' 'axum|Ingress|Deployment|StatefulSet|kube::|k8s_o
   fail "REL-004: packaging domain must not create HTTP or Published Kubernetes resources"
 fi
 
-for required in images.lock.json static-web/Dockerfile static-web/nginx.conf; do
+for required in images.lock.json buildkitd.local.toml static-web/Dockerfile static-web/nginx.conf; do
   if [[ ! -f "$PUBLISHED_RUNTIME_DIR/$required" ]]; then
     fail "REL-008: missing trusted published runtime input: $required"
   fi
@@ -54,6 +54,11 @@ fi
 if ! grep -Eq 'USER 101:101' "$PUBLISHED_RUNTIME_DIR/static-web/Dockerfile" \
   || ! grep -Eq 'location \^~ /\.anydesign/' "$PUBLISHED_RUNTIME_DIR/static-web/nginx.conf"; then
   fail "REL-011: published runtime must run non-root and deny internal metadata"
+fi
+
+base_digest="$(jq -r '.images.staticWebBase.digest' "$PUBLISHED_RUNTIME_DIR/images.lock.json")"
+if ! grep -Fq "$base_digest" "$PUBLISHED_RUNTIME_DIR/static-web/Dockerfile"; then
+  fail "REL-012: static runtime Dockerfile base digest differs from the reviewed lock"
 fi
 
 if grep -RInE --include='*.rs' 'WORK_RELEASE_REGISTRY|registry[_ -]?(password|token|credential)|docker[[:space:]]+push|cosign[[:space:]]+sign' "$SANDBOX_DIR"; then

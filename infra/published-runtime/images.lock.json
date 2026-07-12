@@ -5,9 +5,15 @@
       "source": "registry:3",
       "digest": "sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33"
     },
+    "buildkit": {
+      "source": "moby/buildkit:buildx-stable-1",
+      "digest": "sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f"
+    },
     "staticWebBase": {
       "source": "nginx:stable-alpine",
-      "digest": "sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1"
+      "platform": "linux/arm64/v8",
+      "digest": "sha256:53cadfbebeffa241f12333cf8a63f3c6553eedad8b9f8296de89e32c566a5caa",
+      "localAcceptanceMirror": "host.docker.internal:5001/anydesign/trusted/nginx"
     }
   },
   "tools": {

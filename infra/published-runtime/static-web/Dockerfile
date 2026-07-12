@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=registry-1.docker.io/library/nginx@sha256:0d3b80406a13a767339fbe2f41406d6c7da727ab89cf8fae399e81f780f814d1
+ARG BASE_IMAGE=registry-1.docker.io/library/nginx@sha256:53cadfbebeffa241f12333cf8a63f3c6553eedad8b9f8296de89e32c566a5caa
 FROM ${BASE_IMAGE}
 
 USER root

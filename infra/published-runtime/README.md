@@ -24,3 +24,8 @@ helper itself is independently SHA-256 pinned by
 The local acceptance Registry is intentionally HTTP-only on loopback. Shared
 or production registries must use TLS and workload identity; Registry or signing
 credentials are never passed into an Agent Sandbox.
+
+The local builder must be a named `docker-container` instance created with the
+digest-pinned BuildKit image and `buildkitd.local.toml`. The in-container
+Registry alias is used only to cross the Docker Desktop VM boundary; persisted
+release references retain the caller-visible Registry host.
