@@ -35,6 +35,8 @@ jobs:
         run: bash services/runtime/scripts/check-sandbox-architecture.sh
       - name: Enforce remote workspace filesystem boundary
         run: bash services/runtime/scripts/check-remote-workspace-fs-boundary.sh
+      - name: Enforce Runtime HTTP API boundaries
+        run: bash services/runtime/scripts/check-http-api-architecture.sh
       - name: Verify sandbox tool contract
         run: cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_contract_baseline
       - name: Verify template registry contract

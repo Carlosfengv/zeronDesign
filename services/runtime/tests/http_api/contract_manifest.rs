@@ -3,7 +3,22 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 
 const HTTP_API_SOURCE: &str = include_str!("../../src/http_api/mod.rs");
+const ARTIFACTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/artifacts.rs");
+const CAPTURE_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/capture.rs");
+const DESIGN_SOURCES_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/design_sources.rs");
+const DESIGN_PROFILES_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/design_profiles.rs");
+const INTERNAL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/internal.rs");
+const PROJECTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/projects.rs");
+const PREVIEWS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/previews.rs");
 const RUN_EVENTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/run_events.rs");
+const RUN_START_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/start.rs");
+const RUN_CONTINUE_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/runs/continue_run.rs");
+const RUN_CANCEL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/cancel.rs");
+const RUN_PERMISSION_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/runs/permission.rs");
 const SYSTEM_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/system.rs");
 const ROUTE_MANIFEST_SOURCE: &str = include_str!("../../contracts/http-routes.json");
 
@@ -31,6 +46,20 @@ struct RouteContract {
 
 fn manifest() -> RouteManifest {
     serde_json::from_str(ROUTE_MANIFEST_SOURCE).expect("HTTP route manifest must be valid JSON")
+}
+
+pub(super) fn assert_manifest_entries(surface: &str, entries: &[(&str, &str)]) {
+    let manifest = manifest();
+    for (method, path) in entries {
+        assert!(
+            manifest.routes.iter().any(|route| {
+                route.surface == surface
+                    && route.path == *path
+                    && route.methods.iter().any(|candidate| candidate == method)
+            }),
+            "missing {surface} {method} {path} from executable route manifest"
+        );
+    }
 }
 
 fn router_section<'a>(start: &str, end: &str) -> &'a str {
@@ -128,15 +157,19 @@ fn executable_route_manifest_matches_every_router_declaration() {
             "pub fn capture_router_with_state",
         ),
     );
+    actual.extend(declared_routes("public", ARTIFACTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", DESIGN_PROFILES_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", DESIGN_SOURCES_ROUTES_SOURCE));
+    actual.extend(declared_routes("internal", INTERNAL_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", PROJECTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", PREVIEWS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_EVENTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_START_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_CONTINUE_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_CANCEL_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_PERMISSION_ROUTES_SOURCE));
     actual.extend(declared_routes("public", SYSTEM_ROUTES_SOURCE));
-    actual.extend(declared_routes(
-        "capture",
-        router_section(
-            "pub fn capture_router_with_state",
-            "async fn candidate_capture_root",
-        ),
-    ));
+    actual.extend(declared_routes("capture", CAPTURE_ROUTES_SOURCE));
     actual = actual
         .into_iter()
         .map(|entry| {
