@@ -54,7 +54,7 @@ impl AgentLoop {
             model,
             tool_executor: tools::control_plane::control_plane_executor(),
             post_tool_failure_hook: PostToolUseFailureHook::default(),
-            post_tool_success_hook: PostToolUseSuccessHook::default(),
+            post_tool_success_hook: PostToolUseSuccessHook,
         }
     }
 
@@ -68,7 +68,7 @@ impl AgentLoop {
             model,
             tool_executor,
             post_tool_failure_hook: PostToolUseFailureHook::default(),
-            post_tool_success_hook: PostToolUseSuccessHook::default(),
+            post_tool_success_hook: PostToolUseSuccessHook,
         }
     }
 
@@ -761,7 +761,7 @@ impl AgentLoop {
         let previous_context = self.read_workspace_file(run, "state/context.md").await?;
         let mut profile_context = render_design_profile_context(run, profile, capsule);
         if let Some(override_context) = self.design_profile_override_context(run).await {
-            profile_context.push_str("\n");
+            profile_context.push('\n');
             profile_context.push_str(&override_context);
         }
         let context = match previous_context.as_deref().map(str::trim) {
@@ -1500,13 +1500,12 @@ impl AgentLoop {
                 | AgentRunStatus::Blocked
                 | AgentRunStatus::Failed
                 | AgentRunStatus::Cancelled
-        ) {
-            if !self.tool_executor.is_remote_workspace() {
-                tools::sandbox::cleanup_staged_writes_for_run(
-                    self.tool_executor.workspace_root(),
-                    run_id,
-                );
-            }
+        ) && !self.tool_executor.is_remote_workspace()
+        {
+            tools::sandbox::cleanup_staged_writes_for_run(
+                self.tool_executor.workspace_root(),
+                run_id,
+            );
         }
         self.store.update_run_status(run_id, status).await?;
         let _ = self

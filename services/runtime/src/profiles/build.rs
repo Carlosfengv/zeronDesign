@@ -381,7 +381,7 @@ pub fn promotion_gate_report_from_workspace(
     });
 
     PromotionGateReport {
-        build_log_has_terminal_error: build_log.as_deref().map_or(true, has_terminal_error),
+        build_log_has_terminal_error: build_log.as_deref().is_none_or(has_terminal_error),
         preview_accessible: preview
             .as_ref()
             .and_then(|value| value.get("accessible"))

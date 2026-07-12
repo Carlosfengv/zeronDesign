@@ -648,7 +648,7 @@ impl ToolExecutor {
             }
         }
 
-        let pre_tool_decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let pre_tool_decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: ctx.run.phase,
             tool_name: tool.name().to_string(),
             input,
@@ -1058,7 +1058,7 @@ fn default_tool_cwd(run: &AgentRun) -> String {
 
 fn normalize_tool_input(mut input: Value) -> Value {
     for _ in 0..3 {
-        if !input.as_object().is_some_and(|object| object.len() == 1) {
+        if input.as_object().is_none_or(|object| object.len() != 1) {
             return input;
         };
         let Some(arguments) = input.get("arguments") else {
@@ -1081,9 +1081,7 @@ fn design_context_read_gate(
     tool_name: &str,
     input: &Value,
 ) -> Option<(String, String, Value)> {
-    if run.design_profile_id.is_none() {
-        return None;
-    }
+    run.design_profile_id.as_ref()?;
     if tool_name == "fs.read" {
         let path = input
             .get("path")
@@ -1264,6 +1262,7 @@ fn normalize_design_context_path(path: &str) -> String {
         .to_string()
 }
 
+#[allow(clippy::let_and_return)]
 fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {
     // remote-fs-boundary: allow-begin local-path-normalization
     let mut normalized = PathBuf::new();

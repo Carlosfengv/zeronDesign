@@ -72,6 +72,8 @@ impl ChannelManager {
         .await
     }
 
+    // Keep transport selection explicit at the private boundary; production callers use endpoint().
+    #[allow(clippy::too_many_arguments)]
     async fn endpoint_with_mode(
         &self,
         store: &RuntimeStore,

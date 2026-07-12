@@ -193,6 +193,7 @@ impl<T> JsonWorkspaceChannelBackend<T>
 where
     T: WorkspaceChannelTransport + 'static,
 {
+    #[allow(clippy::let_and_return)]
     pub fn new(transport: T, workspace_root: impl Into<PathBuf>) -> Self {
         // remote-fs-boundary: allow-begin channel-local-root-alias
         let workspace_root = workspace_root.into();

@@ -58,7 +58,7 @@ use std::{
 use tokio::sync::broadcast;
 
 const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
-const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = (MAX_DESIGN_SOURCE_BYTES + 2) / 3 * 4;
+const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = MAX_DESIGN_SOURCE_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -2040,20 +2040,18 @@ async fn start_run(
         run
     };
     let run = maybe_provision_build_sandbox(&state, run).await?;
-    if sandbox_phase_requires_binding(run.phase) {
-        if run.sandbox_id.is_some() {
-            let allowed_parent_run_id = request.input_context.parent_run_id.as_deref();
-            if let Err(error) = state
+    if sandbox_phase_requires_binding(run.phase) && run.sandbox_id.is_some() {
+        let allowed_parent_run_id = request.input_context.parent_run_id.as_deref();
+        if let Err(error) = state
+            .store
+            .acquire_sandbox_binding_for_run(&run.id, allowed_parent_run_id)
+            .await
+        {
+            let _ = state
                 .store
-                .acquire_sandbox_binding_for_run(&run.id, allowed_parent_run_id)
-                .await
-            {
-                let _ = state
-                    .store
-                    .update_run_status(&run.id, AgentRunStatus::Cancelled)
-                    .await;
-                return Err(sandbox_binding_error(error));
-            }
+                .update_run_status(&run.id, AgentRunStatus::Cancelled)
+                .await;
+            return Err(sandbox_binding_error(error));
         }
     }
     if run.phase == AgentPhase::Edit {

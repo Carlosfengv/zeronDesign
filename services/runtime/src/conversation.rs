@@ -499,6 +499,8 @@ impl RuntimeStore {
         .await
     }
 
+    // This append-only store API mirrors the persisted AgentRun identity fields.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_run_with_context(
         &self,
         project_id: String,
@@ -2345,6 +2347,8 @@ impl RuntimeStore {
         .await;
     }
 
+    // Conversation evidence fields stay explicit until the store boundary is split into repositories.
+    #[allow(clippy::too_many_arguments)]
     pub async fn append_conversation_item_with_visibility(
         &self,
         project_id: &str,
@@ -3134,6 +3138,8 @@ impl RuntimeStore {
         Some(permission)
     }
 
+    // Finding identity and evidence fields intentionally remain explicit at this persistence boundary.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_review_finding(
         &self,
         project_id: &str,
@@ -4013,6 +4019,8 @@ impl RuntimeStore {
         Ok(())
     }
 
+    // Publish identity fields form the idempotency and compare-and-swap contract.
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_artifact_publish(
         &self,
         project_id: &str,
@@ -4710,6 +4718,8 @@ impl RuntimeStore {
         })
     }
 
+    // Kubernetes binding identity is persisted atomically and must be supplied as one operation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_sandbox_binding(
         &self,
         project_id: &str,

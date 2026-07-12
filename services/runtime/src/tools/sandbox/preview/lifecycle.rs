@@ -165,17 +165,14 @@ impl Tool for PreviewStartTool {
             .map(str::to_string)
             .unwrap_or_else(|| format!("http://127.0.0.1:{port}"))
             .to_string();
-        let static_output_dir = if explicit_url.is_none() {
-            let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
-            wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
-            Some(static_output)
-        } else if verify_preview_accessible(&url).await.is_err() {
-            let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
-            wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
-            Some(static_output)
-        } else {
-            optional_static_preview_output_dir(&ctx, &cwd, &build)
-        };
+        let static_output_dir =
+            if explicit_url.is_none() || verify_preview_accessible(&url).await.is_err() {
+                let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
+                wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
+                Some(static_output)
+            } else {
+                optional_static_preview_output_dir(&ctx, &cwd, &build)
+            };
         let state = json!({
             "status": "running",
             "url": url,

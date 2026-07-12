@@ -246,11 +246,7 @@ pub fn tool_result_error_text(result: &ToolResult) -> String {
 }
 
 pub fn tool_result_to_content(result: ToolResult) -> Value {
-    if result.is_error {
-        result.content
-    } else {
-        result.content
-    }
+    result.content
 }
 
 pub fn missing_tool_result(tool_use_id: impl Into<String>, reason: impl Into<String>) -> Value {
