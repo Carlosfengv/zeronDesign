@@ -22,6 +22,51 @@ test evidence.
 The Phase B freeze blockers from the API review have been resolved in code and
 covered by the verification suite listed below.
 
+## Executable Route Inventory
+
+The complete Runtime HTTP route inventory is now machine-readable at
+`services/runtime/contracts/http-routes.json`. It covers the public, internal-service, and isolated
+capture routers and freezes, for every route:
+
+- exact Axum path and HTTP methods;
+- exposed surface;
+- authorization mode;
+- request body-limit policy;
+- feature-flag dependency;
+- response family, including JSON, SSE, HTML, artifact, and proxied responses.
+
+`services/runtime/tests/http_api/contract_manifest.rs` compares that manifest with every `.route()`
+declaration in `src/http_api.rs`. Adding, removing, moving, or changing a route method without an
+intentional manifest update fails the HTTP integration test target.
+
+Run the executable freeze gate with:
+
+```bash
+cd services/runtime
+cargo test --test http_api contract_manifest
+```
+
+Changes to this frozen surface are additive by default. Route removal, method removal,
+authorization weakening, body-limit expansion, or moving an internal/capture route onto the public
+surface requires a separately reviewed contract-version decision; updating the JSON file alone is
+not sufficient approval.
+
+### Additive Route Groups After The Original Phase A Freeze
+
+The original Phase A public table below remains stable. The executable inventory additionally
+records these already-implemented groups:
+
+| Route group | Paths | Contract status |
+|---|---|---|
+| Runtime identity | `/`, `/version` | additive |
+| Design source | `/design-source-artifacts`, `/design-source-artifacts/{artifact_id}`, `/design-source-artifacts/{artifact_id}/content` | additive, internal-service authorization |
+| Design Profile | `/design-profiles...`, `/projects/{project_id}/design-profile` | additive; source/import/activation/conversion routes are explicitly annotated |
+| Editable runtime state | `/projects/{project_id}/runtime-state` | additive |
+| Candidate preview proxy | `/previews/{lease_id}...` | additive, conditional public-principal authorization |
+| Immutable artifacts | `/artifacts/{project_id}/current...`, `/_next/{*artifact_path}` | additive |
+| Internal control plane | `/internal/template-build`, `/internal/previews/promote`, `/internal/projects/{project_id}/...` | additive, internal-service authorization; build/promote are feature-gated |
+| Isolated capture listener | `/preview-captures/{lease_id}...` | additive, not part of the public router |
+
 ## Phase B Freeze Blockers Resolved
 
 These items were resolved before declaring the Phase B API contract frozen:
