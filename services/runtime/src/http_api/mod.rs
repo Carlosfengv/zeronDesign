@@ -1,3 +1,4 @@
+mod artifact_legacy;
 mod auth;
 mod contracts;
 mod error;
@@ -8,6 +9,7 @@ mod workspace;
 
 pub use crate::runtime::recover_startup_runs;
 pub use crate::runtime::RuntimeSupervisor;
+use artifact_legacy::*;
 use auth::*;
 pub use contracts::*;
 use error::*;
@@ -25,6 +27,7 @@ use crate::project::ProjectInitWorkspaceTransaction;
 use routes::artifacts::artifact_project_id_from_referer;
 
 use crate::{
+    artifact_manifest::ArtifactResolver,
     artifact_publisher::{safe_segment, FileArtifactPublisher},
     channel_manager::ChannelManager,
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
