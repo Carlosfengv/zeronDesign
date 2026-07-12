@@ -106,7 +106,7 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | G2 | complete | [PR-03](https://github.com/Carlosfengv/zeronDesign/pull/3) | `74fe6e5` | `services/runtime/evidence/runtime-bootstrap-supervisor-g2.md` |
 | G3 | complete | [PR-04](https://github.com/Carlosfengv/zeronDesign/pull/4) | `788c1e8` | `services/runtime/evidence/artifact-manifest-g3.md` |
 | G4 | complete | [PR-05](https://github.com/Carlosfengv/zeronDesign/pull/5) | `ca62ec1` | `services/runtime/evidence/work-release-packaging-g4.md` |
-| G5 | in_progress | PR-06 | 待填写 | 待填写 |
+| G5 | in_progress | PR-06 | 待填写 | `services/runtime/evidence/publication-control-plane-g5.md` |
 | G6 | pending | PR-07 | 待填写 | 待填写 |
 | G7 | pending | PR-08 | 待填写 | 待填写 |
 | G8 | pending | PR-09 | 待填写 | 待填写 |

@@ -824,6 +824,17 @@ reconcile outbox event
 Outbox 投递失败只能导致幂等补发，不能丢失 desired state。相同 Idempotency-Key 和相同 body 返回同一
 Operation；相同 key 不同 body 返回 409。
 
+安全与并发约束进一步冻结为：
+
+- Runtime 只持久化 `idempotencyKeyHash`，不保存客户端原始 Idempotency-Key；
+- `requestHash` 使用长度前缀字段编码，绑定 project、kind、release、expected current release、
+  expected generation 和 RuntimeProfile；
+- 每个 mutation 必须携带 `expectedGeneration`，Update/Rollback 还必须携带
+  `expectedCurrentReleaseId`；任一 CAS 不匹配都不创建新 generation；
+- outbox 保存 `nextAttemptAt` 和 attempts，失败使用有界退避；Runtime 重启时，已 delivered 但
+  `observedGeneration < desiredGeneration` 的非终态 Operation 必须重新入队；
+- host slug 首次提交发布意图时使用随机熵生成并持久化，后续 generation 不得重新分配。
+
 ### 8.2 状态机
 
 ```text
