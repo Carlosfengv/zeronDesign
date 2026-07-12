@@ -192,6 +192,7 @@ async fn internal_upsert_project_access(
 
 async fn internal_project_release_evidence(
     State(state): State<AppState>,
+    Extension(evidence): Extension<Arc<dyn RuntimeEvidenceStore>>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -262,19 +263,9 @@ async fn internal_project_release_evidence(
         .screenshot_id
         .clone()
         .ok_or_else(|| conflict_error(anyhow::anyhow!("screenshot ID missing")))?;
-    let screenshot_path = state
-        .config
-        .runtime_storage_dir
-        .join("screenshots")
-        .join(&project_id)
-        .join(&edit_run_id)
-        .join(format!("{screenshot_id}.json"));
-    // remote-fs-boundary: allow-begin runtime-owned-release-evidence
-    let screenshot: Value = serde_json::from_slice(
-        &fs::read(&screenshot_path).map_err(|error| internal_error(anyhow::anyhow!(error)))?,
-    )
-    .map_err(|error| internal_error(anyhow::anyhow!(error)))?;
-    // remote-fs-boundary: allow-end runtime-owned-release-evidence
+    let screenshot = evidence
+        .read_screenshot(&project_id, &edit_run_id, &screenshot_id)
+        .map_err(internal_error)?;
     Ok(Json(json!({
         "projectId": project_id,
         "buildRunId": base_version.created_by_run_id,

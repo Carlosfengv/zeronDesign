@@ -9,6 +9,7 @@ HTTP_TEST_DIR="$ROOT/services/runtime/tests/http_api"
 RUN_LIFECYCLE_DIR="$ROOT/services/runtime/src/run_lifecycle"
 DESIGN_PROFILE_DIR="$ROOT/services/runtime/src/design_profile"
 DESIGN_PROFILE_SERVICE_DIR="$ROOT/services/runtime/src/design_profile_service"
+ARTIFACT_ACCESS="$ROOT/services/runtime/src/artifact_access.rs"
 status=0
 
 fail() {
@@ -90,6 +91,19 @@ done < <(find "$DESIGN_PROFILE_SERVICE_DIR" -type f -name '*.rs' | sort)
 
 if grep -nE 'state\.store|\.store\.' "$HTTP_DIR/routes/design_profiles.rs"; then
   fail "PROFILE-005: DesignProfile HTTP routes must not orchestrate RuntimeStore directly"
+fi
+
+if grep -RInE --include='*.rs' 'std::fs|tokio::fs|(^|[^[:alnum:]_])fs::' "$HTTP_DIR/routes"; then
+  fail "STORAGE-001: HTTP routes must use Runtime-owned filesystem ports"
+fi
+
+if grep -nE 'std::fs|tokio::fs|(^|[^[:alnum:]_])fs::|axum|HeaderMap|StatusCode|Router' "$ARTIFACT_ACCESS"; then
+  fail "STORAGE-002: ArtifactAccess application service depends on filesystem or HTTP APIs"
+fi
+
+if grep -nE 'state\.store|\.store\.|ArtifactResolver|FileArtifactPublisher|std::fs|tokio::fs' \
+  "$HTTP_DIR/routes/artifacts.rs"; then
+  fail "STORAGE-003: Artifact HTTP route bypasses ArtifactAccessService or presenter"
 fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \

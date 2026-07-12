@@ -1,4 +1,4 @@
-mod artifact_legacy;
+mod artifact_presenter;
 mod auth;
 mod contracts;
 mod error;
@@ -9,7 +9,7 @@ mod workspace;
 
 pub use crate::runtime::recover_startup_runs;
 pub use crate::runtime::RuntimeSupervisor;
-use artifact_legacy::*;
+use artifact_presenter::*;
 use auth::*;
 pub use contracts::*;
 use error::*;
@@ -27,8 +27,7 @@ use crate::tools::sandbox::LocalWorkspaceBackend;
 use routes::artifacts::artifact_project_id_from_referer;
 
 use crate::{
-    artifact_manifest::ArtifactResolver,
-    artifact_publisher::FileArtifactPublisher,
+    artifact_access::ArtifactAccessService,
     channel_manager::ChannelManager,
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
@@ -45,6 +44,7 @@ use crate::{
     runtime::{
         RuntimeBuildSandboxProvisioner, RuntimeEditWorkspaceRestorer, RuntimeSessionLauncher,
     },
+    runtime_storage::{FileArtifactStore, FileRuntimeEvidenceStore, RuntimeEvidenceStore},
     tools::{
         control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
@@ -69,11 +69,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{
-    fs,
-    path::{Path as FsPath, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
 const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = MAX_DESIGN_SOURCE_BYTES.div_ceil(3) * 4;
@@ -118,6 +114,13 @@ pub fn router(config: RuntimeConfig) -> Router {
 pub fn router_with_state(state: AppState) -> Router {
     let design_profiles = DesignProfileService::new(state.store.clone());
     let run_lifecycle = run_lifecycle_service(&state, design_profiles.clone());
+    let artifact_access = ArtifactAccessService::new(
+        state.store.clone(),
+        Arc::new(FileArtifactStore::new(&state.config.runtime_storage_dir)),
+    );
+    let runtime_evidence: Arc<dyn RuntimeEvidenceStore> = Arc::new(FileRuntimeEvidenceStore::new(
+        &state.config.runtime_storage_dir,
+    ));
     Router::new()
         .merge(routes::system::router())
         .merge(routes::runs::router())
@@ -129,6 +132,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::publication::router())
         .merge(routes::artifacts::router())
         .merge(routes::internal::router())
+        .layer(Extension(runtime_evidence))
+        .layer(Extension(artifact_access))
         .layer(Extension(run_lifecycle))
         .layer(Extension(design_profiles))
         .with_state(state)
