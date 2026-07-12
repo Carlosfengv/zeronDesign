@@ -6,6 +6,7 @@ HTTP_DIR="$ROOT/services/runtime/src/http_api"
 FACADE="$HTTP_DIR/mod.rs"
 HTTP_TEST_ROOT="$ROOT/services/runtime/tests/http_api.rs"
 HTTP_TEST_DIR="$ROOT/services/runtime/tests/http_api"
+RUN_LIFECYCLE_DIR="$ROOT/services/runtime/src/run_lifecycle"
 status=0
 
 fail() {
@@ -38,6 +39,14 @@ done < <(find "$HTTP_DIR" -type f -name '*.rs' ! -path "$FACADE" | sort)
 
 if grep -RInE --include='*.rs' 'axum|RuntimeStore|WorkspaceBackend|StatusCode|Router' "$HTTP_DIR/contracts"; then
   fail "HTTP-003: HTTP contracts depend on transport, store, or workspace implementation types"
+fi
+
+if grep -RInE --include='*.rs' '(^|[^[:alnum:]_])axum([^[:alnum:]_]|$)' "$RUN_LIFECYCLE_DIR"; then
+  fail "APP-002: RunLifecycle application service must not depend on Axum"
+fi
+
+if grep -RInE --include='*.rs' 'std::fs|tokio::fs' "$RUN_LIFECYCLE_DIR"; then
+  fail "APP-003: RunLifecycle application service must use filesystem adapters"
 fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \

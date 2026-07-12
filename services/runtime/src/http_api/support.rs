@@ -125,27 +125,21 @@ pub(in crate::http_api) fn last_event_sequence(last_event_id: Option<&str>, run_
 }
 
 pub(crate) fn spawn_session(state: AppState, run_id: String) {
-    let task_name = format!("session/{run_id}");
-    let supervisor = state.supervisor.clone();
-    let config = state.config;
-    let store = state.store;
-    let model = state.model;
-    let _ = supervisor.spawn(task_name, false, async move {
-        let tool_executor = if let Some(run) = store.get_run(&run_id).await {
-            let workspace_root = effective_workspace_root(&config, &run.project_id);
-            if config.sandbox_backend_mode == SandboxBackendMode::PhaseAContract {
-                // remote-fs-boundary: allow-begin phase-a-workspace-bootstrap
-                let _ = fs::create_dir_all(&workspace_root);
-                // remote-fs-boundary: allow-end phase-a-workspace-bootstrap
-            }
-            control_plane_executor_for_config(&config).with_workspace_root(workspace_root)
-        } else {
-            control_plane_executor_for_config(&config)
-        };
-        let session = QuerySession::with_tool_executor(store, model, tool_executor);
-        let _ = session.submit_run(&run_id).await;
-        Ok(())
-    });
+    RuntimeSessionLauncher::new(state.config, state.store, state.model, state.supervisor)
+        .launch(run_id);
+}
+
+pub(in crate::http_api) fn run_lifecycle_service(state: &AppState) -> RunLifecycleService {
+    RunLifecycleService::new(
+        state.config.clone(),
+        state.store.clone(),
+        Arc::new(RuntimeSessionLauncher::new(
+            state.config.clone(),
+            state.store.clone(),
+            state.model.clone(),
+            state.supervisor.clone(),
+        )),
+    )
 }
 
 pub(in crate::http_api) fn require_design_source_authorization(

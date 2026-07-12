@@ -17,6 +17,7 @@ pub mod query_session;
 pub mod recovery;
 pub mod release;
 pub mod repair_loop;
+pub mod run_lifecycle;
 pub mod runtime;
 pub mod sandbox_adapter;
 pub mod sandbox_profiles;

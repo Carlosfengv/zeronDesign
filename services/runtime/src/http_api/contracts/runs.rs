@@ -57,16 +57,6 @@ pub enum PermissionDecision {
     Deny,
 }
 
-impl PermissionDecision {
-    pub(in crate::http_api) fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Ask => "ask",
-            Self::Deny => "deny",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct RunStatusResponse {
     #[serde(rename = "runId")]

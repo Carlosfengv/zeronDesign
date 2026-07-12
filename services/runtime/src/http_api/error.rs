@@ -2,6 +2,20 @@ use super::ErrorResponse;
 use axum::{http::StatusCode, Json};
 use serde_json::{json, Value};
 
+pub(super) fn run_lifecycle_error(
+    error: crate::run_lifecycle::RunLifecycleError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        crate::run_lifecycle::RunLifecycleError::NotFound(message) => not_found(message),
+        crate::run_lifecycle::RunLifecycleError::Conflict(message) => {
+            conflict_error(anyhow::anyhow!(message))
+        }
+        crate::run_lifecycle::RunLifecycleError::Internal(message) => {
+            internal_error(anyhow::anyhow!(message))
+        }
+    }
+}
+
 pub(super) fn not_found(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::NOT_FOUND, Json(ErrorResponse { error }))
 }
@@ -71,15 +85,6 @@ pub(super) fn conflict_error(error: anyhow::Error) -> (StatusCode, Json<ErrorRes
             error: error.to_string(),
         }),
     )
-}
-
-pub(super) fn run_update_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("run not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
 }
 
 pub(super) fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {

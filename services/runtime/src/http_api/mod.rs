@@ -35,22 +35,18 @@ use crate::{
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
-    profiles::edit::{self, EditIntent},
     project::resolve_built_in_template_for_init,
     public_principal::{
         PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION,
         PUBLICATION_READ_OPERATION, PUBLICATION_WRITE_OPERATION,
     },
-    query_session::QuerySession,
+    run_lifecycle::{RunLifecycleService, RunSessionLauncher},
+    runtime::RuntimeSessionLauncher,
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
-        control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
+        control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
-        sandbox::{
-            cancel_run_sandbox_resources, cleanup_staged_writes_for_run,
-            cleanup_staged_writes_for_run_backend, LocalWorkspaceBackend,
-            SandboxChannelWorkspaceBackend, WorkspaceBackend,
-        },
+        sandbox::{LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend},
     },
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
@@ -62,7 +58,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post, put},
@@ -120,6 +116,7 @@ pub fn router(config: RuntimeConfig) -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
+    let run_lifecycle = run_lifecycle_service(&state);
     Router::new()
         .merge(routes::system::router())
         .merge(routes::runs::router())
@@ -131,6 +128,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::publication::router())
         .merge(routes::artifacts::router())
         .merge(routes::internal::router())
+        .layer(Extension(run_lifecycle))
         .with_state(state)
 }
 
