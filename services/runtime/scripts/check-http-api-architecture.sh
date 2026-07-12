@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 HTTP_DIR="$ROOT/services/runtime/src/http_api"
 FACADE="$HTTP_DIR/mod.rs"
+HTTP_TEST_ROOT="$ROOT/services/runtime/tests/http_api.rs"
+HTTP_TEST_DIR="$ROOT/services/runtime/tests/http_api"
 status=0
 
 fail() {
@@ -48,6 +50,24 @@ for family in artifacts capture design_profiles design_sources internal previews
     fail "HTTP-005: route family is missing an independently discovered test module: $family"
   fi
 done
+
+if [[ ! -f "$HTTP_TEST_ROOT" ]] || (( $(wc -l < "$HTTP_TEST_ROOT") > 100 )); then
+  fail "HTTP-006: HTTP integration crate root must exist and remain below 100 lines"
+fi
+if rg -n '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" >/dev/null; then
+  fail "HTTP-006: HTTP integration crate root must not contain test bodies"
+fi
+while IFS= read -r test_module; do
+  lines="$(wc -l < "$test_module" | tr -d ' ')"
+  if (( lines > 800 )); then
+    fail "HTTP-007: HTTP test module exceeds 800 lines: ${test_module#$ROOT/} ($lines)"
+  fi
+done < <(find "$HTTP_TEST_DIR" -type f -name '*.rs' | sort)
+
+test_count="$(rg -n '^#\[(tokio::test|test)' "$HTTP_TEST_ROOT" "$HTTP_TEST_DIR" -g '*.rs' | wc -l | tr -d ' ')"
+if (( test_count < 86 )); then
+  fail "HTTP-008: Cargo-discovered HTTP test inventory fell below the frozen 86-test baseline: $test_count"
+fi
 
 if [[ "$status" -ne 0 ]]; then
   exit "$status"
