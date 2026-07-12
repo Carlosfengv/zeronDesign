@@ -84,6 +84,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
         turns: Arc::new(Mutex::new(HashMap::new())),
     };
     let state = AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: config.clone(),
         store: store.clone(),
         model: Arc::new(model),

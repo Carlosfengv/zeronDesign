@@ -342,7 +342,7 @@ export const PromotePreviewRequestSchema = z.object({
 export const PromotePreviewResponseSchema = PreviewCurrentResponseSchema;
 
 export const HealthResponseSchema = z.object({
-  status: z.literal("ready"),
+  status: z.enum(["ready", "not_ready"]),
 });
 
 export const UpsertProjectAccessRequestSchema = z.object({

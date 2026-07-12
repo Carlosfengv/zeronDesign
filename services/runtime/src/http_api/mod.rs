@@ -3,19 +3,24 @@ mod contracts;
 mod error;
 mod profile_support;
 mod routes;
-mod startup;
 mod support;
 mod workspace;
 
+pub use crate::runtime::recover_startup_runs;
+pub use crate::runtime::RuntimeSupervisor;
 use auth::*;
 pub use contracts::*;
 use error::*;
 use profile_support::*;
 use routes::runs::start::validate_design_profile_template_availability;
-pub use startup::recover_startup_runs;
 use support::*;
 use workspace::*;
 
+pub(crate) use support::spawn_session as spawn_supervised_session;
+pub(crate) use workspace::effective_workspace_root as resolved_workspace_root;
+
+#[cfg(test)]
+use crate::project::ProjectInitWorkspaceTransaction;
 #[cfg(test)]
 use routes::artifacts::artifact_project_id_from_referer;
 
@@ -28,13 +33,9 @@ use crate::{
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
     profiles::edit::{self, EditIntent},
-    project::{
-        audit_project_template_compatibility, resolve_built_in_template_for_init,
-        ProjectInitWorkspaceTransaction,
-    },
+    project::resolve_built_in_template_for_init,
     public_principal::{PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION},
     query_session::QuerySession,
-    recovery::{recover_interrupted_runs, RecoveryOutcome},
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
         control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
@@ -80,9 +81,16 @@ pub struct AppState {
     pub config: RuntimeConfig,
     pub store: RuntimeStore,
     pub model: Arc<dyn ModelClient>,
+    pub supervisor: RuntimeSupervisor,
 }
 
 pub fn app_state(config: RuntimeConfig) -> AppState {
+    let supervisor = RuntimeSupervisor::new();
+    supervisor.mark_recovered();
+    app_state_with_supervisor(config, supervisor)
+}
+
+pub fn app_state_with_supervisor(config: RuntimeConfig, supervisor: RuntimeSupervisor) -> AppState {
     AppState {
         model: Arc::new(
             model_client_from_config(&config)
@@ -90,13 +98,15 @@ pub fn app_state(config: RuntimeConfig) -> AppState {
         ),
         store: RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone()),
         config,
+        supervisor,
     }
 }
 
 pub async fn recovered_router(config: RuntimeConfig) -> anyhow::Result<Router> {
-    Ok(router_with_state(
-        recover_startup_runs(app_state(config)).await?,
-    ))
+    let runtime = crate::runtime::RuntimeBootstrap::new(config)
+        .recover()
+        .await?;
+    Ok(router_with_state(runtime.state))
 }
 
 pub fn router(config: RuntimeConfig) -> Router {
@@ -177,13 +187,15 @@ mod tests {
             .unwrap();
         drop(ctx);
 
-        let recovered = recover_startup_runs(AppState {
+        let recovered = crate::runtime::TestRuntimeBuilder::recover_state(AppState {
+            supervisor: RuntimeSupervisor::new(),
             store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
             model: Arc::new(crate::model_gateway::EmptyModelClient),
             config: config.clone(),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .state;
         let state = recovered
             .store
             .get_project_runtime_state("startup-recovery-project")
@@ -229,7 +241,8 @@ mod tests {
             .await
             .unwrap();
 
-        let error = match recover_startup_runs(AppState {
+        let error = match crate::runtime::TestRuntimeBuilder::recover_state(AppState {
+            supervisor: RuntimeSupervisor::new(),
             store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
             model: Arc::new(crate::model_gateway::EmptyModelClient),
             config,

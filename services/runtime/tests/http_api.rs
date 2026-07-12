@@ -795,6 +795,7 @@ fn design_profile_request_for_scope(
 #[tokio::test]
 async fn root_route_returns_runtime_index_for_browser_access() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -818,6 +819,7 @@ async fn root_route_returns_runtime_index_for_browser_access() {
 async fn design_profile_api_create_bind_and_resolve_for_runs() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1121,6 +1123,7 @@ async fn design_profile_api_create_bind_and_resolve_for_runs() {
 async fn required_unsupported_extended_token_blocks_build_with_capability_state() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1237,6 +1240,7 @@ async fn required_unsupported_extended_token_blocks_build_with_capability_state(
 async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1325,6 +1329,7 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
 async fn start_run_resolves_design_profile_by_workspace_then_project_precedence() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1475,6 +1480,7 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
 async fn start_run_resolves_design_profile_by_organization_fallback() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1545,6 +1551,7 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
 #[tokio::test]
 async fn start_run_with_missing_explicit_design_profile_returns_not_found() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1600,6 +1607,7 @@ async fn start_run_design_profile_template_conflict_enters_needs_user_input() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1680,6 +1688,7 @@ async fn start_run_design_profile_template_conflict_enters_needs_user_input() {
 async fn continue_edit_run_design_profile_conflict_enters_needs_user_input() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1790,6 +1799,7 @@ async fn start_run_and_stream_events() {
         json!({ "status": "completed", "summary": "Brief ready" }),
     )])]);
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(model),
@@ -1831,7 +1841,7 @@ async fn start_run_and_stream_events() {
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
 
-    for _ in 0..20 {
+    for _ in 0..200 {
         if store
             .get_run(&run_id)
             .await
@@ -1865,6 +1875,7 @@ async fn start_run_and_stream_events() {
 #[tokio::test]
 async fn start_run_rejects_empty_contract_identifiers() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1908,6 +1919,7 @@ async fn continue_run_rejects_empty_user_message() {
         )
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -1955,6 +1967,7 @@ async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_a
         )]),
     ]);
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(model),
@@ -2040,6 +2053,7 @@ async fn start_run_uses_configured_agent_model_for_real_provider_runs() {
     let mut config = RuntimeConfig::from_env();
     config.agent_model = "deepseek-chat".to_string();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -2134,6 +2148,7 @@ async fn start_run_input_context_binds_existing_sandbox() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2193,6 +2208,7 @@ async fn start_build_run_auto_provisions_sandbox_workspace_from_brief() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2284,6 +2300,7 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2420,6 +2437,7 @@ async fn sandbox_binding_is_exclusive_until_run_terminal() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2573,6 +2591,7 @@ async fn start_run_input_context_creates_child_run_with_findings() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2666,6 +2685,7 @@ async fn start_repair_run_requires_finding_ids() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2768,6 +2788,7 @@ async fn start_repair_run_can_target_review_child_finding() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2833,6 +2854,7 @@ async fn start_run_rejects_unknown_parent_or_sandbox_binding() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2946,6 +2968,7 @@ async fn start_run_rejects_unknown_parent_or_sandbox_binding() {
 async fn start_run_rejects_sandbox_phase_without_workspace_binding() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -2995,6 +3018,7 @@ async fn start_run_rejects_sandbox_phase_before_binding_ready() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3079,6 +3103,7 @@ async fn start_run_rejects_child_workspace_binding_mismatch() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3162,6 +3187,7 @@ async fn stream_events_reconnect_uses_last_event_id_without_duplicates() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3210,6 +3236,7 @@ async fn stream_events_replays_then_fans_out_without_duplicates() {
             .unwrap();
     }
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3312,6 +3339,7 @@ async fn stream_events_recovered_active_run_uses_next_persisted_sequence() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: recovered_store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3356,6 +3384,7 @@ async fn stream_events_terminal_status_without_terminal_event_waits_for_terminal
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3415,6 +3444,7 @@ async fn append_event_does_not_broadcast_when_run_log_append_fails() {
         )
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3449,6 +3479,7 @@ async fn append_event_does_not_broadcast_when_run_log_append_fails() {
 #[tokio::test]
 async fn stream_events_rejects_unknown_run() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3504,6 +3535,7 @@ async fn project_conversation_returns_user_visible_items_by_default() {
         )
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3598,6 +3630,7 @@ async fn cancel_run_marks_terminal_cancelled() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3665,6 +3698,7 @@ async fn cancel_run_cleans_staged_chunk_sessions_for_run() {
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace_root;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3706,6 +3740,7 @@ async fn cancel_run_rejects_terminal_run_without_reopening_it() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -3752,6 +3787,7 @@ async fn continue_run_records_user_message_and_resumes() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -3776,16 +3812,11 @@ async fn continue_run_records_user_message_and_resumes() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    for _ in 0..20 {
-        if store
-            .get_run(&run.id)
-            .await
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    assert!(
+        wait_for_terminal_with_timeout(&store, &run.id, 10).await,
+        "run did not become terminal; status={:?}",
+        store.get_run(&run.id).await.map(|run| run.status)
+    );
     let conversation = store.conversation_items("project-1").await;
     assert!(conversation.iter().any(|item| item.text == "Continue"));
     assert_eq!(
@@ -3811,6 +3842,7 @@ async fn continue_run_rejects_terminal_run_without_recording_message() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -3861,6 +3893,7 @@ async fn continue_run_on_running_run_queues_message_without_reentrant_session() 
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -3930,7 +3963,9 @@ async fn resolve_permission_allow_resumes_run() {
     let permission = store
         .create_permission_request("project-1", &run.id, "shell.run")
         .await;
+    let supervisor = http_api::RuntimeSupervisor::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: supervisor.clone(),
         config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -3955,16 +3990,11 @@ async fn resolve_permission_allow_resumes_run() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    for _ in 0..20 {
-        if store
-            .get_run(&run.id)
-            .await
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    assert!(
+        wait_for_terminal_with_timeout(&store, &run.id, 10).await,
+        "supervisor readiness: {:?}",
+        supervisor.readiness()
+    );
     assert_eq!(
         store.get_run(&run.id).await.unwrap().status,
         AgentRunStatus::Completed
@@ -3998,7 +4028,9 @@ async fn resolve_permission_after_restart_resumes_same_run() {
         .await;
 
     let reloaded_store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+    let supervisor = http_api::RuntimeSupervisor::new();
     let app = http_api::router_with_state(AppState {
+        supervisor: supervisor.clone(),
         config: phase_a_contract_config(),
         store: reloaded_store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -4023,16 +4055,11 @@ async fn resolve_permission_after_restart_resumes_same_run() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    for _ in 0..20 {
-        if reloaded_store
-            .get_run(&run.id)
-            .await
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    assert!(
+        wait_for_terminal_with_timeout(&reloaded_store, &run.id, 10).await,
+        "supervisor readiness: {:?}",
+        supervisor.readiness()
+    );
     assert_eq!(
         reloaded_store.get_run(&run.id).await.unwrap().status,
         AgentRunStatus::Completed
@@ -4067,6 +4094,7 @@ async fn resolve_permission_ask_keeps_run_waiting_for_user_input() {
         .create_permission_request("project-1", &run.id, "package.install")
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -4142,6 +4170,7 @@ async fn resolve_permission_deny_blocks_run_and_writes_conversation_item() {
         .create_permission_request("project-1", &run.id, "shell.run")
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4200,6 +4229,7 @@ async fn resolve_permission_rejects_expired_terminal_run_permission() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
@@ -4269,6 +4299,7 @@ async fn preview_current_returns_promoted_version_contract() {
     .await
     .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4408,6 +4439,7 @@ async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
     config.workspace_root = workspace;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4570,6 +4602,7 @@ async fn project_runtime_state_reads_phase_a_global_workspace_lifecycle_state() 
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
     config.workspace_root = workspace;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4715,6 +4748,7 @@ async fn project_runtime_state_reads_kubernetes_workspace_channel_lifecycle_stat
     let mut config = RuntimeConfig::from_env();
     config.sandbox_backend_mode = SandboxBackendMode::Kubernetes;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4808,6 +4842,7 @@ async fn start_edit_rejects_stale_base_version() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -4919,6 +4954,7 @@ async fn start_edit_waits_for_continue_before_spawning_agent() {
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(model.clone()),
@@ -4991,6 +5027,7 @@ async fn start_mutable_run_rejects_existing_project_mutation() {
         .await
         .unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -5204,6 +5241,7 @@ async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(model),
@@ -5472,6 +5510,7 @@ async fn phase_a_public_run_uses_project_scoped_workspace_root() {
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(model),
@@ -5629,6 +5668,7 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(model),
@@ -5773,6 +5813,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
         .with_streaming(env_flag("MODEL_STREAMING"))
         .with_strict_tools(env_flag("MODEL_STRICT_TOOLS"));
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(model),
@@ -6191,6 +6232,7 @@ async fn preview_version_returns_pinned_project_version_contract() {
         )
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6309,6 +6351,7 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
     config.public_principal_public_key_files = vec![public_key_path];
     config.public_principal_max_ttl_seconds = 60;
     let state = AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6457,6 +6500,7 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
     let mut config = phase_a_contract_config();
     config.internal_admin_token = Some("admin-project-access-token".to_string());
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6514,6 +6558,7 @@ async fn release_evidence_and_sandbox_release_routes_fail_closed_without_admin_i
     let mut config = phase_a_contract_config();
     config.internal_admin_token = Some("release-evidence-admin".to_string());
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6574,6 +6619,7 @@ async fn production_initial_run_requires_registered_project_access() {
     config.public_principal_public_key_files = vec![public_key_path];
     config.validate_startup().unwrap();
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6661,6 +6707,7 @@ async fn preview_version_rejects_cross_project_version_lookup() {
         )
         .await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6688,6 +6735,7 @@ async fn preview_version_rejects_cross_project_version_lookup() {
 #[tokio::test]
 async fn product_promote_http_route_is_not_exposed() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6718,6 +6766,7 @@ async fn product_promote_http_route_is_not_exposed() {
 #[tokio::test]
 async fn internal_template_build_route_is_disabled_by_default() {
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config: RuntimeConfig::from_env(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6759,6 +6808,7 @@ async fn internal_template_build_route_requires_service_authorization_when_enabl
     config.enable_internal_template_build_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6822,6 +6872,7 @@ async fn internal_promote_route_requires_service_authorization_when_enabled() {
     config.enable_internal_promote_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6884,6 +6935,7 @@ async fn internal_promote_route_promotes_candidate_with_audit_when_authorized() 
     config.enable_internal_promote_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
@@ -6963,6 +7015,7 @@ async fn artifact_serving_supports_next_export_routes_and_assets() {
     config.runtime_storage_dir = workspace.join("runtime-storage");
     let store = install_immutable_artifact(&config, "docs-project", &project_root).await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),
@@ -7049,6 +7102,7 @@ async fn artifact_serving_supports_phase_a_global_workspace_root() {
     config.runtime_storage_dir = workspace.join("runtime-storage");
     let store = install_immutable_artifact(&config, "phase-a-project", &project_root).await;
     let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store,
         model: Arc::new(MockModelClient::new(vec![])),

@@ -947,6 +947,7 @@ describe("shared schemas", () => {
       }).status,
     ).toBe("promoted");
     expect(HealthResponseSchema.parse({ status: "ready" }).status).toBe("ready");
+    expect(HealthResponseSchema.parse({ status: "not_ready" }).status).toBe("not_ready");
     expect(ErrorResponseSchema.parse({ error: "run not found: run-missing" }).error).toContain(
       "run not found",
     );

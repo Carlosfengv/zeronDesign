@@ -874,13 +874,17 @@ async fn startup_recovery_spawns_run_with_checkpoint_message_window() {
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
     config.workspace_channel_tls_mode = WorkspaceChannelTlsMode::DebugLoopback;
     let state = AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
         config,
         store: reloaded_store.clone(),
         model: Arc::new(model),
     };
 
-    http_api::recover_startup_runs(state).await.unwrap();
-    for _ in 0..50 {
+    let _runtime = anydesign_runtime::runtime::TestRuntimeBuilder::recover_state(state)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         if reloaded_store
             .get_run(&run.id)
             .await
@@ -888,7 +892,7 @@ async fn startup_recovery_spawns_run_with_checkpoint_message_window() {
         {
             break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     assert_eq!(

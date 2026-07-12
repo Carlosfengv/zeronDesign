@@ -84,7 +84,7 @@ These routes are stable for Phase B consumption.
 
 | Method | Path | Request | Response | Notes |
 |---|---|---|---|---|
-| `GET` | `/health` | none | `HealthResponse` | Returns `{ "status": "ready" }` when config loads |
+| `GET` | `/health` | none | `HealthResponse` | Returns `200 { "status": "ready" }` only after recovery; returns `503 { "status": "not_ready" }` during shutdown or after a fatal supervised task |
 | `POST` | `/runs` | `StartRunRequest` | `StartRunResponse` | Starts brief/build/review/repair/edit/export runs |
 | `POST` | `/runs/{runId}/continue` | `ContinueRunRequest` | `ContinueRunResponse` | Adds user input or resumes a paused run |
 | `POST` | `/runs/{runId}/cancel` | none | `CancelRunResponse` | Terminal cancellation; completed tool results remain persisted |
