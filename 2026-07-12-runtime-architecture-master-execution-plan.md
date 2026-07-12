@@ -109,8 +109,8 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | G5 | complete | [PR-06](https://github.com/Carlosfengv/zeronDesign/pull/6) | `13f10f5` | `services/runtime/evidence/publication-control-plane-g5.md` |
 | G6 | complete | [PR-07](https://github.com/Carlosfengv/zeronDesign/pull/7) | `aad4022` | `services/runtime/evidence/work-runtime-kubernetes-g6.md` |
 | G7 | complete | [PR-08](https://github.com/Carlosfengv/zeronDesign/pull/8) | `c0bff9f` | `services/runtime/evidence/publish-ingress-g7.md` |
-| G8 | in_progress | PR-09 | 待填写 | `services/runtime/evidence/blue-green-rollback-gc-g8.md` |
-| G9 | pending | PR-10+ | 待填写 | 待填写 |
+| G8 | complete | [PR-09](https://github.com/Carlosfengv/zeronDesign/pull/9) | `5e38242` | `services/runtime/evidence/blue-green-rollback-gc-g8.md` |
+| G9 | in_progress | PR-10+ | 待填写 | 待填写 |
 
 状态只使用：`pending`、`in_progress`、`blocked`、`complete`。不得仅因代码已写完就标记
 `complete`；对应测试、架构门禁、真实环境证据和 PR 合并必须全部完成。
