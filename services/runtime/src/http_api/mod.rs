@@ -1,8 +1,15 @@
+mod contracts;
+mod error;
+mod routes;
+
+pub use contracts::{ErrorResponse, HealthResponse, VersionResponse};
+use error::*;
+
 use crate::{
     artifact_publisher::{safe_segment, FileArtifactPublisher},
     channel_manager::ChannelManager,
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
-    conversation::{RuntimeStore, SequencedAgentEvent},
+    conversation::RuntimeStore,
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
@@ -36,43 +43,23 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        Html, Response,
-    },
+    response::Response,
     routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::Utc;
-use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeSet, VecDeque},
-    convert::Infallible,
+    collections::BTreeSet,
     fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
-use tokio::sync::broadcast;
 
 const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
 const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = MAX_DESIGN_SOURCE_BYTES.div_ceil(3) * 4;
-
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VersionResponse {
-    pub service: &'static str,
-    pub repository_commit: String,
-    pub repository_dirty: bool,
-    pub image_ref: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -192,13 +179,11 @@ pub fn router(config: RuntimeConfig) -> Router {
 
 pub fn router_with_state(state: AppState) -> Router {
     Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/version", get(version))
+        .merge(routes::system::router())
         .route("/runs", post(start_run))
         .route("/runs/{run_id}/continue", post(continue_run))
         .route("/runs/{run_id}/cancel", post(cancel_run))
-        .route("/runs/{run_id}/events", get(stream_run_events))
+        .merge(routes::run_events::router())
         .route(
             "/design-source-artifacts",
             post(create_design_source_artifact)
@@ -454,56 +439,6 @@ async fn proxy_candidate_preview(
         .map_err(|error| internal_error(anyhow::anyhow!(error)))
 }
 
-async fn root(State(state): State<AppState>) -> Html<String> {
-    let base = format!("http://{}:{}", state.config.host, state.config.port);
-    Html(format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AnyDesign Runtime</title>
-  <style>
-    :root {{ color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    body {{ margin: 0; padding: 40px; background: #0f172a; color: #e5e7eb; }}
-    main {{ max-width: 880px; margin: 0 auto; }}
-    h1 {{ margin: 0 0 8px; font-size: 32px; }}
-    p {{ color: #a5b4fc; line-height: 1.6; }}
-    a {{ color: #67e8f9; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 24px; }}
-    .card {{ border: 1px solid #334155; border-radius: 8px; padding: 16px; background: #111827; }}
-    code {{ background: #1f2937; border-radius: 4px; padding: 2px 5px; color: #f8fafc; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>AnyDesign Runtime</h1>
-    <p>Status: <code>ready</code>. This root page is a local runtime index for browser checks.</p>
-    <div class="grid">
-      <div class="card"><strong>Health</strong><p><a href="{base}/health">{base}/health</a></p></div>
-      <div class="card"><strong>Website artifact</strong><p><a href="{base}/artifacts/zeron-real-website-1783303319260/current">{base}/artifacts/zeron-real-website-1783303319260/current</a></p></div>
-      <div class="card"><strong>Docs artifact</strong><p><a href="{base}/artifacts/zeron-real-docs-1783303417188/current/docs">{base}/artifacts/zeron-real-docs-1783303417188/current/docs</a></p></div>
-      <div class="card"><strong>Run stream example</strong><p><code>{base}/runs/&lt;runId&gt;/events</code></p></div>
-    </div>
-  </main>
-</body>
-</html>"#
-    ))
-}
-
-async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ready" })
-}
-
-async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
-    Json(VersionResponse {
-        service: "anydesign-runtime",
-        repository_commit: state.config.repository_commit.clone(),
-        repository_dirty: state.config.repository_dirty,
-        image_ref: state.config.runtime_image_ref.clone(),
-    })
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartRunRequest {
@@ -716,11 +651,6 @@ pub struct DesignProfileDiffChange {
     pub before: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2932,99 +2862,6 @@ async fn resolve_permission(
     }))
 }
 
-async fn stream_run_events(
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<
-    Sse<impl futures::Stream<Item = Result<Event, Infallible>>>,
-    (StatusCode, Json<ErrorResponse>),
-> {
-    state
-        .store
-        .get_run(&run_id)
-        .await
-        .ok_or_else(|| not_found(format!("run not found: {run_id}")))?;
-    let start_after = last_event_sequence(
-        headers
-            .get("last-event-id")
-            .and_then(|value| value.to_str().ok()),
-        &run_id,
-    );
-    let live_events = state.store.subscribe_events(&run_id).await;
-    let events = state.store.events(&run_id).await;
-    let history_len = events.len();
-    let replay_events = events
-        .into_iter()
-        .enumerate()
-        .filter_map(move |(index, event)| {
-            let sequence = index + 1;
-            (sequence > start_after).then_some(SequencedAgentEvent { sequence, event })
-        })
-        .collect::<VecDeque<_>>();
-    let stream = stream::unfold(
-        RunEventsSseState {
-            run_id,
-            replay_events,
-            live_events,
-            min_live_sequence: history_len.max(start_after),
-            finished: false,
-        },
-        next_run_event_sse,
-    );
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default().text("heartbeat")))
-}
-
-struct RunEventsSseState {
-    run_id: String,
-    replay_events: VecDeque<SequencedAgentEvent>,
-    live_events: Option<broadcast::Receiver<SequencedAgentEvent>>,
-    min_live_sequence: usize,
-    finished: bool,
-}
-
-async fn next_run_event_sse(
-    mut state: RunEventsSseState,
-) -> Option<(Result<Event, Infallible>, RunEventsSseState)> {
-    loop {
-        if state.finished {
-            return None;
-        }
-        if let Some(sequenced) = state.replay_events.pop_front() {
-            let is_terminal = sequenced.event.is_run_completed();
-            let event = encode_run_event_sse(&state.run_id, sequenced.sequence, &sequenced.event);
-            if is_terminal {
-                state.finished = true;
-                state.live_events = None;
-            }
-            return Some((Ok(event), state));
-        }
-        let receiver = state.live_events.as_mut()?;
-        let sequenced = match receiver.recv().await {
-            Ok(sequenced) => sequenced,
-            Err(broadcast::error::RecvError::Lagged(_))
-            | Err(broadcast::error::RecvError::Closed) => return None,
-        };
-        if sequenced.sequence <= state.min_live_sequence {
-            continue;
-        }
-        state.min_live_sequence = sequenced.sequence;
-        let is_terminal = sequenced.event.is_run_completed();
-        let event = encode_run_event_sse(&state.run_id, sequenced.sequence, &sequenced.event);
-        if is_terminal {
-            state.finished = true;
-            state.live_events = None;
-        }
-        return Some((Ok(event), state));
-    }
-}
-
-fn encode_run_event_sse(run_id: &str, sequence: usize, event: &AgentEvent) -> Event {
-    Event::default()
-        .id(format!("{run_id}/{sequence}"))
-        .data(serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string()))
-}
-
 async fn project_conversation(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -4719,57 +4556,6 @@ fn spawn_session(state: AppState, run_id: String) {
     });
 }
 
-fn not_found(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse { error }))
-}
-
-fn bad_request(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
-}
-
-fn unauthorized(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error }))
-}
-
-fn forbidden(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::FORBIDDEN, Json(ErrorResponse { error }))
-}
-
-fn error_response_as_value(error: (StatusCode, Json<ErrorResponse>)) -> (StatusCode, Json<Value>) {
-    (error.0, Json(json!({ "error": error.1.error })))
-}
-
-fn sandbox_binding_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("sandbox binding not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
-}
-
-fn design_profile_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("design profile not found") {
-        not_found(message)
-    } else if message.contains("invalid design profile") {
-        bad_request(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
-}
-
-fn design_source_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("design source artifact not found") {
-        not_found(message)
-    } else if message.contains("invalid design source artifact") {
-        bad_request(message)
-    } else {
-        internal_error(anyhow::anyhow!(message))
-    }
-}
-
 fn require_design_source_authorization(
     config: &RuntimeConfig,
     headers: &HeaderMap,
@@ -4825,42 +4611,6 @@ async fn validate_design_profile_source_reference(
         .await
         .map_err(design_source_error)?;
     Ok(())
-}
-
-fn repair_run_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("parent run not found") || message.contains("review finding not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
-}
-
-fn conflict_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::CONFLICT,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
-}
-
-fn run_update_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("run not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
-}
-
-fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
 }
 
 #[cfg(test)]

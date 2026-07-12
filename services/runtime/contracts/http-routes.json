@@ -1,6 +1,6 @@
 {
   "schemaVersion": "runtime-http-routes@1",
-  "source": "src/http_api.rs",
+  "source": "src/http_api/{mod.rs,routes/*.rs}",
   "baselineCommit": "96f9f92c4abdee469f7bd943aa317e8091f482f8",
   "baselineTestCount": 70,
   "routes": [

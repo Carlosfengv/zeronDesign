@@ -2,7 +2,9 @@ use super::*;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
-const HTTP_API_SOURCE: &str = include_str!("../../src/http_api.rs");
+const HTTP_API_SOURCE: &str = include_str!("../../src/http_api/mod.rs");
+const RUN_EVENTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/run_events.rs");
+const SYSTEM_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/system.rs");
 const ROUTE_MANIFEST_SOURCE: &str = include_str!("../../contracts/http-routes.json");
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +128,8 @@ fn executable_route_manifest_matches_every_router_declaration() {
             "pub fn capture_router_with_state",
         ),
     );
+    actual.extend(declared_routes("public", RUN_EVENTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", SYSTEM_ROUTES_SOURCE));
     actual.extend(declared_routes(
         "capture",
         router_section(
@@ -151,7 +155,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
 fn route_manifest_metadata_is_complete_and_fail_closed() {
     let manifest = manifest();
     assert_eq!(manifest.schema_version, "runtime-http-routes@1");
-    assert_eq!(manifest.source, "src/http_api.rs");
+    assert_eq!(manifest.source, "src/http_api/{mod.rs,routes/*.rs}");
     assert_eq!(manifest.baseline_test_count, 70);
     assert_eq!(manifest.baseline_commit.len(), 40);
     assert!(manifest.routes.len() >= 40);
