@@ -1,5 +1,6 @@
 pub mod agent_hooks;
 pub mod agent_loop;
+pub mod artifact_access;
 pub mod artifact_manifest;
 pub mod artifact_publisher;
 pub mod channel_manager;
@@ -21,6 +22,7 @@ pub mod release;
 pub mod repair_loop;
 pub mod run_lifecycle;
 pub mod runtime;
+pub mod runtime_storage;
 pub mod sandbox_adapter;
 pub mod sandbox_profiles;
 pub mod templates;

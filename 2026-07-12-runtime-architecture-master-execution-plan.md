@@ -110,7 +110,7 @@ G0 -> G1 -> G2 -> G5 -> G6 -> G7 -> G8
 | G6 | complete | [PR-07](https://github.com/Carlosfengv/zeronDesign/pull/7) | `aad4022` | `services/runtime/evidence/work-runtime-kubernetes-g6.md` |
 | G7 | complete | [PR-08](https://github.com/Carlosfengv/zeronDesign/pull/8) | `c0bff9f` | `services/runtime/evidence/publish-ingress-g7.md` |
 | G8 | complete | [PR-09](https://github.com/Carlosfengv/zeronDesign/pull/9) | `5e38242` | `services/runtime/evidence/blue-green-rollback-gc-g8.md` |
-| G9 | in_progress | PR-10+ | 待填写 | `services/runtime/evidence/http-api-test-split-g9a.md`, `services/runtime/evidence/run-lifecycle-mutations-g9b1.md`, `services/runtime/evidence/run-lifecycle-start-g9b2.md`, `services/runtime/evidence/design-profile-pure-domain-g9c1.md`, `services/runtime/evidence/design-profile-service-g9c2.md` |
+| G9 | in_progress | PR-10+ | 待填写 | `services/runtime/evidence/http-api-test-split-g9a.md`, `services/runtime/evidence/run-lifecycle-mutations-g9b1.md`, `services/runtime/evidence/run-lifecycle-start-g9b2.md`, `services/runtime/evidence/design-profile-pure-domain-g9c1.md`, `services/runtime/evidence/design-profile-service-g9c2.md`, `services/runtime/evidence/artifact-runtime-storage-boundary-g9d1.md` |
 
 状态只使用：`pending`、`in_progress`、`blocked`、`complete`。不得仅因代码已写完就标记
 `complete`；对应测试、架构门禁、真实环境证据和 PR 合并必须全部完成。
