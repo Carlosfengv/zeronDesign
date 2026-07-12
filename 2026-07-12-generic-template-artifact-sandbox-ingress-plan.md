@@ -416,13 +416,18 @@ pub struct ReleasePackagingRecord {
 
 ```text
 sha256(
-  artifactManifestHash
-  + runtimeManifestHash
-  + baseImageDigest
-  + packagerVersion
-  + scanPolicyVersion
+  lengthPrefix(artifactManifestHash)
+  + lengthPrefix(runtimeManifestHash)
+  + lengthPrefix(baseImageDigest)
+  + lengthPrefix(packagerVersion)
+  + lengthPrefix(scanPolicyVersion)
 )
 ```
+
+`lengthPrefix(value)` 固定为 8-byte big-endian 字节长度加 UTF-8 bytes，避免可变长版本字符串产生
+拼接歧义。Registry repository 不参与内容身份；但同一幂等键再次请求时，project/version/run、模板、
+source snapshot、RuntimeProfile 和 repository 必须与首次绑定完全一致，否则返回 integrity conflict，
+不得把既有 PackagingRecord 静默重绑到另一份 provenance 或 Registry。
 
 状态：
 

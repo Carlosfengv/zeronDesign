@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerondesign.dev/contracts/release-packaging-v1.schema.json",
+  "title": "AnyDesign ReleasePackagingRecord v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "idempotencyKey", "projectId", "releaseId", "artifactManifestHash", "runtimeManifestHash", "baseImageDigest", "packagerVersion", "registryRepository", "builtImageDigest", "pushedImageDigest", "sbomDigest", "provenanceDigest", "signatureIdentity", "signatureDigest", "scanPolicyVersion", "scanEvidence", "status", "attempts", "lastError", "createdAt", "updatedAt"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^packaging-[0-9a-f]{32}$" },
+    "idempotencyKey": { "$ref": "#/$defs/hash" },
+    "projectId": { "type": "string", "minLength": 1 },
+    "releaseId": { "type": "string", "pattern": "^release-[0-9a-f]{32}$" },
+    "artifactManifestHash": { "$ref": "#/$defs/hash" },
+    "runtimeManifestHash": { "$ref": "#/$defs/hash" },
+    "baseImageDigest": { "$ref": "#/$defs/digest" },
+    "packagerVersion": { "type": "string", "minLength": 1 },
+    "registryRepository": { "type": "string", "minLength": 1 },
+    "builtImageDigest": { "$ref": "#/$defs/nullableDigest" },
+    "pushedImageDigest": { "$ref": "#/$defs/nullableDigest" },
+    "sbomDigest": { "$ref": "#/$defs/nullableDigest" },
+    "provenanceDigest": { "$ref": "#/$defs/nullableDigest" },
+    "signatureIdentity": { "type": ["string", "null"] },
+    "signatureDigest": { "$ref": "#/$defs/nullableDigest" },
+    "scanPolicyVersion": { "type": "string", "minLength": 1 },
+    "scanEvidence": { "type": ["object", "null"] },
+    "status": { "enum": ["prepared", "building", "pushed", "scanning", "signing", "validated", "failed", "reconcile_required"] },
+    "attempts": { "type": "integer", "minimum": 0 },
+    "lastError": { "type": ["string", "null"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "nullableDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] }
+  }
+}

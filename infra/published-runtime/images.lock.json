@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "published-runtime-images@1",
+  "images": {
+    "registry": {
+      "source": "registry:3",
+      "digest": "sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33"
+    },
+    "buildkit": {
+      "source": "moby/buildkit:buildx-stable-1",
+      "digest": "sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f"
+    },
+    "staticWebBase": {
+      "source": "nginx:stable-alpine",
+      "platform": "linux/arm64/v8",
+      "digest": "sha256:53cadfbebeffa241f12333cf8a63f3c6553eedad8b9f8296de89e32c566a5caa",
+      "localAcceptanceMirror": "host.docker.internal:5001/anydesign/trusted/nginx"
+    }
+  },
+  "tools": {
+    "syft": {
+      "version": "1.46.0",
+      "darwinArm64Artifact": "syft_1.46.0_darwin_arm64.tar.gz",
+      "darwinArm64Sha256": "cd4e2c40e075684a5746d8959f76b6572bb2d2dda8cf6877dbfff1cc0baeea01"
+    },
+    "trivy": {
+      "version": "0.72.0",
+      "darwinArm64Artifact": "trivy_0.72.0_macOS-ARM64.tar.gz",
+      "darwinArm64Sha256": "88f208680dc05da2b459e19b4f5aa2b4dc7c2117892ba4aab2ae63baba330016"
+    },
+    "cosign": {
+      "version": "3.1.1",
+      "darwinArm64Artifact": "cosign-darwin-arm64",
+      "darwinArm64Sha256": "94b42a9e697be95675f6160ab031a9a5f1ec1e646d6f648d7b2f5cd59ececbc5"
+    }
+  }
+}

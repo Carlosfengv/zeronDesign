@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerondesign.dev/contracts/work-release-v1.schema.json",
+  "title": "AnyDesign WorkRelease v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "projectId", "versionId", "runId", "templateId", "templateVersion", "artifactManifestHash", "runtimeManifestHash", "sourceSnapshotUri", "runtimeProfileId", "runtimeImageRef", "runtimeImageDigest", "status", "createdAt", "updatedAt"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^release-[0-9a-f]{32}$" },
+    "projectId": { "type": "string", "minLength": 1 },
+    "versionId": { "type": "string", "minLength": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "templateId": { "type": "string", "minLength": 1 },
+    "templateVersion": { "type": "string", "minLength": 1 },
+    "artifactManifestHash": { "$ref": "#/$defs/hash" },
+    "runtimeManifestHash": { "$ref": "#/$defs/hash" },
+    "sourceSnapshotUri": { "type": "string", "minLength": 1 },
+    "runtimeProfileId": { "const": "static-web-v1" },
+    "runtimeImageRef": { "type": ["string", "null"] },
+    "runtimeImageDigest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+    "status": { "enum": ["packaging", "packaged", "validated", "failed", "garbage_collectable", "garbage_collected"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

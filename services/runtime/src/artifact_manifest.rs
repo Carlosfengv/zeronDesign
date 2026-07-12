@@ -268,6 +268,27 @@ impl ArtifactResolver {
         Ok(None)
     }
 
+    pub fn verify_all(&self) -> Result<Vec<ResolvedArtifact>> {
+        let mut verified = Vec::with_capacity(self.manifest.files.len());
+        for entry in &self.manifest.files {
+            let artifact = self.resolve(&entry.path)?.ok_or_else(|| {
+                anyhow!("artifact manifest file cannot be resolved: {}", entry.path)
+            })?;
+            if artifact.path != entry.path {
+                return Err(anyhow!(
+                    "artifact manifest path resolved ambiguously: {}",
+                    entry.path
+                ));
+            }
+            verified.push(artifact);
+        }
+        Ok(verified)
+    }
+
+    pub fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+
     fn mount_relative_path(&self, request_path: &str) -> Option<String> {
         self.manifest
             .mounts
