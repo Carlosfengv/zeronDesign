@@ -74,6 +74,8 @@ credentials.
 - HTTP executable route manifest gate passes;
 - `check-publication-control-plane-architecture.sh` passes and rejects any G5
   Kubernetes/container command dependency;
-- `cargo test --all-targets` and clippy are required before PR-06 merge;
-- querying Kubernetes resources with label `anydesign.io/work-release` must
-  remain empty for G5.
+- `cargo test --all-targets` passed after the publication changes and the
+  existing run-log failure-injection regression was corrected;
+- `cargo clippy --all-targets -- -D warnings` passed;
+- `kubectl get deployment,statefulset,service,ingress -A -l
+  anydesign.io/work-release -o name` returned no resources.
