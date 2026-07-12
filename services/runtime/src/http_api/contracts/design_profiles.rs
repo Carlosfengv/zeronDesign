@@ -98,15 +98,5 @@ pub struct DesignProfileDiffResponse {
     pub design_profile_id: String,
     pub from_version: u32,
     pub to_version: u32,
-    pub changes: Vec<DesignProfileDiffChange>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DesignProfileDiffChange {
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<Value>,
+    pub changes: Vec<crate::design_profile_service::ProfileDiffChange>,
 }

@@ -2,6 +2,42 @@ use super::ErrorResponse;
 use axum::{http::StatusCode, Json};
 use serde_json::{json, Value};
 
+pub(super) fn design_profile_service_error(
+    error: crate::design_profile_service::DesignProfileServiceError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::design_profile_service::DesignProfileServiceError;
+    match error {
+        DesignProfileServiceError::InvalidRequest(message) => bad_request(message),
+        DesignProfileServiceError::NotFound(message) => not_found(message),
+        DesignProfileServiceError::Conflict(message)
+        | DesignProfileServiceError::ActivationConflict { message, .. } => {
+            conflict_error(anyhow::anyhow!(message))
+        }
+        DesignProfileServiceError::Internal(message) => internal_error(anyhow::anyhow!(message)),
+    }
+}
+
+pub(super) fn design_profile_activation_error(
+    error: crate::design_profile_service::DesignProfileServiceError,
+) -> (StatusCode, Json<Value>) {
+    if let crate::design_profile_service::DesignProfileServiceError::ActivationConflict {
+        message,
+        current_version,
+        validation_issues,
+    } = error
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": message,
+                "currentVersion": current_version,
+                "validationIssues": validation_issues,
+            })),
+        );
+    }
+    error_response_as_value(design_profile_service_error(error))
+}
+
 pub(super) fn run_lifecycle_error(
     error: crate::run_lifecycle::RunLifecycleError,
 ) -> (StatusCode, Json<ErrorResponse>) {

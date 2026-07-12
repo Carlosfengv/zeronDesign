@@ -82,7 +82,10 @@ pub(in crate::http_api) fn last_event_sequence(last_event_id: Option<&str>, run_
     sequence.parse::<usize>().unwrap_or(0)
 }
 
-pub(in crate::http_api) fn run_lifecycle_service(state: &AppState) -> RunLifecycleService {
+pub(in crate::http_api) fn run_lifecycle_service(
+    state: &AppState,
+    design_profiles: DesignProfileService,
+) -> RunLifecycleService {
     RunLifecycleService::new(
         state.config.clone(),
         state.store.clone(),
@@ -96,6 +99,7 @@ pub(in crate::http_api) fn run_lifecycle_service(state: &AppState) -> RunLifecyc
             sandbox_backend_for_config(&state.config),
         )),
         Arc::new(RuntimeEditWorkspaceRestorer),
+        design_profiles,
     )
 }
 
@@ -112,46 +116,4 @@ pub(in crate::http_api) fn require_design_source_authorization(
             error: "design source artifacts require service authorization".to_string(),
         }),
     ))
-}
-
-pub(in crate::http_api) async fn validate_design_profile_source_reference(
-    store: &RuntimeStore,
-    profile: &DesignProfile,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some(artifact_id) = profile
-        .source
-        .get("primarySourceArtifactId")
-        .and_then(Value::as_str)
-    else {
-        return Ok(());
-    };
-    validate_required_string("profile.source.primarySourceArtifactId", artifact_id)?;
-    let artifact = store
-        .get_design_source_artifact(artifact_id)
-        .await
-        .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
-    if artifact.scope != profile.scope {
-        return Err(bad_request(
-            "profile source artifact scope must exactly match profile scope".to_string(),
-        ));
-    }
-    let source_hash = profile
-        .source
-        .get("sourceHash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            bad_request(
-                "profile.source.sourceHash is required with primarySourceArtifactId".to_string(),
-            )
-        })?;
-    if !artifact.sha256.eq_ignore_ascii_case(source_hash) {
-        return Err(bad_request(
-            "profile.source.sourceHash does not match the referenced artifact".to_string(),
-        ));
-    }
-    store
-        .read_design_source_artifact_content(artifact_id)
-        .await
-        .map_err(design_source_error)?;
-    Ok(())
 }

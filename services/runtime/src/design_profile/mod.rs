@@ -1,4 +1,5 @@
 mod capability;
+mod capsule;
 mod source;
 mod validation;
 
@@ -9,6 +10,7 @@ pub use capability::{
     registered_template_spec, signature_rule_applies_to_surface,
     unsupported_extended_tokens_for_template,
 };
+pub use capsule::render_design_profile_markdown;
 pub use source::{parse_design_profile_source, ParsedDesignProfileSource};
 pub use validation::{design_profile_candidate_issues, normalize_component_roles};
 

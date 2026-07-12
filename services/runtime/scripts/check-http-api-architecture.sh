@@ -8,6 +8,7 @@ HTTP_TEST_ROOT="$ROOT/services/runtime/tests/http_api.rs"
 HTTP_TEST_DIR="$ROOT/services/runtime/tests/http_api"
 RUN_LIFECYCLE_DIR="$ROOT/services/runtime/src/run_lifecycle"
 DESIGN_PROFILE_DIR="$ROOT/services/runtime/src/design_profile"
+DESIGN_PROFILE_SERVICE_DIR="$ROOT/services/runtime/src/design_profile_service"
 status=0
 
 fail() {
@@ -75,6 +76,21 @@ while IFS= read -r profile_module; do
     fail "PROFILE-002/SIZE-001: DesignProfile module exceeds 800 lines: ${profile_module#$ROOT/} ($lines)"
   fi
 done < <(find "$DESIGN_PROFILE_DIR" -type f -name '*.rs' | sort)
+
+if grep -RInE --include='*.rs' 'axum|HeaderMap|StatusCode|Router|std::fs|tokio::fs' "$DESIGN_PROFILE_SERVICE_DIR"; then
+  fail "PROFILE-003: DesignProfile application service depends on HTTP or direct filesystem APIs"
+fi
+
+while IFS= read -r profile_service_module; do
+  lines="$(wc -l < "$profile_service_module" | tr -d ' ')"
+  if (( lines > 800 )); then
+    fail "PROFILE-004/SIZE-001: DesignProfile service module exceeds 800 lines: ${profile_service_module#$ROOT/} ($lines)"
+  fi
+done < <(find "$DESIGN_PROFILE_SERVICE_DIR" -type f -name '*.rs' | sort)
+
+if grep -nE 'state\.store|\.store\.' "$HTTP_DIR/routes/design_profiles.rs"; then
+  fail "PROFILE-005: DesignProfile HTTP routes must not orchestrate RuntimeStore directly"
+fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
   'astro-website|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \

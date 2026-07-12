@@ -120,10 +120,11 @@ async fn continue_run_uses_injected_session_launcher() {
     let launcher = Arc::new(RecordingSessionLauncher::default());
     let service = RunLifecycleService::new(
         RuntimeConfig::from_env(),
-        store,
+        store.clone(),
         launcher.clone(),
         Arc::new(UnusedSandboxProvisioner),
         Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
     );
 
     let outcome = service
@@ -171,6 +172,7 @@ async fn start_build_cancels_created_run_when_sandbox_provisioning_fails() {
         Arc::new(RecordingSessionLauncher::default()),
         provisioner.clone(),
         Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
     );
 
     let error = service
@@ -246,6 +248,7 @@ async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
         Arc::new(RecordingSessionLauncher::default()),
         Arc::new(UnusedSandboxProvisioner),
         restorer.clone(),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
     );
 
     let error = service
@@ -280,6 +283,7 @@ async fn start_keeps_queued_run_recoverable_when_session_registration_fails() {
         launcher.clone(),
         Arc::new(UnusedSandboxProvisioner),
         Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
     );
 
     let error = service
