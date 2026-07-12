@@ -12,11 +12,11 @@ fail() {
   status=1
 }
 
-if ! rg -q 'RuntimeBootstrap::new\(config\)\.run\(\)' "$MAIN"; then
+if ! grep -Eq 'RuntimeBootstrap::new\(config\)\.run\(\)' "$MAIN"; then
   fail "BOOT-001: production main must start exclusively through RuntimeBootstrap::run"
 fi
 
-if rg -n 'http_api|router_with_state|recover_startup_runs|tokio::spawn|axum::serve' "$MAIN"; then
+if grep -En 'http_api|router_with_state|recover_startup_runs|tokio::spawn|axum::serve' "$MAIN"; then
   fail "BOOT-001: production main bypasses RuntimeBootstrap or RuntimeSupervisor"
 fi
 
@@ -24,11 +24,11 @@ if [[ -f "$HTTP_DIR/startup.rs" ]]; then
   fail "BOOT-002: startup recovery must be owned by runtime/bootstrap.rs"
 fi
 
-if ! rg -q 'pub supervisor: RuntimeSupervisor' "$HTTP_DIR/mod.rs"; then
+if ! grep -Eq 'pub supervisor: RuntimeSupervisor' "$HTTP_DIR/mod.rs"; then
   fail "BOOT-003: AppState must carry the Bootstrap-owned RuntimeSupervisor"
 fi
 
-if rg -n 'tokio::spawn' "$HTTP_DIR" --glob '*.rs'; then
+if grep -RIn --include='*.rs' 'tokio::spawn' "$HTTP_DIR"; then
   fail "BOOT-004: HTTP handlers must register background tasks through RuntimeSupervisor"
 fi
 
