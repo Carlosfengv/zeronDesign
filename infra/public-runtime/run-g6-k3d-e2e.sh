@@ -58,7 +58,8 @@ build_release() {
   cp "$ROOT/infra/published-runtime/static-web/Dockerfile" "$context/Dockerfile"
   cp "$ROOT/infra/published-runtime/static-web/nginx.conf" "$context/nginx.conf"
   host_ref="localhost:${REGISTRY_HOST_PORT}/anydesign/works/${release}:latest"
-  docker build --platform linux/arm64 --provenance=false -t "$host_ref" "$context" >/dev/null
+  docker build --platform linux/arm64 --provenance=false \
+    --build-arg "RELEASE_ID=${release}" -t "$host_ref" "$context" >/dev/null
   docker push "$host_ref" >/dev/null
   digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$host_ref" | sed 's/^.*@//')"
   [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { printf 'invalid image digest: %s\n' "$digest" >&2; exit 3; }

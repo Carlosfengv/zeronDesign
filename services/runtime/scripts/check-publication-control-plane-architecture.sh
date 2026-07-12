@@ -13,12 +13,12 @@ fail() {
   status=1
 }
 
-for required in backend.rs model.rs store.rs store_reconcile.rs controller.rs kubernetes.rs; do
+for required in backend.rs model.rs store.rs store_reconcile.rs controller.rs kubernetes.rs kubernetes_ingress.rs; do
   [[ -f "$PUBLICATION_DIR/$required" ]] \
     || fail "PUB-001: missing publication control-plane module: $required"
 done
 
-for file in "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$PUBLICATION_DIR/kubernetes.rs"; do
+for file in "$PUBLICATION_DIR/backend.rs" "$PUBLICATION_DIR/model.rs" "$PUBLICATION_DIR/store.rs" "$PUBLICATION_DIR/store_reconcile.rs" "$PUBLICATION_DIR/controller.rs" "$PUBLICATION_DIR/kubernetes.rs" "$PUBLICATION_DIR/kubernetes_ingress.rs"; do
   lines="$(wc -l < "$file" | tr -d ' ')"
   (( lines <= 700 )) \
     || fail "PUB-009: publication production module exceeds 700 lines: ${file#"$ROOT/"} ($lines)"
@@ -48,9 +48,11 @@ if ! grep -Eq 'PatchParams::apply\(FIELD_MANAGER\)' "$PUBLICATION_DIR/kubernetes
   fail "PUB-011: Kubernetes resources require fixed server-side apply ownership and CAS identity"
 fi
 
-if rg -n '"kind"[[:space:]]*:[[:space:]]*"Ingress"|Api<Ingress>|networking::v1::Ingress' \
-  "$PUBLICATION_DIR/kubernetes.rs" >/dev/null; then
-  fail "PUB-012: G6 Kubernetes adapter must not create Published Ingress"
+if ! grep -Eq 'WorkRuntimeExposureMode::Ingress' "$ROOT/services/runtime/src/config.rs" \
+  || ! grep -Eq 'apply_ingress' "$PUBLICATION_DIR/kubernetes_ingress.rs" \
+  || ! grep -Eq 'verify_external_release' "$PUBLICATION_DIR/kubernetes_ingress.rs" \
+  || ! grep -Eq 'verify_external_closed' "$PUBLICATION_DIR/kubernetes_ingress.rs"; then
+  fail "PUB-012: G7 requires explicit Ingress exposure, external identity probe, and route-closed verification"
 fi
 
 if ! grep -Eq 'struct PublicationCommit' "$PUBLICATION_DIR/store.rs" \

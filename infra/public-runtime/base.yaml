@@ -28,7 +28,7 @@ rules:
     resources: ["services", "services/proxy", "pods"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
+    resources: ["networkpolicies", "ingresses"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
