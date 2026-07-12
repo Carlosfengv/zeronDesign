@@ -458,11 +458,11 @@ impl RuntimeStore {
         let run_log_dir = run_log_dir.into();
         let next_id = initial_id_counter(&[&checkpoint_dir, &run_log_dir]);
         let publication_store = Arc::new(
-            PublicationStore::open(run_log_dir.join("publication"))
+            PublicationStore::open(checkpoint_dir.join("publication"))
                 .expect("publication store should open"),
         );
         let release_store = Arc::new(
-            ReleaseStore::open(run_log_dir.join("work-releases"))
+            ReleaseStore::open(checkpoint_dir.join("work-releases"))
                 .expect("release store should open"),
         );
         Self {
