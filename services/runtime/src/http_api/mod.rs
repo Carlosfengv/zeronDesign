@@ -45,7 +45,6 @@ use crate::{
     runtime::{
         RuntimeBuildSandboxProvisioner, RuntimeEditWorkspaceRestorer, RuntimeSessionLauncher,
     },
-    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
         control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
@@ -54,8 +53,8 @@ use crate::{
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRun, Brief, ConversationItem, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignProfileFidelityReport,
-        DesignProfileUnmappedItem, DesignProfileValidationIssue, DesignSourceArtifact,
-        PreviewLeaseStatus, ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
+        DesignProfileValidationIssue, DesignSourceArtifact, PreviewLeaseStatus,
+        ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use axum::{
