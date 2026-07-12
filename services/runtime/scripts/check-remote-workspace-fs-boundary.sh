@@ -6,8 +6,15 @@ FILES=(
   "services/runtime/src/agent_loop.rs"
   "services/runtime/src/permission.rs"
   "services/runtime/src/tools/runtime.rs"
-  "services/runtime/src/http_api.rs"
 )
+
+if [[ -f "$ROOT/services/runtime/src/http_api.rs" ]]; then
+  FILES+=("services/runtime/src/http_api.rs")
+elif [[ -d "$ROOT/services/runtime/src/http_api" ]]; then
+  while IFS= read -r http_api_file; do
+    FILES+=("${http_api_file#"$ROOT/"}")
+  done < <(find "$ROOT/services/runtime/src/http_api" -type f -name '*.rs' | sort)
+fi
 
 if [[ -f "$ROOT/services/runtime/src/tools/sandbox.rs" ]]; then
   FILES+=("services/runtime/src/tools/sandbox.rs")

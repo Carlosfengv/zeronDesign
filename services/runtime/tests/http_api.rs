@@ -43,6 +43,8 @@ use tower::ServiceExt;
 
 #[path = "http_api/contract_manifest.rs"]
 mod contract_manifest;
+#[path = "http_api/routes/mod.rs"]
+mod route_families;
 
 static SANDBOX_CHANNEL_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 const REAL_PROVIDER_STAGE_TIMEOUT_SECS: u64 = 420;

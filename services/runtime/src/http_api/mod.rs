@@ -1,0 +1,274 @@
+mod auth;
+mod contracts;
+mod error;
+mod profile_support;
+mod routes;
+mod startup;
+mod support;
+mod workspace;
+
+use auth::*;
+pub use contracts::*;
+use error::*;
+use profile_support::*;
+use routes::runs::start::validate_design_profile_template_availability;
+pub use startup::recover_startup_runs;
+use support::*;
+use workspace::*;
+
+#[cfg(test)]
+use routes::artifacts::artifact_project_id_from_referer;
+
+use crate::{
+    artifact_publisher::{safe_segment, FileArtifactPublisher},
+    channel_manager::ChannelManager,
+    config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
+    conversation::RuntimeStore,
+    model_gateway::{model_client_from_config, ModelClient},
+    preview::{promote_preview, PromotionGateReport},
+    profiles::build::{run_template_build, TemplateBuildRequest},
+    profiles::edit::{self, EditIntent},
+    project::{
+        audit_project_template_compatibility, resolve_built_in_template_for_init,
+        ProjectInitWorkspaceTransaction,
+    },
+    public_principal::{PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION},
+    query_session::QuerySession,
+    recovery::{recover_interrupted_runs, RecoveryOutcome},
+    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
+    tools::{
+        control_plane::{control_plane_executor_for_config, sandbox_backend_for_config},
+        runtime::ToolContext,
+        sandbox::{
+            cancel_run_sandbox_resources, cleanup_staged_writes_for_run,
+            cleanup_staged_writes_for_run_backend, LocalWorkspaceBackend,
+            SandboxChannelWorkspaceBackend, WorkspaceBackend,
+        },
+    },
+    types::{
+        sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
+        ConversationItem, DesignProfile, DesignProfileConversionReport, DesignProfileDraft,
+        DesignProfileFidelityReport, DesignProfileUnmappedItem, DesignProfileValidationIssue,
+        DesignSourceArtifact, PreviewLeaseStatus, ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2,
+        MAX_DESIGN_SOURCE_BYTES,
+    },
+};
+use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
+    routing::{get, post, put},
+    Json, Router,
+};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
+
+const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
+const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = MAX_DESIGN_SOURCE_BYTES.div_ceil(3) * 4;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: RuntimeConfig,
+    pub store: RuntimeStore,
+    pub model: Arc<dyn ModelClient>,
+}
+
+pub fn app_state(config: RuntimeConfig) -> AppState {
+    AppState {
+        model: Arc::new(
+            model_client_from_config(&config)
+                .expect("runtime model provider configuration should be valid"),
+        ),
+        store: RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone()),
+        config,
+    }
+}
+
+pub async fn recovered_router(config: RuntimeConfig) -> anyhow::Result<Router> {
+    Ok(router_with_state(
+        recover_startup_runs(app_state(config)).await?,
+    ))
+}
+
+pub fn router(config: RuntimeConfig) -> Router {
+    router_with_state(app_state(config))
+}
+
+pub fn router_with_state(state: AppState) -> Router {
+    Router::new()
+        .merge(routes::system::router())
+        .merge(routes::runs::router())
+        .merge(routes::run_events::router())
+        .merge(routes::design_sources::router())
+        .merge(routes::design_profiles::router())
+        .merge(routes::projects::router())
+        .merge(routes::previews::router())
+        .merge(routes::artifacts::router())
+        .merge(routes::internal::router())
+        .with_state(state)
+}
+
+pub fn capture_router_with_state(state: AppState) -> Router {
+    routes::capture::router().with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // remote-fs-boundary: allow-begin startup-recovery-test-fixture
+    #[tokio::test]
+    async fn startup_recovery_completes_committed_project_init_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-project-init-startup-recovery-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.runtime_storage_dir = root.join("runtime");
+        config.workspace_root = root.join("workspaces");
+        let store = RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir);
+        let run = store
+            .create_run(
+                "startup-recovery-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let workspace_root = project_workspace_root(&config, &run.project_id);
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let ctx = ToolContext::new(store, run.clone(), workspace_root.clone());
+        let mut transaction = ProjectInitWorkspaceTransaction::begin(
+            &LocalWorkspaceBackend,
+            &ctx,
+            &workspace_root.join("project"),
+            "astro-website",
+        )
+        .await
+        .unwrap();
+        transaction
+            .mark_workspace_committed(serde_json::json!({
+                "projectId": run.project_id,
+                "runId": run.id,
+                "appRoot": "project",
+                "templateKey": "astro-website",
+                "templateVersion": "astro-website@runtime-p3",
+                "templateManifestSha256": "7374f4f493c49752bbcbdad49992b02d089f79c1f01784c42fa7224668136e3f",
+                "framework": "astro",
+                "sandboxExecutionProfileId": "astro-website",
+                "sandboxExecutionProfileVersion": "0.1.0",
+                "packageManager": "npm",
+                "lockfile": "package-lock.json",
+                "registry": "https://registry.npmjs.org/"
+            }))
+            .await
+            .unwrap();
+        drop(ctx);
+
+        let recovered = recover_startup_runs(AppState {
+            store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
+            model: Arc::new(crate::model_gateway::EmptyModelClient),
+            config: config.clone(),
+        })
+        .await
+        .unwrap();
+        let state = recovered
+            .store
+            .get_project_runtime_state("startup-recovery-project")
+            .await
+            .unwrap();
+        assert_eq!(state.template_key, "astro-website");
+        assert!(!workspace_root
+            .join("state/project-init-transactions/startup-recovery-project/journal.json")
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    // remote-fs-boundary: allow-end startup-recovery-test-fixture
+
+    // remote-fs-boundary: allow-begin startup-template-audit-test-fixture
+    #[tokio::test]
+    async fn startup_rejects_persisted_project_with_missing_historical_template_spec() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-template-compatibility-audit-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.runtime_storage_dir = root.join("runtime");
+        config.workspace_root = root.join("workspaces");
+        let store = RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir);
+        store
+            .upsert_project_runtime_state_with_template_identity(
+                "incompatible-project",
+                "project".to_string(),
+                "astro-website".to_string(),
+                "astro-website@runtime-p3".to_string(),
+                Some(
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                ),
+                "astro".to_string(),
+                Some("astro-website".to_string()),
+                Some("0.1.0".to_string()),
+                "npm".to_string(),
+                "package-lock.json".to_string(),
+                "https://registry.npmjs.org/".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let error = match recover_startup_runs(AppState {
+            store: RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir),
+            model: Arc::new(crate::model_gateway::EmptyModelClient),
+            config,
+        })
+        .await
+        {
+            Ok(_) => panic!("startup must reject incompatible persisted template identity"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("persisted project template compatibility audit failed"));
+        assert!(error.to_string().contains("template.version_incompatible"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    // remote-fs-boundary: allow-end startup-template-audit-test-fixture
+
+    #[test]
+    fn artifact_project_id_from_referer_extracts_current_artifact_project() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:8080/artifacts/project-docs-1/current/docs"),
+        );
+
+        assert_eq!(
+            artifact_project_id_from_referer(&headers).as_deref(),
+            Some("project-docs-1")
+        );
+    }
+
+    #[test]
+    fn artifact_project_id_from_referer_rejects_non_artifact_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:8080/docs"),
+        );
+
+        assert_eq!(artifact_project_id_from_referer(&headers), None);
+    }
+}
