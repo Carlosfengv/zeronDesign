@@ -5,6 +5,7 @@ mod error;
 mod internal;
 mod previews;
 mod projects;
+mod publication;
 mod runs;
 mod system;
 
@@ -15,6 +16,7 @@ pub use error::ErrorResponse;
 pub use internal::*;
 pub use previews::*;
 pub use projects::*;
+pub use publication::*;
 pub use runs::{
     ContinueRunRequest, PermissionDecision, ResolvePermissionRequest, RunStatusResponse,
     StartRunInputContext, StartRunRequest, StartRunResponse,

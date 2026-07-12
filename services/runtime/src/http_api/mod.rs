@@ -37,7 +37,10 @@ use crate::{
     profiles::build::{run_template_build, TemplateBuildRequest},
     profiles::edit::{self, EditIntent},
     project::resolve_built_in_template_for_init,
-    public_principal::{PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION},
+    public_principal::{
+        PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION,
+        PUBLICATION_READ_OPERATION, PUBLICATION_WRITE_OPERATION,
+    },
     query_session::QuerySession,
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
@@ -125,6 +128,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::design_profiles::router())
         .merge(routes::projects::router())
         .merge(routes::previews::router())
+        .merge(routes::publication::router())
         .merge(routes::artifacts::router())
         .merge(routes::internal::router())
         .with_state(state)

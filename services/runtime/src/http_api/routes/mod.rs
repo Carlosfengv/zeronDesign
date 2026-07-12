@@ -5,6 +5,7 @@ pub(super) mod design_sources;
 pub(super) mod internal;
 pub(super) mod previews;
 pub(super) mod projects;
+pub(super) mod publication;
 pub(super) mod run_events;
 pub(super) mod runs;
 pub(super) mod system;
