@@ -61,3 +61,10 @@ Run `infra/public-runtime/run-g7-k3d-e2e.sh` for the real TLS lifecycle gate.
 It verifies host collision rejection, external release headers, security
 headers, ordered Unpublish, complete workload teardown, and Republish using the
 same random host identity.
+
+Run `infra/public-runtime/run-g8-k3d-e2e.sh` for release-specific Update and
+Rollback. It verifies Service selector CAS, exclusive EndpointSlice convergence,
+restart after a selector-switch checkpoint, automatic blue restoration on a
+bounded convergence timeout, and the Runtime/Kubernetes Registry GC protection
+snapshot. Operational recovery steps are in
+`infra/published-runtime/blue-green-runbook.md`.
