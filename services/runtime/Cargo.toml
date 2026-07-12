@@ -11,6 +11,8 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 futures = "0.3"
+k8s-openapi = { version = "0.28", features = ["latest"] }
+kube = { version = "4", features = ["client", "rustls-tls"] }
 png = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1"
@@ -28,5 +30,6 @@ x509-parser = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+kube = { version = "4", features = ["client", "rustls-tls", "ws"] }
 serde_yaml = "0.9"
 tower = { version = "0.5", features = ["util"] }

@@ -8,6 +8,22 @@ pub enum SandboxBackendMode {
     PhaseAContract,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkRuntimeBackendMode {
+    ControlPlaneOnly,
+    Kubernetes,
+}
+
+impl WorkRuntimeBackendMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "kubernetes" | "k8s" => Self::Kubernetes,
+            _ => Self::ControlPlaneOnly,
+        }
+    }
+}
+
 impl SandboxBackendMode {
     fn from_env_value(value: &str) -> Self {
         match value {
@@ -119,6 +135,7 @@ pub struct RuntimeConfig {
     pub public_principal_public_key_files: Vec<PathBuf>,
     pub public_principal_max_ttl_seconds: u64,
     pub k8s_namespace: String,
+    pub work_runtime_backend_mode: WorkRuntimeBackendMode,
     pub sandbox_backend_mode: SandboxBackendMode,
     pub policy_profile: RuntimePolicyProfile,
     pub npm_registry: String,
@@ -227,6 +244,10 @@ impl RuntimeConfig {
                 .unwrap_or(120),
             k8s_namespace: env::var("K8S_NAMESPACE")
                 .unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
+            work_runtime_backend_mode: env::var("WORK_RUNTIME_BACKEND")
+                .ok()
+                .map(|value| WorkRuntimeBackendMode::from_env_value(&value))
+                .unwrap_or(WorkRuntimeBackendMode::ControlPlaneOnly),
             sandbox_backend_mode: env::var("SANDBOX_BACKEND_MODE")
                 .ok()
                 .map(|value| SandboxBackendMode::from_env_value(&value))

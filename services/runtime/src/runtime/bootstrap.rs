@@ -2,10 +2,13 @@ use super::RuntimeSupervisor;
 use crate::{
     artifact_publisher::FileArtifactPublisher,
     channel_manager::ChannelManager,
-    config::SandboxBackendMode,
+    config::{SandboxBackendMode, WorkRuntimeBackendMode},
     http_api::{self, AppState},
     project::{audit_project_template_compatibility, ProjectInitWorkspaceTransaction},
-    publication::{ControlPlaneOnlyBackend, WorkRuntimeController},
+    publication::{
+        ControlPlaneOnlyBackend, KubernetesWorkRuntimeBackend, WorkRuntimeBackend,
+        WorkRuntimeController,
+    },
     recovery::{recover_interrupted_runs, RecoveryOutcome},
     templates::BuiltInTemplateRegistry,
     tools::{
@@ -37,9 +40,17 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         .store
         .publication_store()
         .replay_nonterminal_outbox()?;
+    let work_runtime_backend: Arc<dyn WorkRuntimeBackend> =
+        match state.config.work_runtime_backend_mode {
+            WorkRuntimeBackendMode::ControlPlaneOnly => Arc::new(ControlPlaneOnlyBackend),
+            WorkRuntimeBackendMode::Kubernetes => {
+                Arc::new(KubernetesWorkRuntimeBackend::try_default().await?)
+            }
+        };
     WorkRuntimeController::new(
         state.store.publication_store(),
-        Arc::new(ControlPlaneOnlyBackend),
+        state.store.release_store(),
+        work_runtime_backend,
         Duration::from_secs(5),
     )
     .spawn(&state.supervisor)?;

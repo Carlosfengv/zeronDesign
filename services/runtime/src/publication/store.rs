@@ -281,12 +281,18 @@ impl PublicationStore {
         outbox_id: &str,
         error: Option<String>,
     ) -> Result<PublicationOutboxEvent, PublicationStoreError> {
-        self.update_outbox(outbox_id, |_, _, outbox| {
+        self.update_outbox(outbox_id, |operation, runtime, outbox| {
             if outbox.status == PublicationOutboxStatus::Delivered {
                 return Ok(());
             }
             outbox.attempts = outbox.attempts.saturating_add(1);
             outbox.last_error = error.clone();
+            if let Some(error) = &error {
+                operation.status = PublishOperationStatus::ReconcileRequired;
+                operation.last_error = Some(error.clone());
+                runtime.status = WorkRuntimeStatus::ReconcileRequired;
+                runtime.last_error = Some(error.clone());
+            }
             let backoff_seconds = 1_i64 << outbox.attempts.min(6);
             outbox.next_attempt_at = Utc::now() + chrono::Duration::seconds(backoff_seconds);
             Ok(())
@@ -649,3 +655,6 @@ fn write_checkpoint(
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
+
+#[path = "store_reconcile.rs"]
+mod reconcile;

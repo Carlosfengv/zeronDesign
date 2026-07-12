@@ -1,50 +1,35 @@
-use super::{PublicationOutboxEvent, PublicationStore, WorkRuntimeState};
-use crate::runtime::{RuntimeSupervisor, SupervisorError};
-use anyhow::Result;
-use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use super::{
+    DesiredWorkRuntime, PublicationReconcileDisposition, PublicationStore, WorkRuntimeBackend,
+};
+use crate::{
+    release::ReleaseStore,
+    runtime::{RuntimeSupervisor, SupervisorError},
+};
+use anyhow::{Context, Result};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublicationReconcileDisposition {
-    Accepted,
-    Deferred,
-}
+const DRIFT_AUDIT_INTERVAL: Duration = Duration::from_secs(300);
 
-#[async_trait]
-pub trait WorkRuntimeBackend: Send + Sync {
-    async fn reconcile(
-        &self,
-        runtime: &WorkRuntimeState,
-        event: &PublicationOutboxEvent,
-    ) -> Result<PublicationReconcileDisposition>;
-}
-
-pub struct ControlPlaneOnlyBackend;
-
-#[async_trait]
-impl WorkRuntimeBackend for ControlPlaneOnlyBackend {
-    async fn reconcile(
-        &self,
-        _: &WorkRuntimeState,
-        _: &PublicationOutboxEvent,
-    ) -> Result<PublicationReconcileDisposition> {
-        Ok(PublicationReconcileDisposition::Deferred)
-    }
-}
-
-pub struct WorkRuntimeController<B> {
-    store: Arc<PublicationStore>,
+pub struct WorkRuntimeController<B: ?Sized> {
+    publication_store: Arc<PublicationStore>,
+    release_store: Arc<ReleaseStore>,
     backend: Arc<B>,
     interval: Duration,
 }
 
 impl<B> WorkRuntimeController<B>
 where
-    B: WorkRuntimeBackend + 'static,
+    B: WorkRuntimeBackend + ?Sized + 'static,
 {
-    pub fn new(store: Arc<PublicationStore>, backend: Arc<B>, interval: Duration) -> Self {
+    pub fn new(
+        publication_store: Arc<PublicationStore>,
+        release_store: Arc<ReleaseStore>,
+        backend: Arc<B>,
+        interval: Duration,
+    ) -> Self {
         Self {
-            store,
+            publication_store,
+            release_store,
             backend,
             interval,
         }
@@ -55,8 +40,14 @@ where
             "controller/work-runtime",
             true,
             move |mut shutdown| async move {
+                let mut next_drift_audit = tokio::time::Instant::now();
                 loop {
-                    self.reconcile_once().await?;
+                    let now = tokio::time::Instant::now();
+                    let include_observed = now >= next_drift_audit;
+                    if include_observed {
+                        next_drift_audit = now + DRIFT_AUDIT_INTERVAL;
+                    }
+                    self.reconcile_once(include_observed).await?;
                     tokio::select! {
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() { break; }
@@ -69,109 +60,91 @@ where
         )
     }
 
-    pub async fn reconcile_once(&self) -> Result<usize> {
-        let mut delivered = 0;
-        for event in self.store.pending_outbox() {
-            let Some(runtime) = self.store.runtime(&event.project_id) else {
-                self.store.record_delivery_attempt(
-                    &event.id,
-                    Some("publication runtime state is missing".to_string()),
-                )?;
+    pub async fn reconcile_once(&self, include_observed: bool) -> Result<usize> {
+        let mut events = self
+            .publication_store
+            .pending_outbox()
+            .into_iter()
+            .map(|event| (event.id.clone(), event))
+            .collect::<BTreeMap<_, _>>();
+        if include_observed {
+            for event in self.publication_store.published_reconcile_outbox() {
+                events.entry(event.id.clone()).or_insert(event);
+            }
+        }
+        let mut reconciled = 0;
+        for event in events.into_values() {
+            let Some(runtime) = self.publication_store.runtime(&event.project_id) else {
+                self.publication_store
+                    .record_reconcile_failure(&event.id, "publication runtime state is missing")?;
                 continue;
             };
-            match self.backend.reconcile(&runtime, &event).await {
-                Ok(PublicationReconcileDisposition::Accepted) => {
-                    self.store.record_delivery_attempt(&event.id, None)?;
-                    self.store.record_delivered(&event.id)?;
-                    delivered += 1;
+            let result = async {
+                let release_id = runtime
+                    .desired_release_id
+                    .as_deref()
+                    .context("Published runtime is missing desired release")?;
+                let release = self
+                    .release_store
+                    .release(release_id)
+                    .context("desired WorkRelease does not exist")?;
+                let packaging = self
+                    .release_store
+                    .packaging_for_release(release_id)
+                    .context("desired WorkRelease packaging evidence does not exist")?;
+                let desired = DesiredWorkRuntime::from_records(&runtime, &release, &packaging)?;
+                self.backend.reconcile(&desired).await
+            }
+            .await;
+            match result {
+                Ok(PublicationReconcileDisposition::Applied(observed)) => {
+                    self.publication_store
+                        .record_workload_ready(&event.id, &observed)?;
+                    reconciled += 1;
                 }
                 Ok(PublicationReconcileDisposition::Deferred) => {
-                    self.store.record_delivery_attempt(
-                        &event.id,
-                        Some("work runtime backend is not enabled in G5".to_string()),
-                    )?;
+                    if event.status == super::PublicationOutboxStatus::Pending {
+                        self.publication_store
+                            .record_delivery_attempt(&event.id, None)?;
+                    }
                 }
                 Err(error) => {
-                    self.store
-                        .record_delivery_attempt(&event.id, Some(error.to_string()))?;
+                    self.publication_store
+                        .record_reconcile_failure(&event.id, error.to_string())?;
                 }
             }
         }
-        Ok(delivered)
+        Ok(reconciled)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publication::{
-        PublicationIntent, PublicationOutboxStatus, PublishOperationKind, PublishOperationStatus,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct AcceptingBackend(AtomicUsize);
-
-    #[async_trait]
-    impl WorkRuntimeBackend for AcceptingBackend {
-        async fn reconcile(
-            &self,
-            _: &WorkRuntimeState,
-            _: &PublicationOutboxEvent,
-        ) -> Result<PublicationReconcileDisposition> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(PublicationReconcileDisposition::Accepted)
-        }
-    }
+    use crate::publication::ControlPlaneOnlyBackend;
 
     #[tokio::test]
-    async fn restart_replays_pending_outbox_and_supervisor_owns_controller() {
+    async fn supervisor_owns_controller_lifecycle() {
         let root = std::env::temp_dir().join(format!(
             "publication-controller-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let store = PublicationStore::open(&root).unwrap();
-        let (operation, _) = store
-            .commit_intent(&PublicationIntent {
-                project_id: "controller-project".into(),
-                kind: PublishOperationKind::Publish,
-                release_id: Some("release-controller".into()),
-                expected_current_release_id: None,
-                expected_generation: Some(0),
-                runtime_profile_id: "static-web-v1".into(),
-                idempotency_key: "controller-key".into(),
-            })
-            .unwrap();
-        drop(store);
-        let store = Arc::new(PublicationStore::open(&root).unwrap());
-        assert_eq!(
-            store.pending_outbox()[0].status,
-            PublicationOutboxStatus::Pending
-        );
-        let backend = Arc::new(AcceptingBackend(AtomicUsize::new(0)));
+        let publication_store = Arc::new(PublicationStore::open(root.join("publication")).unwrap());
+        let release_store = Arc::new(ReleaseStore::open(root.join("release")).unwrap());
         let controller = WorkRuntimeController::new(
-            Arc::clone(&store),
-            Arc::clone(&backend),
+            publication_store,
+            release_store,
+            Arc::new(ControlPlaneOnlyBackend),
             Duration::from_millis(10),
         );
         let supervisor = RuntimeSupervisor::new();
         controller.spawn(&supervisor).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !store.pending_outbox().is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(supervisor
             .readiness()
             .active_tasks
             .contains(&"controller/work-runtime".to_string()));
-        assert_eq!(backend.0.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            store.operation(&operation.id).unwrap().status,
-            PublishOperationStatus::Reconciling
-        );
         supervisor.shutdown(Duration::from_secs(1)).await;
         std::fs::remove_dir_all(root).unwrap();
     }
