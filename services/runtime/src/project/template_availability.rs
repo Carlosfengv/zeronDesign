@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+type ReadinessCache = HashMap<String, (Instant, Result<bool, String>)>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateDescriptor {
     pub id: TemplateId,
@@ -92,7 +94,7 @@ pub struct KubernetesSandboxExecutionProfileReadiness<R = TokioCommandRunner> {
     kubectl: String,
     namespace: String,
     ttl: Duration,
-    cache: Mutex<HashMap<String, (Instant, Result<bool, String>)>>,
+    cache: Mutex<ReadinessCache>,
 }
 
 impl KubernetesSandboxExecutionProfileReadiness<TokioCommandRunner> {

@@ -486,6 +486,7 @@ async fn assert_event_order(store: &RuntimeStore, run_id: &str) {
     assert!(preview < completed);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_evidence(
     store: &RuntimeStore,
     storage: &std::path::Path,

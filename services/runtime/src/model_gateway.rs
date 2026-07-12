@@ -987,7 +987,7 @@ impl From<ModelGatewayToolCall> for ToolCall {
 
 fn normalize_tool_input(mut input: Value) -> Value {
     for _ in 0..3 {
-        if !input.as_object().is_some_and(|object| object.len() == 1) {
+        if input.as_object().is_none_or(|object| object.len() != 1) {
             return input;
         };
         let Some(arguments) = input.get("arguments") else {

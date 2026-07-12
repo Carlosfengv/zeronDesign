@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_rejects_workspace_tools_during_brief_phase() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Brief,
             tool_name: "fs.read".to_string(),
             input: json!({ "path": "project/src/pages/index.astro" }),
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_rejects_brief_write_tools_outside_brief_phase() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "brief.write_draft".to_string(),
             input: json!({ "brief": {} }),
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_injects_default_cwd_for_build_execution_tools() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "shell.run".to_string(),
             input: json!({ "argv": ["node", "-e", "process.stdout.write('ok')"] }),
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_preserves_explicit_cwd() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Edit,
             tool_name: "project.build".to_string(),
             input: json!({ "cwd": "project/site" }),
@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_normalizes_workspace_virtual_path_fields() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "fs.read".to_string(),
             input: json!({ "path": "/workspace/project/src/pages/index.astro" }),
@@ -878,7 +878,7 @@ mod tests {
         assert!(decision.rejection.is_none());
         assert_eq!(decision.input["path"], "project/src/pages/index.astro");
 
-        let cwd_decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let cwd_decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "project.build".to_string(),
             input: json!({ "cwd": "/workspace/project/site" }),
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_redirects_shell_dependency_installs_to_runtime_tools() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "shell.run".to_string(),
             input: json!({ "argv": ["pnpm", "install"] }),
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_redirects_shell_preview_servers_to_preview_tools() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "shell.run".to_string(),
             input: json!({ "argv": ["pnpm", "run", "dev"] }),
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn pre_tool_hook_redirects_interactive_scaffolds_to_project_tools() {
-        let decision = PreToolUseHook::default().apply(PreToolUseObservation {
+        let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "shell.run".to_string(),
             input: json!({ "argv": ["npm", "create", "astro@latest"] }),
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn post_tool_success_hook_classifies_build_state_updates() {
-        let decision = PostToolUseSuccessHook::default().apply(ToolSuccessObservation {
+        let decision = PostToolUseSuccessHook.apply(ToolSuccessObservation {
             tool_name: "project.build".to_string(),
             content: json!({
                 "status": "ok",
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn post_tool_success_hook_classifies_publish_promotion_updates() {
-        let decision = PostToolUseSuccessHook::default().apply(ToolSuccessObservation {
+        let decision = PostToolUseSuccessHook.apply(ToolSuccessObservation {
             tool_name: "preview.publish".to_string(),
             content: json!({
                 "promotion": {

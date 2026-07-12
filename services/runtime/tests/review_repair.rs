@@ -176,7 +176,7 @@ async fn active_descendant_repair_run_prevents_preview_promotion() {
     let repair = store
         .create_repair_run_for_findings(
             &review.id,
-            &[finding.id.clone()],
+            std::slice::from_ref(&finding.id),
             Some("event-review-finding-1".to_string()),
             "repair".to_string(),
             "internal-balanced".to_string(),

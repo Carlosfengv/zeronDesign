@@ -57,8 +57,8 @@ pub(super) async fn verify_screenshot_artifact(
             .get("nonblankPixelRatio")
             .and_then(Value::as_f64)
             .unwrap_or_default();
-        if !png_hash.is_some_and(|hash| hash.len() == 64)
-            || !document_hash.is_some_and(|hash| hash.len() == 64)
+        if png_hash.is_none_or(|hash| hash.len() != 64)
+            || document_hash.is_none_or(|hash| hash.len() != 64)
             || !screenshot_uri.is_some_and(|uri| {
                 uri.starts_with("runtime://screenshots/")
                     || uri.starts_with("runtime://preview-captures/")
@@ -77,82 +77,6 @@ pub(super) async fn verify_screenshot_artifact(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod browser_worker_tests {
-    use super::*;
-    use crate::RuntimeStore;
-    use std::sync::Mutex as StdMutex;
-    use tokio::io::AsyncReadExt;
-
-    static BROWSER_ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
-    #[tokio::test]
-    async fn runtime_browser_worker_writes_real_nonblank_png_evidence() {
-        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-        if !executable.is_file() {
-            return;
-        }
-        let _guard = BROWSER_ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("RUNTIME_BROWSER_EXECUTABLE", executable);
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let mut request = [0_u8; 4096];
-                    let _ = stream.read(&mut request).await;
-                    let html = "<!doctype html><style>html,body{margin:0;height:100%}body{background:linear-gradient(90deg,#f00 50%,#00f 50%)}</style>";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        html.len(),
-                        html
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        let store = RuntimeStore::new();
-        let run = store
-            .create_run(
-                "browser-project".to_string(),
-                AgentPhase::Review,
-                "review".to_string(),
-                "fixture".to_string(),
-                vec![],
-            )
-            .await;
-        let storage = std::env::temp_dir().join(format!(
-            "runtime-browser-test-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let mut ctx = ToolContext::new(store, run, storage.join("workspace"));
-        ctx.runtime_storage_dir = storage;
-        let capture = browser::capture_runtime_screenshot(
-            &ctx,
-            "real-browser",
-            &format!("http://{address}/"),
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        unsafe {
-            std::env::remove_var("RUNTIME_BROWSER_EXECUTABLE");
-        }
-        server.abort();
-        assert_eq!((capture.width, capture.height), (1440, 900));
-        assert_eq!(capture.png_sha256.len(), 64);
-        assert!(capture.nonblank_pixel_ratio > 0.25);
-        assert!(capture.uri.starts_with("runtime://screenshots/"));
-    }
 }
 
 pub(super) fn is_internal_preview_url(url: &str) -> bool {
@@ -226,4 +150,80 @@ pub(super) async fn verify_preview_accessible(url: &str) -> Result<(), ToolError
         ToolError::Recoverable(format!("preview.start could not reach {url}: {error}"))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod browser_worker_tests {
+    use super::*;
+    use crate::RuntimeStore;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::Mutex;
+
+    static BROWSER_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn runtime_browser_worker_writes_real_nonblank_png_evidence() {
+        let executable = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        if !executable.is_file() {
+            return;
+        }
+        let _guard = BROWSER_ENV_LOCK.lock().await;
+        unsafe {
+            std::env::set_var("RUNTIME_BROWSER_EXECUTABLE", executable);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let html = "<!doctype html><style>html,body{margin:0;height:100%}body{background:linear-gradient(90deg,#f00 50%,#00f 50%)}</style>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        html.len(),
+                        html
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "browser-project".to_string(),
+                AgentPhase::Review,
+                "review".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let storage = std::env::temp_dir().join(format!(
+            "runtime-browser-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut ctx = ToolContext::new(store, run, storage.join("workspace"));
+        ctx.runtime_storage_dir = storage;
+        let capture = browser::capture_runtime_screenshot(
+            &ctx,
+            "real-browser",
+            &format!("http://{address}/"),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        unsafe {
+            std::env::remove_var("RUNTIME_BROWSER_EXECUTABLE");
+        }
+        server.abort();
+        assert_eq!((capture.width, capture.height), (1440, 900));
+        assert_eq!(capture.png_sha256.len(), 64);
+        assert!(capture.nonblank_pixel_ratio > 0.25);
+        assert!(capture.uri.starts_with("runtime://screenshots/"));
+    }
 }

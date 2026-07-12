@@ -34,13 +34,17 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
+    sync::Mutex as AsyncMutex,
     task::JoinHandle,
     time::{timeout, Duration},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tower::ServiceExt;
 
-static SANDBOX_CHANNEL_ENV_LOCK: Mutex<()> = Mutex::new(());
+#[path = "http_api/contract_manifest.rs"]
+mod contract_manifest;
+
+static SANDBOX_CHANNEL_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 const REAL_PROVIDER_STAGE_TIMEOUT_SECS: u64 = 420;
 
 struct SandboxChannelEnvOverride;
@@ -4605,7 +4609,7 @@ async fn project_runtime_state_reads_phase_a_global_workspace_lifecycle_state() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn project_runtime_state_reads_kubernetes_workspace_channel_lifecycle_state() {
-    let _env_guard = SANDBOX_CHANNEL_ENV_LOCK.lock().unwrap();
+    let _env_guard = SANDBOX_CHANNEL_ENV_LOCK.lock().await;
     let mut files = HashMap::new();
     files.insert(
         "/workspace/state/style-contract.json".to_string(),
@@ -5828,6 +5832,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_real_provider_lifecycle_project(
     app: axum::Router,
     store: &RuntimeStore,

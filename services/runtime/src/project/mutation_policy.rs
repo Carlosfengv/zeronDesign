@@ -17,7 +17,7 @@ pub struct ProjectMutationViolation {
 pub fn check_project_write_path(
     ctx: &ToolContext,
     path: &Path,
-) -> Result<(), ProjectMutationViolation> {
+) -> Result<(), Box<ProjectMutationViolation>> {
     let Some(state) = ctx.run.project_state_snapshot.as_ref() else {
         return Ok(());
     };
@@ -43,12 +43,12 @@ pub fn check_project_write_path(
     {
         return Ok(());
     }
-    Err(ProjectMutationViolation {
+    Err(Box::new(ProjectMutationViolation {
         template_id: template_id.to_string(),
         error_kind: spec.mutation_policy.error_kind,
         path: path.to_path_buf(),
         app_root,
         forbidden_roots,
         guidance: spec.mutation_policy.guidance,
-    })
+    }))
 }

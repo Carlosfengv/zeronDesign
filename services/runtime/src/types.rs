@@ -599,9 +599,9 @@ impl DesignProfile {
         if self.version == 0 {
             return Err("version must be positive".to_string());
         }
-        if !object_string(&self.scope, "projectId").is_some()
-            && !object_string(&self.scope, "workspaceId").is_some()
-            && !object_string(&self.scope, "organizationId").is_some()
+        if object_string(&self.scope, "projectId").is_none()
+            && object_string(&self.scope, "workspaceId").is_none()
+            && object_string(&self.scope, "organizationId").is_none()
         {
             return Err("scope requires projectId, workspaceId, or organizationId".to_string());
         }

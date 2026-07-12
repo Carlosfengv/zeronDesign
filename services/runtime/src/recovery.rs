@@ -9,7 +9,7 @@ use chrono::Utc;
 pub enum RecoveryOutcome {
     Resumed {
         run_id: String,
-        checkpoint: AgentCheckpoint,
+        checkpoint: Box<AgentCheckpoint>,
     },
     Failed {
         run_id: String,
@@ -75,7 +75,7 @@ pub async fn recover_run(store: &RuntimeStore, run_id: &str) -> Result<RecoveryO
             .await;
         return Ok(RecoveryOutcome::Resumed {
             run_id: run_id.to_string(),
-            checkpoint,
+            checkpoint: Box::new(checkpoint),
         });
     }
 
