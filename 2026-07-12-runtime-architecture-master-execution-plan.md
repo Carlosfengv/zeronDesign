@@ -417,6 +417,22 @@ test(runtime): verify packaging crash provenance integrity and recovery
 - 需要让 Agent/Sandbox 直接 push image；
 - 相同 Release 可能绑定两个不同 image digest。
 
+### 9.6.1 G4 外部工具链决策门
+
+进入真实 image build/push 前必须形成一条已批准的 `ReleaseToolchainDecision`，至少冻结：
+
+| 字段 | 本地真实验收建议 | 生产要求 |
+|---|---|---|
+| Registry | CNCF Distribution v3，仅绑定本机测试端口 | TLS、鉴权、不可变/删除策略和审计已配置的 Harbor/GHCR/企业 Registry |
+| Builder | Runtime 控制的 Docker Buildx `docker-container` builder | 独立受信 builder identity；Agent/Sandbox 不可访问 daemon 或 push credential |
+| SBOM | Syft SPDX JSON，并记录 digest | 工具版本固定，SBOM 作为 OCI attestation/受保护 evidence 保存 |
+| Scan | Trivy vuln+secret；Critical 或 secret finding 阻断，High 记录 | 经安全团队批准并版本化的 policy，离线 DB/例外和 EOL 策略明确 |
+| Signing | Cosign 测试 key，仅用于本地验收 | KMS/Keyless identity、验证规则、Rekor/私有 transparency 策略明确 |
+| Base image | 静态 runtime image 必须 digest pin | 允许仓库、更新责任、SBOM、provenance 和 admission policy 明确 |
+
+当前决策状态为 `pending` 时，只允许合并 RuntimeManifest、Release 状态机、可信 backend interface 和
+mock failure matrix；不得把 mock evidence 标记为 G4 完成，也不得创建 Published workload。
+
 ### 9.7 可复制 Goal 文本
 
 ```text
