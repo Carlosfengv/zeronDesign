@@ -1,0 +1,43 @@
+name: Runtime Sandbox Architecture
+
+"on":
+  pull_request:
+    paths:
+      - "services/runtime/**"
+      - "infra/agent-sandbox/**"
+      - ".github/workflows/runtime-sandbox-architecture.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "services/runtime/**"
+      - "infra/agent-sandbox/**"
+      - ".github/workflows/runtime-sandbox-architecture.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  architecture-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/shared/package-lock.json
+      - name: Enforce sandbox module boundaries
+        env:
+          SANDBOX_ARCHITECTURE_STRICT: "1"
+        run: bash services/runtime/scripts/check-sandbox-architecture.sh
+      - name: Enforce remote workspace filesystem boundary
+        run: bash services/runtime/scripts/check-remote-workspace-fs-boundary.sh
+      - name: Verify sandbox tool contract
+        run: cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_contract_baseline
+      - name: Verify template registry contract
+        run: cargo test --manifest-path services/runtime/Cargo.toml --test template_registry
+      - name: Verify project initializer fault matrix
+        run: cargo test --manifest-path services/runtime/Cargo.toml recovers_every_mutation_checkpoint --lib

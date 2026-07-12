@@ -17,6 +17,12 @@ run_step "cargo fmt" \
 run_step "remote workspace filesystem boundary" \
   services/runtime/scripts/check-remote-workspace-fs-boundary.sh
 
+run_step "sandbox architecture boundary" \
+  services/runtime/scripts/check-sandbox-architecture.sh
+
+run_step "sandbox tool contract baseline" \
+  cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_contract_baseline -- --nocapture
+
 run_step "runtime agent hooks" \
   cargo test --manifest-path services/runtime/Cargo.toml agent_hooks -- --nocapture
 
