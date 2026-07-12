@@ -1,17 +1,17 @@
 use super::start_validation::{sandbox_phase_requires_binding, validate_openable_sandbox_binding};
 use super::{
-    conflict as conflict_error, design_profile_error, internal as internal_error,
-    invalid_request as bad_request, not_found, repair_run_error, sandbox_binding_error,
-    RunLifecycleError, RunLifecycleOutcome, RunLifecycleService,
+    conflict as conflict_error, design_profile_error, internal as internal_error, not_found,
+    profile_service_error, repair_run_error, sandbox_binding_error, RunLifecycleError,
+    RunLifecycleOutcome, RunLifecycleService,
 };
 use crate::{
     config::PublicPrincipalAuthMode,
     conversation::RuntimeStore,
     project::resolve_built_in_template_for_init,
-    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource, DesignProfile},
+    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource},
 };
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub struct StartRunCommand {
@@ -44,11 +44,21 @@ impl RunLifecycleService {
         validate_project_access_before_initial_run(self, &request).await?;
         validate_sandbox_context(&self.store, &request).await?;
         validate_project_lifecycle_context(&self.store, &request).await?;
-        let design_profile = resolve_design_profile_context(&self.store, &request).await?;
-        let design_profile_target = design_profile_execution_target(&self.store, &request).await?;
-        let design_profile_conflict =
-            preflight_design_profile_conflicts(&self.store, &request, design_profile.as_ref())
-                .await?;
+        let prepared = self
+            .design_profiles
+            .prepare_run_context(crate::design_profile_service::RunProfileContextQuery {
+                project_id: &request.project_id,
+                workspace_id: request.input_context.workspace_id.as_deref(),
+                organization_id: request.input_context.organization_id.as_deref(),
+                explicit_profile_id: request.input_context.design_profile_id.as_deref(),
+                phase: request.phase,
+                brief_id: request.input_context.brief_id.as_deref(),
+            })
+            .await
+            .map_err(profile_service_error)?;
+        let design_profile = prepared.profile;
+        let design_profile_target = prepared.execution_target;
+        let design_profile_conflict = prepared.conflict;
         let content_sources = merge_content_sources(
             inherited_build_content_sources(&self.store, &request).await,
             request.input_context.content_sources.clone(),
@@ -157,7 +167,7 @@ impl RunLifecycleService {
         };
         if let Some(profile) = design_profile.as_ref() {
             if let Some((blocked_state, message)) =
-                design_profile_prebuild_failure(&self.store, &run, profile).await
+                self.design_profiles.prebuild_failure(&run, profile).await
             {
                 self.store
                     .append_conversation_item(
@@ -428,168 +438,6 @@ fn merge_content_sources(
     merged
 }
 
-async fn resolve_design_profile_context(
-    store: &RuntimeStore,
-    request: &StartRunCommand,
-) -> Result<Option<DesignProfile>, RunLifecycleError> {
-    store
-        .resolve_design_profile(
-            &request.project_id,
-            request.input_context.workspace_id.as_deref(),
-            request.input_context.organization_id.as_deref(),
-            request.input_context.design_profile_id.as_deref(),
-        )
-        .await
-        .map_err(design_profile_error)
-}
-
-async fn design_profile_execution_target(
-    store: &RuntimeStore,
-    request: &StartRunCommand,
-) -> Result<Option<(String, String)>, RunLifecycleError> {
-    if request.phase != AgentPhase::Build {
-        return Ok(None);
-    }
-    let Some(brief_id) = request.input_context.brief_id.as_deref() else {
-        return Ok(None);
-    };
-    let brief = store
-        .get_brief(brief_id)
-        .await
-        .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
-    let template = resolve_built_in_template_for_init(&brief.recommended_template)
-        .await
-        .map_err(|error| bad_request(error.to_string()))?;
-    Ok(Some((
-        template.surface.to_string(),
-        brief.recommended_template,
-    )))
-}
-
-async fn design_profile_prebuild_failure(
-    store: &RuntimeStore,
-    run: &AgentRun,
-    profile: &DesignProfile,
-) -> Option<(String, String)> {
-    if run.phase != AgentPhase::Build {
-        return None;
-    }
-    if profile.status != "active" {
-        return Some((
-            "needs_user_input:design_profile_integrity_failed".to_string(),
-            "DesignProfile must be active before Build.".to_string(),
-        ));
-    }
-    if run.design_profile_hash.as_deref() != Some(profile.stable_hash().as_str()) {
-        return Some((
-            "needs_user_input:design_profile_integrity_failed".to_string(),
-            "DesignProfile hash no longer matches the run snapshot.".to_string(),
-        ));
-    }
-    if let (Some(surface), Some(template), Some(expected_hash)) = (
-        run.design_profile_surface.as_deref(),
-        run.design_profile_template.as_deref(),
-        run.design_profile_effective_hash.as_deref(),
-    ) {
-        match profile.effective_for(surface, template) {
-            Ok(effective) if effective.effective_profile_hash == expected_hash => {}
-            _ => {
-                return Some((
-                    "needs_user_input:design_profile_integrity_failed".to_string(),
-                    "Effective DesignProfile hash or template resolution changed.".to_string(),
-                ))
-            }
-        }
-    }
-    if profile.schema_version == crate::types::DESIGN_PROFILE_SCHEMA_V1 {
-        store
-            .append_audit_record(
-                &run.project_id,
-                &run.id,
-                "design_profile.legacy_source",
-                "schemaVersion=design-profile@1",
-                "allow",
-                "legacy-warning: source artifact verification unavailable",
-            )
-            .await;
-        return None;
-    }
-    if profile.source.get("kind").and_then(Value::as_str) != Some("imported") {
-        return None;
-    }
-    if profile.source.get("integrity").and_then(Value::as_str) != Some("verified") {
-        return Some((
-            "needs_user_input:design_profile_integrity_failed".to_string(),
-            "Imported DesignProfile source integrity is not verified.".to_string(),
-        ));
-    }
-    let Some(artifact_id) = run.design_source_artifact_id.as_deref() else {
-        return Some((
-            "needs_user_input:design_profile_source_missing".to_string(),
-            "Imported DesignProfile source artifact is missing from the run snapshot.".to_string(),
-        ));
-    };
-    let Some(artifact) = store.get_design_source_artifact(artifact_id).await else {
-        return Some((
-            "needs_user_input:design_profile_source_missing".to_string(),
-            "Imported DesignProfile source artifact metadata is missing.".to_string(),
-        ));
-    };
-    if run.design_source_hash.as_deref() != Some(artifact.sha256.as_str())
-        || profile.source.get("sourceHash").and_then(Value::as_str)
-            != Some(artifact.sha256.as_str())
-    {
-        return Some((
-            "needs_user_input:design_profile_integrity_failed".to_string(),
-            "Imported DesignProfile source hash does not match the immutable artifact.".to_string(),
-        ));
-    }
-    if store
-        .read_design_source_artifact_content(artifact_id)
-        .await
-        .is_err()
-    {
-        return Some((
-            "needs_user_input:design_profile_integrity_failed".to_string(),
-            "Imported DesignProfile source bytes failed integrity verification.".to_string(),
-        ));
-    }
-    None
-}
-
-async fn preflight_design_profile_conflicts(
-    store: &RuntimeStore,
-    request: &StartRunCommand,
-    design_profile: Option<&DesignProfile>,
-) -> Result<Option<String>, RunLifecycleError> {
-    let Some(design_profile) = design_profile else {
-        return Ok(None);
-    };
-    if request.phase != AgentPhase::Build {
-        return Ok(None);
-    }
-    let Some(brief_id) = request.input_context.brief_id.as_deref() else {
-        return Ok(None);
-    };
-    let brief = store
-        .get_brief(brief_id)
-        .await
-        .ok_or_else(|| not_found(format!("brief not found: {brief_id}")))?;
-    let allowed = design_profile
-        .technical
-        .get("allowedTemplates")
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if !allowed.is_empty() && !allowed.contains(&brief.recommended_template.as_str()) {
-        return Ok(Some(format!(
-            "Brief recommendedTemplate={} is not allowed by DesignProfile {}",
-            brief.recommended_template, design_profile.id
-        )));
-    }
-    Ok(None)
-}
-
 async fn validate_sandbox_context(
     store: &RuntimeStore,
     request: &StartRunCommand,
@@ -668,25 +516,6 @@ async fn validate_build_confirmed_brief(
     resolve_built_in_template_for_init(&brief.recommended_template)
         .await
         .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
-    Ok(())
-}
-
-pub async fn validate_design_profile_template_availability(
-    profile: &DesignProfile,
-) -> Result<(), String> {
-    let allowed_templates = profile
-        .technical
-        .get("allowedTemplates")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "technical.allowedTemplates is required".to_string())?;
-    for template in allowed_templates {
-        let template = template
-            .as_str()
-            .ok_or_else(|| "technical.allowedTemplates must contain strings".to_string())?;
-        resolve_built_in_template_for_init(template)
-            .await
-            .map_err(|error| format!("{}: {error}", error.error_kind()))?;
-    }
     Ok(())
 }
 

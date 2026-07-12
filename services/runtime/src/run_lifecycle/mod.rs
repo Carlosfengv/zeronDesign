@@ -9,9 +9,11 @@ mod start_validation;
 mod tests;
 
 pub use permission::PermissionDecision;
-pub use start::{validate_design_profile_template_availability, StartRunCommand, StartRunContext};
+pub use start::{StartRunCommand, StartRunContext};
 
-use crate::{config::RuntimeConfig, conversation::RuntimeStore};
+use crate::{
+    config::RuntimeConfig, conversation::RuntimeStore, design_profile_service::DesignProfileService,
+};
 use async_trait::async_trait;
 use std::{error::Error, fmt, sync::Arc};
 
@@ -47,6 +49,7 @@ pub struct RunLifecycleService {
     session_launcher: Arc<dyn RunSessionLauncher>,
     sandbox_provisioner: Arc<dyn BuildSandboxProvisioner>,
     edit_workspace_restorer: Arc<dyn EditWorkspaceRestorer>,
+    design_profiles: DesignProfileService,
 }
 
 impl RunLifecycleService {
@@ -56,6 +59,7 @@ impl RunLifecycleService {
         session_launcher: Arc<dyn RunSessionLauncher>,
         sandbox_provisioner: Arc<dyn BuildSandboxProvisioner>,
         edit_workspace_restorer: Arc<dyn EditWorkspaceRestorer>,
+        design_profiles: DesignProfileService,
     ) -> Self {
         Self {
             config,
@@ -63,6 +67,7 @@ impl RunLifecycleService {
             session_launcher,
             sandbox_provisioner,
             edit_workspace_restorer,
+            design_profiles,
         }
     }
 
@@ -149,5 +154,22 @@ fn repair_run_error(error: anyhow::Error) -> RunLifecycleError {
         not_found(message)
     } else {
         RunLifecycleError::Conflict(message)
+    }
+}
+
+fn profile_service_error(
+    error: crate::design_profile_service::DesignProfileServiceError,
+) -> RunLifecycleError {
+    use crate::design_profile_service::DesignProfileServiceError;
+    match error {
+        DesignProfileServiceError::InvalidRequest(message) => {
+            RunLifecycleError::InvalidRequest(message)
+        }
+        DesignProfileServiceError::NotFound(message) => RunLifecycleError::NotFound(message),
+        DesignProfileServiceError::Conflict(message)
+        | DesignProfileServiceError::ActivationConflict { message, .. } => {
+            RunLifecycleError::Conflict(message)
+        }
+        DesignProfileServiceError::Internal(message) => RunLifecycleError::Internal(message),
     }
 }

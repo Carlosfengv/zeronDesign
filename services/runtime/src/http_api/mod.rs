@@ -7,7 +7,6 @@ mod routes;
 mod support;
 mod workspace;
 
-use crate::run_lifecycle::validate_design_profile_template_availability;
 pub use crate::runtime::recover_startup_runs;
 pub use crate::runtime::RuntimeSupervisor;
 use artifact_legacy::*;
@@ -33,6 +32,7 @@ use crate::{
     channel_manager::ChannelManager,
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
+    design_profile_service::DesignProfileService,
     model_gateway::{model_client_from_config, ModelClient},
     preview::{promote_preview, PromotionGateReport},
     profiles::build::{run_template_build, TemplateBuildRequest},
@@ -70,7 +70,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -117,7 +116,8 @@ pub fn router(config: RuntimeConfig) -> Router {
 }
 
 pub fn router_with_state(state: AppState) -> Router {
-    let run_lifecycle = run_lifecycle_service(&state);
+    let design_profiles = DesignProfileService::new(state.store.clone());
+    let run_lifecycle = run_lifecycle_service(&state, design_profiles.clone());
     Router::new()
         .merge(routes::system::router())
         .merge(routes::runs::router())
@@ -130,6 +130,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::artifacts::router())
         .merge(routes::internal::router())
         .layer(Extension(run_lifecycle))
+        .layer(Extension(design_profiles))
         .with_state(state)
 }
 
