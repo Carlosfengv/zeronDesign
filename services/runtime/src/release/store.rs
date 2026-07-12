@@ -117,6 +117,19 @@ impl ReleaseStore {
                     ReleaseStoreError::Storage("packaging release link is corrupt".to_string())
                 })?
                 .clone();
+            if release.project_id != input.project_id
+                || release.version_id != input.version_id
+                || release.run_id != input.run_id
+                || release.template_id != input.template_id
+                || release.template_version != input.template_version
+                || release.source_snapshot_uri != input.source_snapshot_uri
+                || release.runtime_profile_id != input.runtime_profile_id
+                || packaging.registry_repository != input.registry_repository
+            {
+                return Err(ReleaseStoreError::IntegrityConflict(
+                    "idempotency key is already bound to different release provenance".to_string(),
+                ));
+            }
             return Ok((release, packaging));
         }
 
@@ -592,6 +605,20 @@ mod tests {
         let recovered = ReleaseStore::open(&root).unwrap();
         assert_eq!(recovered.release(&first.0.id), Some(first.0));
         assert_eq!(recovered.packaging(&first.1.id), Some(first.1));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idempotency_key_cannot_be_rebound_to_different_provenance() {
+        let root = root("idempotency-conflict");
+        let store = ReleaseStore::open(&root).unwrap();
+        store.prepare(&input()).unwrap();
+        let mut conflicting = input();
+        conflicting.registry_repository = "other-registry.example/works".to_string();
+        assert!(matches!(
+            store.prepare(&conflicting),
+            Err(ReleaseStoreError::IntegrityConflict(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
