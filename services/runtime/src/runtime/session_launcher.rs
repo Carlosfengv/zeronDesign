@@ -33,13 +33,13 @@ impl RuntimeSessionLauncher {
 }
 
 impl RunSessionLauncher for RuntimeSessionLauncher {
-    fn launch(&self, run_id: String) {
+    fn launch(&self, run_id: String) -> anyhow::Result<()> {
         let task_name = format!("session/{run_id}");
         let supervisor = self.supervisor.clone();
         let config = self.config.clone();
         let store = self.store.clone();
         let model = self.model.clone();
-        let _ = supervisor.clone().spawn(task_name, false, async move {
+        supervisor.clone().spawn(task_name, false, async move {
             let tool_executor = if let Some(run) = store.get_run(&run_id).await {
                 let workspace_root = effective_workspace_root(&config, &run.project_id);
                 if config.sandbox_backend_mode == SandboxBackendMode::PhaseAContract {
@@ -54,7 +54,8 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
             let session = QuerySession::with_tool_executor(store, model, tool_executor);
             let _ = session.submit_run(&run_id).await;
             Ok(())
-        });
+        })?;
+        Ok(())
     }
 }
 

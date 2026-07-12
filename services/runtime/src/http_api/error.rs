@@ -6,6 +6,7 @@ pub(super) fn run_lifecycle_error(
     error: crate::run_lifecycle::RunLifecycleError,
 ) -> (StatusCode, Json<ErrorResponse>) {
     match error {
+        crate::run_lifecycle::RunLifecycleError::InvalidRequest(message) => bad_request(message),
         crate::run_lifecycle::RunLifecycleError::NotFound(message) => not_found(message),
         crate::run_lifecycle::RunLifecycleError::Conflict(message) => {
             conflict_error(anyhow::anyhow!(message))
@@ -38,15 +39,6 @@ pub(super) fn error_response_as_value(
     (error.0, Json(json!({ "error": error.1.error })))
 }
 
-pub(super) fn sandbox_binding_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("sandbox binding not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
-    }
-}
-
 pub(super) fn design_profile_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     let message = error.to_string();
     if message.contains("design profile not found") {
@@ -66,15 +58,6 @@ pub(super) fn design_source_error(error: anyhow::Error) -> (StatusCode, Json<Err
         bad_request(message)
     } else {
         internal_error(anyhow::anyhow!(message))
-    }
-}
-
-pub(super) fn repair_run_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let message = error.to_string();
-    if message.contains("parent run not found") || message.contains("review finding not found") {
-        not_found(message)
-    } else {
-        conflict_error(anyhow::anyhow!(message))
     }
 }
 

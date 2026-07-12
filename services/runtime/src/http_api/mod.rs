@@ -7,6 +7,7 @@ mod routes;
 mod support;
 mod workspace;
 
+use crate::run_lifecycle::validate_design_profile_template_availability;
 pub use crate::runtime::recover_startup_runs;
 pub use crate::runtime::RuntimeSupervisor;
 use artifact_legacy::*;
@@ -14,21 +15,21 @@ use auth::*;
 pub use contracts::*;
 use error::*;
 use profile_support::*;
-use routes::runs::start::validate_design_profile_template_availability;
 use support::*;
 use workspace::*;
 
-pub(crate) use support::spawn_session as spawn_supervised_session;
 pub(crate) use workspace::effective_workspace_root as resolved_workspace_root;
 
 #[cfg(test)]
 use crate::project::ProjectInitWorkspaceTransaction;
 #[cfg(test)]
+use crate::tools::sandbox::LocalWorkspaceBackend;
+#[cfg(test)]
 use routes::artifacts::artifact_project_id_from_referer;
 
 use crate::{
     artifact_manifest::ArtifactResolver,
-    artifact_publisher::{safe_segment, FileArtifactPublisher},
+    artifact_publisher::FileArtifactPublisher,
     channel_manager::ChannelManager,
     config::{PublicPrincipalAuthMode, RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
@@ -40,20 +41,21 @@ use crate::{
         PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION,
         PUBLICATION_READ_OPERATION, PUBLICATION_WRITE_OPERATION,
     },
-    run_lifecycle::{RunLifecycleService, RunSessionLauncher},
-    runtime::RuntimeSessionLauncher,
+    run_lifecycle::RunLifecycleService,
+    runtime::{
+        RuntimeBuildSandboxProvisioner, RuntimeEditWorkspaceRestorer, RuntimeSessionLauncher,
+    },
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     tools::{
         control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
-        sandbox::{LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend},
+        sandbox::{SandboxChannelWorkspaceBackend, WorkspaceBackend},
     },
     types::{
-        sha256_hex, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief, ContentSource,
-        ConversationItem, DesignProfile, DesignProfileConversionReport, DesignProfileDraft,
-        DesignProfileFidelityReport, DesignProfileUnmappedItem, DesignProfileValidationIssue,
-        DesignSourceArtifact, PreviewLeaseStatus, ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2,
-        MAX_DESIGN_SOURCE_BYTES,
+        sha256_hex, AgentEvent, AgentPhase, AgentRun, Brief, ConversationItem, DesignProfile,
+        DesignProfileConversionReport, DesignProfileDraft, DesignProfileFidelityReport,
+        DesignProfileUnmappedItem, DesignProfileValidationIssue, DesignSourceArtifact,
+        PreviewLeaseStatus, ProjectAccessRecord, DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use axum::{

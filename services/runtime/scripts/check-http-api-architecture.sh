@@ -49,6 +49,21 @@ if grep -RInE --include='*.rs' 'std::fs|tokio::fs' "$RUN_LIFECYCLE_DIR"; then
   fail "APP-003: RunLifecycle application service must use filesystem adapters"
 fi
 
+while IFS= read -r application_module; do
+  lines="$(wc -l < "$application_module" | tr -d ' ')"
+  if (( lines > 800 )); then
+    fail "APP-004/SIZE-001: RunLifecycle application module exceeds 800 lines: ${application_module#$ROOT/} ($lines)"
+  fi
+done < <(find "$RUN_LIFECYCLE_DIR" -type f -name '*.rs' | sort)
+
+for mutation_route in cancel continue_run permission start; do
+  route_module="$HTTP_DIR/routes/runs/$mutation_route.rs"
+  lines="$(wc -l < "$route_module" | tr -d ' ')"
+  if (( lines > 50 )); then
+    fail "HTTP-009: Run mutation route adapter exceeds 50 lines: ${route_module#$ROOT/} ($lines)"
+  fi
+done
+
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
   'astro-website|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \
   "$HTTP_DIR/routes"; then
