@@ -1,6 +1,9 @@
 import { z } from "zod";
 import {
   AgentPhaseSchema,
+  AgentRunStatusSchema,
+  BriefSchema,
+  BriefStatusSchema,
   ConversationItemSchema,
   DesignProfileBaseSchema,
   DesignProfileDraftSchema,
@@ -88,6 +91,15 @@ export const ContinueRunResponseSchema = z.object({
 export const CancelRunResponseSchema = z.object({
   runId: z.string().min(1),
   status: z.literal("cancelled"),
+});
+
+export const BriefResponseSchema = z.object({
+  briefId: z.string().min(1),
+  projectId: z.string().min(1),
+  runId: z.string().min(1),
+  status: BriefStatusSchema,
+  runStatus: AgentRunStatusSchema,
+  brief: BriefSchema,
 });
 
 export const CreateDesignSourceArtifactRequestSchema = z.object({
@@ -324,6 +336,158 @@ export const ProjectRuntimeStateResponseSchema = z
     }
   });
 
+export const CreateReleaseRequestSchema = z.object({
+  runtimeProfileId: z.literal("static-web-v1").default("static-web-v1"),
+});
+
+export const WorkReleaseStatusSchema = z.enum([
+  "packaging", "packaged", "validated", "failed", "garbage_collectable", "garbage_collected",
+]);
+
+export const ReleasePackagingStatusSchema = z.enum([
+  "prepared", "building", "pushed", "scanning", "signing", "validated", "failed",
+  "reconcile_required",
+]);
+
+export const PackagingScanEvidenceSchema = z.object({
+  policyVersion: z.string().min(1),
+  passed: z.boolean(),
+  criticalVulnerabilities: z.number().int().nonnegative(),
+  highVulnerabilities: z.number().int().nonnegative(),
+  secretFindings: z.number().int().nonnegative(),
+  reportDigest: z.string().regex(/^[a-fA-F0-9]{64}$/),
+});
+
+export const WorkReleaseSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  versionId: z.string().min(1),
+  runId: z.string().min(1),
+  templateId: z.string().min(1),
+  templateVersion: z.string().min(1),
+  artifactManifestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  runtimeManifestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  sourceSnapshotUri: z.string().min(1),
+  runtimeProfileId: z.literal("static-web-v1"),
+  runtimeImageRef: z.string().min(1).nullish(),
+  runtimeImageDigest: z.string().regex(/^sha256:[a-fA-F0-9]{64}$/).nullish(),
+  status: WorkReleaseStatusSchema,
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+
+export const ReleasePackagingRecordSchema = z.object({
+  id: z.string().min(1),
+  idempotencyKey: z.string().min(1),
+  projectId: z.string().min(1),
+  releaseId: z.string().min(1),
+  artifactManifestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  runtimeManifestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  baseImageDigest: z.string().regex(/^sha256:[a-fA-F0-9]{64}$/),
+  packagerVersion: z.string().min(1),
+  registryRepository: z.string().min(1),
+  builtImageDigest: z.string().regex(/^sha256:[a-fA-F0-9]{64}$/).nullish(),
+  pushedImageDigest: z.string().regex(/^sha256:[a-fA-F0-9]{64}$/).nullish(),
+  sbomDigest: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  provenanceDigest: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  signatureIdentity: z.string().min(1).nullish(),
+  signatureDigest: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  scanPolicyVersion: z.string().min(1),
+  scanEvidence: PackagingScanEvidenceSchema.nullish(),
+  status: ReleasePackagingStatusSchema,
+  attempts: z.number().int().nonnegative(),
+  lastError: z.string().nullish(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+
+export const ReleasePackagingResponseSchema = z.object({
+  release: WorkReleaseSchema,
+  packaging: ReleasePackagingRecordSchema,
+});
+
+export const PublishWorkRequestSchema = z.object({
+  releaseId: z.string().min(1),
+  expectedCurrentReleaseId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative(),
+  runtimeProfileId: z.literal("static-web-v1").default("static-web-v1"),
+});
+
+export const UnpublishWorkRequestSchema = z.object({
+  expectedCurrentReleaseId: z.string().min(1),
+  expectedGeneration: z.number().int().nonnegative(),
+  runtimeProfileId: z.literal("static-web-v1").default("static-web-v1"),
+});
+
+export const PublishOperationKindSchema = z.enum(["publish", "update", "rollback", "unpublish"]);
+export const PublishOperationStatusSchema = z.enum([
+  "requested", "packaging", "release_validated", "desired_state_committed", "reconciling",
+  "workload_ready", "traffic_switched", "external_probe_passed", "completed", "failed",
+  "cancelled", "reconcile_required",
+]);
+export const PublishCheckpointSchema = z.enum([
+  "requested", "packaging", "release_validated", "desired_state_committed", "reconciling",
+  "workload_ready", "traffic_switched", "external_probe_passed", "completed",
+]);
+export const PublishOperationSchema = z.object({
+  schemaVersion: z.literal("publish-operation@1"),
+  id: z.string().min(1),
+  idempotencyKeyHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  requestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  projectId: z.string().min(1),
+  releaseId: z.string().min(1).nullish(),
+  expectedCurrentReleaseId: z.string().min(1).nullish(),
+  desiredGeneration: z.number().int().nonnegative(),
+  kind: PublishOperationKindSchema,
+  status: PublishOperationStatusSchema,
+  checkpoint: PublishCheckpointSchema,
+  lastError: z.string().nullish(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export const PublicationOperationResponseSchema = z.object({ operation: PublishOperationSchema });
+
+export const PublicationDesiredStateSchema = z.enum(["unpublished", "published"]);
+export const WorkRuntimeStatusSchema = z.enum([
+  "unpublished", "publishing", "published", "updating", "unpublishing", "publish_failed",
+  "update_failed", "reconcile_required",
+]);
+export const WorkRuntimeStateSchema = z.object({
+  schemaVersion: z.literal("work-runtime-state@1"),
+  projectId: z.string().min(1),
+  desiredPublication: PublicationDesiredStateSchema,
+  desiredReleaseId: z.string().min(1).nullish(),
+  currentReleaseId: z.string().min(1).nullish(),
+  previousReleaseId: z.string().min(1).nullish(),
+  lastSuccessfulReleaseId: z.string().min(1).nullish(),
+  desiredGeneration: z.number().int().nonnegative(),
+  hostSlug: z.string().min(1),
+  runtimeProfileId: z.string().min(1),
+  currentDeploymentName: z.string().min(1).nullish(),
+  previousDeploymentName: z.string().min(1).nullish(),
+  serviceName: z.string().min(1),
+  ingressName: z.string().min(1),
+  deploymentUid: z.string().min(1).nullish(),
+  deploymentResourceVersion: z.string().min(1).nullish(),
+  serviceUid: z.string().min(1).nullish(),
+  serviceResourceVersion: z.string().min(1).nullish(),
+  ingressUid: z.string().min(1).nullish(),
+  ingressResourceVersion: z.string().min(1).nullish(),
+  observedGeneration: z.number().int().nonnegative(),
+  status: WorkRuntimeStatusSchema,
+  lastError: z.string().nullish(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export const DeploymentStateResponseSchema = z.object({
+  runtime: WorkRuntimeStateSchema,
+  publicUrl: z.string().url().nullish(),
+});
+export const WorkReleaseListResponseSchema = z.object({
+  projectId: z.string().min(1),
+  releases: z.array(WorkReleaseSchema),
+});
+
 export const PromotePreviewRequestSchema = z.object({
   projectId: z.string().min(1),
   runId: z.string().min(1),
@@ -374,6 +538,7 @@ export type StartRunResponse = z.infer<typeof StartRunResponseSchema>;
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
 export type ContinueRunResponse = z.infer<typeof ContinueRunResponseSchema>;
 export type CancelRunResponse = z.infer<typeof CancelRunResponseSchema>;
+export type BriefResponse = z.infer<typeof BriefResponseSchema>;
 export type CreateDesignSourceArtifactRequest = z.infer<
   typeof CreateDesignSourceArtifactRequestSchema
 >;
@@ -410,6 +575,17 @@ export type RuntimeLatestBuild = z.infer<typeof RuntimeLatestBuildSchema>;
 export type RuntimeDependencyState = z.infer<typeof RuntimeDependencyStateSchema>;
 export type RuntimePreviewState = z.infer<typeof RuntimePreviewStateSchema>;
 export type ProjectRuntimeStateResponse = z.infer<typeof ProjectRuntimeStateResponseSchema>;
+export type CreateReleaseRequest = z.input<typeof CreateReleaseRequestSchema>;
+export type WorkRelease = z.infer<typeof WorkReleaseSchema>;
+export type ReleasePackagingRecord = z.infer<typeof ReleasePackagingRecordSchema>;
+export type ReleasePackagingResponse = z.infer<typeof ReleasePackagingResponseSchema>;
+export type PublishWorkRequest = z.input<typeof PublishWorkRequestSchema>;
+export type UnpublishWorkRequest = z.input<typeof UnpublishWorkRequestSchema>;
+export type PublishOperation = z.infer<typeof PublishOperationSchema>;
+export type PublicationOperationResponse = z.infer<typeof PublicationOperationResponseSchema>;
+export type WorkRuntimeState = z.infer<typeof WorkRuntimeStateSchema>;
+export type DeploymentStateResponse = z.infer<typeof DeploymentStateResponseSchema>;
+export type WorkReleaseListResponse = z.infer<typeof WorkReleaseListResponseSchema>;
 export type PromotePreviewRequest = z.infer<typeof PromotePreviewRequestSchema>;
 export type PromotePreviewResponse = z.infer<typeof PromotePreviewResponseSchema>;
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;

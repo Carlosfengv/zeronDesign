@@ -4,10 +4,12 @@ import {
   ActivateDesignProfileResponseSchema,
   CancelRunResponseSchema,
   BindProjectDesignProfileRequest,
+  BriefResponseSchema,
   ContinueRunRequest,
   ContinueRunResponseSchema,
   ConversationListResponseSchema,
   CreateDesignSourceArtifactRequest,
+  CreateReleaseRequest,
   CreateDesignProfileRequest,
   DesignSourceArtifactResponseSchema,
   DesignProfileDiffResponseSchema,
@@ -15,6 +17,7 @@ import {
   DesignProfileFidelityReportSchema,
   DesignProfileResponseSchema,
   DesignProfileVersionsResponseSchema,
+  DeploymentStateResponseSchema,
   ErrorResponseSchema,
   HealthResponseSchema,
   ImportDesignProfileRequest,
@@ -22,15 +25,20 @@ import {
   ListDesignProfilesResponseSchema,
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
+  PublicationOperationResponseSchema,
+  PublishWorkRequest,
   ProjectAccessResponseSchema,
   ProjectDesignProfileResponseSchema,
   ProjectRuntimeStateResponseSchema,
   ResolvePermissionRequest,
   ResolvePermissionResponseSchema,
+  ReleasePackagingResponseSchema,
   StartRunRequest,
   StartRunResponseSchema,
   UpsertProjectAccessRequest,
+  UnpublishWorkRequest,
   UpdateDesignProfileRequest,
+  WorkReleaseListResponseSchema,
 } from "./api-types.js";
 import { AgentEventSchema, type AgentEvent } from "./events.js";
 
@@ -55,6 +63,7 @@ export type RuntimeClientOptions = {
   baseUrl: string;
   fetch?: RuntimeFetch;
   internalAdminToken?: string;
+  publicPrincipalToken?: string;
 };
 
 export class RuntimeApiError extends Error {
@@ -107,6 +116,41 @@ export type RuntimeClient = {
     request: ContinueRunRequest,
   ): Promise<z.output<typeof ContinueRunResponseSchema>>;
   cancelRun(runId: string): Promise<z.output<typeof CancelRunResponseSchema>>;
+  createRelease(
+    projectId: string,
+    versionId: string,
+    request: CreateReleaseRequest,
+    idempotencyKey: string,
+  ): Promise<z.output<typeof ReleasePackagingResponseSchema>>;
+  getReleasePackaging(
+    packagingId: string,
+  ): Promise<z.output<typeof ReleasePackagingResponseSchema>>;
+  publishWork(
+    projectId: string,
+    request: PublishWorkRequest,
+    idempotencyKey: string,
+  ): Promise<z.output<typeof PublicationOperationResponseSchema>>;
+  rollbackWork(
+    projectId: string,
+    request: PublishWorkRequest,
+    idempotencyKey: string,
+  ): Promise<z.output<typeof PublicationOperationResponseSchema>>;
+  unpublishWork(
+    projectId: string,
+    request: UnpublishWorkRequest,
+    idempotencyKey: string,
+  ): Promise<z.output<typeof PublicationOperationResponseSchema>>;
+  getDeploymentState(
+    projectId: string,
+  ): Promise<z.output<typeof DeploymentStateResponseSchema>>;
+  listWorkReleases(
+    projectId: string,
+  ): Promise<z.output<typeof WorkReleaseListResponseSchema>>;
+  getPublicationOperation(
+    operationId: string,
+  ): Promise<z.output<typeof PublicationOperationResponseSchema>>;
+  getBrief(briefId: string): Promise<z.output<typeof BriefResponseSchema>>;
+  confirmBrief(briefId: string): Promise<z.output<typeof BriefResponseSchema>>;
   createDesignSourceArtifact(
     request: CreateDesignSourceArtifactRequest,
   ): Promise<z.output<typeof DesignSourceArtifactResponseSchema>>;
@@ -197,12 +241,15 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         "x-runtime-admin-token": options.internalAdminToken,
       }
     : {};
+  const publicHeaders: Record<string, string> = options.publicPrincipalToken
+    ? { authorization: `Bearer ${options.publicPrincipalToken}` }
+    : {};
 
   async function get<TSchema extends z.ZodTypeAny>(
     path: string,
     schema: TSchema,
   ): Promise<z.infer<TSchema>> {
-    return requestJson(fetchImpl, baseUrl, path, schema);
+    return requestJson(fetchImpl, baseUrl, path, schema, { headers: publicHeaders });
   }
 
   async function post<TSchema extends z.ZodTypeAny>(
@@ -212,7 +259,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
   ): Promise<z.infer<TSchema>> {
     return requestJson(fetchImpl, baseUrl, path, schema, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...publicHeaders },
       body: JSON.stringify(body),
     });
   }
@@ -224,6 +271,64 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       post(`/runs/${encodePathSegment(runId)}/continue`, request, ContinueRunResponseSchema),
     cancelRun: (runId) =>
       post(`/runs/${encodePathSegment(runId)}/cancel`, {}, CancelRunResponseSchema),
+    createRelease: (projectId, versionId, request, idempotencyKey) =>
+      requestJson(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/versions/${encodePathSegment(versionId)}/releases`,
+        ReleasePackagingResponseSchema,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": idempotencyKey,
+            ...publicHeaders,
+          },
+          body: JSON.stringify(request),
+        },
+      ),
+    getReleasePackaging: (packagingId) =>
+      get(
+        `/release-packagings/${encodePathSegment(packagingId)}`,
+        ReleasePackagingResponseSchema,
+      ),
+    publishWork: (projectId, request, idempotencyKey) =>
+      publicationMutation(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/publish`,
+        request,
+        idempotencyKey,
+        publicHeaders,
+      ),
+    rollbackWork: (projectId, request, idempotencyKey) =>
+      publicationMutation(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/rollback`,
+        request,
+        idempotencyKey,
+        publicHeaders,
+      ),
+    unpublishWork: (projectId, request, idempotencyKey) =>
+      publicationMutation(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/unpublish`,
+        request,
+        idempotencyKey,
+        publicHeaders,
+      ),
+    getDeploymentState: (projectId) =>
+      get(`/projects/${encodePathSegment(projectId)}/deployment-state`, DeploymentStateResponseSchema),
+    listWorkReleases: (projectId) =>
+      get(`/projects/${encodePathSegment(projectId)}/releases`, WorkReleaseListResponseSchema),
+    getPublicationOperation: (operationId) =>
+      get(`/operations/${encodePathSegment(operationId)}`, PublicationOperationResponseSchema),
+    getBrief: (briefId) =>
+      get(`/briefs/${encodePathSegment(briefId)}`, BriefResponseSchema),
+    confirmBrief: (briefId) =>
+      post(`/briefs/${encodePathSegment(briefId)}/confirm`, {}, BriefResponseSchema),
     createDesignSourceArtifact: (request) =>
       requestJson(
         fetchImpl,
@@ -372,7 +477,8 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
     runEventsUrl: (runId, eventOptions) =>
       runEventsUrl(baseUrl, runId, eventOptions?.lastEventId),
     runtimeRunEventsPath,
-    runEventsProxyHeaders,
+    runEventsProxyHeaders: (lastEventId) =>
+      runEventsProxyHeaders(lastEventId, options.publicPrincipalToken),
     subscribeRunEvents: (subscribeOptions) =>
       subscribeRunEvents(baseUrl, subscribeOptions),
   };
@@ -396,8 +502,14 @@ export function runEventsUrl(
   return url.toString();
 }
 
-export function runEventsProxyHeaders(lastEventId?: string): Record<string, string> {
-  return lastEventId ? { "last-event-id": lastEventId } : {};
+export function runEventsProxyHeaders(
+  lastEventId?: string,
+  principalToken?: string,
+): Record<string, string> {
+  return {
+    ...(lastEventId ? { "last-event-id": lastEventId } : {}),
+    ...(principalToken ? { authorization: `Bearer ${principalToken}` } : {}),
+  };
 }
 
 export function runtimePreviewPath(leaseId: string, previewPath = ""): string {
@@ -486,6 +598,27 @@ async function requestJson<TSchema extends z.ZodTypeAny>(
     );
   }
   return schema.parse(payload);
+}
+
+async function publicationMutation(
+  fetchImpl: RuntimeFetch,
+  baseUrl: string,
+  path: string,
+  request: PublishWorkRequest | UnpublishWorkRequest,
+  idempotencyKey: string,
+  publicHeaders: Record<string, string>,
+): Promise<z.output<typeof PublicationOperationResponseSchema>> {
+  const expected = request.expectedCurrentReleaseId;
+  return requestJson(fetchImpl, baseUrl, path, PublicationOperationResponseSchema, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "idempotency-key": idempotencyKey,
+      ...(expected ? { "if-match": `"${expected}"` } : { "if-none-match": "*" }),
+      ...publicHeaders,
+    },
+    body: JSON.stringify(request),
+  });
 }
 
 async function requestBytes(

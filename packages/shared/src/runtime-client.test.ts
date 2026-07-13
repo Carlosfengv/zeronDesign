@@ -116,6 +116,167 @@ class MockEventSource implements EventSourceLike {
 }
 
 describe("runtime client", () => {
+  it("creates and reads release packaging with idempotency and principal headers", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const release = {
+      id: "release-1", projectId: "project-1", versionId: "version-1", runId: "run-1",
+      templateId: "astro-website", templateVersion: "astro-website@runtime-p3",
+      artifactManifestHash: "a".repeat(64), runtimeManifestHash: "b".repeat(64),
+      sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
+      runtimeProfileId: "static-web-v1", runtimeImageRef: null, runtimeImageDigest: null,
+      status: "packaging", createdAt: timestamp, updatedAt: timestamp,
+    };
+    const packaging = {
+      id: "packaging-1", idempotencyKey: "content-key", projectId: "project-1",
+      releaseId: "release-1", artifactManifestHash: "a".repeat(64),
+      runtimeManifestHash: "b".repeat(64), baseImageDigest: `sha256:${"c".repeat(64)}`,
+      packagerVersion: "packager@1", registryRepository: "registry.example/works",
+      builtImageDigest: null, pushedImageDigest: null, sbomDigest: null,
+      provenanceDigest: null, signatureIdentity: null, signatureDigest: null,
+      scanPolicyVersion: "scan@1", scanEvidence: null, status: "prepared", attempts: 0,
+      lastError: null, createdAt: timestamp, updatedAt: timestamp,
+    };
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return { ok: true, status: 200, async json() { return { release, packaging }; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local", fetch: fetchImpl,
+      publicPrincipalToken: "principal-token",
+    });
+
+    await client.createRelease(
+      "project/1", "version/1", { runtimeProfileId: "static-web-v1" }, "publish-click-1",
+    );
+    await client.getReleasePackaging("packaging/1");
+
+    expect(calls[0]).toEqual({
+      url: "http://runtime.local/projects/project%2F1/versions/version%2F1/releases",
+      init: {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": "publish-click-1",
+          authorization: "Bearer principal-token",
+        },
+        body: JSON.stringify({ runtimeProfileId: "static-web-v1" }),
+      },
+    });
+    expect(calls[1]).toEqual({
+      url: "http://runtime.local/release-packagings/packaging%2F1",
+      init: { headers: { authorization: "Bearer principal-token" } },
+    });
+  });
+
+  it("sends publication compare-and-swap headers for initial publish and updates", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const operation = {
+      schemaVersion: "publish-operation@1",
+      id: "operation-1",
+      idempotencyKeyHash: "a".repeat(64),
+      requestHash: "b".repeat(64),
+      projectId: "project-1",
+      releaseId: "release-2",
+      expectedCurrentReleaseId: null,
+      desiredGeneration: 1,
+      kind: "publish",
+      status: "requested",
+      checkpoint: "requested",
+      lastError: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return { ok: true, status: 202, async json() { return { operation }; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      publicPrincipalToken: "principal-token",
+    });
+
+    await client.publishWork(
+      "project-1",
+      { releaseId: "release-1", expectedGeneration: 0, runtimeProfileId: "static-web-v1" },
+      "publish-1",
+    );
+    await client.publishWork(
+      "project-1",
+      {
+        releaseId: "release-2",
+        expectedCurrentReleaseId: "release-1",
+        expectedGeneration: 1,
+        runtimeProfileId: "static-web-v1",
+      },
+      "update-1",
+    );
+
+    expect(calls[0]?.init?.headers).toMatchObject({
+      "idempotency-key": "publish-1",
+      "if-none-match": "*",
+      authorization: "Bearer principal-token",
+    });
+    expect(calls[1]?.init?.headers).toMatchObject({
+      "idempotency-key": "update-1",
+      "if-match": '"release-1"',
+      authorization: "Bearer principal-token",
+    });
+  });
+
+  it("gets and confirms structured briefs using public principal authorization", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const payload = {
+      briefId: "brief-1",
+      projectId: "project-1",
+      runId: "run-1",
+      status: "draft",
+      runStatus: "needs_user_input",
+      brief: {
+        projectType: "website",
+        audience: "product teams",
+        contentHierarchy: ["hero"],
+        pageStructure: [
+          { title: "Home", purpose: "Explain the product", keyContent: ["hero"] },
+        ],
+        visualDirection: "clear editorial",
+        recommendedTemplate: "astro-website",
+        assumptions: [],
+        missingInformation: [],
+      },
+    };
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return { ok: true, status: 200, async json() { return payload; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      publicPrincipalToken: "principal-token",
+    });
+
+    await client.getBrief("brief/1");
+    await client.confirmBrief("brief/1");
+
+    expect(calls).toEqual([
+      {
+        url: "http://runtime.local/briefs/brief%2F1",
+        init: { headers: { authorization: "Bearer principal-token" } },
+      },
+      {
+        url: "http://runtime.local/briefs/brief%2F1/confirm",
+        init: {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer principal-token",
+          },
+          body: "{}",
+        },
+      },
+    ]);
+  });
+
   it("builds BFF preview proxy requests with only the minted principal token", () => {
     expect(runtimePreviewPath("lease/1", "assets/app.js")).toBe(
       "/previews/lease%2F1/assets/app.js",
@@ -223,6 +384,83 @@ describe("runtime client", () => {
         },
       },
     ]);
+  });
+
+  it("continues and cancels runs with project principal authorization", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return url.toString().endsWith("/cancel")
+            ? { runId: "run/1", status: "cancelled" }
+            : { runId: "run/1", status: "running" };
+        },
+      };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      publicPrincipalToken: "project.jwt.token",
+    });
+
+    await client.continueRun("run/1", { userMessage: "Use the darker direction" });
+    await client.cancelRun("run/1");
+
+    expect(calls).toEqual([
+      {
+        url: "http://runtime.local/runs/run%2F1/continue",
+        init: {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer project.jwt.token",
+          },
+          body: JSON.stringify({ userMessage: "Use the darker direction" }),
+        },
+      },
+      {
+        url: "http://runtime.local/runs/run%2F1/cancel",
+        init: {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer project.jwt.token",
+          },
+          body: "{}",
+        },
+      },
+    ]);
+  });
+
+  it("forwards the project principal to protected JSON and SSE proxy requests", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      publicPrincipalToken: "project.jwt.token",
+      fetch: async (url, init) => {
+        calls.push({ url: url.toString(), init });
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { projectId: "project-1", items: [] };
+          },
+        };
+      },
+    });
+
+    await client.getConversation("project-1");
+
+    expect(calls[0].init?.headers).toEqual({
+      authorization: "Bearer project.jwt.token",
+    });
+    expect(client.runEventsProxyHeaders("run-1/3")).toEqual({
+      authorization: "Bearer project.jwt.token",
+      "last-event-id": "run-1/3",
+    });
   });
 
   it("surfaces runtime error responses", async () => {
@@ -556,6 +794,9 @@ describe("runtime client", () => {
       "last-event-id": "run-1/3",
     });
     expect(runEventsProxyHeaders()).toEqual({});
+    expect(runEventsProxyHeaders(undefined, "principal.jwt.token")).toEqual({
+      authorization: "Bearer principal.jwt.token",
+    });
   });
 
   it("parses run event messages with the shared AgentEvent schema", () => {

@@ -142,6 +142,17 @@ const designProfile = () => ({
 
 describe("shared schemas", () => {
   it("accepts every AgentRun status including partial", () => {
+    expect(AgentRunStatusSchema.options).toEqual([
+      "queued",
+      "running",
+      "validating",
+      "needs_user_input",
+      "completed",
+      "partial",
+      "blocked",
+      "failed",
+      "cancelled",
+    ]);
     for (const status of AgentRunStatusSchema.options) {
       expect(() =>
         AgentRunSchema.parse({
@@ -612,6 +623,7 @@ describe("shared schemas", () => {
       "progress",
       "approval_request",
       "permission_requested",
+      "permission_resolved",
       "permission_denied",
       "preview_update",
       "review_finding",

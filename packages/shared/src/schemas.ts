@@ -15,6 +15,7 @@ export const AgentPhaseSchema = z.enum([
 export const AgentRunStatusSchema = z.enum([
   "queued",
   "running",
+  "validating",
   "needs_user_input",
   "completed",
   "partial",
@@ -90,6 +91,7 @@ export const ConversationItemKindSchema = z.enum([
   "progress",
   "approval_request",
   "permission_requested",
+  "permission_resolved",
   "permission_denied",
   "preview_update",
   "review_finding",
