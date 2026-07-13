@@ -8,7 +8,11 @@ pub(in crate::http_api) fn present_artifact(
     content: ArtifactContent,
     route_prefix: &str,
 ) -> ArtifactHttpResponse {
-    let bytes = if content.legacy_html_rewrite {
+    // Modern manifest-backed artifacts are served below /artifacts/<project>/..., while
+    // Astro and Next emit root-relative asset URLs. Rewrite every HTML artifact, not only
+    // the legacy fallback path, so those assets remain reachable from the stable URL.
+    let rewrite_html = content.content_type.starts_with("text/html");
+    let bytes = if rewrite_html {
         String::from_utf8(content.bytes)
             .map(|html| rewrite_legacy_artifact_html(&html, route_prefix).into_bytes())
             .unwrap_or_else(|error| error.into_bytes())
@@ -54,4 +58,28 @@ fn rewrite_legacy_artifact_html(html: &str, prefix: &str) -> String {
         .replace("\\\"/_astro/", &format!("\\\"{prefix}/_astro/"))
         .replace("\\\"/docs", &format!("\\\"{prefix}/docs"))
         .replace("\\\"/\\\"", &format!("\\\"{prefix}/\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_root_relative_astro_assets_for_manifest_backed_html() {
+        let (_, body) = present_artifact(
+            ArtifactContent {
+                content_type: "text/html; charset=utf-8".to_string(),
+                bytes: br#"<link rel="stylesheet" href="/_astro/app.css">"#.to_vec(),
+                legacy_html_rewrite: false,
+                nosniff: true,
+            },
+            "/artifacts/project-1/current",
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"<link rel="stylesheet" href="/artifacts/project-1/current/_astro/app.css">"#
+        );
+    }
 }
