@@ -1983,6 +1983,14 @@ async fn project_init_fumadocs_docs_writes_docs_source_contract() {
     assert!(global_css.contains("@import 'tailwindcss'"));
     assert!(global_css.contains("@import './tokens.css'"));
     assert!(global_css.contains("var(--runtime-primary)"));
+    assert!(global_css.contains("background: var(--color-fd-background)"));
+    assert!(global_css.contains("color: var(--color-fd-foreground)"));
+    assert!(global_css.contains(":root:not(.dark)"));
+    assert!(global_css.contains("--color-fd-background: var(--runtime-bg)"));
+    assert!(global_css.contains("--color-fd-foreground: var(--runtime-text)"));
+    assert!(!global_css.contains("\n:root {\n  --fd-primary"));
+    assert!(!global_css.contains("body {\n  background: var(--runtime-bg)"));
+    assert!(!global_css.contains("\n  color: var(--runtime-text);\n  font-family"));
     assert!(workspace.join("project/app/tokens.css").exists());
     let button_component =
         fs::read_to_string(workspace.join("project/components/ui/button.jsx")).unwrap();

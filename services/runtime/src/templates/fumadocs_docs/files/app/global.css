@@ -4,8 +4,8 @@
 @import 'fumadocs-ui/css/preset.css';
 
 body {
-  background: var(--runtime-bg);
-  color: var(--runtime-text);
+  background: var(--color-fd-background);
+  color: var(--color-fd-foreground);
   font-family: var(--runtime-font-sans);
   letter-spacing: var(--runtime-type-body-tracking);
 }
@@ -17,12 +17,13 @@ h3 {
   letter-spacing: var(--runtime-type-display-tracking);
 }
 
-:root {
-  --fd-primary: var(--runtime-primary);
-  --fd-background: var(--runtime-bg);
-  --fd-foreground: var(--runtime-text);
-  --fd-muted-foreground: var(--runtime-muted);
-  --fd-border: var(--runtime-border);
+:root:not(.dark) {
+  --color-fd-primary: var(--runtime-primary);
+  --color-fd-primary-foreground: var(--runtime-primary-contrast);
+  --color-fd-background: var(--runtime-bg);
+  --color-fd-foreground: var(--runtime-text);
+  --color-fd-muted-foreground: var(--runtime-muted);
+  --color-fd-border: var(--runtime-border);
 }
 
 .runtime-button {
