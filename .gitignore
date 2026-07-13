@@ -1,9 +1,12 @@
 .DS_Store
 node_modules/
+.next/
+.data/
 target/
 services/runtime/target/
 dist/
 coverage/
+*.tsbuildinfo
 .env
 .env.*
 claude-code-main/

@@ -1,0 +1,27 @@
+{
+  "name": "@zerondesign/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "predev": "npm --prefix ../../packages/shared run build",
+    "dev": "next dev",
+    "prebuild": "npm --prefix ../../packages/shared run build",
+    "build": "next build",
+    "start": "next start",
+    "pretypecheck": "npm --prefix ../../packages/shared run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@zerondesign/shared": "file:../../packages/shared",
+    "next": "16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.9.3"
+  }
+}
