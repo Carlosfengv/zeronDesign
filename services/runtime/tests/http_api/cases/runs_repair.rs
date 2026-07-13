@@ -34,7 +34,7 @@ async fn start_repair_run_requires_finding_ids() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -137,7 +137,7 @@ async fn start_repair_run_can_target_review_child_finding() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -203,7 +203,7 @@ async fn start_run_rejects_unknown_parent_or_sandbox_binding() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -317,7 +317,7 @@ async fn start_run_rejects_sandbox_phase_without_workspace_binding() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -367,7 +367,7 @@ async fn start_run_rejects_sandbox_phase_before_binding_ready() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -452,7 +452,7 @@ async fn start_run_rejects_child_workspace_binding_mismatch() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });

@@ -162,7 +162,7 @@ async fn cancel_run_rejects_terminal_run_without_reopening_it() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -264,7 +264,7 @@ async fn continue_run_rejects_terminal_run_without_recording_message() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -315,7 +315,7 @@ async fn continue_run_on_running_run_queues_message_without_reentrant_session() 
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -404,7 +404,13 @@ async fn resolve_permission_allow_resumes_run() {
                 .method("POST")
                 .uri(format!("/permissions/{}/decision", permission.id))
                 .header("content-type", "application/json")
-                .body(Body::from(json!({ "decision": "allow" }).to_string()))
+                .body(Body::from(
+                    json!({
+                        "decision": "allow",
+                        "updatedInput": { "command": ["git", "status"] }
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -425,6 +431,15 @@ async fn resolve_permission_allow_resumes_run() {
         .await
         .iter()
         .any(|record| record.decision == "allow" && record.tool == "shell.run"));
+    assert_eq!(
+        store
+            .pending_permission(&permission.id)
+            .await
+            .unwrap()
+            .resolved_input
+            .unwrap()["command"],
+        json!(["git", "status"])
+    );
 }
 
 #[tokio::test]
@@ -516,7 +531,7 @@ async fn resolve_permission_ask_keeps_run_waiting_for_user_input() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(
@@ -569,6 +584,16 @@ async fn resolve_permission_ask_keeps_run_waiting_for_user_input() {
         .await
         .iter()
         .any(|record| record.decision == "ask" && record.tool == "package.install"));
+    assert!(store
+        .conversation_items("project-1")
+        .await
+        .iter()
+        .any(|item| {
+            item.kind == "permission_resolved"
+                && item.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["permissionId"] == permission.id && metadata["decision"] == "ask"
+                })
+        }));
 }
 
 #[tokio::test]
@@ -592,7 +617,7 @@ async fn resolve_permission_deny_blocks_run_and_writes_conversation_item() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -623,10 +648,9 @@ async fn resolve_permission_deny_blocks_run_and_writes_conversation_item() {
     assert!(conversation.iter().any(|item| {
         item.kind == "permission_denied"
             && item.text.contains("shell.run")
-            && item
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata["tool"] == "shell.run")
+            && item.metadata.as_ref().is_some_and(|metadata| {
+                metadata["tool"] == "shell.run" && metadata["permissionId"] == permission.id
+            })
     }));
 }
 
@@ -651,7 +675,7 @@ async fn resolve_permission_rejects_expired_terminal_run_permission() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
             ToolCall::new(

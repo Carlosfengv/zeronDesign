@@ -100,8 +100,18 @@ fn preview_prefix_header(
 
 async fn preview_current(
     State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<PreviewCurrentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &project_id,
+        PREVIEW_READ_OPERATION,
+    )
+    .await?;
     let version = state
         .store
         .current_project_version(&project_id)
@@ -121,8 +131,18 @@ async fn preview_current(
 
 async fn preview_version(
     State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
     Path((project_id, version_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<PreviewVersionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &project_id,
+        PREVIEW_READ_OPERATION,
+    )
+    .await?;
     let version = state
         .store
         .get_project_version(&version_id)

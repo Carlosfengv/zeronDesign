@@ -23,10 +23,15 @@ async fn artifact_serving_supports_next_export_routes_and_assets() {
     )
     .unwrap();
 
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.workspace_root = workspace.clone();
     config.runtime_storage_dir = workspace.join("runtime-storage");
     let store = install_immutable_artifact(&config, "docs-project", &project_root).await;
+    let version_id = store
+        .current_project_version("docs-project")
+        .await
+        .unwrap()
+        .id;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
         config,
@@ -61,6 +66,42 @@ async fn artifact_serving_supports_next_export_routes_and_assets() {
         .await
         .unwrap();
     assert_eq!(root.status(), StatusCode::OK);
+
+    let pinned = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/artifacts/docs-project/versions/{version_id}/docs"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned.status(), StatusCode::OK);
+    let pinned_body =
+        String::from_utf8(to_bytes(pinned.into_body(), 4096).await.unwrap().to_vec()).unwrap();
+    assert!(pinned_body.contains(&format!(
+        "href=\"/artifacts/docs-project/versions/{version_id}/_next/static/css/app.css\""
+    )));
+    assert!(pinned_body.contains(&format!(
+        "href=\"/artifacts/docs-project/versions/{version_id}/docs/runtime-flow\""
+    )));
+
+    let cross_project = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/artifacts/other-project/versions/{version_id}/docs"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_project.status(), StatusCode::NOT_FOUND);
 
     let nested_page = app
         .clone()
@@ -110,7 +151,7 @@ async fn artifact_serving_supports_phase_a_global_workspace_root() {
     .unwrap();
     fs::write(project_root.join("_astro/app.css"), "body{color:white}").unwrap();
 
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.workspace_root = workspace.clone();
     config.runtime_storage_dir = workspace.join("runtime-storage");
     let store = install_immutable_artifact(&config, "phase-a-project", &project_root).await;

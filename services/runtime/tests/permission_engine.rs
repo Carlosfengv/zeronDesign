@@ -160,6 +160,38 @@ impl Tool for EchoPathAllowTool {
     }
 }
 
+struct ApprovalEchoTool;
+
+#[async_trait]
+impl Tool for ApprovalEchoTool {
+    fn name(&self) -> &'static str {
+        "test.approval_echo"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, _input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Ask {
+            message: "approval required".to_string(),
+            reason: PermissionReason::Other {
+                reason: "test approval".to_string(),
+            },
+            suggestions: None,
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({ "path": input["path"] })))
+    }
+}
+
 async fn create_run(store: &RuntimeStore) -> String {
     store
         .create_run(
@@ -414,6 +446,68 @@ async fn headless_permission_request_hook_can_allow_and_update_input() {
     assert_eq!(audits[0].decision, "allow");
     assert!(audits[0].reason.contains("PermissionRequest"));
     assert!(audits[0].input_summary.contains("approved.txt"));
+}
+
+#[tokio::test]
+async fn api_approved_updated_input_is_validated_executed_and_consumed_once() {
+    let storage = unique_temp_dir("approved-permission-restart");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run_id = create_run(&store).await;
+    let permission = store
+        .create_tool_permission_request(
+            "project-1",
+            &run_id,
+            "test.approval_echo",
+            Some("tool-original"),
+            Some(json!({ "path": "project/requested.txt" })),
+        )
+        .await;
+    store
+        .resolve_permission_with_input(
+            &permission.id,
+            "allow",
+            Some(json!({ "path": "project/approved.txt" })),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let executor = ToolExecutor::new(vec![Arc::new(ApprovalEchoTool)], PermissionRules::default());
+
+    let approved = executor
+        .execute(
+            store.clone(),
+            &run_id,
+            "tool-retried",
+            "test.approval_echo",
+            json!({ "path": "project/model-retry.txt" }),
+        )
+        .await;
+
+    assert!(!approved.result.is_error);
+    assert_eq!(approved.result.content["path"], "project/approved.txt");
+    let consumed = store.pending_permission(&permission.id).await.unwrap();
+    assert_eq!(
+        consumed.resolved_input.unwrap()["path"],
+        "project/approved.txt"
+    );
+    assert!(consumed.consumed_at.is_some());
+
+    let second = executor
+        .execute(
+            store.clone(),
+            &run_id,
+            "tool-after-consume",
+            "test.approval_echo",
+            json!({ "path": "project/second.txt" }),
+        )
+        .await;
+    assert!(second.result.is_error);
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::NeedsUserInput
+    );
+    fs::remove_dir_all(storage).unwrap();
 }
 
 #[tokio::test]

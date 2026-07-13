@@ -6,7 +6,10 @@ use anydesign_runtime::{
         ToolInputParseFailure,
     },
     preview::{promote_preview, PromotionGateReport},
-    public_principal::{PublicPrincipalClaims, PublicPrincipalJwtIssuer, PREVIEW_READ_OPERATION},
+    public_principal::{
+        PublicPrincipalClaims, PublicPrincipalJwtIssuer, PREVIEW_READ_OPERATION,
+        PROJECT_READ_OPERATION, PROJECT_WRITE_OPERATION,
+    },
     types::{
         sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief, BriefStatus, ContentSource,
         PreviewLeaseStatus, ReviewFindingCategory, ReviewFindingSeverity, ReviewFindingStatus,
@@ -92,6 +95,12 @@ pub(super) fn phase_a_contract_config() -> RuntimeConfig {
     config.policy_profile = RuntimePolicyProfile::LocalE2e;
     config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
     config.runtime_storage_dir = unique_temp_dir("http-runtime-storage");
+    config
+}
+
+pub(super) fn public_auth_disabled_config() -> RuntimeConfig {
+    let mut config = RuntimeConfig::from_env();
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
     config
 }
 
@@ -561,6 +570,8 @@ async fn assert_preview_updated_before_completed(store: &RuntimeStore, run_id: &
 
 #[path = "../cases/artifacts.rs"]
 mod artifacts;
+#[path = "../cases/briefs.rs"]
+mod briefs;
 #[path = "../cases/design_profiles.rs"]
 mod design_profiles;
 #[path = "../cases/design_sources.rs"]
@@ -577,8 +588,12 @@ mod lifecycle_website;
 mod previews;
 #[path = "../cases/profile_run_integration.rs"]
 mod profile_run_integration;
+#[path = "../cases/project_authorization.rs"]
+mod project_authorization;
 #[path = "../cases/project_runtime.rs"]
 mod project_runtime;
+#[path = "../cases/release_packaging.rs"]
+mod release_packaging;
 #[path = "../cases/run_events.rs"]
 mod run_events;
 #[path = "../cases/run_mutations.rs"]

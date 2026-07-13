@@ -758,7 +758,7 @@ mod tests {
                 "appRoot": "project",
                 "templateKey": "fumadocs-docs",
                 "templateVersion": "fumadocs-docs@runtime-p3",
-                "templateManifestSha256": "2bad43ae3a97dd2a2472779e45206cf8a95f380176cb6214602a2a3868c5a494",
+                "templateManifestSha256": "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
                 "framework": "fumadocs",
                 "sandboxExecutionProfileId": "fumadocs-docs",
                 "sandboxExecutionProfileVersion": "0.1.0",

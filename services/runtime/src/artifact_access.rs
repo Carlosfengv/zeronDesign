@@ -42,4 +42,34 @@ impl ArtifactAccessService {
                 .and_then(|publish| publish.artifact_manifest_hash.as_deref()),
         })
     }
+
+    pub async fn read_version(
+        &self,
+        project_id: &str,
+        version_id: &str,
+        artifact_path: &str,
+    ) -> Result<ArtifactContent, ArtifactReadError> {
+        let version = self
+            .store
+            .get_project_version(version_id)
+            .await
+            .filter(|version| version.project_id == project_id)
+            .ok_or_else(|| {
+                ArtifactReadError::NotFound(format!(
+                    "artifact version {version_id} not found for project: {project_id}"
+                ))
+            })?;
+        let publish = self
+            .store
+            .artifact_publish_for_version(project_id, &version.created_by_run_id, version_id)
+            .await;
+        self.artifacts.read(ArtifactReadRequest {
+            project_id,
+            version_id,
+            artifact_path,
+            expected_manifest_hash: publish
+                .as_ref()
+                .and_then(|publish| publish.artifact_manifest_hash.as_deref()),
+        })
+    }
 }

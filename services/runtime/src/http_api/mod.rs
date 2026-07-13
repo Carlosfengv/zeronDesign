@@ -42,7 +42,8 @@ use crate::{
     project::resolve_built_in_template_for_init,
     public_principal::{
         PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION,
-        PUBLICATION_READ_OPERATION, PUBLICATION_WRITE_OPERATION,
+        PROJECT_READ_OPERATION, PROJECT_WRITE_OPERATION, PUBLICATION_READ_OPERATION,
+        PUBLICATION_WRITE_OPERATION,
     },
     release_evidence::{ReleaseEvidenceError, ReleaseEvidenceService},
     run_lifecycle::RunLifecycleService,

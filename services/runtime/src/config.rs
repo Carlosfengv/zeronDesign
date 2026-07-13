@@ -172,6 +172,15 @@ pub struct RuntimeConfig {
     pub repository_commit: String,
     pub repository_dirty: bool,
     pub runtime_image_ref: Option<String>,
+    pub release_base_image_digest: Option<String>,
+    pub release_packager_version: Option<String>,
+    pub release_registry_repository: Option<String>,
+    pub release_scan_policy_version: Option<String>,
+    pub release_packaging_helper_path: Option<PathBuf>,
+    pub release_packaging_helper_sha256: Option<String>,
+    pub release_packaging_deadline_seconds: u64,
+    pub release_packager_root: Option<PathBuf>,
+    pub release_packager_tools: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -322,6 +331,18 @@ impl RuntimeConfig {
                 .unwrap_or_else(|_| "unknown".to_string()),
             repository_dirty: truthy_env("RUNTIME_REPOSITORY_DIRTY"),
             runtime_image_ref: secret_env("RUNTIME_IMAGE_REF"),
+            release_base_image_digest: optional_string_env("RELEASE_BASE_IMAGE_DIGEST"),
+            release_packager_version: optional_string_env("RELEASE_PACKAGER_VERSION"),
+            release_registry_repository: optional_string_env("RELEASE_REGISTRY_REPOSITORY"),
+            release_scan_policy_version: optional_string_env("RELEASE_SCAN_POLICY_VERSION"),
+            release_packaging_helper_path: optional_path_env("ANYDESIGN_RELEASE_PACKAGER_HELPER"),
+            release_packaging_helper_sha256: optional_string_env("RELEASE_PACKAGING_HELPER_SHA256"),
+            release_packaging_deadline_seconds: env::var("RELEASE_PACKAGING_DEADLINE_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(20 * 60),
+            release_packager_root: optional_path_env("ANYDESIGN_PACKAGER_ROOT"),
+            release_packager_tools: optional_string_env("ANYDESIGN_PACKAGER_TOOLS"),
         }
     }
 
@@ -448,6 +469,27 @@ impl RuntimeConfig {
         if !(10..=600).contains(&self.model_request_timeout_seconds) {
             return Err("MODEL_REQUEST_TIMEOUT_SECONDS must be between 10 and 600".to_string());
         }
+        let release_configuration = [
+            self.release_base_image_digest.is_some(),
+            self.release_packager_version.is_some(),
+            self.release_registry_repository.is_some(),
+            self.release_scan_policy_version.is_some(),
+            self.release_packaging_helper_path.is_some(),
+            self.release_packaging_helper_sha256.is_some(),
+        ];
+        if release_configuration.iter().any(|configured| *configured)
+            && !release_configuration.iter().all(|configured| *configured)
+        {
+            return Err(
+                "release packaging requires the complete profile and helper configuration"
+                    .to_string(),
+            );
+        }
+        if !(1..=3600).contains(&self.release_packaging_deadline_seconds) {
+            return Err(
+                "RELEASE_PACKAGING_DEADLINE_SECONDS must be between 1 and 3600".to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -545,6 +587,41 @@ mod tests {
         config.policy_profile = RuntimePolicyProfile::LocalE2e;
         config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
         config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn release_packaging_requires_complete_profile_and_helper_configuration() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.release_base_image_digest = Some(format!("sha256:{}", "a".repeat(64)));
+        config.release_packager_version = None;
+        config.release_registry_repository = None;
+        config.release_scan_policy_version = None;
+        config.release_packaging_helper_path = None;
+        config.release_packaging_helper_sha256 = None;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("complete profile and helper"));
+    }
+
+    #[test]
+    fn release_packaging_deadline_is_bounded() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.release_base_image_digest = None;
+        config.release_packager_version = None;
+        config.release_registry_repository = None;
+        config.release_scan_policy_version = None;
+        config.release_packaging_helper_path = None;
+        config.release_packaging_helper_sha256 = None;
+        config.release_packaging_deadline_seconds = 0;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("RELEASE_PACKAGING_DEADLINE_SECONDS"));
     }
 
     #[test]

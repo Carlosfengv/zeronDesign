@@ -86,7 +86,7 @@ async fn start_run_and_stream_events() {
 async fn start_run_rejects_empty_contract_identifiers() {
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -130,7 +130,7 @@ async fn continue_run_rejects_empty_user_message() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -260,7 +260,7 @@ async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_a
 #[tokio::test]
 async fn start_run_uses_configured_agent_model_for_real_provider_runs() {
     let store = RuntimeStore::new();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.agent_model = "deepseek-chat".to_string();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),

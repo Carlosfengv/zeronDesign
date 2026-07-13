@@ -5,7 +5,7 @@ async fn required_unsupported_extended_token_blocks_build_with_capability_state(
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -122,7 +122,7 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -211,7 +211,7 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -362,7 +362,7 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -433,7 +433,7 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
 async fn start_run_with_missing_explicit_design_profile_returns_not_found() {
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -489,7 +489,7 @@ async fn start_run_design_profile_template_conflict_enters_needs_user_input() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -570,7 +570,7 @@ async fn continue_edit_run_design_profile_conflict_enters_needs_user_input() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });

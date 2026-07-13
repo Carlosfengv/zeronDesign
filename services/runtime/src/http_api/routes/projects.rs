@@ -14,20 +14,40 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
 
 async fn project_conversation(
     State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
+    headers: HeaderMap,
     Query(query): Query<ConversationQuery>,
-) -> Json<ConversationListResponse> {
+) -> Result<Json<ConversationListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &project_id,
+        PROJECT_READ_OPERATION,
+    )
+    .await?;
     let mut items = state.store.conversation_items(&project_id).await;
     if !query.include_debug {
         items.retain(|item| item.visibility == "user");
     }
-    Json(ConversationListResponse { project_id, items })
+    Ok(Json(ConversationListResponse { project_id, items }))
 }
 
 async fn project_runtime_state(
     State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
     Path(project_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ProjectRuntimeStateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &project_id,
+        PROJECT_READ_OPERATION,
+    )
+    .await?;
     let current = state
         .store
         .current_project_version(&project_id)

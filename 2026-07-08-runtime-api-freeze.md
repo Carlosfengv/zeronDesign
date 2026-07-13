@@ -61,9 +61,10 @@ records these already-implemented groups:
 | Runtime identity | `/`, `/version` | additive |
 | Design source | `/design-source-artifacts`, `/design-source-artifacts/{artifact_id}`, `/design-source-artifacts/{artifact_id}/content` | additive, internal-service authorization |
 | Design Profile | `/design-profiles...`, `/projects/{project_id}/design-profile` | additive; source/import/activation/conversion routes are explicitly annotated |
+| Structured Brief | `/briefs/{brief_id}`, `/briefs/{brief_id}/confirm` | additive, project-scoped read/write authorization |
 | Editable runtime state | `/projects/{project_id}/runtime-state` | additive |
 | Candidate preview proxy | `/previews/{lease_id}...` | additive, conditional public-principal authorization |
-| Immutable artifacts | `/artifacts/{project_id}/current...`, `/_next/{*artifact_path}` | additive |
+| Immutable artifacts | `/artifacts/{project_id}/current...`, `/artifacts/{project_id}/versions/{version_id}...`, `/_next/{*artifact_path}` | additive |
 | Internal control plane | `/internal/template-build`, `/internal/previews/promote`, `/internal/projects/{project_id}/...` | additive, internal-service authorization; build/promote are feature-gated |
 | Isolated capture listener | `/preview-captures/{lease_id}...` | additive, not part of the public router |
 
@@ -89,10 +90,22 @@ These routes are stable for Phase B consumption.
 | `POST` | `/runs/{runId}/continue` | `ContinueRunRequest` | `ContinueRunResponse` | Adds user input or resumes a paused run |
 | `POST` | `/runs/{runId}/cancel` | none | `CancelRunResponse` | Terminal cancellation; completed tool results remain persisted |
 | `GET` | `/runs/{runId}/events` | `Last-Event-ID` optional | SSE `AgentEvent` JSON payloads | Replays after the supplied event id without duplicates |
+| `GET` | `/briefs/{briefId}` | none | `BriefResponse` | Returns the structured Brief, owner project/run and current statuses |
+| `POST` | `/briefs/{briefId}/confirm` | none | `BriefResponse` | Idempotently confirms a draft through the existing Brief run lifecycle |
 | `POST` | `/permissions/{permissionId}/decision` | `ResolvePermissionRequest` | `ResolvePermissionResponse` | Resolves platform permission asks |
 | `GET` | `/projects/{projectId}/conversation` | `includeDebug` optional query | `ConversationListResponse` | Defaults to user-visible conversation items only |
 | `GET` | `/preview/{projectId}/current` | none | `PreviewCurrentResponse` | Returns the promoted current preview |
 | `GET` | `/preview/{projectId}/{versionId}` | none | `PreviewVersionResponse` | Returns a candidate, promoted, or failed version for the project |
+| `GET` | `/artifacts/{projectId}/current/{*artifactPath}` | none | Artifact bytes | Reads the current promoted artifact with `preview.read` authorization |
+| `GET` | `/artifacts/{projectId}/versions/{versionId}/{*artifactPath}` | none | Immutable artifact bytes | Reads a project-owned fixed version; bytes and manifest identity are verified |
+| `POST` | `/projects/{projectId}/versions/{versionId}/releases` | `CreateReleaseRequest` | `ReleasePackagingResponse` | Prepares idempotent packaging for a promoted immutable version |
+| `GET` | `/release-packagings/{packagingId}` | none | `ReleasePackagingResponse` | Reads current packaging and release state |
+| `POST` | `/projects/{projectId}/publish` | `PublishWorkRequest` + CAS headers | `PublicationOperationResponse` | First publish or atomic update to a validated Release |
+| `POST` | `/projects/{projectId}/rollback` | `PublishWorkRequest` + `If-Match` | `PublicationOperationResponse` | Rolls the stable host back to a validated historical Release |
+| `POST` | `/projects/{projectId}/unpublish` | `UnpublishWorkRequest` + `If-Match` | `PublicationOperationResponse` | Removes public serving while retaining host identity and history |
+| `GET` | `/projects/{projectId}/deployment-state` | none | `DeploymentStateResponse` | Reads desired/current Release, generation, status and stable public URL |
+| `GET` | `/projects/{projectId}/releases` | none | `WorkReleaseListResponse` | Lists immutable Release history for one project |
+| `GET` | `/operations/{operationId}` | none | `PublicationOperationResponse` | Reads recoverable publication progress |
 
 All public error responses use:
 
@@ -101,6 +114,17 @@ type ErrorResponse = {
   error: string;
 };
 ```
+
+Create Release requires `Idempotency-Key`. Runtime derives the actual Release
+identity from the immutable version, artifact/runtime manifest hashes and
+packaging trust inputs, so retries with the same content converge on the same
+Release and Packaging records.
+
+The supervised packaging controller is enabled only when the complete
+production configuration is present: `RELEASE_BASE_IMAGE_DIGEST`,
+`RELEASE_PACKAGER_VERSION`, `RELEASE_REGISTRY_REPOSITORY`,
+`RELEASE_SCAN_POLICY_VERSION`, `ANYDESIGN_RELEASE_PACKAGER_HELPER`, and
+`RELEASE_PACKAGING_HELPER_SHA256`. Partial configuration fails startup.
 
 ## Shared Contract Source Of Truth
 
@@ -113,11 +137,19 @@ Phase B should import runtime contract types from `packages/shared/src`:
   - `ContinueRunRequest`
   - `ContinueRunResponse`
   - `CancelRunResponse`
+  - `BriefResponse`
   - `ResolvePermissionRequest`
   - `ResolvePermissionResponse`
   - `PreviewCurrentResponse`
   - `PreviewVersionResponse`
   - `ConversationListResponse`
+  - `CreateReleaseRequest`
+  - `ReleasePackagingResponse`
+  - `PublishWorkRequest`
+  - `UnpublishWorkRequest`
+  - `PublicationOperationResponse`
+  - `DeploymentStateResponse`
+  - `WorkReleaseListResponse`
   - `HealthResponse`
   - `ErrorResponse`
 - `events.ts`
@@ -157,7 +189,7 @@ type StartRunRequest = {
 
 type StartRunResponse = {
   runId: string;
-  status: "queued";
+  status: "queued" | "needs_user_input";
 };
 ```
 
@@ -190,6 +222,26 @@ type CancelRunResponse = {
 };
 ```
 
+### Structured Brief
+
+```ts
+type BriefResponse = {
+  briefId: string;
+  projectId: string;
+  runId: string;
+  status: "draft" | "confirmed" | "superseded";
+  runStatus: AgentRunStatus;
+  brief: Brief;
+};
+```
+
+`POST /briefs/{briefId}/confirm` is idempotent after confirmation. For a draft,
+it succeeds only while its owning Brief run is in `needs_user_input` and the run
+still references that Brief. Confirmation reuses the same lifecycle as an
+explicit confirmation message sent to `/runs/{runId}/continue`; it persists the
+confirmed Brief checkpoint, completes the run, emits `run.completed`, and adds
+the user-visible completion conversation item.
+
 ### Resolve Permission
 
 ```ts
@@ -205,7 +257,10 @@ type ResolvePermissionResponse = {
 ```
 
 Permission decisions are audited. `allow` resumes the run, `ask` keeps it in a
-user-input state, and `deny` blocks it.
+user-input state, and `deny` blocks it. Runtime persists `updatedInput` with the
+permission decision. For `allow`, it is bound to the pending tool identity,
+revalidated through the normal tool schema and deny policy, and consumed once
+when the matching tool is retried. Audit records store only an input digest.
 
 ### Preview
 
@@ -239,6 +294,24 @@ type ConversationListResponse = {
 
 By default, debug conversation items are filtered out. Phase B may opt in with
 `includeDebug=true` for internal diagnostics views only.
+
+### Project-scoped public authorization
+
+When `PUBLIC_PRINCIPAL_AUTH_MODE=required`, public Runtime calls require a
+short-lived signed principal whose `projectId` and owner identity match the
+persisted project access record. The operation scopes are:
+
+| Scope | Routes |
+|---|---|
+| `project.read` | run events, structured Brief reads, project conversation, editable runtime state |
+| `project.write` | start/continue/cancel run, structured Brief confirmation, resolve permission |
+| `preview.read` | candidate/promoted preview metadata, current and fixed-version artifact bytes |
+| `publication.read` | deployment state, release and operation reads |
+| `publication.write` | Create Release, publish, unpublish and rollback |
+
+The BFF must forward the same bearer token to SSE and artifact proxy requests;
+a Referer or an opaque resource ID identifies a resource but never authorizes
+access to it.
 
 ## DesignProfile Fidelity Addendum (2026-07-10)
 
@@ -368,10 +441,8 @@ These routes are not Phase B public product contracts:
 
 | Method | Path | Status |
 |---|---|---|
-| `POST` | `/internal/template-build` | Local/test/admin helper currently registered without auth; must be gated before non-local exposure |
+| `POST` | `/internal/template-build` | Disabled by default; requires explicit enablement and internal service authorization |
 | `POST` | `/internal/previews/promote` | Disabled by default and requires internal service authorization |
-| `GET` | `/artifacts/{projectId}/current` | Runtime artifact serving surface; product preview routing should use preview APIs |
-| `GET` | `/artifacts/{projectId}/{*path}` | Runtime artifact serving surface |
 
 Phase B must not call the internal promotion endpoint as a normal product
 operation. Promotion remains enforced by runtime tools and gates. Phase B should
@@ -416,6 +487,7 @@ The frozen contract is covered by:
 - `packages/shared/src/mock-bff-contract-types.test.ts`
 - `packages/shared/src/schemas.test.ts`
 - `infra/phase-a/verify.sh`
+- `apps/web` typecheck and production build (when the Phase B application exists)
 - Real `deepseek-v4-pro` website generation E2E:
   `real_deepseek_design_md_website_generation_e2e`
 

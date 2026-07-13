@@ -47,7 +47,7 @@ async fn stream_events_reconnect_uses_last_event_id_without_duplicates() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -96,7 +96,7 @@ async fn stream_events_replays_then_fans_out_without_duplicates() {
     }
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -199,7 +199,7 @@ async fn stream_events_recovered_active_run_uses_next_persisted_sequence() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: recovered_store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -244,7 +244,7 @@ async fn stream_events_terminal_status_without_terminal_event_waits_for_terminal
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -304,7 +304,7 @@ async fn append_event_does_not_broadcast_when_run_log_append_fails() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -339,7 +339,7 @@ async fn append_event_does_not_broadcast_when_run_log_append_fails() {
 async fn stream_events_rejects_unknown_run() {
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -395,7 +395,7 @@ async fn project_conversation_returns_user_visible_items_by_default() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });

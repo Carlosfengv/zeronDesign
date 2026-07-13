@@ -82,14 +82,14 @@ pub trait TrustedReleasePackagingBackend: Send + Sync {
     ) -> Result<ReleaseSignatureEvidence>;
 }
 
-pub struct ReleasePackager<B> {
+pub struct ReleasePackager<B: ?Sized> {
     store: Arc<ReleaseStore>,
     backend: Arc<B>,
 }
 
 impl<B> ReleasePackager<B>
 where
-    B: TrustedReleasePackagingBackend,
+    B: TrustedReleasePackagingBackend + ?Sized,
 {
     pub fn new(store: Arc<ReleaseStore>, backend: Arc<B>) -> Self {
         Self { store, backend }

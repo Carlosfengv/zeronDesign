@@ -1,4 +1,5 @@
 mod artifacts;
+mod briefs;
 mod capture;
 mod design_profiles;
 mod design_sources;

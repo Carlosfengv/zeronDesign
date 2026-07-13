@@ -314,7 +314,7 @@ pub fn spec() -> TemplateSpec {
         id: TemplateId::parse("fumadocs-docs").unwrap(),
         version: TemplateVersion::parse("fumadocs-docs@runtime-p3").unwrap(),
         manifest_sha256: ManifestHash::parse(
-            "2bad43ae3a97dd2a2472779e45206cf8a95f380176cb6214602a2a3868c5a494",
+            "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
         )
         .unwrap(),
         framework: FrameworkId::parse("fumadocs").unwrap(),

@@ -23,7 +23,7 @@ async fn preview_version_returns_pinned_project_version_contract() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });

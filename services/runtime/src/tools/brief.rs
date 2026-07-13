@@ -24,6 +24,10 @@ pub async fn request_confirmation(
     message: Option<&str>,
 ) -> Result<Value> {
     let text = message.unwrap_or("Brief is ready for confirmation.");
+    let brief_id = store
+        .get_run(run_id)
+        .await
+        .and_then(|run| run.brief_version);
     store
         .append_conversation_item(
             project_id,
@@ -31,7 +35,10 @@ pub async fn request_confirmation(
             "approval_request",
             Some("assistant"),
             text,
-            None,
+            Some(json!({
+                "briefId": brief_id.clone(),
+                "state": "needs_user_input",
+            })),
         )
         .await;
     let _ = store
@@ -41,7 +48,11 @@ pub async fn request_confirmation(
             timestamp: Utc::now(),
         })
         .await;
-    Ok(json!({ "status": "needs_user_input", "message": text }))
+    Ok(json!({
+        "status": "needs_user_input",
+        "message": text,
+        "briefId": brief_id,
+    }))
 }
 
 pub fn normalize_draft_input(input: Value) -> Value {

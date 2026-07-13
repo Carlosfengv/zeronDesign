@@ -1,4 +1,5 @@
 use anydesign_runtime::{
+    config::{PublicPrincipalAuthMode, RuntimePolicyProfile},
     http_api::{self, AppState},
     model_gateway::{MockModelClient, ModelResponse},
     preview::{promote_preview, PromotionGateReport},
@@ -15,9 +16,12 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 fn app(store: RuntimeStore, responses: Vec<ModelResponse>) -> Router {
+    let mut config = RuntimeConfig::from_env();
+    config.policy_profile = RuntimePolicyProfile::LocalE2e;
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
     http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config,
         store,
         model: Arc::new(MockModelClient::new(responses)),
     })
@@ -138,7 +142,7 @@ async fn edit_run_modifies_existing_project_version_chain() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(payload["runId"], edit_run.id);
     assert_eq!(payload["status"], "running");
     let run = store.get_run(&edit_run.id).await.unwrap();
@@ -208,7 +212,7 @@ async fn brief_conflict_pauses_edit_run_until_user_confirms_direction_change() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(payload["runId"], edit_run.id);
     assert_eq!(payload["status"], "needs_user_input");
     assert_eq!(

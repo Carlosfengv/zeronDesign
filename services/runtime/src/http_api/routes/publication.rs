@@ -1,7 +1,8 @@
 use super::super::*;
 use crate::{
     publication::{PublicationIntent, PublicationStoreError, PublishOperationKind},
-    release::WorkReleaseStatus,
+    release::{ReleasePackagingInput, ReleaseStoreError, RuntimeProfile, WorkReleaseStatus},
+    types::{ArtifactPublishStatus, ProjectVersionStatus},
 };
 
 const PUBLICATION_BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -17,7 +18,139 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
         )
         .route("/projects/{project_id}/releases", get(work_releases))
         .route("/operations/{operation_id}", get(publication_operation))
+        .route(
+            "/projects/{project_id}/versions/{version_id}/releases",
+            post(create_release),
+        )
+        .route("/release-packagings/{packaging_id}", get(release_packaging))
         .layer(DefaultBodyLimit::max(PUBLICATION_BODY_LIMIT_BYTES))
+}
+
+async fn create_release(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Path((project_id, version_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<CreateReleaseRequest>,
+) -> Result<(StatusCode, Json<ReleasePackagingResponse>), (StatusCode, Json<ErrorResponse>)> {
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
+    let _client_idempotency_key = idempotency_key(&headers)?;
+    if request.runtime_profile_id != crate::release::STATIC_WEB_PROFILE_ID {
+        return Err(bad_request("runtime profile is not supported".to_string()));
+    }
+    let version = state
+        .store
+        .get_project_version(&version_id)
+        .await
+        .filter(|version| version.project_id == project_id)
+        .ok_or_else(|| not_found(format!("project version not found: {version_id}")))?;
+    if version.status != ProjectVersionStatus::Promoted {
+        return Err(conflict_error(anyhow::anyhow!(
+            "release source version must be promoted"
+        )));
+    }
+    let publish = state
+        .store
+        .artifact_publish_for_version(&project_id, &version.created_by_run_id, &version_id)
+        .await
+        .filter(|publish| publish.status == ArtifactPublishStatus::Promoted)
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("promoted artifact evidence is missing")))?;
+    let artifact_manifest_hash = publish.artifact_manifest_hash.clone().ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "promoted artifact manifest hash is missing"
+        ))
+    })?;
+    let project_state = state
+        .store
+        .get_project_runtime_state(&project_id)
+        .await
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("project runtime state is missing")))?;
+    let profile = configured_release_profile(&state.config)?;
+    let input = ReleasePackagingInput {
+        project_id: project_id.clone(),
+        version_id: version_id.clone(),
+        run_id: version.created_by_run_id,
+        template_id: project_state.template_key,
+        template_version: project_state.template_version,
+        artifact_manifest_hash,
+        runtime_manifest_hash: profile.manifest.sha256().map_err(internal_error)?,
+        source_snapshot_uri: version
+            .source_snapshot_uri
+            .unwrap_or(publish.source_snapshot_uri),
+        runtime_profile_id: profile.id,
+        base_image_digest: profile.base_image_digest,
+        packager_version: profile.packager_version,
+        registry_repository: state
+            .config
+            .release_registry_repository
+            .clone()
+            .expect("configured release profile checked"),
+        scan_policy_version: profile.scan_policy_version,
+    };
+    let store = state.store.release_store();
+    let (release, packaging) = tokio::task::spawn_blocking(move || store.prepare(&input))
+        .await
+        .map_err(|error| internal_error(anyhow::anyhow!(error)))?
+        .map_err(release_store_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ReleasePackagingResponse { release, packaging }),
+    ))
+}
+
+async fn release_packaging(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Path(packaging_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ReleasePackagingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let store = state.store.release_store();
+    let packaging = store
+        .packaging(&packaging_id)
+        .ok_or_else(|| not_found(format!("release packaging not found: {packaging_id}")))?;
+    let release = store
+        .release(&packaging.release_id)
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("release packaging link is missing")))?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &release.project_id,
+        PUBLICATION_READ_OPERATION,
+    )
+    .await?;
+    Ok(Json(ReleasePackagingResponse { release, packaging }))
+}
+
+fn configured_release_profile(
+    config: &RuntimeConfig,
+) -> Result<RuntimeProfile, (StatusCode, Json<ErrorResponse>)> {
+    let base_image_digest = config.release_base_image_digest.clone();
+    let packager_version = config.release_packager_version.clone();
+    let registry_repository = config.release_registry_repository.clone();
+    let scan_policy_version = config.release_scan_policy_version.clone();
+    if base_image_digest.is_none()
+        || packager_version.is_none()
+        || registry_repository.is_none()
+        || scan_policy_version.is_none()
+    {
+        return Err(conflict_error(anyhow::anyhow!(
+            "release packaging profile is not configured"
+        )));
+    }
+    RuntimeProfile::static_web_v1(
+        base_image_digest.unwrap(),
+        packager_version.unwrap(),
+        scan_policy_version.unwrap(),
+    )
+    .map_err(conflict_error)
 }
 
 async fn publish_work(
@@ -356,5 +489,15 @@ fn publication_store_error(error: PublicationStoreError) -> (StatusCode, Json<Er
             conflict_error(anyhow::anyhow!(message))
         }
         PublicationStoreError::Storage(message) => internal_error(anyhow::anyhow!(message)),
+    }
+}
+
+fn release_store_error(error: ReleaseStoreError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        ReleaseStoreError::InvalidInput(message) => bad_request(message),
+        ReleaseStoreError::NotFound(message) => not_found(message),
+        ReleaseStoreError::InvalidTransition(message)
+        | ReleaseStoreError::IntegrityConflict(message) => conflict_error(anyhow::anyhow!(message)),
+        ReleaseStoreError::Storage(message) => internal_error(anyhow::anyhow!(message)),
     }
 }

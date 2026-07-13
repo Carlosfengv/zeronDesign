@@ -9,10 +9,14 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io, path::Path};
 
 pub const PREVIEW_READ_OPERATION: &str = "preview.read";
+pub const PROJECT_READ_OPERATION: &str = "project.read";
+pub const PROJECT_WRITE_OPERATION: &str = "project.write";
 pub const PUBLICATION_READ_OPERATION: &str = "publication.read";
 pub const PUBLICATION_WRITE_OPERATION: &str = "publication.write";
 const PUBLIC_PRINCIPAL_OPERATIONS: &[&str] = &[
     PREVIEW_READ_OPERATION,
+    PROJECT_READ_OPERATION,
+    PROJECT_WRITE_OPERATION,
     PUBLICATION_READ_OPERATION,
     PUBLICATION_WRITE_OPERATION,
 ];

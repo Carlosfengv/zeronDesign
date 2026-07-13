@@ -1,4 +1,5 @@
 pub(super) mod artifacts;
+pub(super) mod briefs;
 pub(super) mod capture;
 pub(super) mod design_profiles;
 pub(super) mod design_sources;

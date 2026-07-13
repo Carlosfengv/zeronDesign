@@ -8,6 +8,11 @@ fn publication_route_family_is_frozen() {
             ("POST", "/projects/{project_id}/rollback"),
             ("GET", "/projects/{project_id}/deployment-state"),
             ("GET", "/projects/{project_id}/releases"),
+            (
+                "POST",
+                "/projects/{project_id}/versions/{version_id}/releases",
+            ),
+            ("GET", "/release-packagings/{packaging_id}"),
             ("GET", "/operations/{operation_id}"),
         ],
     );

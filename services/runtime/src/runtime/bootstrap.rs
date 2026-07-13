@@ -10,6 +10,9 @@ use crate::{
         WorkRuntimeController,
     },
     recovery::{recover_interrupted_runs, RecoveryOutcome},
+    release::{
+        ProcessReleasePackagingBackend, ReleasePackagingController, TrustedReleasePackagingBackend,
+    },
     run_lifecycle::RunSessionLauncher,
     runtime::RuntimeSessionLauncher,
     templates::BuiltInTemplateRegistry,
@@ -20,7 +23,7 @@ use crate::{
     RuntimeConfig,
 };
 use chrono::Utc;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
 pub struct RecoveredRuntime {
@@ -42,6 +45,15 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         .store
         .publication_store()
         .replay_nonterminal_outbox()?;
+    if let Some(backend) = release_packaging_backend(&state.config)? {
+        ReleasePackagingController::new(
+            state.store.release_store(),
+            backend,
+            state.config.runtime_storage_dir.clone(),
+            Duration::from_secs(2),
+        )
+        .spawn(&state.supervisor)?;
+    }
     let work_runtime_backend: Arc<dyn WorkRuntimeBackend> =
         match state.config.work_runtime_backend_mode {
             WorkRuntimeBackendMode::ControlPlaneOnly => Arc::new(ControlPlaneOnlyBackend),
@@ -69,6 +81,41 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         }
     }
     Ok(state)
+}
+
+fn release_packaging_backend(
+    config: &crate::RuntimeConfig,
+) -> anyhow::Result<Option<Arc<dyn TrustedReleasePackagingBackend>>> {
+    let (Some(program), Some(expected_sha256)) = (
+        config.release_packaging_helper_path.clone(),
+        config.release_packaging_helper_sha256.clone(),
+    ) else {
+        return Ok(None);
+    };
+    let mut environment = BTreeMap::new();
+    for name in ["PATH", "HOME", "DOCKER_HOST", "TMPDIR", "XDG_CONFIG_HOME"] {
+        if let Ok(value) = env::var(name) {
+            environment.insert(name.to_string(), value);
+        }
+    }
+    let packager_root = config
+        .release_packager_root
+        .clone()
+        .unwrap_or_else(|| config.runtime_storage_dir.join("release-packager"));
+    environment.insert(
+        "ANYDESIGN_PACKAGER_ROOT".to_string(),
+        packager_root.display().to_string(),
+    );
+    if let Some(tools) = config.release_packager_tools.clone() {
+        environment.insert("ANYDESIGN_PACKAGER_TOOLS".to_string(), tools);
+    }
+    let backend = ProcessReleasePackagingBackend::new(
+        program,
+        expected_sha256,
+        environment,
+        Duration::from_secs(config.release_packaging_deadline_seconds),
+    )?;
+    Ok(Some(Arc::new(backend)))
 }
 
 async fn audit_persisted_template_compatibility(state: &AppState) -> anyhow::Result<()> {

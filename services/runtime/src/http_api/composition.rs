@@ -23,6 +23,7 @@ pub(super) fn router_with_services(state: AppState) -> Router {
     let preview_access = PreviewAccessService::new(state.store.clone(), authorization.clone());
     Router::new()
         .merge(routes::system::router())
+        .merge(routes::briefs::router())
         .merge(routes::runs::router())
         .merge(routes::run_events::router())
         .merge(routes::design_sources::router())

@@ -3,7 +3,7 @@ use crate::{
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::ModelToolDefinition,
-    permission::{PermissionEngine, PermissionResult, PermissionRules},
+    permission::{PermissionEngine, PermissionReason, PermissionResult, PermissionRules},
     profiles::policy,
     types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, TranscriptMode},
 };
@@ -584,6 +584,19 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("No such tool available: {tool_name}")),
             };
         };
+        let approved_permission = store
+            .approved_permission_for_tool(run_id, tool.name())
+            .await;
+        let input = approved_permission
+            .as_ref()
+            .and_then(|permission| {
+                permission
+                    .resolved_input
+                    .clone()
+                    .or_else(|| permission.requested_input.clone())
+            })
+            .map(normalize_tool_input)
+            .unwrap_or(input);
         if ctx.run.status == AgentRunStatus::Validating
             && candidate_freeze_blocks(tool.name())
             && !ctx.allow_runtime_owned_writes
@@ -738,15 +751,25 @@ impl ToolExecutor {
             .permission_engine
             .decide(tool.as_ref(), &validated_input, &ctx)
             .await;
-        let audited_permission = match permission {
-            PermissionResult::Allow {
-                updated_input: Value::Null,
-                reason,
-            } => PermissionResult::Allow {
+        let audited_permission = match (approved_permission.as_ref(), permission) {
+            (Some(permission), PermissionResult::Ask { .. })
+            | (Some(permission), PermissionResult::Passthrough { .. }) => PermissionResult::Allow {
+                updated_input: validated_input.clone(),
+                reason: PermissionReason::Other {
+                    reason: format!("approved by permission {}", permission.id),
+                },
+            },
+            (
+                _,
+                PermissionResult::Allow {
+                    updated_input: Value::Null,
+                    reason,
+                },
+            ) => PermissionResult::Allow {
                 updated_input: validated_input.clone(),
                 reason,
             },
-            other => other,
+            (_, other) => other,
         };
         let audit_input = match &audited_permission {
             PermissionResult::Allow { updated_input, .. } => updated_input,
@@ -757,6 +780,27 @@ impl ToolExecutor {
 
         match audited_permission {
             PermissionResult::Allow { updated_input, .. } => {
+                if let Some(permission) = approved_permission.as_ref() {
+                    match store.consume_approved_permission(&permission.id).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return ToolExecution {
+                                result: ToolResult::error_with_recoverable(
+                                    "permission approval was already consumed",
+                                    true,
+                                ),
+                            };
+                        }
+                        Err(error) => {
+                            return ToolExecution {
+                                result: ToolResult::error_with_recoverable(
+                                    format!("failed to consume permission approval: {error}"),
+                                    true,
+                                ),
+                            };
+                        }
+                    }
+                }
                 let progress = ProgressSink::new(run_id, tool_use_id, store.clone());
                 let tracked_input = updated_input.clone();
                 let execution = match tool.call(updated_input, ctx.clone(), progress).await {
@@ -817,7 +861,13 @@ impl ToolExecutor {
                 let permission_message = format!("Permission required for {}", tool.name());
                 let permission = ctx
                     .store
-                    .create_permission_request(&ctx.project_id, run_id, tool.name())
+                    .create_tool_permission_request(
+                        &ctx.project_id,
+                        run_id,
+                        tool.name(),
+                        Some(tool_use_id),
+                        Some(validated_input.clone()),
+                    )
                     .await;
                 let _ = ctx
                     .store

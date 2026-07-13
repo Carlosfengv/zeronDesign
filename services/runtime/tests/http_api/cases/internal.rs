@@ -120,6 +120,18 @@ async fn production_initial_run_requires_registered_project_access() {
             .as_bytes(),
     )
     .unwrap();
+    let issuer = PublicPrincipalJwtIssuer::from_signing_key(
+        signing_key,
+        "anydesign-bff",
+        "anydesign-runtime-public",
+        60,
+    );
+    let token = scoped_project_token(
+        &issuer,
+        "principal-owned",
+        "owned-project",
+        PROJECT_WRITE_OPERATION,
+    );
     let mut config = phase_a_contract_config();
     config.policy_profile = RuntimePolicyProfile::Production;
     config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
@@ -141,7 +153,7 @@ async fn production_initial_run_requires_registered_project_access() {
         .to_string()
     };
 
-    let missing = app
+    let missing_auth = app
         .clone()
         .oneshot(
             Request::builder()
@@ -153,7 +165,22 @@ async fn production_initial_run_requires_registered_project_access() {
         )
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::CONFLICT);
+    assert_eq!(missing_auth.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_access = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/runs")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(request_body("workspace-owned")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_access.status(), StatusCode::FORBIDDEN);
 
     store
         .upsert_project_access(
@@ -171,6 +198,7 @@ async fn production_initial_run_requires_registered_project_access() {
                 .method("POST")
                 .uri("/runs")
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::from(request_body("workspace-other")))
                 .unwrap(),
         )
@@ -184,12 +212,33 @@ async fn production_initial_run_requires_registered_project_access() {
                 .method("POST")
                 .uri("/runs")
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::from(request_body("workspace-owned")))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+fn scoped_project_token(
+    issuer: &PublicPrincipalJwtIssuer,
+    principal_id: &str,
+    project_id: &str,
+    operation: &str,
+) -> String {
+    issuer
+        .issue(PublicPrincipalClaims {
+            iss: String::new(),
+            aud: String::new(),
+            sub: principal_id.to_string(),
+            jti: format!("initial-run-{principal_id}-0001"),
+            exp: 0,
+            iat: 0,
+            project_id: project_id.to_string(),
+            operations: vec![operation.to_string()],
+        })
+        .unwrap()
 }
 
 #[tokio::test]
@@ -215,7 +264,7 @@ async fn preview_version_rejects_cross_project_version_lookup() {
         .await;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -243,7 +292,7 @@ async fn preview_version_rejects_cross_project_version_lookup() {
 async fn product_promote_http_route_is_not_exposed() {
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -274,7 +323,7 @@ async fn product_promote_http_route_is_not_exposed() {
 async fn internal_template_build_route_is_disabled_by_default() {
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: RuntimeStore::new(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -311,7 +360,7 @@ async fn internal_template_build_route_is_disabled_by_default() {
 #[tokio::test]
 async fn internal_template_build_route_requires_service_authorization_when_enabled() {
     let store = RuntimeStore::new();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.enable_internal_template_build_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {
@@ -375,7 +424,7 @@ async fn internal_promote_route_requires_service_authorization_when_enabled() {
             None,
         )
         .await;
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.enable_internal_promote_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {
@@ -438,7 +487,7 @@ async fn internal_promote_route_promotes_candidate_with_audit_when_authorized() 
             None,
         )
         .await;
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.enable_internal_promote_api = true;
     config.internal_admin_token = Some("test-token".to_string());
     let app = http_api::router_with_state(AppState {

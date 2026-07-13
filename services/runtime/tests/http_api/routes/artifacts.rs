@@ -5,6 +5,11 @@ fn artifact_route_family_is_frozen() {
         &[
             ("GET", "/artifacts/{project_id}/current"),
             ("GET", "/artifacts/{project_id}/current/{*artifact_path}"),
+            ("GET", "/artifacts/{project_id}/versions/{version_id}"),
+            (
+                "GET",
+                "/artifacts/{project_id}/versions/{version_id}/{*artifact_path}",
+            ),
             ("GET", "/_next/{*artifact_path}"),
         ],
     );

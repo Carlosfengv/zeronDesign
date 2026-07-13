@@ -43,6 +43,20 @@ pub struct WorkReleaseListResponse {
     pub releases: Vec<crate::release::WorkRelease>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateReleaseRequest {
+    #[serde(default = "default_static_web_profile")]
+    pub runtime_profile_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasePackagingResponse {
+    pub release: crate::release::WorkRelease,
+    pub packaging: crate::release::ReleasePackagingRecord,
+}
+
 fn default_static_web_profile() -> String {
     crate::release::STATIC_WEB_PROFILE_ID.to_string()
 }

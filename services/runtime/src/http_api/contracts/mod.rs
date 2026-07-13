@@ -1,4 +1,5 @@
 mod access;
+mod briefs;
 mod design_profiles;
 mod design_sources;
 mod error;
@@ -10,6 +11,7 @@ mod runs;
 mod system;
 
 pub use access::*;
+pub use briefs::*;
 pub use design_profiles::*;
 pub use design_sources::*;
 pub use error::ErrorResponse;

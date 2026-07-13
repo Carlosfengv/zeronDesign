@@ -1,3 +1,4 @@
+mod controller;
 mod garbage_collector;
 mod manifest;
 mod model;
@@ -6,6 +7,7 @@ mod process_backend;
 mod protection;
 mod store;
 
+pub use controller::ReleasePackagingController;
 pub use garbage_collector::{ReleaseGarbageCollector, TrustedReleaseGarbageCollectionBackend};
 pub use manifest::{
     RuntimeHealthSpec, RuntimeManifest, RuntimeNetworkSpec, RuntimeProfile, RuntimeProfileRegistry,

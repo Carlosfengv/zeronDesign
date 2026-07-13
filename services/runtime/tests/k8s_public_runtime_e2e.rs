@@ -1,11 +1,16 @@
 use anydesign_runtime::{
-    config::SandboxBackendMode,
+    config::{PublicPrincipalAuthMode, SandboxBackendMode},
     http_api::{self, AppState},
     model_gateway::{ModelClient, ModelRequest, ModelResponse, ToolCall},
+    public_principal::{
+        PublicPrincipalClaims, PublicPrincipalJwtIssuer, PREVIEW_READ_OPERATION,
+        PROJECT_WRITE_OPERATION,
+    },
     tools::control_plane::{sandbox_backend_for_config, SandboxBackend},
     types::{sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief},
     RuntimeConfig, RuntimeStore,
 };
+use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -75,8 +80,35 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     config.runtime_browser_proxy_bind = capture_address;
     config.npm_registry =
         "http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/".to_string();
+    let principal_signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+    let principal_public_key = storage.join("public-principal.der");
+    fs::write(
+        &principal_public_key,
+        principal_signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+    config.public_principal_public_key_files = vec![principal_public_key];
+    let principal_issuer = PublicPrincipalJwtIssuer::from_signing_key(
+        principal_signing_key,
+        config.public_principal_issuer.clone(),
+        config.public_principal_audience.clone(),
+        60,
+    );
 
     let store = RuntimeStore::with_checkpoint_dir(&storage);
+    for project_id in ["website-k3d", "docs-k3d"] {
+        store
+            .upsert_project_access(project_id, "k3d-e2e-owner".to_string(), None, None)
+            .await
+            .unwrap();
+    }
+    let website_token = principal_token(&principal_issuer, "website-k3d");
+    let docs_token = principal_token(&principal_issuer, "docs-k3d");
     let website_brief_id = confirmed_brief(&store, "website-k3d", website_brief()).await;
     let docs_brief_id = confirmed_brief(&store, "docs-k3d", docs_brief()).await;
     let model = RoutingFixtureModel {
@@ -112,6 +144,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             &store,
             "website-k3d",
             &website_brief_id,
+            &website_token,
         ),
         run_build(
             &client,
@@ -119,6 +152,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             &store,
             "docs-k3d",
             &docs_brief_id,
+            &docs_token,
         )
     );
     let website_build_version = store
@@ -137,6 +171,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             "website-k3d",
             &website_build_version.id,
             website_build.sandbox_id.as_deref().unwrap(),
+            &website_token,
         ),
         run_edit(
             &client,
@@ -145,6 +180,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             "docs-k3d",
             &docs_build_version.id,
             docs_build.sandbox_id.as_deref().unwrap(),
+            &docs_token,
         )
     );
     assert_ne!(
@@ -186,6 +222,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             "{}/artifacts/website-k3d/current/",
             config.runtime_public_base_url
         ))
+        .bearer_auth(&website_token)
         .send()
         .await
         .expect("website artifact after release");
@@ -194,6 +231,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             "{}/artifacts/docs-k3d/current/",
             config.runtime_public_base_url
         ))
+        .bearer_auth(&docs_token)
         .send()
         .await
         .expect("docs artifact after release");
@@ -250,9 +288,11 @@ async fn run_build(
     store: &RuntimeStore,
     project_id: &str,
     brief_id: &str,
+    principal_token: &str,
 ) -> anydesign_runtime::types::AgentRun {
     let response = client
         .post(format!("{base_url}/runs"))
+        .bearer_auth(principal_token)
         .json(&json!({
             "projectId": project_id,
             "phase": "build",
@@ -291,9 +331,11 @@ async fn run_edit(
     project_id: &str,
     base_version_id: &str,
     sandbox_binding_id: &str,
+    principal_token: &str,
 ) -> anydesign_runtime::types::AgentRun {
     let response = client
         .post(format!("{base_url}/runs"))
+        .bearer_auth(principal_token)
         .json(&json!({
             "projectId": project_id,
             "phase": "edit",
@@ -312,6 +354,7 @@ async fn run_edit(
     let run_id = payload["runId"].as_str().expect("runId");
     let continued = client
         .post(format!("{base_url}/runs/{run_id}/continue"))
+        .bearer_auth(principal_token)
         .json(&json!({ "userMessage": "Apply the deterministic RC edit." }))
         .send()
         .await
@@ -340,6 +383,24 @@ async fn run_edit(
         assert!(time::Instant::now() < deadline, "edit timed out: {run_id}");
         time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn principal_token(issuer: &PublicPrincipalJwtIssuer, project_id: &str) -> String {
+    issuer
+        .issue(PublicPrincipalClaims {
+            iss: String::new(),
+            aud: String::new(),
+            sub: "k3d-e2e-owner".to_string(),
+            jti: format!("k3d-e2e-{project_id}-principal"),
+            exp: 0,
+            iat: 0,
+            project_id: project_id.to_string(),
+            operations: vec![
+                PROJECT_WRITE_OPERATION.to_string(),
+                PREVIEW_READ_OPERATION.to_string(),
+            ],
+        })
+        .unwrap()
 }
 
 fn website_build_response() -> ModelResponse {

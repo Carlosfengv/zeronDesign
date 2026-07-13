@@ -6,11 +6,11 @@ pub(in crate::http_api) type ArtifactHttpResponse =
 
 pub(in crate::http_api) fn present_artifact(
     content: ArtifactContent,
-    project_id: &str,
+    route_prefix: &str,
 ) -> ArtifactHttpResponse {
     let bytes = if content.legacy_html_rewrite {
         String::from_utf8(content.bytes)
-            .map(|html| rewrite_legacy_artifact_html(&html, project_id).into_bytes())
+            .map(|html| rewrite_legacy_artifact_html(&html, route_prefix).into_bytes())
             .unwrap_or_else(|error| error.into_bytes())
     } else {
         content.bytes
@@ -39,8 +39,7 @@ pub(in crate::http_api) fn artifact_read_error(
     }
 }
 
-fn rewrite_legacy_artifact_html(html: &str, project_id: &str) -> String {
-    let prefix = format!("/artifacts/{project_id}/current");
+fn rewrite_legacy_artifact_html(html: &str, prefix: &str) -> String {
     html.replace("href=\"/_next/", &format!("href=\"{prefix}/_next/"))
         .replace("src=\"/_next/", &format!("src=\"{prefix}/_next/"))
         .replace("href=\"/_astro/", &format!("href=\"{prefix}/_astro/"))

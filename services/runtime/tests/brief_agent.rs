@@ -87,9 +87,15 @@ async fn prompt_and_markdown_produce_structured_brief_draft_and_wait_for_confirm
         )
     }));
     let conversation = store.conversation_items("project-1").await;
-    assert!(conversation
+    let approval = conversation
         .iter()
-        .any(|item| item.kind == "approval_request" && item.text.contains("confirm this Brief")));
+        .find(|item| item.kind == "approval_request" && item.text.contains("confirm this Brief"))
+        .expect("approval request should be visible to the product UI");
+    assert_eq!(approval.metadata.as_ref().unwrap()["briefId"], brief_id);
+    assert_eq!(
+        approval.metadata.as_ref().unwrap()["state"],
+        "needs_user_input"
+    );
 }
 
 #[tokio::test]

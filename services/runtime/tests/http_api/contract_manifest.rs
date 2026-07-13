@@ -4,6 +4,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 const HTTP_API_SOURCE: &str = include_str!("../../src/http_api/mod.rs");
 const ARTIFACTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/artifacts.rs");
+const BRIEFS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/briefs.rs");
 const CAPTURE_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/capture.rs");
 const DESIGN_SOURCES_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/design_sources.rs");
@@ -172,6 +173,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
         ),
     );
     actual.extend(declared_routes("public", ARTIFACTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", BRIEFS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_PROFILES_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_SOURCES_ROUTES_SOURCE));
     actual.extend(declared_routes_in_dir(
@@ -216,9 +218,13 @@ fn route_manifest_metadata_is_complete_and_fail_closed() {
     let allowed_authorization = [
         "none",
         "artifact_referer",
+        "artifact_referer_and_preview_principal_when_required",
         "capture_listener_only",
         "internal_service",
         "project_access_in_production",
+        "project_principal_read_when_required",
+        "project_principal_write_when_required",
+        "preview_principal_when_required",
         "public_principal_when_required",
     ];
     for route in &manifest.routes {

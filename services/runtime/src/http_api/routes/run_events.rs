@@ -1,7 +1,11 @@
-use super::super::{last_event_sequence, not_found, AppState, ErrorResponse};
+use super::super::{
+    authorize_project_operation, last_event_sequence, not_found, AppState, ErrorResponse,
+    PROJECT_READ_OPERATION,
+};
+use crate::authorization::ApplicationAuthorizationPolicy;
 use crate::{conversation::SequencedAgentEvent, types::AgentEvent};
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
@@ -17,17 +21,26 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
 
 async fn stream_run_events(
     State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<
     Sse<impl futures::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    state
+    let run = state
         .store
         .get_run(&run_id)
         .await
         .ok_or_else(|| not_found(format!("run not found: {run_id}")))?;
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &run.project_id,
+        PROJECT_READ_OPERATION,
+    )
+    .await?;
     let start_after = last_event_sequence(
         headers
             .get("last-event-id")

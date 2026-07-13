@@ -285,7 +285,7 @@ async fn design_profile_api_create_bind_and_resolve_for_runs() {
     let store = RuntimeStore::new();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });

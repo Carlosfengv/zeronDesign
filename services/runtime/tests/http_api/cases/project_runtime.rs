@@ -32,7 +32,7 @@ async fn preview_current_returns_promoted_version_contract() {
     .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: RuntimeConfig::from_env(),
+        config: public_auth_disabled_config(),
         store,
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -167,7 +167,7 @@ async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
     )
     .await
     .unwrap();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
     config.workspace_root = workspace;
     let app = http_api::router_with_state(AppState {
@@ -330,7 +330,7 @@ async fn project_runtime_state_reads_phase_a_global_workspace_lifecycle_state() 
     )
     .await
     .unwrap();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
     config.workspace_root = workspace;
     let app = http_api::router_with_state(AppState {
@@ -477,7 +477,7 @@ async fn project_runtime_state_reads_kubernetes_workspace_channel_lifecycle_stat
     )
     .await
     .unwrap();
-    let mut config = RuntimeConfig::from_env();
+    let mut config = public_auth_disabled_config();
     config.sandbox_backend_mode = SandboxBackendMode::Kubernetes;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),

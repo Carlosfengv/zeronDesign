@@ -1539,9 +1539,17 @@ pub struct PendingPermission {
     pub project_id: String,
     pub run_id: String,
     pub tool: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub requested_input: Option<Value>,
+    #[serde(default)]
+    pub resolved_input: Option<Value>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

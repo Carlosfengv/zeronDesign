@@ -2276,6 +2276,14 @@ impl RuntimeStore {
         Some(snapshot.status)
     }
 
+    pub async fn brief_run_id(&self, brief_id: &str) -> Option<String> {
+        if let Some(run_id) = self.inner.read().await.brief_run_ids.get(brief_id).cloned() {
+            return Some(run_id);
+        }
+        self.brief_status(brief_id).await?;
+        self.inner.read().await.brief_run_ids.get(brief_id).cloned()
+    }
+
     pub async fn is_brief_confirmed(&self, brief_id: &str) -> bool {
         self.brief_status(brief_id).await == Some(BriefStatus::Confirmed)
     }
@@ -3106,14 +3114,33 @@ impl RuntimeStore {
         run_id: &str,
         tool: &str,
     ) -> PendingPermission {
+        self.create_tool_permission_request(project_id, run_id, tool, None, None)
+            .await
+    }
+
+    pub async fn create_tool_permission_request(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        tool: &str,
+        tool_use_id: Option<&str>,
+        requested_input: Option<serde_json::Value>,
+    ) -> PendingPermission {
         let request = PendingPermission {
-            id: self.next_id("permission"),
+            id: format!(
+                "permission-{}",
+                crate::types::sha256_hex(&rand::random::<[u8; 32]>())
+            ),
             project_id: project_id.to_string(),
             run_id: run_id.to_string(),
             tool: tool.to_string(),
+            tool_use_id: tool_use_id.map(str::to_string),
+            requested_input,
+            resolved_input: None,
             status: "pending".to_string(),
             created_at: Utc::now(),
             resolved_at: None,
+            consumed_at: None,
         };
         let mut inner = self.inner.write().await;
         inner
@@ -3134,6 +3161,16 @@ impl RuntimeStore {
         permission_id: &str,
         decision: &str,
     ) -> Result<PendingPermission> {
+        self.resolve_permission_with_input(permission_id, decision, None)
+            .await
+    }
+
+    pub async fn resolve_permission_with_input(
+        &self,
+        permission_id: &str,
+        decision: &str,
+        resolved_input: Option<serde_json::Value>,
+    ) -> Result<PendingPermission> {
         let mut inner = self.inner.write().await;
         if !inner.pending_permissions.contains_key(permission_id) {
             if let Some(permission) = self.read_pending_permission(permission_id)? {
@@ -3153,11 +3190,61 @@ impl RuntimeStore {
             ));
         }
         permission.status = decision.to_string();
+        permission.resolved_input = resolved_input;
         permission.resolved_at = Some(Utc::now());
         let permission = permission.clone();
         drop(inner);
         self.append_pending_permission_snapshot(&permission)?;
         Ok(permission)
+    }
+
+    pub async fn approved_permission_for_tool(
+        &self,
+        run_id: &str,
+        tool: &str,
+    ) -> Option<PendingPermission> {
+        let persisted = self.read_pending_permissions().ok().unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        for permission in persisted {
+            inner
+                .pending_permissions
+                .entry(permission.id.clone())
+                .or_insert(permission);
+        }
+        inner
+            .pending_permissions
+            .values()
+            .filter(|permission| {
+                permission.run_id == run_id
+                    && permission.tool == tool
+                    && permission.status == "allow"
+                    && permission.consumed_at.is_none()
+            })
+            .max_by_key(|permission| permission.resolved_at)
+            .cloned()
+    }
+
+    pub async fn consume_approved_permission(&self, permission_id: &str) -> Result<bool> {
+        let persisted = self.read_pending_permission(permission_id)?;
+        let mut inner = self.inner.write().await;
+        if let Some(permission) = persisted {
+            inner
+                .pending_permissions
+                .entry(permission.id.clone())
+                .or_insert(permission);
+        }
+        let permission = inner
+            .pending_permissions
+            .get_mut(permission_id)
+            .ok_or_else(|| anyhow!("permission request not found: {permission_id}"))?;
+        if permission.status != "allow" || permission.consumed_at.is_some() {
+            return Ok(false);
+        }
+        permission.consumed_at = Some(Utc::now());
+        let permission = permission.clone();
+        drop(inner);
+        self.append_pending_permission_snapshot(&permission)?;
+        Ok(true)
     }
 
     pub async fn pending_permission(&self, permission_id: &str) -> Option<PendingPermission> {
