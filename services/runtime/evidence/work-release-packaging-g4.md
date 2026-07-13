@@ -92,3 +92,41 @@ anydesign.io/work-release -o name` returned no resources.
 - Use a separately authorized builder identity and Registry credential provider.
 - Do not create Deployment, Service, or Ingress until G5/G6/G7 control-plane
   contracts and gates are complete.
+
+## 2026-07-13 Runtime API Freeze revalidation
+
+The current worktree was revalidated with a fresh Registry repository rather
+than by reading the earlier validated record:
+
+```text
+repository: localhost:5001/anydesign/work-releases-freeze-audit
+releaseId: release-cfa84e4b585684fe82537dae020758f9
+status: validated
+attempts: 1
+helperSha256: 8525fb794f15979b8c4a0e2f5d1f5be09335eeb6cf8f1b5ca0f5c48722933152
+imageDigest: sha256:7b7a03b301a91db7d97c9dbb04651f2741f0c128db82152d2ce937e1d0d8d99b
+sbomDigest: sha256:19dd10593b3249677336157767b5765e209ff4f9745f6758579ca5a9ee0d53a0
+scanReportDigest: sha256:d4fdb25712b455d7160f8cc9a6dc75d20730e7ff721359d27fdcd7e982fd1fdc
+scan: passed; critical=0; high=4; secrets=0
+signatureIdentity: local-cosign-key:sha256:4adce916bcaf857f1f74985f94d8803c0379ad9ef57bf7dd9eead63d626c78c4
+signatureDigest: sha256:3d2de73f673a0cd86cde76b7763b172dfcccc422bce9ff5bee5aa8c3f137e8a9
+```
+
+Independent checks then read the Registry manifest, verified one Cosign
+signature against the generated public key, pulled the image by immutable
+digest, and started a clean container:
+
+```text
+Registry Docker-Content-Digest -> sha256:7b7a03b301a91db7d97c9dbb04651f2741f0c128db82152d2ce937e1d0d8d99b
+Cosign verified signatures      -> 1
+GET /                           -> 200
+GET /.well-known/anydesign/healthz -> 200 {"status":"ok"}
+GET /.anydesign/runtime-manifest.json -> 404
+container user                  -> 101:101
+container image                 -> sha256:7b7a03b301a91db7d97c9dbb04651f2741f0c128db82152d2ce937e1d0d8d99b
+```
+
+This remains local acceptance: the signature intentionally uses the frozen
+no-Rekor configuration and verification therefore requires
+`--insecure-ignore-tlog`. The production KMS/Keyless and transparency policy
+stop condition above remains open.

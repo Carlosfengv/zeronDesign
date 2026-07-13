@@ -13,11 +13,6 @@ run_step() {
   "$@"
 }
 
-if [[ -d apps/web ]]; then
-  printf 'Phase A runtime must not contain apps/web code, but apps/web exists.\n' >&2
-  exit 1
-fi
-
 run_step "Rust runtime formatting" \
   cargo fmt --manifest-path services/runtime/Cargo.toml -- --check
 
@@ -29,6 +24,14 @@ run_step "Shared package tests" \
 
 run_step "Shared package typecheck" \
   npm run typecheck --prefix packages/shared
+
+if [[ -d apps/web ]]; then
+  run_step "Phase B web typecheck" \
+    npm run typecheck --prefix apps/web
+
+  run_step "Phase B web production build" \
+    npm run build --prefix apps/web
+fi
 
 if [[ "${ANYDESIGN_SKIP_K8S_E2E:-0}" == "1" ]]; then
   printf '\n==> K8s sandbox E2E skipped because ANYDESIGN_SKIP_K8S_E2E=1\n'

@@ -76,3 +76,23 @@ bash infra/public-runtime/run-g6-k3d-e2e.sh
 bash infra/public-runtime/run-g7-k3d-e2e.sh
 bash infra/public-runtime/run-g8-k3d-e2e.sh
 ```
+
+## 2026-07-13 Runtime API Freeze revalidation
+
+The strongest real lifecycle gate was rerun from the current dirty worktree:
+
+```text
+test update_rollback_restart_and_failed_switch_restore_blue_on_k3d ... ok
+test result: ok. 1 passed; 0 failed; 1 filtered out
+G8 k3d gate passed: cluster=zerondesign-g8
+host=w-7c406457803bf7d149e5.g8.test
+releaseA=release-6e2fc7bac9ff969db25cfc510aa854c3
+digestA=sha256:d8b2c64f680dc068cea917388fa264ab2c370ec4dbbcc11d3436f51094daa34d
+releaseB=release-454e623cce1ec899c9ff9b68a550021d
+digestB=sha256:2a34ec07e4e77da357eef052c14ff02fa3c0ff4f6f73595525e97a9766728d4a
+```
+
+This current-state run again proved stable-host initial publish, A to B update,
+B to A rollback, restart recovery after selector switch, injected mixed
+EndpointSlice failure with restoration of the prior release, and idempotent
+replay after removing the fault.

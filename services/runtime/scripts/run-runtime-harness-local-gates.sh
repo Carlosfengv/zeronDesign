@@ -61,6 +61,8 @@ run_step "fumadocs smoke script syntax" \
   bash -n services/runtime/scripts/smoke-fumadocs-docs-build.sh
 run_step "computed-style smoke script syntax" \
   bash -n services/runtime/scripts/smoke-computed-style-artifact.sh
+run_step "fumadocs dark-theme smoke script syntax" \
+  bash -n services/runtime/scripts/smoke-fumadocs-dark-theme.sh
 
 run_step "node script syntax" \
   node --check services/runtime/scripts/verify-computed-style.mjs
@@ -93,6 +95,9 @@ run_step "fumadocs real build smoke" \
 
 run_step "computed-style local artifact smoke" \
   bash services/runtime/scripts/smoke-computed-style-artifact.sh
+
+run_step "fumadocs dark-theme computed-style smoke" \
+  bash services/runtime/scripts/smoke-fumadocs-dark-theme.sh
 
 run_step "computed-style custom property smoke" \
   bash -c 'tmpdir=".runtime-evidence/style-only-custom-property-$(date +%Y%m%d-%H%M%S)"; RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_STYLE_SELECTOR=":root" RUNTIME_E2E_STYLE_PROPERTY="--runtime-primary" RUNTIME_E2E_STYLE_EXPECTED="#f97316" bash services/runtime/scripts/smoke-computed-style-artifact.sh >/tmp/runtime-style-custom-property.out; grep -q "\"property\": \"--runtime-primary\"" "$tmpdir/evidence-summary.json"; grep -q "\"actual\": \"#f97316\"" "$tmpdir/evidence-summary.json"; echo "STYLE_CUSTOM_PROPERTY_EVIDENCE_DIR=$tmpdir"'
