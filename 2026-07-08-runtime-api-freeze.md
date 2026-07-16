@@ -183,6 +183,9 @@ type StartRunRequest = {
     baseVersionId?: string;
     sandboxBindingId?: string;
     parentRunId?: string;
+    // Optional requested ModelResource. Gateway policy remains the authority
+    // for allowlisting and selects the final executable resource/revision.
+    modelResourceId?: string;
     findingIds?: string[];
   };
 };
