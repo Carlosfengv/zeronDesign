@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-gateway
+  namespace: provider-system
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provider-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: provider-gateway
+    spec:
+      serviceAccountName: provider-gateway
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provider-gateway
+          image: registry.example.invalid/zerondesign/provider-gateway:replace-me
+          args: []
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 9000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          env:
+            - name: PROVIDER_GATEWAY_LISTEN
+              value: 0.0.0.0:9000
+            - name: PROVIDER_GATEWAY_CONFIG_FILE
+              value: /etc/provider-gateway/model-resources.json
+            - name: PROVIDER_GATEWAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: provider-gateway-postgres
+                  key: url
+            - name: PROVIDER_GATEWAY_RUNTIME_TOKEN_FILE
+              value: /var/run/secrets/provider-gateway-runtime-auth/token
+            - name: PROVIDER_GATEWAY_ADMIN_TOKEN_FILE
+              value: /var/run/secrets/provider-gateway-admin-auth/token
+            - name: PROVIDER_GATEWAY_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/provider-gateway-encryption/key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/provider-gateway
+              readOnly: true
+            - name: runtime-auth
+              mountPath: /var/run/secrets/provider-gateway-runtime-auth
+              readOnly: true
+            - name: admin-auth
+              mountPath: /var/run/secrets/provider-gateway-admin-auth
+              readOnly: true
+            - name: encryption-key
+              mountPath: /var/run/secrets/provider-gateway-encryption
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+      volumes:
+        - name: config
+          configMap:
+            name: provider-gateway-model-resources
+        - name: runtime-auth
+          secret:
+            secretName: provider-gateway-runtime-auth
+        - name: admin-auth
+          secret:
+            secretName: provider-gateway-admin-auth
+        - name: encryption-key
+          secret:
+            secretName: provider-gateway-encryption-key

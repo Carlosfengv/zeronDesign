@@ -1,0 +1,70 @@
+{
+  "listen": "0.0.0.0:9000",
+  "databaseUrl": "sqlite:/var/lib/provider-gateway/gateway.db",
+  "resources": [
+    {
+      "schemaVersion": "model-resource@1",
+      "id": "deepseek-design-balanced",
+      "displayName": "DeepSeek Design Balanced",
+      "kind": "openai_compatible",
+      "enabled": true,
+      "revision": 1,
+      "endpoint": {
+        "baseUrl": "https://api.deepseek.com",
+        "chatCompletionsPath": "/v1/chat/completions"
+      },
+      "auth": {
+        "type": "bearer",
+        "secretRef": "db:deepseek-design-balanced"
+      },
+      "physicalModel": "deepseek-v4-pro",
+      "capabilities": {
+        "toolCalls": true,
+        "strictToolSchema": true,
+        "streaming": false,
+        "vision": false
+      },
+      "defaults": {
+        "requestTimeoutMs": 180000,
+        "maxAttempts": 1,
+        "maxConcurrentRequests": 8,
+        "temperature": 0.2
+      }
+    }
+  ],
+  "policies": [
+    {
+      "schemaVersion": "model-selection-policy@1",
+      "id": "website-generation-default",
+      "revision": 1,
+      "scope": {
+        "organizationIds": ["org-1"],
+        "workspaceIds": ["workspace-1"],
+        "projectIds": []
+      },
+      "appliesTo": {
+        "phases": ["build", "edit", "repair"],
+        "agentProfiles": []
+      },
+      "candidates": [
+        {
+          "modelResourceId": "deepseek-design-balanced",
+          "priority": 10,
+          "weight": 100
+        }
+      ],
+      "directSelection": {
+        "allowedModelResourceIds": ["deepseek-design-balanced"]
+      },
+      "automaticSwitch": {
+        "enabled": false,
+        "allowedReasons": [],
+        "maxModelSwitchesPerTurn": 0
+      },
+      "limits": {
+        "maxConcurrentTurns": 8,
+        "dailyInputTokens": 5000000
+      }
+    }
+  ]
+}

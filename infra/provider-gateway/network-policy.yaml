@@ -1,0 +1,82 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: provider-gateway
+  namespace: provider-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: provider-gateway
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: runtime-system
+      ports:
+        - protocol: TCP
+          port: 9000
+    # The metrics endpoint uses the same internal listener. Change this
+    # namespace selector if the cluster's Prometheus installation differs.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: provider-system
+      ports:
+        - protocol: TCP
+          port: 9000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: provider-gateway-postgres
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: provider-gateway-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Standard NetworkPolicy cannot express an FQDN allowlist. This baseline
+    # permits public HTTPS while excluding private, loopback, link-local and
+    # metadata networks; clusters with Cilium/Calico FQDN policies should
+    # replace this rule with the reviewed Provider host allowlist.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443

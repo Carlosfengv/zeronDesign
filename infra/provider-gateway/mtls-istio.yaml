@@ -1,0 +1,54 @@
+# Apply this overlay only in clusters where the existing Istio/SPIFFE PKI is
+# installed. It makes Runtime -> Gateway transport mutually authenticated at
+# the sidecar boundary; the Gateway application still validates its scoped
+# runtime bearer token as defense in depth.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: provider-gateway
+  namespace: provider-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provider-gateway
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: provider-gateway-runtime
+  namespace: provider-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provider-gateway
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # Align this principal with the existing Runtime ServiceAccount
+            # before applying the overlay.
+            principals:
+              - cluster.local/ns/runtime-system/sa/anydesign-runtime
+      to:
+        - operation:
+            ports: ["9000"]
+    - from:
+        - source:
+            # Prometheus may scrape only the metrics endpoint. Replace the
+            # namespace if the cluster uses a different monitoring namespace.
+            namespaces: ["monitoring"]
+      to:
+        - operation:
+            ports: ["9000"]
+            paths: ["/metrics"]
+    - from:
+        - source:
+            # The GitOps reconciler/Admin control-plane workload. It remains
+            # subject to Gateway bearer, idempotency, and audit checks.
+            principals:
+              - cluster.local/ns/provider-system/sa/provider-gateway-admin
+      to:
+        - operation:
+            ports: ["9000"]

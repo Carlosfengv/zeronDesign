@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provider-gateway-model-resources
+  namespace: provider-system
+data:
+  model-resources.json: |
+    {
+      "resources": [],
+      "policies": []
+    }
+# Replace this ConfigMap through GitOps with an approved configuration derived
+# from model-resources.example.json. The empty default intentionally fails the
+# Gateway readiness/startup check instead of enabling an unreviewed provider.
