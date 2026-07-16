@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Model Selection Policy",
+  "type": "object",
+  "required": ["schemaVersion", "id", "revision", "scope", "candidates", "directSelection"],
+  "properties": {
+    "schemaVersion": { "const": "model-selection-policy@1" },
+    "id": { "type": "string" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "organizationIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "workspaceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "projectIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "appliesTo": {
+      "type": "object",
+      "properties": {
+        "phases": {
+          "type": "array",
+          "items": { "enum": ["brief", "build", "repair", "review", "edit", "export"] },
+          "uniqueItems": true
+        },
+        "agentProfiles": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "candidates": { "type": "array" },
+    "directSelection": {
+      "type": "object",
+      "required": ["allowedModelResourceIds"],
+      "properties": { "allowedModelResourceIds": { "type": "array", "items": { "type": "string" } } }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "maxConcurrentTurns": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "dailyInputTokens": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

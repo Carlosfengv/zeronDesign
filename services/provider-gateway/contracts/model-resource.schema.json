@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Model Resource",
+  "type": "object",
+  "required": ["schemaVersion", "id", "kind", "enabled", "revision", "endpoint", "auth", "physicalModel", "capabilities"],
+  "properties": {
+    "schemaVersion": { "const": "model-resource@1" },
+    "id": { "type": "string" },
+    "kind": { "enum": ["openai_compatible", "fixture"] },
+    "enabled": { "type": "boolean" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "endpoint": { "type": "object" },
+    "auth": { "type": "object", "required": ["type", "secretRef"] },
+    "physicalModel": { "type": "string" },
+    "capabilities": { "type": "object" },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "requestTimeoutMs": { "type": "integer", "minimum": 1 },
+        "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "maxConcurrentRequests": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "temperature": { "type": "number" }
+      }
+    }
+  }
+}

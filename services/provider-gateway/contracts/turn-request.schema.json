@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Turn Request",
+  "type": "object",
+  "required": ["schemaVersion", "requestId", "idempotencyKey", "deadlineAt", "scope", "routing", "input"],
+  "properties": {
+    "schemaVersion": { "const": "provider-gateway-turn-request@1" },
+    "requestId": { "type": "string", "minLength": 1 },
+    "idempotencyKey": { "type": "string", "minLength": 1 },
+    "deadlineAt": { "type": "string", "format": "date-time" },
+    "scope": {
+      "type": "object",
+      "required": ["organizationId", "workspaceId", "projectId", "runId", "turn", "phase", "agentProfile"],
+      "properties": {
+        "organizationId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": "string", "minLength": 1 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "runId": { "type": "string", "minLength": 1 },
+        "turn": { "type": "integer", "minimum": 1 },
+        "phase": { "type": "string" },
+        "agentProfile": { "type": "string" }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "required": ["requiredCapabilities"],
+      "properties": {
+        "modelResourceId": { "type": ["string", "null"] },
+        "requiredCapabilities": { "type": "object" }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["systemPrompt", "messages", "tools", "deferredTools"],
+      "properties": {
+        "systemPrompt": { "type": "string" },
+        "messages": { "type": "array" },
+        "tools": { "type": "array" },
+        "deferredTools": { "type": "array" }
+      }
+    }
+  }
+}

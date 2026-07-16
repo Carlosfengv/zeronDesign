@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Turn Response",
+  "type": "object",
+  "required": ["schemaVersion", "requestId", "type", "finishReason", "modelExecution", "usage", "provider"],
+  "properties": {
+    "schemaVersion": { "const": "provider-gateway-turn-response@1" },
+    "requestId": { "type": "string" },
+    "type": { "enum": ["text", "tool_calls"] },
+    "toolCalls": { "type": "array" },
+    "text": { "type": ["string", "null"] },
+    "finishReason": { "type": "string" },
+    "modelExecution": {
+      "type": "object",
+      "required": ["id", "modelResourceId", "modelResourceRevision", "physicalModel", "selectionPolicyId", "selectionPolicyRevision", "capabilitySnapshotHash", "selectionReason", "automaticSwitch"],
+      "properties": {
+        "id": { "type": "string" },
+        "modelResourceId": { "type": "string" },
+        "modelResourceRevision": { "type": "integer", "minimum": 1 },
+        "physicalModel": { "type": "string" },
+        "selectionPolicyId": { "type": "string" },
+        "selectionPolicyRevision": { "type": "integer", "minimum": 1 },
+        "capabilitySnapshotHash": { "type": "string" },
+        "selectionReason": { "type": "string" },
+        "automaticSwitch": { "type": "object" }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "required": ["inputTokens", "outputTokens", "cachedInputTokens"],
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 },
+        "cachedInputTokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "required": ["requestId", "attemptCount"],
+      "additionalProperties": false,
+      "properties": {
+        "requestId": { "type": ["string", "null"] },
+        "attemptCount": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
