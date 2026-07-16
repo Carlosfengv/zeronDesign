@@ -75,6 +75,7 @@ impl DesignProfileService {
             extended_token_mapping: payload_value(&payload, "extendedTokenMapping")
                 .unwrap_or_else(|| json!({})),
             components: required_value(&payload, "components")?,
+            website_context: payload_value(&payload, "websiteContext").unwrap_or(Value::Null),
             content: required_value(&payload, "content")?,
             accessibility: required_value(&payload, "accessibility")?,
             technical: required_value(&payload, "technical")?,
@@ -362,6 +363,8 @@ impl DesignProfileService {
             extended_token_mapping: payload_value(&payload, "extendedTokenMapping")
                 .unwrap_or(existing.extended_token_mapping),
             components: required_value(&payload, "components")?,
+            website_context: payload_value(&payload, "websiteContext")
+                .unwrap_or(existing.website_context),
             content: required_value(&payload, "content")?,
             accessibility: required_value(&payload, "accessibility")?,
             technical: required_value(&payload, "technical")?,

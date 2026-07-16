@@ -1,7 +1,7 @@
 use anydesign_runtime::tools::sandbox::sandbox_tools;
 use sha2::{Digest, Sha256};
 
-const SANDBOX_TOOL_CONTRACT_V1: &[(&str, &str)] = &[
+const SANDBOX_TOOL_CONTRACT_V2: &[(&str, &str)] = &[
     (
         "fs.read",
         "5f44faa29592ec02a89e7547856c46c4d100b0a62a9866c3d05a25154d081cd9",
@@ -107,6 +107,18 @@ const SANDBOX_TOOL_CONTRACT_V1: &[(&str, &str)] = &[
         "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
     ),
     (
+        "diagnostics.accessibility",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "preview.audit_responsive",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "design_context.status",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
         "browser.open",
         "45e0e2b57d9db3323a7fd5dca298dd49947a0c51bd9b90043aa15919a0d21d60",
     ),
@@ -121,7 +133,7 @@ const SANDBOX_TOOL_CONTRACT_V1: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn sandbox_tool_order_and_input_schemas_match_v1_contract() {
+fn sandbox_tool_order_and_input_schemas_match_v2_contract() {
     let tools = sandbox_tools();
     let actual = tools
         .iter()
@@ -131,7 +143,7 @@ fn sandbox_tool_order_and_input_schemas_match_v1_contract() {
             (tool.name(), format!("{digest:x}"))
         })
         .collect::<Vec<_>>();
-    let expected = SANDBOX_TOOL_CONTRACT_V1
+    let expected = SANDBOX_TOOL_CONTRACT_V2
         .iter()
         .map(|(name, digest)| (*name, (*digest).to_string()))
         .collect::<Vec<_>>();

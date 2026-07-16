@@ -4,7 +4,10 @@ use crate::{
     channel_manager::ChannelManager,
     config::{SandboxBackendMode, WorkRuntimeBackendMode},
     http_api::{self, AppState},
-    project::{audit_project_template_compatibility, ProjectInitWorkspaceTransaction},
+    project::{
+        audit_project_template_compatibility, ProjectInitWorkspaceTransaction,
+        WorkspaceTransactionError,
+    },
     publication::{
         ControlPlaneOnlyBackend, KubernetesWorkRuntimeBackend, WorkRuntimeBackend,
         WorkRuntimeController,
@@ -18,11 +21,13 @@ use crate::{
     templates::BuiltInTemplateRegistry,
     tools::{
         runtime::ToolContext,
-        sandbox::{LocalWorkspaceBackend, SandboxChannelWorkspaceBackend},
+        sandbox::{LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend},
     },
+    types::{AgentEvent, AgentRun, AgentRunStatus},
     RuntimeConfig,
 };
 use chrono::Utc;
+use serde_json::json;
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 
@@ -139,24 +144,91 @@ async fn audit_persisted_template_compatibility(state: &AppState) -> anyhow::Res
 }
 
 async fn recover_project_init_transactions(state: &AppState) -> anyhow::Result<()> {
-    for run in state.store.runs_requiring_recovery().await {
-        let workspace_root = http_api::resolved_workspace_root(&state.config, &run.project_id);
-        let mut ctx = ToolContext::new(state.store.clone(), run, workspace_root);
-        ctx.remote_workspace = state.config.sandbox_backend_mode == SandboxBackendMode::Kubernetes;
-        ctx.runtime_storage_dir = state.config.runtime_storage_dir.clone();
-        ctx.runtime_public_base_url = state.config.runtime_public_base_url.clone();
-        match state.config.sandbox_backend_mode {
-            SandboxBackendMode::PhaseAContract => {
-                ProjectInitWorkspaceTransaction::recover_pending(&LocalWorkspaceBackend, &ctx)
-                    .await?;
-            }
-            SandboxBackendMode::Kubernetes => {
-                let backend = SandboxChannelWorkspaceBackend::from_runtime_config(&state.config)
-                    .map_err(anyhow::Error::new)?;
-                ProjectInitWorkspaceTransaction::recover_pending(&backend, &ctx).await?;
-            }
+    match state.config.sandbox_backend_mode {
+        SandboxBackendMode::PhaseAContract => {
+            recover_project_init_transactions_with_backend(state, &LocalWorkspaceBackend, false)
+                .await
+        }
+        SandboxBackendMode::Kubernetes => {
+            let backend = SandboxChannelWorkspaceBackend::from_runtime_config(&state.config)
+                .map_err(anyhow::Error::new)?;
+            recover_project_init_transactions_with_backend(state, &backend, true).await
         }
     }
+}
+
+async fn recover_project_init_transactions_with_backend(
+    state: &AppState,
+    backend: &dyn WorkspaceBackend,
+    remote_workspace: bool,
+) -> anyhow::Result<()> {
+    for run in state.store.runs_requiring_recovery().await {
+        let workspace_root = http_api::resolved_workspace_root(&state.config, &run.project_id);
+        let mut ctx = ToolContext::new(state.store.clone(), run.clone(), workspace_root);
+        ctx.remote_workspace = remote_workspace;
+        ctx.runtime_storage_dir = state.config.runtime_storage_dir.clone();
+        ctx.runtime_public_base_url = state.config.runtime_public_base_url.clone();
+        if let Err(error) = ProjectInitWorkspaceTransaction::recover_pending(backend, &ctx).await {
+            isolate_project_init_recovery_failure(state, &run, &error).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn isolate_project_init_recovery_failure(
+    state: &AppState,
+    run: &AgentRun,
+    error: &WorkspaceTransactionError,
+) -> anyhow::Result<()> {
+    let reason = format!(
+        "Runtime startup isolated project.init recovery failure [{}]: {}",
+        error.error_kind, error.message
+    );
+    state
+        .store
+        .append_audit_record(
+            &run.project_id,
+            &run.id,
+            "project.init.startup_recovery",
+            format!(
+                "sandboxBindingId={}",
+                run.sandbox_id.as_deref().unwrap_or("none")
+            ),
+            "recovery_required",
+            reason.clone(),
+        )
+        .await;
+    state
+        .store
+        .update_run_status(&run.id, AgentRunStatus::Failed)
+        .await?;
+    state
+        .store
+        .append_event(AgentEvent::RunCompleted {
+            run_id: run.id.clone(),
+            status: "failed".to_string(),
+            summary: reason.clone(),
+            timestamp: Utc::now(),
+        })
+        .await?;
+    state
+        .store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "error_summary",
+            Some("system"),
+            &reason,
+            Some(json!({
+                "recoverable": true,
+                "errorKind": error.error_kind,
+                "checkpointId": run.checkpoint_id,
+                "sandboxBindingId": run.sandbox_id,
+                "journalPreserved": true,
+                "suggestedAction": "Restore or replace the sandbox workspace binding, then inspect the preserved project.init journal before retrying."
+            })),
+        )
+        .await;
     Ok(())
 }
 
@@ -280,7 +352,66 @@ impl TestRuntimeBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use async_trait::async_trait;
+    use std::{fs, io, path::Path};
+
+    struct SelectiveUnavailableWorkspace;
+
+    #[async_trait]
+    impl WorkspaceBackend for SelectiveUnavailableWorkspace {
+        async fn read_to_string(&self, ctx: &ToolContext, _path: &Path) -> io::Result<String> {
+            if ctx.project_id == "stale-project-init" {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "failed to lookup address information: Name or service not known",
+                ));
+            }
+            Err(io::Error::new(io::ErrorKind::NotFound, "no journal"))
+        }
+
+        async fn write_string(
+            &self,
+            _ctx: &ToolContext,
+            _path: &Path,
+            _text: &str,
+        ) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+
+        async fn list_dir(
+            &self,
+            _ctx: &ToolContext,
+            _path: &Path,
+        ) -> io::Result<Vec<crate::tools::sandbox::WorkspaceEntry>> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+
+        async fn path_kind(
+            &self,
+            _ctx: &ToolContext,
+            _path: &Path,
+        ) -> io::Result<crate::tools::sandbox::WorkspacePathKind> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+
+        async fn remove_file(&self, _ctx: &ToolContext, _path: &Path) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+
+        async fn remove_dir_all(&self, _ctx: &ToolContext, _path: &Path) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+
+        async fn copy_dir_all(
+            &self,
+            _ctx: &ToolContext,
+            _from: &Path,
+            _to: &Path,
+            _skip_dir_names: &[String],
+        ) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "unused"))
+        }
+    }
 
     fn test_config(name: &str) -> RuntimeConfig {
         let root = std::env::temp_dir().join(format!(
@@ -317,6 +448,94 @@ mod tests {
             .active_tasks
             .contains(&"controller/work-runtime".to_string()));
         runtime.supervisor.shutdown(Duration::from_secs(1)).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_isolates_unreachable_project_init_journal_and_continues_other_runs() {
+        let config = test_config("stale-project-init");
+        let root = config.runtime_storage_dir.parent().unwrap().to_path_buf();
+        let store = crate::RuntimeStore::with_checkpoint_dir(&config.runtime_storage_dir);
+        let stale = store
+            .create_run(
+                "stale-project-init".to_string(),
+                crate::types::AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let healthy = store
+            .create_run(
+                "healthy-project-init".to_string(),
+                crate::types::AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let state = AppState {
+            supervisor: RuntimeSupervisor::new(),
+            store: store.clone(),
+            model: Arc::new(crate::model_gateway::EmptyModelClient),
+            config,
+        };
+
+        recover_project_init_transactions_with_backend(
+            &state,
+            &SelectiveUnavailableWorkspace,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.get_run(&stale.id).await.unwrap().status,
+            AgentRunStatus::Failed
+        );
+        assert_eq!(
+            store.get_run(&healthy.id).await.unwrap().status,
+            AgentRunStatus::Queued
+        );
+        assert_eq!(
+            store
+                .runs_requiring_recovery()
+                .await
+                .into_iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![healthy.id.clone()]
+        );
+        let audit = store
+            .audit_records()
+            .await
+            .into_iter()
+            .find(|record| record.run_id == stale.id)
+            .expect("startup recovery audit must be preserved");
+        assert_eq!(audit.tool, "project.init.startup_recovery");
+        assert_eq!(audit.decision, "recovery_required");
+        assert!(audit
+            .reason
+            .contains("project.init_recovery_workspace_unavailable"));
+        let completion = store
+            .events(&stale.id)
+            .await
+            .into_iter()
+            .find(|event| event.is_run_completed())
+            .expect("failed recovery must emit a terminal event");
+        assert!(format!("{completion:?}").contains("project.init_recovery_workspace_unavailable"));
+        let summary = store
+            .conversation_items(&stale.project_id)
+            .await
+            .into_iter()
+            .find(|item| item.run_id.as_deref() == Some(stale.id.as_str()))
+            .expect("failed recovery must preserve an operator summary");
+        assert_eq!(summary.metadata.as_ref().unwrap()["journalPreserved"], true);
+        assert_eq!(
+            summary.metadata.as_ref().unwrap()["errorKind"],
+            "project.init_recovery_workspace_unavailable"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }

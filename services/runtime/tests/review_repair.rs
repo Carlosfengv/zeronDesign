@@ -730,6 +730,18 @@ async fn repair_child_run_has_scoped_write_policy_without_parent_session_allow_r
         .contains(&"fs.patch".to_string()));
     assert!(repair
         .profile_snapshot
+        .allowed_tools
+        .contains(&"fs.write_chunk".to_string()));
+    assert!(repair
+        .profile_snapshot
+        .allowed_tools
+        .contains(&"fs.commit_chunks".to_string()));
+    assert!(repair
+        .profile_snapshot
+        .denied_tools
+        .contains(&"preview.report_candidate".to_string()));
+    assert!(repair
+        .profile_snapshot
         .denied_tools
         .contains(&"mcp__*".to_string()));
     assert!(repair.profile_snapshot.mcp_server_names.is_empty());
@@ -739,11 +751,21 @@ async fn repair_child_run_has_scoped_write_policy_without_parent_session_allow_r
         .execute_calls(
             store.clone(),
             &repair.id,
-            vec![ToolCall::new(
-                "tool-1",
-                "mcp__figma__get_file",
-                serde_json::json!({ "fileKey": "figma-file" }),
-            )],
+            vec![
+                ToolCall::new(
+                    "tool-1",
+                    "mcp__figma__get_file",
+                    serde_json::json!({ "fileKey": "figma-file" }),
+                ),
+                ToolCall::new(
+                    "tool-2",
+                    "preview.report_candidate",
+                    serde_json::json!({
+                        "url": "http://127.0.0.1:4321",
+                        "screenshotId": "shot-manual-repair"
+                    }),
+                ),
+            ],
         )
         .await;
 
@@ -752,11 +774,21 @@ async fn repair_child_run_has_scoped_write_policy_without_parent_session_allow_r
         .as_str()
         .unwrap()
         .contains("denied by frozen run profile policy"));
+    assert!(result[1].result.is_error);
+    assert!(result[1].result.content["error"]
+        .as_str()
+        .unwrap()
+        .contains("denied by frozen run profile policy"));
     assert!(store
         .audit_records()
         .await
         .iter()
         .any(|record| record.tool == "mcp__figma__get_file" && record.decision == "deny"));
+    assert!(store
+        .audit_records()
+        .await
+        .iter()
+        .any(|record| record.tool == "preview.report_candidate" && record.decision == "deny"));
 }
 
 #[tokio::test]

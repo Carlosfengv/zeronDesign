@@ -7,15 +7,18 @@
     },
     "rustBuilder": {
       "ref": "docker.io/library/rust:1.94-bookworm",
+      "fallbackRef": "mirror.gcr.io/library/rust:1.94-bookworm",
       "digest": "sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55"
     },
     "debianRuntime": {
       "ref": "docker.io/library/debian:bookworm-slim",
-      "digest": "sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+      "fallbackRef": "mirror.gcr.io/library/debian:bookworm-slim",
+      "digest": "sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
     },
     "sandboxNode": {
       "ref": "docker.io/library/node:22-bookworm",
-      "digest": "sha256:a25c9934ff6382cd4f08b6bc26c82bf4ea69b1e6f8dabfb2ead457374127c365"
+      "fallbackRef": "mirror.gcr.io/library/node:22-bookworm",
+      "digest": "sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37"
     },
     "k3s": {
       "ref": "docker.io/rancher/k3s:v1.31.5-k3s1",
@@ -40,6 +43,10 @@
     "localPathProvisioner": {
       "ref": "docker.io/rancher/local-path-provisioner:v0.0.30",
       "digest": "sha256:9b914881170048f80ae9302f36e5b99b4a6b18af73a38adc1c66d12f65d360be"
+    },
+    "localPathHelper": {
+      "ref": "docker.io/rancher/mirrored-library-busybox:1.36.1",
+      "digest": "sha256:8a45424ddf949bbe9bb3231b05f9032a45da5cd036eb4867b511b00734756d6f"
     }
   }
 }

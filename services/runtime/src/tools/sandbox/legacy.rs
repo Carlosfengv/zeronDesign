@@ -47,6 +47,8 @@ mod browser;
 mod build_support;
 #[path = "fs/delete.rs"]
 mod delete;
+#[path = "design_context_status.rs"]
+mod design_context_status;
 #[path = "diagnostics.rs"]
 mod diagnostics;
 #[path = "support/fs.rs"]
@@ -162,6 +164,9 @@ pub fn sandbox_tools_with_backends(
         preview_lifecycle::preview_stop_tool(workspace_backend.clone(), command_backend.clone()),
         diagnostics::diagnostics_build_log_tool(workspace_backend.clone()),
         diagnostics::diagnostics_typescript_tool(workspace_backend.clone()),
+        diagnostics::diagnostics_accessibility_tool(workspace_backend.clone()),
+        diagnostics::preview_audit_responsive_tool(workspace_backend.clone()),
+        design_context_status::design_context_status_tool(),
         browser::browser_open_tool(workspace_backend.clone()),
         browser::browser_screenshot_tool(workspace_backend.clone()),
         browser::browser_inspect_tool(workspace_backend),

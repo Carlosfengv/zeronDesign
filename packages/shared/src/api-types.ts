@@ -93,6 +93,142 @@ export const CancelRunResponseSchema = z.object({
   status: z.literal("cancelled"),
 });
 
+// The DCP payload stays Runtime-owned.  The Web surface only receives the
+// identity and verification facts it needs to explain a Run and to start an
+// explicit Profile Sync operation.
+export const DesignContextPackageSummarySchema = z.object({
+  version: z.string().min(1).nullish(),
+  contentHash: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  artifactManifestHash: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  compilerVersion: z.string().min(1).nullish(),
+  briefHash: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+  expectedAppRoot: z.string().min(1).nullish(),
+  declaredEnforcementMode: z.string().min(1).nullish(),
+  effectiveCompatibilityMode: z.string().min(1).nullish(),
+  verificationPolicyId: z.string().min(1),
+  warnings: z.array(z.string()),
+  surface: z.enum(["website", "docs"]),
+  template: z.string().min(1),
+  designProfileId: z.string().min(1),
+  designProfileVersion: z.number().int().positive(),
+  effectiveProfileHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+});
+
+export const DesignContextArtifactSchema = z.object({
+  path: z.string().min(1),
+  kind: z.string().min(1),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  requiredBeforeMutation: z.boolean(),
+});
+
+export const DesignContextManifestResponseSchema = z.object({
+  runId: z.string().min(1),
+  package: DesignContextPackageSummarySchema,
+  artifacts: z.array(DesignContextArtifactSchema),
+});
+
+export const DesignContextFidelityAssertionSummarySchema = z.object({
+  ruleId: z.string().min(1).max(200),
+  recipeId: z.string().min(1).max(200).nullable(),
+  priority: z.string().min(1).max(40),
+  kind: z.string().min(1).max(80),
+  route: z.string().min(1).max(200),
+  viewport: z.number().int().nonnegative().nullable(),
+  selector: z.string().min(1).max(240).nullable(),
+  property: z.string().min(1).max(120).nullable(),
+  actualSummary: z.string().max(160).nullable(),
+  expectedSummary: z.string().max(160).nullable(),
+  comparator: z.string().min(1).max(80).nullable(),
+  passed: z.boolean(),
+  reason: z.string().min(1).max(320).nullable(),
+});
+
+export const DesignContextFidelitySummarySchema = z.object({
+  status: z.enum(["passed", "failed"]),
+  checkedAt: z.string().min(1).max(80).nullable(),
+  outputVersionId: z.string().min(1).max(200).nullable(),
+  requiredFailedRuleIds: z.array(z.string().min(1).max(200)).max(64),
+  assertions: z.array(DesignContextFidelityAssertionSummarySchema).max(64),
+  repairContext: z.object({
+    targets: z.array(z.string().min(1).max(240)).max(2),
+    instructions: z.array(z.string().min(1).max(240)).max(4),
+  }),
+});
+
+export const DesignContextDiagnosticsResponseSchema = z.object({
+  runId: z.string().min(1),
+  package: DesignContextPackageSummarySchema,
+  requiredReads: z.array(z.object({ path: z.string().min(1), reason: z.string().min(1) })),
+  readFiles: z.array(z.string().min(1)),
+  missingRequiredReads: z.array(z.string().min(1)),
+  gate: z.enum(["ready", "read_required"]),
+  materialization: z.object({ hash: z.string().min(1).nullish(), ready: z.boolean() }),
+  // A newly created child Run owns a frozen DCP before its Agent loop has
+  // materialized and verified the restored style contract.
+  styleContract: z.object({ verified: z.boolean().nullable() }),
+  verification: z.object({
+    policyId: z.string().min(1).nullish(),
+    registryVersion: z.string().min(1).nullish(),
+    capabilitySnapshotHash: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+    capabilities: z.record(z.string().min(1), z.object({ available: z.boolean() })).default({}),
+  }),
+  fidelity: DesignContextFidelitySummarySchema.nullable(),
+});
+
+export const ProfileTokenSyncStateSchema = z.enum([
+  "already_target", "apply_target", "conflict", "not_managed",
+]);
+export const ProfileTokenSyncResolutionSchema = z.enum(["keep_current", "apply_target"]);
+export const ProfileTokenSyncItemSchema = z.object({
+  token: z.string().min(1),
+  base: z.string().nullable(),
+  current: z.string().nullable(),
+  target: z.string().nullable(),
+  state: ProfileTokenSyncStateSchema,
+  resolution: ProfileTokenSyncResolutionSchema.nullable(),
+});
+export const ProfileTokenSyncOperationStatusSchema = z.enum([
+  "planned", "confirmed", "applying", "applied", "rejected", "recovery_required",
+]);
+export const PlanDesignProfileSyncRequestSchema = z.object({
+  targetDesignProfileId: z.string().min(1),
+  targetDesignProfileVersion: z.number().int().positive(),
+  targetEffectiveProfileHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  expectedSourceContentHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  idempotencyKey: z.string().min(1).max(200),
+});
+export const ConfirmDesignProfileSyncRequestSchema = z.object({
+  planHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  conflictDecisions: z.record(z.string().min(1), ProfileTokenSyncResolutionSchema).default({}),
+  idempotencyKey: z.string().min(1).max(200),
+});
+export const ProfileTokenSyncOperationResponseSchema = z.object({
+  operationId: z.string().min(1),
+  status: ProfileTokenSyncOperationStatusSchema,
+  expiresAt: z.string().datetime(),
+  planHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  sourceContentHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  targetDesignProfileId: z.string().min(1),
+  targetDesignProfileVersion: z.number().int().positive(),
+  targetEffectiveProfileHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  styleContractIdentity: z.object({
+    hash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    version: z.string().min(1),
+    template: z.string().min(1),
+    appRoot: z.string().min(1),
+    tokenMappings: z.record(z.string().min(1), z.string().min(1)),
+  }),
+  snapshots: z.object({
+    baseHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    currentHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    targetHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  }),
+  items: z.array(ProfileTokenSyncItemSchema),
+  conflictDecisions: z.record(z.string().min(1), ProfileTokenSyncResolutionSchema),
+  childRunId: z.string().min(1).nullable(),
+});
+
 export const BriefResponseSchema = z.object({
   briefId: z.string().min(1),
   projectId: z.string().min(1),
@@ -530,6 +666,7 @@ export const ProjectAccessResponseSchema = z.object({
 
 export const ErrorResponseSchema = z.object({
   error: z.string().min(1),
+  errorCode: z.string().min(1).optional(),
 });
 
 export type ContentSource = z.infer<typeof ContentSourceSchema>;
@@ -538,6 +675,13 @@ export type StartRunResponse = z.infer<typeof StartRunResponseSchema>;
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
 export type ContinueRunResponse = z.infer<typeof ContinueRunResponseSchema>;
 export type CancelRunResponse = z.infer<typeof CancelRunResponseSchema>;
+export type DesignContextManifestResponse = z.infer<typeof DesignContextManifestResponseSchema>;
+export type DesignContextDiagnosticsResponse = z.infer<typeof DesignContextDiagnosticsResponseSchema>;
+export type PlanDesignProfileSyncRequest = z.input<typeof PlanDesignProfileSyncRequestSchema>;
+export type ConfirmDesignProfileSyncRequest = z.input<typeof ConfirmDesignProfileSyncRequestSchema>;
+export type ProfileTokenSyncOperationResponse = z.infer<
+  typeof ProfileTokenSyncOperationResponseSchema
+>;
 export type BriefResponse = z.infer<typeof BriefResponseSchema>;
 export type CreateDesignSourceArtifactRequest = z.infer<
   typeof CreateDesignSourceArtifactRequestSchema

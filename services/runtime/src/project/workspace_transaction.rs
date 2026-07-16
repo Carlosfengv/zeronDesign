@@ -72,8 +72,13 @@ pub struct WorkspaceTransactionError {
 
 impl WorkspaceTransactionError {
     fn io(action: &str, error: io::Error) -> Self {
+        let error_kind = if action == "read journal" && workspace_is_unavailable(&error) {
+            "project.init_recovery_workspace_unavailable"
+        } else {
+            "project.init_transaction_failed"
+        };
         Self {
-            error_kind: "project.init_transaction_failed",
+            error_kind,
             message: format!("project init transaction {action} failed: {error}"),
         }
     }
@@ -84,6 +89,31 @@ impl WorkspaceTransactionError {
             message: message.into(),
         }
     }
+}
+
+fn workspace_is_unavailable(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "failed to lookup address information",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "no such host",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 impl fmt::Display for WorkspaceTransactionError {

@@ -164,6 +164,7 @@ impl Tool for PreviewReportCandidateTool {
             url,
             screenshot_id,
             source_snapshot_uri.as_deref(),
+            None,
         )
         .await
         .map(ToolResult::ok)
@@ -300,9 +301,41 @@ impl Tool for PreviewPublishTool {
             })?
             .to_string();
 
-        let published =
-            report_preview_candidate(&*self.workspace, &ctx, url, screenshot_id, None).await?;
-        let fidelity = evaluate_design_profile_fidelity(
+        // Create the immutable candidate identity before fidelity evaluation so
+        // every failure (including an unavailable enforced verifier) has a
+        // durable candidate/evidence target.  Promotion and artifact staging
+        // happen only after the DCP gate has accepted this exact candidate.
+        let source_snapshot_uri = build
+            .get("sourceSnapshotUri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "preview.publish build did not return sourceSnapshotUri".to_string(),
+                    "preview.source_snapshot_missing",
+                    json!({ "build": build }),
+                )
+            })?;
+        let candidate = ctx
+            .store
+            .create_project_version_candidate(
+                &ctx.project_id,
+                &ctx.run.id,
+                url.clone(),
+                Some(screenshot_id.clone()),
+                Some(source_snapshot_uri.to_string()),
+            )
+            .await;
+        let _ = ctx
+            .store
+            .append_event(AgentEvent::PreviewCandidate {
+                run_id: ctx.run.id.clone(),
+                url: url.clone(),
+                version_id: candidate.id.clone(),
+                screenshot_id: Some(screenshot_id.clone()),
+                timestamp: Utc::now(),
+            })
+            .await;
+        let fidelity = match evaluate_design_profile_fidelity(
             &*self.workspace,
             &ctx,
             preview
@@ -313,7 +346,32 @@ impl Tool for PreviewPublishTool {
                 .get("screenshotId")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            &published,
+            &json!({ "versionId": candidate.id.clone() }),
+        )
+        .await
+        {
+            Ok(fidelity) => fidelity,
+            Err(error) => {
+                reopen_run_after_fidelity_rejection(&ctx).await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = block_required_design_context_verification(
+            ctx.run
+                .design_context_effective_compatibility_mode
+                .as_deref(),
+            &fidelity,
+        ) {
+            reopen_run_after_fidelity_rejection(&ctx).await?;
+            return Err(error);
+        }
+        let published = report_preview_candidate(
+            &*self.workspace,
+            &ctx,
+            url,
+            screenshot_id,
+            Some(source_snapshot_uri),
+            Some(candidate),
         )
         .await?;
         Ok(ToolResult::ok(json!({
@@ -327,12 +385,48 @@ impl Tool for PreviewPublishTool {
     }
 }
 
+async fn reopen_run_after_fidelity_rejection(ctx: &ToolContext) -> Result<(), ToolError> {
+    ctx.store
+        .update_run_status(&ctx.run.id, AgentRunStatus::Running)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            ToolError::Terminal(format!(
+                "failed to reopen run after Design Context verification rejection: {error}"
+            ))
+        })
+}
+
+fn block_required_design_context_verification(
+    effective_compatibility_mode: Option<&str>,
+    fidelity: &Value,
+) -> Result<(), ToolError> {
+    let required_failures = fidelity
+        .get("requiredFailedRuleIds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if effective_compatibility_mode == Some("enforced") && !required_failures.is_empty() {
+        return Err(ToolError::typed_recoverable(
+            "preview.publish blocked by required Design Context verification failures",
+            "design_context.required_verification_failed",
+            json!({
+                "requiredFailedRuleIds": required_failures,
+                "fidelityReportPath": "state/design-profile-fidelity.json",
+                "suggestedAction": "Read the fidelity report, repair source under the declared app root, then rebuild and publish again."
+            }),
+        ));
+    }
+    Ok(())
+}
+
 async fn report_preview_candidate(
     workspace: &dyn WorkspaceBackend,
     ctx: &ToolContext,
     url: String,
     screenshot_id: String,
     source_snapshot_uri: Option<&str>,
+    existing_candidate: Option<crate::types::ProjectVersion>,
 ) -> Result<Value, ToolError> {
     verify_preview_accessible(&url).await?;
     verify_screenshot_artifact(workspace, ctx, &screenshot_id).await?;
@@ -389,16 +483,34 @@ async fn report_preview_candidate(
             }),
         ));
     }
-    let candidate = ctx
-        .store
-        .create_project_version_candidate(
-            &ctx.project_id,
-            &ctx.run.id,
-            url.clone(),
-            Some(screenshot_id.clone()),
-            Some(source_snapshot_uri.to_string()),
-        )
-        .await;
+    let candidate_was_announced = existing_candidate.is_some();
+    let candidate = match existing_candidate {
+        Some(candidate) => {
+            if candidate.project_id != ctx.project_id
+                || candidate.created_by_run_id != ctx.run.id
+                || candidate.preview_url != url
+                || candidate.screenshot_id.as_deref() != Some(screenshot_id.as_str())
+                || candidate.source_snapshot_uri.as_deref() != Some(source_snapshot_uri)
+            {
+                return Err(ToolError::Terminal(
+                    "preview candidate identity does not match the current publish evidence"
+                        .to_string(),
+                ));
+            }
+            candidate
+        }
+        None => {
+            ctx.store
+                .create_project_version_candidate(
+                    &ctx.project_id,
+                    &ctx.run.id,
+                    url.clone(),
+                    Some(screenshot_id.clone()),
+                    Some(source_snapshot_uri.to_string()),
+                )
+                .await
+        }
+    };
     let candidate_manifest_hash = latest_build
         .get("candidateManifestHash")
         .and_then(Value::as_str)
@@ -529,16 +641,18 @@ async fn report_preview_candidate(
         )
         .await
         .map_err(|error| ToolError::Terminal(format!("artifact staged state failed: {error}")))?;
-    let _ = ctx
-        .store
-        .append_event(AgentEvent::PreviewCandidate {
-            run_id: ctx.run.id.clone(),
-            url,
-            version_id: candidate.id.clone(),
-            screenshot_id: Some(screenshot_id.clone()),
-            timestamp: Utc::now(),
-        })
-        .await;
+    if !candidate_was_announced {
+        let _ = ctx
+            .store
+            .append_event(AgentEvent::PreviewCandidate {
+                run_id: ctx.run.id.clone(),
+                url,
+                version_id: candidate.id.clone(),
+                screenshot_id: Some(screenshot_id.clone()),
+                timestamp: Utc::now(),
+            })
+            .await;
+    }
     let review_run = match ctx
         .store
         .create_child_run(
@@ -779,4 +893,36 @@ pub(super) async fn collect_artifact_files(
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_required_design_context_verification;
+    use crate::tools::runtime::ToolError;
+    use serde_json::json;
+
+    #[test]
+    fn enforced_publish_is_blocked_but_observe_mode_is_not() {
+        let report = json!({
+            "requiredFailedRuleIds": ["craft:accessibility-baseline:image-alt"]
+        });
+        let error =
+            block_required_design_context_verification(Some("enforced"), &report).unwrap_err();
+        match error {
+            ToolError::RecoverableWithMetadata {
+                error_kind,
+                metadata,
+                ..
+            } => {
+                assert_eq!(error_kind, "design_context.required_verification_failed");
+                assert_eq!(
+                    metadata["requiredFailedRuleIds"],
+                    json!(["craft:accessibility-baseline:image-alt"])
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(block_required_design_context_verification(Some("observe"), &report).is_ok());
+        assert!(block_required_design_context_verification(Some("enforced"), &json!({})).is_ok());
+    }
 }

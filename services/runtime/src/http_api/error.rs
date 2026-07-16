@@ -54,19 +54,43 @@ pub(super) fn run_lifecycle_error(
 }
 
 pub(super) fn not_found(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse { error }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error,
+            error_code: None,
+        }),
+    )
 }
 
 pub(super) fn bad_request(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error,
+            error_code: None,
+        }),
+    )
 }
 
 pub(super) fn unauthorized(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error }))
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error,
+            error_code: None,
+        }),
+    )
 }
 
 pub(super) fn forbidden(error: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::FORBIDDEN, Json(ErrorResponse { error }))
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error,
+            error_code: None,
+        }),
+    )
 }
 
 pub(super) fn error_response_as_value(
@@ -102,6 +126,7 @@ pub(super) fn conflict_error(error: anyhow::Error) -> (StatusCode, Json<ErrorRes
         StatusCode::CONFLICT,
         Json(ErrorResponse {
             error: error.to_string(),
+            error_code: None,
         }),
     )
 }
@@ -111,6 +136,7 @@ pub(super) fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorRes
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
             error: error.to_string(),
+            error_code: None,
         }),
     )
 }

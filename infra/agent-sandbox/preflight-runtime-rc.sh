@@ -3,7 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 lock_file="${ROOT_DIR}/infra/agent-sandbox/images.lock.json"
+evidence_path="${PREFLIGHT_EVIDENCE_PATH:-}"
 cd "${ROOT_DIR}"
+
+if [[ -n "${evidence_path}" ]]; then
+  mkdir -p "$(dirname "${evidence_path}")"
+fi
 
 for command in docker k3d kubectl openssl node cargo; do
   command -v "${command}" >/dev/null || {
@@ -31,10 +36,14 @@ browser="${RUNTIME_BROWSER_EXECUTABLE:-/Applications/Google Chrome.app/Contents/
   exit 4
 }
 
-node - "${lock_file}" "${PREFLIGHT_PREFETCH_IMAGES:-1}" <<'NODE'
+node - "${lock_file}" "${PREFLIGHT_PREFETCH_IMAGES:-1}" "${evidence_path}" <<'NODE'
+const crypto = require("crypto");
 const fs = require("fs");
 const { spawnSync } = require("child_process");
-const lock = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const lockRaw = fs.readFileSync(process.argv[2], "utf8");
+const lock = JSON.parse(lockRaw);
+const prefetchImages = process.argv[3] === "1";
+const evidencePath = process.argv[4] || "";
 const registryAttempts = Math.max(1, Number(process.env.PREFLIGHT_REGISTRY_ATTEMPTS || 5));
 const baseDelayMs = Math.max(0, Number(process.env.PREFLIGHT_REGISTRY_RETRY_BASE_MS || 1000));
 const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -47,25 +56,128 @@ const runDockerWithRetry = (args, timeout) => {
   }
   return result;
 };
+const resultText = result => `${result?.stderr || ""}\n${result?.stdout || ""}`;
+const fallbackReason = result => {
+  if (result?.error?.code === "ETIMEDOUT") return "timeout";
+  const text = resultText(result);
+  if (/429|Too Many Requests|pull rate limit/i.test(text)) return "rate_limited";
+  if (/unexpected EOF|connection reset|TLS handshake timeout/i.test(text)) return "transport_interrupted";
+  return null;
+};
+const runWithFallback = (argsForRef, canonicalRef, fallbackRef, timeout) => {
+  const canonical = runDockerWithRetry(argsForRef(canonicalRef), timeout);
+  if (!canonical.error && canonical.status === 0) {
+    return { result: canonical, source: "canonical", selectedRef: canonicalRef, fallbackReason: null };
+  }
+  const reason = fallbackReason(canonical);
+  if (!fallbackRef || !reason) {
+    return { result: canonical, source: "canonical", selectedRef: canonicalRef, fallbackReason: null };
+  }
+  const fallback = runDockerWithRetry(argsForRef(fallbackRef), timeout);
+  if (!fallback.error && fallback.status === 0) {
+    return { result: fallback, source: "approved-fallback", selectedRef: fallbackRef, fallbackReason: reason };
+  }
+  return { result: fallback, source: "approved-fallback", selectedRef: fallbackRef, fallbackReason: reason };
+};
 if (lock.schemaVersion !== "anydesign-runtime-images@1") throw new Error("invalid image lock schema");
+const failures = [];
+const drifts = [];
+const entries = [];
 for (const [name, image] of Object.entries(lock.images || {})) {
   if (typeof image.ref !== "string" || !/^sha256:[a-f0-9]{64}$/.test(image.digest || "")) {
-    throw new Error(`invalid image lock entry: ${name}`);
+    failures.push(`invalid image lock entry: ${name}`);
+    continue;
   }
-  const inspect = runDockerWithRetry(
-    ["buildx", "imagetools", "inspect", image.ref, "--format", "{{json .Manifest.Digest}}"],
+  if (image.fallbackRef !== undefined
+    && (typeof image.fallbackRef !== "string"
+      || !/^mirror\.gcr\.io\/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$/.test(image.fallbackRef))) {
+    failures.push(`invalid approved fallback image ref: ${name}`);
+    continue;
+  }
+  const lockedRef = `${image.ref}@${image.digest}`;
+  const fallbackLockedRef = image.fallbackRef ? `${image.fallbackRef}@${image.digest}` : null;
+  const lockedInspect = runWithFallback(
+    ref => ["buildx", "imagetools", "inspect", ref, "--format", "{{json .Manifest.Digest}}"],
+    lockedRef,
+    fallbackLockedRef,
     45000,
   );
-  if (inspect.error?.code === "ETIMEDOUT") throw new Error(`infrastructure.registry_unavailable: ${name} inspect timeout`);
-  if (inspect.status !== 0) throw new Error(`infrastructure.registry_unavailable: ${name} ${inspect.stderr.trim()}`);
-  const actual = inspect.stdout.trim().replaceAll('"', "");
-  if (actual !== image.digest) throw new Error(`image digest drift: ${name} expected=${image.digest} actual=${actual}`);
-  if (process.argv[3] === "1") {
-    const pull = runDockerWithRetry(["pull", `${image.ref}@${image.digest}`], 120000);
-    if (pull.error?.code === "ETIMEDOUT" || pull.status !== 0) {
-      throw new Error(`infrastructure.registry_unavailable: ${name} pull failed`);
+  if (lockedInspect.result.error?.code === "ETIMEDOUT") {
+    failures.push(`infrastructure.registry_unavailable: ${name} locked digest inspect timeout`);
+    continue;
+  }
+  if (lockedInspect.result.status !== 0) {
+    failures.push(`infrastructure.registry_unavailable: ${name} locked digest ${(lockedInspect.result.stderr || "").trim()}`);
+    continue;
+  }
+  const lockedActual = lockedInspect.result.stdout.trim().replaceAll('"', "");
+  if (lockedActual !== image.digest) {
+    failures.push(`locked image identity mismatch: ${name} expected=${image.digest} actual=${lockedActual}`);
+    continue;
+  }
+
+  const tagInspect = runWithFallback(
+    ref => ["buildx", "imagetools", "inspect", ref, "--format", "{{json .Manifest.Digest}}"],
+    image.ref,
+    image.fallbackRef,
+    45000,
+  );
+  if (tagInspect.result.error?.code === "ETIMEDOUT") {
+    failures.push(`infrastructure.registry_unavailable: ${name} mutable tag inspect timeout`);
+    continue;
+  }
+  if (tagInspect.result.status !== 0) {
+    failures.push(`infrastructure.registry_unavailable: ${name} mutable tag ${(tagInspect.result.stderr || "").trim()}`);
+    continue;
+  }
+  const tagActual = tagInspect.result.stdout.trim().replaceAll('"', "");
+  if (tagActual !== image.digest) {
+    drifts.push(`image digest drift: ${name} expected=${image.digest} actual=${tagActual}`);
+    continue;
+  }
+  let pull = null;
+  if (prefetchImages) {
+    pull = runWithFallback(ref => ["pull", ref], lockedRef, fallbackLockedRef, 120000);
+    if (pull.result.error?.code === "ETIMEDOUT" || pull.result.status !== 0) {
+      failures.push(`infrastructure.registry_unavailable: ${name} pull failed`);
+      continue;
     }
   }
+  const sources = [lockedInspect, tagInspect, pull].filter(Boolean);
+  const fallbackReasons = [...new Set(sources.map(item => item.fallbackReason).filter(Boolean))];
+  entries.push({
+    name,
+    canonicalRef: image.ref,
+    approvedFallbackRef: image.fallbackRef || null,
+    lockedDigest: image.digest,
+    lockedDigestVerified: true,
+    mutableTagDigest: tagActual,
+    mutableTagMatchesLock: true,
+    inspectSource: lockedInspect.source === tagInspect.source ? lockedInspect.source : "mixed",
+    pullSource: pull?.source || null,
+    fallbackReasons,
+    pulled: prefetchImages,
+  });
+  if (fallbackReasons.length) {
+    process.stdout.write(`preflight.registry_fallback_verified: ${name} reasons=${fallbackReasons.join(",")} digest=${image.digest}\n`);
+  }
+}
+const lockHash = crypto.createHash("sha256").update(lockRaw).digest("hex");
+const passed = failures.length === 0 && drifts.length === 0 && entries.length === Object.keys(lock.images || {}).length;
+if (evidencePath) {
+  fs.writeFileSync(evidencePath, `${JSON.stringify({
+    schemaVersion: "runtime-rc-preflight@1",
+    recordedAt: new Date().toISOString(),
+    lockHash,
+    prefetchImages,
+    registryAttempts,
+    entries,
+    passed,
+    errors: [...failures, ...drifts],
+  }, null, 2)}\n`);
+}
+if (failures.length || drifts.length) {
+  throw new Error([...failures, ...drifts].join("\n"));
 }
 NODE
 

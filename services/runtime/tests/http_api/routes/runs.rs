@@ -6,6 +6,13 @@ fn run_route_family_is_frozen() {
             ("POST", "/runs"),
             ("POST", "/runs/{run_id}/continue"),
             ("POST", "/runs/{run_id}/cancel"),
+            ("GET", "/runs/{run_id}/design-context-manifest"),
+            ("GET", "/runs/{run_id}/design-context-diagnostics"),
+            ("POST", "/runs/{run_id}/design-profile-sync-plan"),
+            (
+                "POST",
+                "/runs/{run_id}/design-profile-sync-operations/{operation_id}/confirm",
+            ),
             ("POST", "/permissions/{permission_id}/decision"),
         ],
     );

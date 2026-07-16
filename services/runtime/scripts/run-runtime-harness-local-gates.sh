@@ -74,6 +74,10 @@ run_step "evidence summary tests syntax" \
   node --check services/runtime/scripts/test-real-provider-evidence-summary.mjs
 run_step "evidence summary tests" \
   node services/runtime/scripts/test-real-provider-evidence-summary.mjs
+run_step "design-context canary evidence validator syntax" \
+  node --check services/runtime/scripts/validate-design-context-canary-evidence.mjs
+run_step "design-context canary evidence validator tests" \
+  node services/runtime/scripts/test-design-context-canary-evidence-validator.mjs
 
 run_step "provider gate no-key failure" \
   bash -c 'set +e; RUNTIME_E2E_RUN_LOCAL_GATES=0 DEEPSEEK_API_KEY= RUNTIME_E2E_ENV_FILE= DEEPSEEK_API_KEY_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-no-key.out 2>/tmp/runtime-provider-no-key.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "DEEPSEEK_API_KEY is required" /tmp/runtime-provider-no-key.err'

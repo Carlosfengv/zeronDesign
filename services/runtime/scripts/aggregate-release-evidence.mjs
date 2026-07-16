@@ -11,7 +11,7 @@ function parseArgs(argv) {
     if (!key?.startsWith("--") || argv[index + 1] === undefined) throw new Error(`invalid argument: ${key ?? "<missing>"}`);
     args[key.slice(2)] = argv[index + 1];
   }
-  for (const required of ["runtime", "channel", "npm", "recovery", "lock", "out", "mode"]) {
+  for (const required of ["runtime", "preflight", "channel", "npm", "recovery", "lock", "out", "mode"]) {
     if (!args[required]) throw new Error(`--${required} is required`);
   }
   if (!new Set(["audit", "release"]).has(args.mode)) throw new Error("--mode must be audit or release");
@@ -28,6 +28,32 @@ function sha256(value) {
 
 function digestRef(image) {
   return `${image.ref}@${image.digest}`;
+}
+
+function enforcedDcpLifecyclePassed(fixture) {
+  const dcp = fixture?.designContextEnforced;
+  const lifecycle = dcp?.lifecycle;
+  const stages = [dcp?.build, dcp?.edit, dcp?.repair];
+  const runIds = [lifecycle?.buildRunId, lifecycle?.editRunId, lifecycle?.reviewRunId, lifecycle?.repairRunId];
+  if (runIds.some(value => typeof value !== "string" || value.length === 0) || new Set(runIds).size !== 4) return false;
+  if (lifecycle?.findingStatus !== "fixed" || !lifecycle?.findingId || !lifecycle?.candidateVersionId) return false;
+  if (stages.some(stage => stage?.package?.effectiveCompatibilityMode !== "enforced"
+    || stage?.gate !== "ready"
+    || stage?.materialization?.ready !== true
+    || stage?.styleContract?.verified !== true
+    || !Array.isArray(stage?.missingRequiredReads)
+    || stage.missingRequiredReads.length !== 0
+    || ["computed-style", "a11y", "viewport"].some(capability => stage?.verification?.capabilities?.[capability]?.available !== true))) return false;
+  if (dcp.build.runId !== lifecycle.buildRunId || dcp.edit.runId !== lifecycle.editRunId || dcp.repair.runId !== lifecycle.repairRunId) return false;
+  if (new Set(stages.map(stage => stage.package.contentHash)).size !== 1
+    || new Set(stages.map(stage => stage.materialization.hash)).size !== 1) return false;
+  const repairFinding = fixture?.reviewRepair?.findings?.find(item => item?.findingId === lifecycle.findingId);
+  return fixture?.reviewRepair?.reviewRunId === lifecycle.reviewRunId
+    && fixture?.reviewRepair?.repairRunId === lifecycle.repairRunId
+    && repairFinding?.versionId === lifecycle.candidateVersionId
+    && repairFinding?.severity === "blocking"
+    && repairFinding?.repairable === true
+    && repairFinding?.status === "fixed";
 }
 
 function normalizeProject(project) {
@@ -57,7 +83,35 @@ function normalizeProject(project) {
     terminalToolFailureCount: project.terminalToolFailureCount ?? 0,
     sandboxReleasedAt: project.sandboxReleasedAt,
     artifactHttpStatusAfterRelease: project.artifactHttpStatusAfterRelease,
+    artifactAccessAfterRelease: project.artifactAccessAfterRelease,
+    reviewRepair: project.reviewRepair,
+    designContextEnforced: project.designContextEnforced,
   };
+}
+
+function artifactAvailableAfterRelease(project) {
+  return project?.artifactHttpStatusAfterRelease === 200
+    && project?.artifactAccessAfterRelease?.authentication === "project-principal"
+    && project?.artifactAccessAfterRelease?.authenticated === true
+    && project?.artifactAccessAfterRelease?.projectId === project?.projectId
+    && project?.artifactAccessAfterRelease?.httpStatus === 200;
+}
+
+function providerDcpProjectPassed(project) {
+  const provenance = project?.designContextEnforced?.reviewProvenance;
+  return project?.kind === "website"
+    && enforcedDcpLifecyclePassed(project)
+    && project?.artifactAssertions?.content?.matched === true
+    && project?.artifactAssertions?.computedStyle?.passed === true
+    && project?.artifactAssertions?.route === "/"
+    && project?.cancelCleanup?.passed === true
+    && project?.dependencyEvidence?.passed === true
+    && project?.terminalToolFailureCount === 0
+    && artifactAvailableAfterRelease(project)
+    && provenance?.source === "fixture-seeded"
+    && provenance?.mutationProvider === "deepseek"
+    && provenance?.reviewProvider === "deterministic-tool-sequence"
+    && provenance?.repairProvider === "deepseek";
 }
 
 function secretScan(rawFiles) {
@@ -80,18 +134,21 @@ function secretScan(rawFiles) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const inputFiles = [args.runtime, args.channel, args.npm, args.recovery, args.lock];
+  const inputFiles = [args.runtime, args.preflight, args.channel, args.npm, args.recovery, args.lock];
   if (args.provider) inputFiles.push(args.provider);
   const rawFiles = await Promise.all(inputFiles.map(async file => ({ file, text: await readFile(file, "utf8") })));
-  const [runtime, channel, npm, recovery, lock] = await Promise.all([
-    json(args.runtime), json(args.channel), json(args.npm), json(args.recovery), json(args.lock),
+  const [runtime, preflight, channel, npm, recovery, lock] = await Promise.all([
+    json(args.runtime), json(args.preflight), json(args.channel), json(args.npm), json(args.recovery), json(args.lock),
   ]);
   const provider = args.provider ? await json(args.provider) : runtime.provider;
   const repository = runtime.repository ?? {};
   const releaseCandidate = args.mode === "release"
     && repository.dirty === false
     && provider?.mode === "approved-real"
-    && Boolean(provider?.approvalReference);
+    && Boolean(provider?.approvalReference)
+    && preflight?.schemaVersion === "runtime-rc-preflight@1"
+    && preflight?.passed === true
+    && preflight?.prefetchImages === true;
   const sandboxRef = channel.sandbox?.imageRef ?? runtime.images?.sandbox?.ref ?? "";
   const sandboxDigest = channel.sandbox?.imageId ?? runtime.images?.sandbox?.configDigest ?? "";
   const projects = (runtime.projects ?? []).map(normalizeProject);
@@ -140,11 +197,14 @@ async function main() {
       approvalReference: provider?.approvalReference ?? args["approval-reference"] ?? null,
       credentialPresent: provider?.credentialPresent === true,
     },
+    preflight,
     fixture: {
       deployed: runtime.fixture?.execution?.passed === true,
       concurrent: runtime.fixture?.execution?.mode === "concurrent",
       projects: (runtime.fixture?.projects ?? []).map(normalizeProject),
     },
+    enforcedDcpFixture: runtime.enforcedDcpFixture ?? null,
+    providerDcpProject: runtime.providerDcpProject ? normalizeProject(runtime.providerDcpProject) : null,
     projects,
     recoveryScenarios: Array.isArray(recovery.scenarios) ? recovery.scenarios : [],
     networkChecks: {
@@ -167,8 +227,15 @@ async function main() {
     "artifact-staged-before-cas", "cas-before-event", "run-cancel",
   ]);
   const releaseEligible = releaseCandidate
+    && evidence.preflight.lockHash === evidence.repository.lockHash
+    && evidence.preflight.entries?.length === Object.keys(lock.images || {}).length
+    && evidence.preflight.entries.every(entry => entry.lockedDigestVerified === true
+      && entry.mutableTagMatchesLock === true
+      && entry.pulled === true)
     && evidence.fixture.deployed
     && evidence.fixture.concurrent
+    && enforcedDcpLifecyclePassed(evidence.enforcedDcpFixture)
+    && providerDcpProjectPassed(evidence.providerDcpProject)
     && fixtureKinds.has("website")
     && fixtureKinds.has("docs")
     && projectKinds.has("website")
@@ -184,10 +251,11 @@ async function main() {
     && [...requiredRecovery].every(scenario => evidence.recoveryScenarios.some(item => item.scenario === scenario && item.result === "pass" && item.orphanCount === 0))
     && evidence.projects.every(project => project.artifactAssertions?.content?.matched === true
       && project.artifactAssertions?.computedStyle?.passed === true
+      && project.artifactAssertions?.route === (project.kind === "docs" ? "/docs/" : "/")
       && project.cancelCleanup?.passed === true
       && project.dependencyEvidence?.passed === true
       && project.terminalToolFailureCount === 0
-      && project.artifactHttpStatusAfterRelease === 200)
+      && artifactAvailableAfterRelease(project))
     && scan.matches.length === 0;
   evidence.releaseEligible = releaseEligible;
   evidence.result = releaseEligible ? "pass" : "fail";

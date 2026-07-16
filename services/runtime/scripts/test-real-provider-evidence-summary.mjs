@@ -68,11 +68,24 @@ function runtimeState(versionId) {
   };
 }
 
+function websiteDcpEvidence(readFiles = ["inputs/design-profile.json"]) {
+  return {
+    contentHash: "a".repeat(64),
+    artifactManifestHash: "b".repeat(64),
+    briefHash: "c".repeat(64),
+    verificationPolicyId: "website-verification@1",
+    effectiveCompatibilityMode: "enforced",
+    requiredReadPaths: ["inputs/design-profile.json"],
+    readFiles,
+  };
+}
+
 function completeProviderLog(overrides = {}) {
   const projects = ["real-http-website", "real-http-docs"];
-  const stages = ["build", "edit"];
   const lines = [];
   for (const project of projects) {
+    const stages =
+      project === "real-http-website" ? ["build", "edit", "repair"] : ["build", "edit"];
     for (const stage of stages) {
       const versionId = `version-${project}-${stage}`;
       const runId = `run-${project}-${stage}`;
@@ -155,12 +168,31 @@ function completeProviderLog(overrides = {}) {
         evidence.artifactContainsEditMarker = true;
         evidence.expectedArtifactText = `expected text for ${project} ${stage}`;
       }
+      if (stage === "repair") {
+        evidence.baseVersionId = `version-${project}-edit`;
+        evidence.repairedVersionId = versionId;
+        evidence.baseSourceSnapshotUri = `runtime://snapshots/version-${project}-edit`;
+        evidence.repairedSourceSnapshotUri = `runtime://snapshots/${versionId}`;
+        evidence.sourceSnapshotChanged = true;
+        evidence.artifactContainsExpectedText = true;
+        evidence.expectedArtifactText = `expected text for ${project} ${stage}`;
+        evidence.reviewRunId = `run-${project}-review`;
+        evidence.findingId = `finding-${project}`;
+        evidence.findingStatus = "fixed";
+        evidence.candidateVersionId = `version-${project}-edit`;
+        evidence.findingSource = "harness-seeded-review";
+      }
       applyOverrides(evidence, evidenceOverrides);
       const evidenceLine =
         `REAL_PROVIDER_EVIDENCE ${JSON.stringify({
           project,
           stage,
           runId,
+          provider: {
+            name: "deepseek",
+            model: "deepseek-chat",
+            approvalReference: "approval-123",
+          },
           evidence,
           ...evidenceWrapperOverrides,
         })}`;
@@ -193,6 +225,27 @@ function singleStageProviderLog(project, stage) {
         lines.push(line);
       }
     }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function withoutStageProviderLog(project, stage) {
+  const lines = [];
+  let skipStream = false;
+  for (const line of completeProviderLog().trimEnd().split("\n")) {
+    if (line.startsWith("REAL_PROVIDER_STREAM_BEGIN ")) {
+      skipStream = line.includes(`project=${project} `) && line.includes(`stage=${stage} `);
+      if (skipStream) continue;
+    }
+    if (skipStream) {
+      if (line.startsWith("REAL_PROVIDER_STREAM_END ")) skipStream = false;
+      continue;
+    }
+    if (line.startsWith("REAL_PROVIDER_EVIDENCE ")) {
+      const wrapper = JSON.parse(line.slice("REAL_PROVIDER_EVIDENCE ".length));
+      if (wrapper.project === project && wrapper.stage === stage) continue;
+    }
+    lines.push(line);
   }
   return `${lines.join("\n")}\n`;
 }
@@ -327,7 +380,7 @@ function main() {
   const passingPayload = assertPass("passing provider evidence", passing, [
     "--require-computed-style",
   ]);
-  assert.equal(passingPayload.stages.length, 4);
+  assert.equal(passingPayload.stages.length, 5);
   assert.equal(passingPayload.computedStyle.ok, true);
   assert.equal(passingPayload.requireComputedStyle, true);
   assert.deepEqual(passingPayload.computedStyleTarget, {
@@ -347,6 +400,99 @@ function main() {
   ]);
   assert.deepEqual(filteredPayload.requiredProjects, ["real-http-website"]);
   assert.deepEqual(filteredPayload.requiredStages, ["edit"]);
+  const dcpProviderEvidence = writeCase(
+    root,
+    "website-dcp-provider-evidence",
+    completeProviderLog({
+      evidence: {
+        "real-http-website:build": { designContext: websiteDcpEvidence() },
+        "real-http-website:edit": { designContext: websiteDcpEvidence() },
+        "real-http-website:repair": { designContext: websiteDcpEvidence() },
+      },
+    }),
+  );
+  const dcpPayload = assertPass(
+    "website DCP provider evidence",
+    dcpProviderEvidence,
+    ["--require-dcp-project", "real-http-website"],
+  );
+  assert.deepEqual(dcpPayload.requiredDcpProjects, ["real-http-website"]);
+  const providerRepairPayload = assertPass(
+    "enforced Website provider Repair evidence",
+    dcpProviderEvidence,
+    [
+      "--require-dcp-project",
+      "real-http-website",
+      "--require-repair-project",
+      "real-http-website",
+      "--require-approval-reference",
+      "approval-123",
+    ],
+  );
+  assert.deepEqual(providerRepairPayload.requiredRepairProjects, ["real-http-website"]);
+  assert.equal(providerRepairPayload.requiredApprovalReference, "approval-123");
+  assertFail(
+    "missing Website provider Repair stage",
+    writeCase(
+      root,
+      "missing-provider-repair",
+      withoutStageProviderLog("real-http-website", "repair"),
+    ),
+    "real-http-website:repair: missing stage",
+    ["--require-repair-project", "real-http-website"],
+  );
+  assertFail(
+    "unfixed Website provider Repair finding",
+    writeCase(
+      root,
+      "unfixed-provider-repair",
+      completeProviderLog({
+        evidence: {
+          "real-http-website:build": { designContext: websiteDcpEvidence() },
+          "real-http-website:edit": { designContext: websiteDcpEvidence() },
+          "real-http-website:repair": {
+            designContext: websiteDcpEvidence(),
+            findingStatus: "repairing",
+          },
+        },
+      }),
+    ),
+    "repair findingStatus is not fixed",
+    [
+      "--require-dcp-project",
+      "real-http-website",
+      "--require-repair-project",
+      "real-http-website",
+    ],
+  );
+  assertFail(
+    "provider approval reference mismatch",
+    dcpProviderEvidence,
+    "provider approvalReference does not match required approval",
+    ["--require-approval-reference", "approval-other"],
+  );
+  assertFail(
+    "missing Website DCP provider evidence",
+    passing,
+    "DCP evidence missing",
+    ["--require-dcp-project", "real-http-website"],
+  );
+  assertFail(
+    "missing required DCP Build read",
+    writeCase(
+      root,
+      "missing-dcp-read",
+      completeProviderLog({
+        evidence: {
+          "real-http-website:build": { designContext: websiteDcpEvidence([]) },
+          "real-http-website:edit": { designContext: websiteDcpEvidence() },
+          "real-http-website:repair": { designContext: websiteDcpEvidence() },
+        },
+      }),
+    ),
+    "DCP Build required reads were not all recorded",
+    ["--require-dcp-project", "real-http-website"],
+  );
   assertPass(
     "provider evidence with edit marker field only",
     writeCase(

@@ -38,7 +38,8 @@ function productDatabase(): DatabaseSync {
   if (globalDatabase.zeronDesignProductDatabase) {
     return globalDatabase.zeronDesignProductDatabase;
   }
-  const databasePath = join(process.cwd(), ".data", "product.sqlite");
+  const databasePath = process.env.ZERONDESIGN_PRODUCT_DB_PATH?.trim()
+    || join(process.cwd(), ".data", "product.sqlite");
   mkdirSync(dirname(databasePath), { recursive: true });
   const database = new DatabaseSync(databasePath);
   database.exec("PRAGMA busy_timeout = 5000;");

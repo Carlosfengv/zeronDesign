@@ -10,6 +10,15 @@ function projectId(body) {
   return String(body.projectId || body.systemPrompt?.match(/^Project:\s*(.+)$/m)?.[1] || "");
 }
 
+function isEnforcedDcpFixture(body) {
+  return projectId(body).includes("dcp-enforced");
+}
+
+function runtimeIdentityValue(body, key) {
+  const match = String(body.systemPrompt || "").match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match?.[1]?.trim() || "";
+}
+
 function briefResponse(body, state) {
   const docs = projectId(body).toLowerCase().includes("docs");
   if (state.turn++ === 0) {
@@ -44,6 +53,7 @@ function briefResponse(body, state) {
 }
 
 function buildResponse(body, state) {
+  if (isEnforcedDcpFixture(body)) return enforcedDcpBuildResponse(state);
   state.docs ||= projectId(body).toLowerCase().includes("docs");
   const turn = state.turn++;
   if (turn === 0) {
@@ -107,7 +117,65 @@ function buildResponse(body, state) {
   };
 }
 
+function enforcedDcpBuildResponse(state) {
+  const turn = state.turn++;
+  if (turn === 0) {
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        "inputs/brief.md",
+        "inputs/design-profile.json",
+        "inputs/design-profile-usage.md",
+        "inputs/component-recipes.json",
+        "inputs/template-style-contract.json",
+      ].map((path, index) => tool(`fixture-dcp-build-read-${index}`, "fs.read", { path })),
+    };
+  }
+  if (turn === 1) {
+    return {
+      type: "tool_calls",
+      toolCalls: [tool("fixture-dcp-init", "project.init", { template: "astro-website" })],
+    };
+  }
+  if (turn === 2) {
+    const buildScript = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:48px sans-serif;background:#fff;color:#111}</style><h1>RC Enforced DCP Website</h1>');";
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        tool("fixture-dcp-style-contract", "fs.read", { path: "state/style-contract.json" }),
+        tool("fixture-dcp-package", "fs.write", {
+          path: "project/package.json", text: '{"scripts":{"build":"node build.cjs"}}',
+        }),
+        tool("fixture-dcp-build-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
+      ],
+    };
+  }
+  if (turn === 3) {
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        tool("fixture-dcp-dependency", "project.ensure_dependencies", {
+          mode: "add",
+          packages: ["is-number@7.0.0"],
+          cwd: "project",
+        }),
+      ],
+    };
+  }
+  return {
+    type: "tool_calls",
+    toolCalls: [
+      tool("fixture-dcp-build", "project.build", { cwd: "project" }),
+      tool("fixture-dcp-publish", "preview.publish", { screenshotId: "rc-enforced-dcp-build" }),
+      tool("fixture-dcp-complete", "run.complete", {
+        status: "completed", summary: "Deployed Runtime enforced DCP fixture build complete",
+      }),
+    ],
+  };
+}
+
 function editResponse(body, state) {
+  if (isEnforcedDcpFixture(body)) return enforcedDcpEditResponse(state);
   state.docs ||= projectId(body).toLowerCase().includes("docs");
   const docs = state.docs;
   const buildScript = docs
@@ -133,6 +201,85 @@ function editResponse(body, state) {
   };
 }
 
+function enforcedDcpEditResponse(state) {
+  const turn = state.turn++;
+  if (turn === 0) {
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        "inputs/design-profile.json",
+        "inputs/design-profile-usage.md",
+        "inputs/component-recipes.json",
+      ].map((path, index) => tool(`fixture-dcp-edit-read-${index}`, "fs.read", { path })),
+    };
+  }
+  const buildScript = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:44px sans-serif;background:#fff;color:#111}</style><h1>RC Enforced DCP Website Edited</h1>');";
+  return {
+    type: "tool_calls",
+    toolCalls: [
+      tool("fixture-dcp-edit-style-contract", "fs.read", { path: "state/style-contract.json" }),
+      tool("fixture-dcp-edit-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
+      tool("fixture-dcp-edit-build", "project.build", { cwd: "project" }),
+      tool("fixture-dcp-edit-publish", "preview.publish", { screenshotId: "rc-enforced-dcp-edit" }),
+      tool("fixture-dcp-edit-complete", "run.complete", {
+        status: "completed", summary: "Deployed Runtime enforced DCP fixture edit complete",
+      }),
+    ],
+  };
+}
+
+function reviewResponse(body, state) {
+  const candidateVersion = runtimeIdentityValue(body, "CandidateVersion");
+  if (!candidateVersion) throw new Error("Review fixture requires CandidateVersion runtime identity");
+  const providerDcp = projectId(body).includes("dcp-provider");
+  state.turn++;
+  return {
+    type: "tool_calls",
+    toolCalls: [
+      tool("fixture-dcp-review-finding", "review.report_finding", {
+        versionId: candidateVersion,
+        severity: "blocking",
+        category: "visual",
+        summary: providerDcp
+          ? "Replace the visible heading with the exact text RC Enforced DCP Provider Website Repaired, preserve the current design tokens, rebuild, verify the served artifact, and publish a new candidate"
+          : "Repair the deployed enforced DCP lifecycle heading",
+        repairable: true,
+        evidence: { filePath: "project/build.cjs" },
+      }),
+      tool("fixture-dcp-review-complete", "run.complete", {
+        status: "completed", summary: "Deployed Runtime enforced DCP review complete",
+      }),
+    ],
+  };
+}
+
+function repairResponse(body, state) {
+  if (!isEnforcedDcpFixture(body)) throw new Error("Repair fixture is only defined for enforced DCP RC");
+  const turn = state.turn++;
+  if (turn === 0) {
+    return {
+      type: "tool_calls",
+      toolCalls: [
+        "inputs/design-profile-usage.md",
+        "inputs/component-recipes.json",
+        "state/style-contract.json",
+      ].map((path, index) => tool(`fixture-dcp-repair-read-${index}`, "fs.read", { path })),
+    };
+  }
+  const buildScript = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:42px sans-serif;background:#fff;color:#111}</style><h1>RC Enforced DCP Website Repaired</h1>');";
+  return {
+    type: "tool_calls",
+    toolCalls: [
+      tool("fixture-dcp-repair-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
+      tool("fixture-dcp-repair-build", "project.build", { cwd: "project" }),
+      tool("fixture-dcp-repair-publish", "preview.publish", { screenshotId: "rc-enforced-dcp-repair" }),
+      tool("fixture-dcp-repair-complete", "run.complete", {
+        status: "completed", summary: "Deployed Runtime enforced DCP fixture repair complete",
+      }),
+    ],
+  };
+}
+
 http.createServer((request, response) => {
   if (request.method !== "POST" || request.url !== "/v1/agent/turn") {
     response.writeHead(request.url === "/health" ? 200 : 404);
@@ -147,9 +294,13 @@ http.createServer((request, response) => {
       const state = runs.get(body.runId) || { turn: 0, docs: false };
       const payload = body.phase === "brief"
         ? briefResponse(body, state)
-        : body.phase === "edit"
-          ? editResponse(body, state)
-          : buildResponse(body, state);
+        : body.phase === "review"
+          ? reviewResponse(body, state)
+          : body.phase === "repair"
+            ? repairResponse(body, state)
+            : body.phase === "edit"
+              ? editResponse(body, state)
+              : buildResponse(body, state);
       runs.set(body.runId, state);
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(payload));

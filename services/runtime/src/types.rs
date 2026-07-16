@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const RUNTIME_TOKEN_MAPPING_KEYS: [&str; 12] = [
     "color.background",
@@ -236,6 +237,41 @@ pub struct AgentRun {
     pub design_source_read_section_hashes: Vec<String>,
     #[serde(default)]
     pub design_context_read_files: Vec<String>,
+    #[serde(default)]
+    pub design_context_package_version: Option<String>,
+    #[serde(default)]
+    pub design_context_content_hash: Option<String>,
+    #[serde(default)]
+    pub design_context_artifact_manifest_hash: Option<String>,
+    #[serde(default)]
+    pub design_context_materialization_hash: Option<String>,
+    #[serde(default)]
+    pub design_context_compiler_version: Option<String>,
+    #[serde(default)]
+    pub design_context_brief_hash: Option<String>,
+    #[serde(default)]
+    pub design_context_verification_policy_id: Option<String>,
+    #[serde(default)]
+    pub design_context_expected_app_root: Option<String>,
+    #[serde(default)]
+    pub design_context_declared_enforcement_mode: Option<String>,
+    #[serde(default)]
+    pub design_context_effective_compatibility_mode: Option<String>,
+    #[serde(default)]
+    pub design_context_warnings: Vec<String>,
+    #[serde(default)]
+    pub design_context_verification_environment: Option<Value>,
+    #[serde(default)]
+    pub design_context_style_contract_verified: Option<bool>,
+    /// Immutable outer manifest persisted with the run. This is intentionally
+    /// separate from the content hash: the manifest does not participate in
+    /// computing the package's deterministic identity.
+    #[serde(default)]
+    pub design_context_manifest: Option<Value>,
+    /// Exact text bytes expected at the DCP artifact paths. Persisting these
+    /// prevents a later Profile revision from silently changing a queued run.
+    #[serde(default)]
+    pub design_context_artifacts: BTreeMap<String, String>,
     pub base_version_id: Option<String>,
     pub output_version_id: Option<String>,
     pub finding_ids: Option<Vec<String>>,
@@ -277,6 +313,22 @@ pub struct ProjectAccessRecord {
     pub owner_principal_id: String,
     pub workspace_id: Option<String>,
     pub organization_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Runtime-owned, revisioned rollout decision for one exact DesignProfile
+/// revision. This is intentionally separate from the Profile itself: changing
+/// a profile must not silently widen its enforcement rollout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignContextEnforcementPolicy {
+    pub project_id: String,
+    pub design_profile_id: String,
+    pub design_profile_version: u32,
+    pub enabled: bool,
+    pub revision: u64,
+    pub updated_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -423,6 +475,8 @@ pub struct DesignProfile {
     #[serde(default)]
     pub extended_token_mapping: Value,
     pub components: Value,
+    #[serde(default)]
+    pub website_context: Value,
     pub content: Value,
     pub accessibility: Value,
     pub technical: Value,
@@ -545,7 +599,18 @@ pub struct DesignSourceIndexSection {
     pub start_byte: usize,
     pub end_byte: usize,
     pub sha256: String,
+    #[serde(default)]
+    pub purpose: Vec<String>,
+    #[serde(default = "default_design_source_section_priority")]
+    pub priority: String,
+    #[serde(default)]
+    pub recipe_ids: Vec<String>,
+    #[serde(default)]
     pub required_by_rule_ids: Vec<String>,
+}
+
+fn default_design_source_section_priority() -> String {
+    "optional".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -653,6 +718,7 @@ impl DesignProfile {
         }
         if self.schema_version == DESIGN_PROFILE_SCHEMA_V2 {
             validate_design_profile_v2(self)?;
+            validate_website_context(&self.website_context, &self.components)?;
         }
         Ok(())
     }
@@ -729,8 +795,12 @@ impl DesignProfile {
 }
 
 pub fn canonical_json_hash(value: &Value) -> String {
+    sha256_hex(&canonical_json_bytes(value))
+}
+
+pub fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     let canonical = canonical_json_value(value);
-    sha256_hex(&serde_json::to_vec(&canonical).unwrap_or_default())
+    serde_json::to_vec(&canonical).unwrap_or_default()
 }
 
 fn canonical_json_value(value: &Value) -> Value {
@@ -919,12 +989,123 @@ fn validate_design_profile_v2(profile: &DesignProfile) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_website_context(website_context: &Value, components: &Value) -> Result<(), String> {
+    if !website_context.is_null() {
+        let context = website_context
+            .as_object()
+            .ok_or_else(|| "websiteContext must be an object".to_string())?;
+        if let Some(mode) = context.get("enforcementMode") {
+            if !matches!(mode.as_str(), Some("observe" | "enforced")) {
+                return Err(
+                    "websiteContext.enforcementMode must be observe or enforced".to_string()
+                );
+            }
+        }
+        if let Some(packs) = context.get("craftPacks") {
+            let packs = packs
+                .as_array()
+                .ok_or_else(|| "websiteContext.craftPacks must be an array".to_string())?;
+            let supported = [
+                "accessibility-baseline",
+                "responsive-layout",
+                "form-states",
+                "anti-generic-ui",
+            ];
+            for pack in packs {
+                let pack = pack
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        "websiteContext.craftPacks must contain non-empty strings".to_string()
+                    })?;
+                if !supported.contains(&pack) {
+                    return Err(format!(
+                        "websiteContext.craftPacks contains unknown pack: {pack}"
+                    ));
+                }
+            }
+        }
+        if context
+            .get("layoutGuidance")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err("websiteContext.layoutGuidance must be an array".to_string());
+        }
+    }
+
+    let Some(recipes) = components
+        .as_object()
+        .and_then(|components| components.get("recipes"))
+    else {
+        return Ok(());
+    };
+    let recipes = recipes
+        .as_array()
+        .ok_or_else(|| "components.recipes must be an array".to_string())?;
+    if recipes.len() > 64 {
+        return Err("components.recipes must contain at most 64 recipes".to_string());
+    }
+    let mut recipe_ids = std::collections::HashSet::new();
+    for (index, recipe) in recipes.iter().enumerate() {
+        let recipe = recipe
+            .as_object()
+            .ok_or_else(|| format!("components.recipes[{index}] must be an object"))?;
+        let id = required_nonempty_string(recipe, "id", &format!("components.recipes[{index}]"))?;
+        if !recipe_ids.insert(id.to_string()) {
+            return Err(format!("components.recipes contains duplicate id: {id}"));
+        }
+        match recipe.get("priority").and_then(Value::as_str) {
+            Some("required" | "preferred") => {}
+            _ => {
+                return Err(format!(
+                    "components.recipes[{index}].priority must be required or preferred"
+                ))
+            }
+        }
+        if recipe
+            .get("role")
+            .is_some_and(|value| value.as_str().is_none_or(|role| role.trim().is_empty()))
+        {
+            return Err(format!(
+                "components.recipes[{index}].role must be a non-empty string"
+            ));
+        }
+        let verifications = recipe.get("verification").and_then(Value::as_array);
+        if recipe.get("priority").and_then(Value::as_str) == Some("required")
+            && verifications.is_none_or(Vec::is_empty)
+        {
+            return Err(format!(
+                "components.recipes[{index}].verification is required for required recipes"
+            ));
+        }
+        for (verification_index, verification) in verifications.into_iter().flatten().enumerate() {
+            let verification = verification.as_object().ok_or_else(|| {
+                format!(
+                    "components.recipes[{index}].verification[{verification_index}] must be an object"
+                )
+            })?;
+            validate_signature_verification_at(
+                &format!("components.recipes[{index}].verification[{verification_index}]"),
+                verification,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_signature_verification(
     index: usize,
     verification: &serde_json::Map<String, Value>,
 ) -> Result<(), String> {
     let path = format!("signatureRules[{index}].verification");
-    let kind = required_nonempty_string(verification, "kind", &path)?;
+    validate_signature_verification_at(&path, verification)
+}
+
+fn validate_signature_verification_at(
+    path: &str,
+    verification: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let kind = required_nonempty_string(verification, "kind", path)?;
     match kind {
         "token" => {
             required_nonempty_string(verification, "token", &path)?;
@@ -1741,6 +1922,52 @@ mod design_profile_effective_tests {
             );
             assert!(profile.effective_for("website", "astro-website").is_ok());
         }
+    }
+
+    #[test]
+    fn v2_website_context_and_required_component_recipes_are_validated() {
+        let mut profile: DesignProfile =
+            serde_json::from_str(include_str!("../fixtures/design-profiles/authkit-v2.json"))
+                .unwrap();
+        profile.website_context = json!({
+            "enforcementMode": "observe",
+            "craftPacks": ["responsive-layout"],
+            "layoutGuidance": [{ "area": "hero" }]
+        });
+        profile.components["recipes"] = json!([{
+            "id": "navigation.primary",
+            "role": "navigation",
+            "priority": "required",
+            "verification": [{
+                "kind": "dom",
+                "route": "/",
+                "selector": "nav[data-primary]",
+                "minMatches": 1
+            }]
+        }]);
+        profile.validate_for_runtime().unwrap();
+
+        profile.website_context["craftPacks"] = json!(["unrecognized-pack"]);
+        assert!(profile
+            .validate_for_runtime()
+            .unwrap_err()
+            .contains("unknown pack"));
+    }
+
+    #[test]
+    fn v2_required_component_recipe_requires_executable_verification() {
+        let mut profile: DesignProfile =
+            serde_json::from_str(include_str!("../fixtures/design-profiles/authkit-v2.json"))
+                .unwrap();
+        profile.components["recipes"] = json!([{
+            "id": "button.primary",
+            "priority": "required",
+            "verification": []
+        }]);
+        assert!(profile
+            .validate_for_runtime()
+            .unwrap_err()
+            .contains("verification is required"));
     }
 
     #[test]

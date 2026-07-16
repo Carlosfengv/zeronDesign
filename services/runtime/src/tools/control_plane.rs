@@ -1133,10 +1133,13 @@ impl Tool for RunCompleteTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
-        if matches!(ctx.run.phase, AgentPhase::Build | AgentPhase::Edit) {
+        if matches!(
+            ctx.run.phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        ) {
             let Some(version_id) = ctx.run.output_version_id.as_deref() else {
                 return Ok(ToolResult::error(
-                    "No output_version_id set. Build/Edit must promote a preview before completing.",
+                    "No output_version_id set. Build/Edit/Repair must promote a preview before completing.",
                 ));
             };
             let Some(version) = ctx.store.get_project_version(version_id).await else {
@@ -1148,6 +1151,50 @@ impl Tool for RunCompleteTool {
                 return Ok(ToolResult::error(
                     "Preview has not been promoted. Emit preview.updated before completing the run.",
                 ));
+            }
+            if ctx.run.phase == AgentPhase::Repair {
+                let Some(base_version_id) = ctx.run.base_version_id.as_deref() else {
+                    return Ok(ToolResult::error(
+                        "Repair run has no base_version_id and cannot prove a fresh repair candidate.",
+                    ));
+                };
+                if version_id == base_version_id {
+                    return Ok(ToolResult::error(
+                        "Repair must promote a new output version different from base_version_id before completing.",
+                    ));
+                }
+                if version.created_by_run_id != ctx.run.id {
+                    return Ok(ToolResult::error(
+                        "Repair output version was not created by this Repair run. Apply the finding and use preview.publish.",
+                    ));
+                }
+                let Some(base_version) = ctx.store.get_project_version(base_version_id).await
+                else {
+                    return Ok(ToolResult::error(format!(
+                        "Repair base version not found: {base_version_id}"
+                    )));
+                };
+                if version.source_snapshot_uri.is_none()
+                    || version.source_snapshot_uri == base_version.source_snapshot_uri
+                {
+                    return Ok(ToolResult::error(
+                        "Repair output must reference a fresh Runtime-owned source snapshot. Make a real source mutation and use preview.publish.",
+                    ));
+                }
+                let preview_updated = ctx.store.events(&ctx.run.id).await.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::PreviewUpdated {
+                            version_id: updated_version_id,
+                            ..
+                        } if updated_version_id == version_id
+                    )
+                });
+                if !preview_updated {
+                    return Ok(ToolResult::error(
+                        "Repair output has no matching preview.updated event. Use preview.publish before run.complete.",
+                    ));
+                }
             }
         }
         if ctx.run.phase == AgentPhase::Brief
@@ -1164,8 +1211,10 @@ impl Tool for RunCompleteTool {
                 ));
             }
         }
-        if matches!(ctx.run.phase, AgentPhase::Build | AgentPhase::Edit)
-            && ctx.run.design_profile_id.is_some()
+        if matches!(
+            ctx.run.phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        ) && ctx.run.design_profile_id.is_some()
         {
             let fidelity_reports = ctx
                 .store

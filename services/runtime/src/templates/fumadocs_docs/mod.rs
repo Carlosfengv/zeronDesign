@@ -352,6 +352,8 @@ pub fn spec() -> TemplateSpec {
             structured_page_write: false,
             mdx_document_write: true,
             static_export: true,
+            supported_component_roles: &["navigation", "content", "action"],
+            supported_craft_packs: &["accessibility-baseline", "responsive-layout"],
         },
         mutation_policy: MutationPolicySpec {
             forbidden_write_roots: &["pages", "src/pages"],

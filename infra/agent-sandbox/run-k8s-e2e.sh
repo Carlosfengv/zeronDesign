@@ -22,6 +22,7 @@ k3s_image="${K3S_IMAGE:-$(locked_image k3s)}"
 sandbox_base_image="${SANDBOX_BASE_IMAGE:-$(locked_image sandboxNode)}"
 controller_image="$(locked_image agentSandboxController)"
 npm_proxy_image="$(locked_image npmProxy)"
+local_path_helper_image="$(locked_image localPathHelper)"
 if ! "${K3D}" cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "${cluster_name}"; then
   "${K3D}" cluster create "${cluster_name}" \
     --image "${k3s_image}" \
@@ -81,6 +82,38 @@ assert_deployment_digest \
   local-path-provisioner \
   app=local-path-provisioner \
   "$(locked_image localPathProvisioner)"
+
+# K3s ships local-path-provisioner with a mutable BusyBox helper tag. PVC
+# creation is part of the Sandbox supply chain, so pin the helper before any
+# SandboxTemplate can request a workspace volume.
+"${KUBECTL}" get configmap local-path-config -n kube-system -o json \
+  | node -e '
+let input="";process.stdin.on("data",chunk=>input+=chunk).on("end",()=>{
+  const cm=JSON.parse(input);
+  const helper=cm.data?.["helperPod.yaml"];
+  if(typeof helper!=="string"||!/^(\s*)image:\s*.+$/m.test(helper))process.exit(2);
+  cm.data["helperPod.yaml"]=helper.replace(
+    /^(\s*)image:\s*.+$/m,
+    (_,indent)=>`${indent}image: "${process.argv[1]}"`,
+  );
+  delete cm.metadata.managedFields;
+  delete cm.metadata.resourceVersion;
+  delete cm.metadata.uid;
+  delete cm.metadata.creationTimestamp;
+  process.stdout.write(JSON.stringify(cm));
+});
+' "${local_path_helper_image}" \
+  | "${KUBECTL}" apply -f - >/dev/null
+actual_local_path_helper="$(${KUBECTL} get configmap local-path-config -n kube-system \
+  -o 'jsonpath={.data.helperPod\.yaml}' | awk '/^[[:space:]]*image:/ {gsub(/[" ]/, "", $2); print $2; exit}')"
+[[ "${actual_local_path_helper}" == "${local_path_helper_image}" ]] || {
+  printf 'local-path helper image pin failed: expected=%s actual=%s\n' \
+    "${local_path_helper_image}" "${actual_local_path_helper:-<missing>}" >&2
+  exit 3
+}
+"${KUBECTL}" rollout restart deployment/local-path-provisioner -n kube-system >/dev/null
+"${KUBECTL}" rollout status deployment/local-path-provisioner \
+  -n kube-system --timeout=300s >/dev/null
 git_sha="$(git rev-parse --short=12 HEAD)"
 dirty="$(git status --porcelain | wc -l | tr -d ' ')"
 image_tag="${git_sha}"
@@ -94,6 +127,11 @@ if [[ "${dirty}" != "0" ]]; then
   image_tag="${git_sha}-dirty-${worktree_fingerprint}"
 fi
 sandbox_image="anydesign/astro-website-sandbox:${image_tag}"
+# Runtime's built-in sandbox execution profile deliberately pins this public
+# reference.  The isolated gate imports the locally built bytes under the same
+# reference so readiness verifies the production identity instead of accepting
+# a test-only tag.
+runtime_profile_sandbox_image="ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0"
 
 docker build \
   -f infra/agent-sandbox/astro-website/Dockerfile \
@@ -101,10 +139,12 @@ docker build \
   --build-arg "SANDBOX_BASE_IMAGE=${sandbox_base_image}" \
   -t "${sandbox_image}" \
   infra/agent-sandbox
+docker tag "${sandbox_image}" "${runtime_profile_sandbox_image}"
 expected_image_id="sha256:$(docker image save "${sandbox_image}" \
   | tar -xOf - manifest.json \
   | node -e 'const fs=require("fs");const manifest=JSON.parse(fs.readFileSync(0,"utf8"));process.stdout.write(manifest[0].Config.split("/").pop())')"
-"${K3D}" image import --cluster "${cluster_name}" "${sandbox_image}"
+"${K3D}" image import --cluster "${cluster_name}" \
+  "${sandbox_image}" "${runtime_profile_sandbox_image}"
 
 required_crds=(
   "sandboxes.agents.x-k8s.io"
@@ -258,11 +298,11 @@ openssl x509 -req -sha256 -days 2 \
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/config-map.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/deployment.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/service.yaml
-sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${sandbox_image}|" \
+sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
   infra/agent-sandbox/astro-website/sandbox-template.yaml \
   | "${KUBECTL}" apply -f -
 "${KUBECTL}" apply -f infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml
-sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${sandbox_image}|" \
+sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
   infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml \
   | "${KUBECTL}" apply -f -
 "${KUBECTL}" apply -f infra/agent-sandbox/fumadocs-docs/sandbox-warm-pool.yaml
@@ -301,7 +341,7 @@ while true; do
         -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
       image="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes \
         -o 'jsonpath={.spec.containers[0].image}' 2>/dev/null || true)"
-      if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${sandbox_image}" ]]; then
+      if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${runtime_profile_sandbox_image}" ]]; then
         warm_pod="${pod}"
         break
       fi
@@ -323,7 +363,7 @@ pod_image="$(${KUBECTL} get pod "${warm_pod}" -n anydesign-sandboxes \
   -o 'jsonpath={.spec.containers[0].image}')"
 pod_image_id="$(${KUBECTL} get pod "${warm_pod}" -n anydesign-sandboxes \
   -o 'jsonpath={.status.containerStatuses[0].imageID}')"
-if [[ "${pod_image}" != "${sandbox_image}" || "${pod_image_id}" != "${expected_image_id}" ]]; then
+if [[ "${pod_image}" != "${runtime_profile_sandbox_image}" || "${pod_image_id}" != "${expected_image_id}" ]]; then
   printf 'sandbox image parity failed: expected=%s expectedID=%s actual=%s imageID=%s\n' \
     "${sandbox_image}" "${expected_image_id}" "${pod_image}" "${pod_image_id}" >&2
   exit 4
@@ -341,7 +381,7 @@ while [[ -z "${docs_warm_pod}" ]]; do
       phase="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.status.phase}' 2>/dev/null || true)"
       ready="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
       image="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.spec.containers[0].image}' 2>/dev/null || true)"
-      if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${sandbox_image}" ]]; then
+      if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${runtime_profile_sandbox_image}" ]]; then
         docs_warm_pod="${pod}"
         break
       fi
@@ -470,6 +510,10 @@ for (const project of evidence.projects) {
   if (project.previewLeaseStatusAfterRelease !== "stopped") process.exit(6);
   if (project.screenshot?.pngSha256?.length !== 64 || project.screenshot?.documentSha256?.length !== 64 || project.screenshot?.nonblankPixelRatio <= 0.0005) process.exit(7);
   if (project.events?.sequenceValid !== true) process.exit(8);
+  if (project.kind === "website") {
+    const dcp = project.designContext;
+    if (!dcp || !/^[a-f0-9]{64}$/.test(dcp.contentHash || "") || !/^[a-f0-9]{64}$/.test(dcp.artifactManifestHash || "") || !/^[a-f0-9]{64}$/.test(dcp.materializationHash || "") || dcp.effectiveCompatibilityMode !== "observe" || !Array.isArray(dcp.readFiles) || !["inputs/design-profile.json", "inputs/design-profile-usage.md", "inputs/component-recipes.json", "state/style-contract.json"].every((path) => dcp.readFiles.includes(path))) process.exit(10);
+  }
 }
 if (evidence.projects[0].screenshot.documentSha256 === evidence.projects[1].screenshot.documentSha256) process.exit(9);
 ' "${public_runtime_evidence_path}"

@@ -7,6 +7,8 @@ const RBAC_YAML: &str =
     include_str!("../../../infra/agent-sandbox/rbac/runtime-service-account.yaml");
 const TEMPLATE_YAML: &str =
     include_str!("../../../infra/agent-sandbox/astro-website/sandbox-template.yaml");
+const DOCS_TEMPLATE_YAML: &str =
+    include_str!("../../../infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml");
 const RUNTIME_DEPLOYMENT_YAML: &str =
     include_str!("../../../infra/agent-sandbox/runtime/deployment.yaml");
 const ASTRO_SANDBOX_DOCKERFILE: &str =
@@ -14,6 +16,79 @@ const ASTRO_SANDBOX_DOCKERFILE: &str =
 const WORKSPACE_INIT_SH: &str = include_str!("../../../infra/agent-sandbox/base/workspace-init.sh");
 const WORKSPACE_CHANNEL_SERVER_JS: &str =
     include_str!("../../../infra/agent-sandbox/base/workspace-channel-server.js");
+const IMAGE_LOCK_JSON: &str = include_str!("../../../infra/agent-sandbox/images.lock.json");
+const K8S_E2E_SH: &str = include_str!("../../../infra/agent-sandbox/run-k8s-e2e.sh");
+const RUNTIME_RC_GATE_SH: &str =
+    include_str!("../../../infra/agent-sandbox/run-runtime-rc-gate.sh");
+const RUNTIME_RC_PREFLIGHT_SH: &str =
+    include_str!("../../../infra/agent-sandbox/preflight-runtime-rc.sh");
+
+#[test]
+fn runtime_rc_refreshes_short_lived_principal_after_provider_waits() {
+    assert!(RUNTIME_RC_GATE_SH.contains(
+        "# Provider SSE waits may outlive the deliberately short principal JWT.\n  principal_token=\"$(issue_principal_token \"${project_id}\")\""
+    ));
+    assert!(RUNTIME_RC_GATE_SH.contains(
+        "# Never reuse a token issued before a model/build wait for artifact access.\n  principal_token=\"$(issue_principal_token \"${project_id}\")\"\n  artifact_url="
+    ));
+
+    let refresh_count = RUNTIME_RC_GATE_SH
+        .matches("principal_token=\"$(issue_principal_token \"${project_id}\")\"")
+        .count();
+    assert!(
+        refresh_count >= 15,
+        "RC gate must refresh 120-second principal tokens around every long provider wait; found {refresh_count} refreshes"
+    );
+}
+
+#[test]
+fn runtime_rc_proves_released_artifacts_with_a_fresh_project_principal() {
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("Artifact routes remain principal-protected after Sandbox release. Refresh the"));
+    assert!(RUNTIME_RC_GATE_SH.contains("artifact_status=\"$(curl --silent"));
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("-H \"authorization: Bearer ${principal_token}\" \"${artifact_url}\")\""));
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("artifactAccessAfterRelease={authentication:\"project-principal\""));
+}
+
+#[test]
+fn runtime_rc_asserts_real_docs_on_the_fumadocs_content_route() {
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("The initialized Fumadocs source renders authored content at /docs/;"));
+    assert!(RUNTIME_RC_GATE_SH.contains("artifact_assertion_path=\"/docs/\""));
+    assert!(RUNTIME_RC_GATE_SH.contains("artifact_assertion_url=\"${artifact_url}docs/\""));
+    assert!(RUNTIME_RC_GATE_SH.contains("evidence.route=process.argv[2]"));
+}
+
+#[test]
+fn runtime_rc_real_provider_build_and_edit_have_distinct_acceptance_text() {
+    assert!(RUNTIME_RC_GATE_SH.contains("build_expected_text=\"RC ${kind} Built\""));
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("Make and verify that source mutation before the first preview.publish call."));
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("Before any preview.publish call, make one minimal source patch"));
+    assert!(RUNTIME_RC_GATE_SH
+        .contains("replaces the exact text ${build_expected_text} with ${expected_text}"));
+}
+
+#[test]
+fn runtime_rc_registry_fallback_is_lock_bound_and_evidence_backed() {
+    let lock: serde_json::Value = serde_json::from_str(IMAGE_LOCK_JSON).unwrap();
+    for name in ["rustBuilder", "debianRuntime", "sandboxNode"] {
+        let image = &lock["images"][name];
+        assert!(image["fallbackRef"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("mirror.gcr.io/library/")));
+        assert!(image["digest"]
+            .as_str()
+            .is_some_and(|value| value.len() == 71));
+    }
+    assert!(RUNTIME_RC_PREFLIGHT_SH.contains("runtime-rc-preflight@1"));
+    assert!(RUNTIME_RC_PREFLIGHT_SH.contains("lockedDigestVerified: true"));
+    assert!(RUNTIME_RC_PREFLIGHT_SH.contains("mutableTagMatchesLock: true"));
+    assert!(RUNTIME_RC_GATE_SH.contains("--preflight \"${preflight_evidence}\""));
+}
 
 #[test]
 fn sandbox_network_policy_defaults_to_deny_all_ingress_and_egress() {
@@ -83,6 +158,47 @@ fn sandbox_network_policy_allows_runtime_preview_and_internal_npm_proxy_only() {
         assert!(!yaml_contains(doc, "::/0"));
         assert!(!yaml_contains(doc, "registry.npmjs.org"));
     }
+}
+
+#[test]
+fn sandbox_templates_delegate_egress_only_to_repository_network_policies() {
+    for (yaml, name) in [
+        (TEMPLATE_YAML, "anydesign-astro-website"),
+        (DOCS_TEMPLATE_YAML, "anydesign-fumadocs-docs"),
+    ] {
+        let docs = yaml_documents(yaml);
+        let template = named_doc(&docs, "SandboxTemplate", name);
+        let spec = field(template, "spec");
+
+        assert_eq!(
+            field(spec, "networkPolicyManagement").as_str(),
+            Some("Unmanaged"),
+            "{name} must not let the Sandbox controller generate its public-internet allow policy"
+        );
+        assert!(
+            field_optional(spec, "networkPolicy").is_none(),
+            "{name} must use infra/agent-sandbox/network/default-deny.yaml as its only egress authority"
+        );
+    }
+}
+
+#[test]
+fn local_path_workspace_helper_is_digest_pinned_before_sandbox_pvcs() {
+    let lock: serde_json::Value = serde_json::from_str(IMAGE_LOCK_JSON).unwrap();
+    let helper = &lock["images"]["localPathHelper"];
+
+    assert_eq!(
+        helper["ref"].as_str(),
+        Some("docker.io/rancher/mirrored-library-busybox:1.36.1")
+    );
+    assert_eq!(
+        helper["digest"].as_str(),
+        Some("sha256:8a45424ddf949bbe9bb3231b05f9032a45da5cd036eb4867b511b00734756d6f")
+    );
+    assert!(K8S_E2E_SH.contains("local_path_helper_image=\"$(locked_image localPathHelper)\""));
+    assert!(K8S_E2E_SH.contains("configmap local-path-config"));
+    assert!(K8S_E2E_SH.contains("helperPod.yaml"));
+    assert!(K8S_E2E_SH.contains("rollout restart deployment/local-path-provisioner"));
 }
 
 #[test]
@@ -209,7 +325,9 @@ fn sandbox_template_uses_image_with_baked_bootstrap_assets() {
         "SandboxTemplate must not use the plain node image because bootstrap scripts must be baked into the sandbox image"
     );
     assert!(
-        ASTRO_SANDBOX_DOCKERFILE.contains("ARG SANDBOX_BASE_IMAGE=node:22-bookworm")
+        ASTRO_SANDBOX_DOCKERFILE.contains(
+            "ARG SANDBOX_BASE_IMAGE=node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+        )
             && ASTRO_SANDBOX_DOCKERFILE.contains("FROM ${SANDBOX_BASE_IMAGE}")
             && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh")
             && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-channel-server.js")

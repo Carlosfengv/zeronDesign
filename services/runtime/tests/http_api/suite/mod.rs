@@ -570,8 +570,12 @@ async fn assert_preview_updated_before_completed(store: &RuntimeStore, run_id: &
 
 #[path = "../cases/artifacts.rs"]
 mod artifacts;
+#[path = "../cases/bff_runtime_e2e.rs"]
+mod bff_runtime_e2e;
 #[path = "../cases/briefs.rs"]
 mod briefs;
+#[path = "../cases/design_context_sync.rs"]
+mod design_context_sync;
 #[path = "../cases/design_profiles.rs"]
 mod design_profiles;
 #[path = "../cases/design_sources.rs"]

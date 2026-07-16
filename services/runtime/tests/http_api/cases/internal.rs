@@ -60,6 +60,136 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
 }
 
 #[tokio::test]
+async fn design_context_enforcement_policy_requires_admin_uses_cas_and_survives_restart() {
+    let storage = unique_temp_dir("design-context-enforcement-policy");
+    let store = RuntimeStore::with_checkpoint_dir(storage.clone());
+    let mut config = phase_a_contract_config();
+    config.internal_admin_token = Some("admin-design-context-policy-token".to_string());
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    design_profile_request("project-policy-1", vec!["astro-website"]).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let body = to_bytes(created.into_body(), 32_768).await.unwrap();
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let profile_id = created["designProfile"]["id"].as_str().unwrap();
+    let profile_version = created["designProfile"]["version"].as_u64().unwrap();
+    let policy_uri = "/internal/projects/project-policy-1/design-context-enforcement";
+    let create_body = json!({
+        "designProfileId": profile_id,
+        "designProfileVersion": profile_version,
+        "enabled": true,
+        "expectedRevision": 0,
+        "updatedBy": "release-operator-1"
+    })
+    .to_string();
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(policy_uri)
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let created_policy = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(policy_uri)
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-design-context-policy-token")
+                .body(Body::from(create_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_policy.status(), StatusCode::OK);
+    let body = to_bytes(created_policy.into_body(), 32_768).await.unwrap();
+    let created_policy: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created_policy["policy"]["revision"], 1);
+    assert_eq!(created_policy["policy"]["enabled"], true);
+
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(policy_uri)
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-design-context-policy-token")
+                .body(Body::from(create_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+    let disabled = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(policy_uri)
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-design-context-policy-token")
+                .body(Body::from(
+                    json!({
+                        "designProfileId": profile_id,
+                        "designProfileVersion": profile_version,
+                        "enabled": false,
+                        "expectedRevision": 1,
+                        "updatedBy": "release-operator-2"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
+
+    drop(store);
+    let restarted = RuntimeStore::with_checkpoint_dir(storage);
+    let policy = restarted
+        .get_design_context_enforcement_policy(
+            "project-policy-1",
+            profile_id,
+            profile_version as u32,
+        )
+        .await
+        .unwrap();
+    assert!(!policy.enabled);
+    assert_eq!(policy.revision, 2);
+    assert_eq!(policy.updated_by, "release-operator-2");
+}
+
+#[tokio::test]
 async fn release_evidence_and_sandbox_release_routes_fail_closed_without_admin_identity() {
     let store = RuntimeStore::new();
     let mut config = phase_a_contract_config();

@@ -7,9 +7,10 @@ use anydesign_runtime::{
         PROJECT_WRITE_OPERATION,
     },
     tools::control_plane::{sandbox_backend_for_config, SandboxBackend},
-    types::{sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief},
+    types::{sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief, DesignProfile},
     RuntimeConfig, RuntimeStore,
 };
+use chrono::Utc;
 use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use serde_json::{json, Value};
 use std::{
@@ -42,9 +43,26 @@ impl ModelClient for RoutingFixtureModel {
             *turn
         };
         match (run.phase, run.project_id.as_str(), turn) {
-            (AgentPhase::Build, "website-k3d", 1) => Ok(website_build_response()),
+            (AgentPhase::Build, "website-k3d", 1) => Ok(website_dcp_bootstrap_response()),
+            (AgentPhase::Build, "website-k3d", 2) => {
+                Ok(ModelResponse::ToolCalls(vec![ToolCall::new(
+                    "website-dcp-init",
+                    "project.init",
+                    json!({ "template": "astro-website" }),
+                )]))
+            }
+            (AgentPhase::Build, "website-k3d", 3) => Ok(website_build_response()),
             (AgentPhase::Build, "docs-k3d", 1) => Ok(docs_init_response()),
             (AgentPhase::Build, "docs-k3d", 2) => Ok(docs_build_response()),
+            (AgentPhase::Edit, "website-k3d", 1) => Ok(website_edit_dcp_reads_response()),
+            (AgentPhase::Edit, "website-k3d", 2) => {
+                Ok(ModelResponse::ToolCalls(vec![ToolCall::new(
+                    "website-edit-dcp-style-contract",
+                    "fs.read",
+                    json!({ "path": "state/style-contract.json" }),
+                )]))
+            }
+            (AgentPhase::Edit, "website-k3d", 3) => Ok(website_dcp_edit_response()),
             (AgentPhase::Edit, _, 1) => Ok(deterministic_edit_response("edit")),
             _ => Err(anyhow::anyhow!(
                 "unexpected fixture model turn: project={} phase={:?} turn={turn}",
@@ -80,6 +98,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     config.runtime_browser_proxy_bind = capture_address;
     config.npm_registry =
         "http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/".to_string();
+    config.enable_design_context_package = true;
     let principal_signing_key = SigningKey::from_bytes(&[31_u8; 32]);
     let principal_public_key = storage.join("public-principal.der");
     fs::write(
@@ -111,6 +130,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     let docs_token = principal_token(&principal_issuer, "docs-k3d");
     let website_brief_id = confirmed_brief(&store, "website-k3d", website_brief()).await;
     let docs_brief_id = confirmed_brief(&store, "docs-k3d", docs_brief()).await;
+    bind_observe_website_dcp_profile(&store, "website-k3d").await;
     let model = RoutingFixtureModel {
         store: store.clone(),
         turns: Arc::new(Mutex::new(HashMap::new())),
@@ -183,6 +203,15 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             &docs_token,
         )
     );
+    assert!(website_build.design_context_manifest.is_some());
+    assert_eq!(
+        website.design_context_content_hash, website_build.design_context_content_hash,
+        "the k3d Edit Run must inherit the Website Build DCP"
+    );
+    assert!(website
+        .design_context_read_files
+        .iter()
+        .any(|path| path == "inputs/design-profile.json"));
     assert_ne!(
         store
             .current_project_version("website-k3d")
@@ -280,6 +309,55 @@ async fn confirmed_brief(store: &RuntimeStore, project_id: &str, brief: Brief) -
     let brief_id = store.write_brief(&run.id, brief).await.unwrap();
     store.confirm_brief(&run.id, &brief_id).await.unwrap();
     brief_id
+}
+
+async fn bind_observe_website_dcp_profile(store: &RuntimeStore, project_id: &str) {
+    let now = Utc::now();
+    let profile = store
+        .create_design_profile(DesignProfile {
+            id: "website-k3d-dcp-profile".to_string(),
+            schema_version: "design-profile@1".to_string(),
+            name: "K3d Website DCP Profile".to_string(),
+            status: "active".to_string(),
+            version: 1,
+            scope: json!({ "projectId": project_id }),
+            source: json!({ "kind": "manual" }),
+            product: json!({ "name": "K3d Website", "category": "runtime e2e" }),
+            brand: json!({}),
+            visual: json!({ "direction": "high contrast operations" }),
+            tokens: json!({}),
+            runtime_token_mapping: json!({
+                "color.background": "#ffffff",
+                "color.surface": "#f8fafc",
+                "color.surfaceStrong": "#e2e8f0",
+                "color.text": "#0f172a",
+                "color.muted": "#475569",
+                "color.primary": "#2563eb",
+                "color.primaryContrast": "#ffffff",
+                "color.border": "#cbd5e1",
+                "radius.card": "8px",
+                "radius.control": "6px",
+                "font.sans": "Inter, sans-serif",
+                "shadow.soft": "0 1px 2px rgba(15, 23, 42, 0.12)"
+            }),
+            extended_token_mapping: json!({}),
+            components: json!({}),
+            website_context: json!({ "enforcementMode": "observe" }),
+            content: json!({}),
+            accessibility: json!({}),
+            technical: json!({ "allowedTemplates": ["astro-website"] }),
+            governance: json!({ "conflictBehavior": "ask" }),
+            signature_rules: Vec::new(),
+            overrides: json!({}),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .bind_project_design_profile(project_id, &profile.id)
+        .await
+        .unwrap();
 }
 
 async fn run_build(
@@ -403,13 +481,35 @@ fn principal_token(issuer: &PublicPrincipalJwtIssuer, project_id: &str) -> Strin
         .unwrap()
 }
 
+fn website_dcp_bootstrap_response() -> ModelResponse {
+    ModelResponse::ToolCalls(
+        [
+            "inputs/brief.md",
+            "inputs/design-profile.json",
+            "inputs/design-profile-usage.md",
+            "inputs/component-recipes.json",
+            "inputs/template-style-contract.json",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            ToolCall::new(
+                format!("website-dcp-bootstrap-read-{index}"),
+                "fs.read",
+                json!({ "path": path }),
+            )
+        })
+        .collect(),
+    )
+}
+
 fn website_build_response() -> ModelResponse {
     let build_script = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:48px sans-serif;background:#fff;color:#111}</style><h1>K3d Website</h1>');";
     ModelResponse::ToolCalls(vec![
         ToolCall::new(
-            "web-init",
-            "project.init",
-            json!({ "template": "astro-website" }),
+            "website-dcp-style-contract",
+            "fs.read",
+            json!({ "path": "state/style-contract.json" }),
         ),
         ToolCall::new(
             "web-package",
@@ -422,26 +522,61 @@ fn website_build_response() -> ModelResponse {
             json!({ "path": "project/build.cjs", "text": build_script }),
         ),
         ToolCall::new("web-build", "project.build", json!({ "cwd": "project" })),
-        ToolCall::new("web-preview", "preview.start", json!({})),
         ToolCall::new(
-            "web-open",
-            "browser.open",
-            json!({ "url": "http://127.0.0.1:4321" }),
-        ),
-        ToolCall::new(
-            "web-shot",
-            "browser.screenshot",
+            "web-publish",
+            "preview.publish",
             json!({ "screenshotId": "website-k3d-shot" }),
-        ),
-        ToolCall::new(
-            "web-promote",
-            "preview.report_candidate",
-            json!({ "url": "http://127.0.0.1:4321", "screenshotId": "website-k3d-shot" }),
         ),
         ToolCall::new(
             "web-complete",
             "run.complete",
             json!({ "status": "completed", "summary": "Website k3d gate complete" }),
+        ),
+    ])
+}
+
+fn website_edit_dcp_reads_response() -> ModelResponse {
+    ModelResponse::ToolCalls(
+        [
+            "inputs/design-profile.json",
+            "inputs/design-profile-usage.md",
+            "inputs/component-recipes.json",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            ToolCall::new(
+                format!("website-edit-dcp-read-{index}"),
+                "fs.read",
+                json!({ "path": path }),
+            )
+        })
+        .collect(),
+    )
+}
+
+fn website_dcp_edit_response() -> ModelResponse {
+    let build_script = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:44px sans-serif;background:#fff;color:#111}</style><h1>K3d Website Edited</h1>');";
+    ModelResponse::ToolCalls(vec![
+        ToolCall::new(
+            "website-edit-write",
+            "fs.write",
+            json!({ "path": "project/build.cjs", "text": build_script }),
+        ),
+        ToolCall::new(
+            "website-edit-build",
+            "project.build",
+            json!({ "cwd": "project" }),
+        ),
+        ToolCall::new(
+            "website-edit-publish",
+            "preview.publish",
+            json!({ "screenshotId": "k3d-edit-shot" }),
+        ),
+        ToolCall::new(
+            "website-edit-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "K3d DCP edit gate complete" }),
         ),
     ])
 }
@@ -647,6 +782,15 @@ async fn write_evidence(
                 "currentVersionAfterCas": website_version.id,
                 "events": event_ids(&website.id, &website_events),
                 "sandboxReleasedAt": website_released.last_seen_at,
+                "designContext": {
+                    "contentHash": website.design_context_content_hash,
+                    "artifactManifestHash": website.design_context_artifact_manifest_hash,
+                    "briefHash": website.design_context_brief_hash,
+                    "verificationPolicyId": website.design_context_verification_policy_id,
+                    "effectiveCompatibilityMode": website.design_context_effective_compatibility_mode,
+                    "materializationHash": website.design_context_materialization_hash,
+                    "readFiles": website.design_context_read_files,
+                },
             },
             {
                 "kind": "docs", "projectId": docs.project_id,

@@ -1,4 +1,4 @@
-ARG SANDBOX_BASE_IMAGE=node:22-bookworm
+ARG SANDBOX_BASE_IMAGE=node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37
 FROM ${SANDBOX_BASE_IMAGE}
 
 RUN mkdir -p /opt/anydesign/bootstrap /workspace/project

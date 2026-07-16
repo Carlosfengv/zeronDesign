@@ -8,6 +8,7 @@
     "prebuild": "npm --prefix ../../packages/shared run build",
     "build": "next build",
     "start": "next start",
+    "test:design-context-bff": "node scripts/run-design-context-bff-smoke.mjs",
     "pretypecheck": "npm --prefix ../../packages/shared run build",
     "typecheck": "tsc --noEmit"
   },

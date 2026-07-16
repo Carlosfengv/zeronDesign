@@ -33,6 +33,7 @@ pub(in crate::http_api) async fn authorize_project_operation(
                 status,
                 Json(ErrorResponse {
                     error: error.message().into(),
+                    error_code: None,
                 }),
             )
         })?;

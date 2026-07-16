@@ -212,6 +212,17 @@ impl Tool for DesignSourceReadSectionsTool {
                     json!({ "state": "needs_user_input:design_profile_source_budget_exceeded" }),
                 )
             })?;
+        crate::tools::runtime::record_design_context_metric(
+            &ctx.store,
+            &ctx.run,
+            "design_context_source_sections_read",
+            hashes.len() as u64,
+            json!({
+                "accessMode": "indexed",
+                "bytesRead": bytes_read,
+            }),
+        )
+        .await;
         Ok(ToolResult::ok(json!({
             "trustLabel": "untrusted_design_reference",
             "sourceArtifactId": artifact_id,
@@ -238,7 +249,10 @@ impl Tool for FsReadTool {
     }
 
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        // fs.read persists a per-run read lease in state/read-tracking.json.
+        // Concurrent read-modify-write updates would lose sibling leases and
+        // make a successfully read file fail the later fs.patch gate.
+        false
     }
 
     async fn validate_input(

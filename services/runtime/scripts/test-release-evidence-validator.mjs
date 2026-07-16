@@ -20,6 +20,10 @@ const fixture = {
   transport: { mode: "mtls", mtlsVerified: true, rotationWindowVerified: true, runtimeSanHash: sha, sandboxSanHash: sha, runtimeCertSerialHash: sha, sandboxCertSerialHash: sha, runtimeCertExpiresAt: "2026-07-13T00:00:00Z", sandboxCertExpiresAt: "2026-07-13T00:00:00Z" },
   auth: { principalMode: "required", projectOwnershipVerified: true, channelJwtVerified: true },
   provider: { mode: "approved-real", model: "approved-model", approvalReference: "R17-1", credentialPresent: true },
+  preflight: {
+    schemaVersion: "runtime-rc-preflight@1", passed: true, prefetchImages: true, lockHash: sha,
+    entries: [{ name: "runtime", canonicalRef: "registry.example/runtime:v1", lockedDigest: `sha256:${sha}`, lockedDigestVerified: true, mutableTagMatchesLock: true, pulled: true }],
+  },
   projects: ["website", "docs"].map(kind => ({
     kind, projectId: kind, buildRunId: `${kind}-build`, editRunId: `${kind}-edit`, bindingId: `${kind}-binding`, podUid: `${kind}-pod`,
     buildId: `${kind}-build-id`, candidateManifestHash: sha, sourceSnapshotUri: `runtime://snapshot/${kind}`,
@@ -27,6 +31,7 @@ const fixture = {
     versionBeforeCas: `${kind}-v1`, versionAfterCas: `${kind}-v2`, artifactManifestHash: sha,
     artifactUrl: `/artifacts/${kind}/current/`, events: { previewUpdated: "1", runCompleted: "2", sequenceValid: true },
     artifactAssertions: {
+      route: kind === "docs" ? "/docs/" : "/",
       content: { expectedTextSha256: sha, documentSha256: sha, matched: true },
       computedStyle: { selector: "body", display: "block", color: "rgb(0, 0, 0)", fontFamily: "sans-serif", passed: true },
     },
@@ -34,6 +39,7 @@ const fixture = {
     dependencyEvidence: { podUid: `${kind}-pod`, pod: `${kind}-pod-name`, podIp: `10.0.0.${kind === "website" ? 1 : 2}`, nodeModulesPresent: true, lockfileSha256: kind === "website" ? "d".repeat(64) : "e".repeat(64), tarballRequestCount: 2, passed: true },
     recoverableToolFailureCount: 0, terminalToolFailureCount: 0,
     sandboxReleasedAt: "2026-07-11T00:00:00Z", artifactHttpStatusAfterRelease: 200,
+    artifactAccessAfterRelease: { authentication: "project-principal", projectId: kind, httpStatus: 200, authenticated: true },
   })),
   recoveryScenarios: [
     ["runtime-restart", "active-preview-lease"],
@@ -57,6 +63,63 @@ fixture.fixture.projects[0].podUid = "fixture-website-pod";
 fixture.fixture.projects[1].podUid = "fixture-docs-pod";
 fixture.fixture.projects[0].artifactManifestHash = "b".repeat(64);
 fixture.fixture.projects[1].artifactManifestHash = "c".repeat(64);
+const dcpStage = runId => ({
+  runId,
+  gate: "ready",
+  missingRequiredReads: [],
+  materialization: { hash: sha, ready: true },
+  package: { contentHash: sha, effectiveCompatibilityMode: "enforced" },
+  styleContract: { verified: true },
+  verification: { capabilities: {
+    "computed-style": { available: true }, a11y: { available: true }, viewport: { available: true },
+  } },
+});
+fixture.enforcedDcpFixture = {
+  reviewRepair: {
+    editRunId: "dcp-edit",
+    reviewRunId: "dcp-review",
+    repairRunId: "dcp-repair",
+    findings: [{ findingId: "dcp-finding", versionId: "dcp-v2", severity: "blocking", repairable: true, status: "fixed" }],
+  },
+  designContextEnforced: {
+    lifecycle: {
+      buildRunId: "dcp-build", editRunId: "dcp-edit", reviewRunId: "dcp-review", repairRunId: "dcp-repair",
+      findingId: "dcp-finding", candidateVersionId: "dcp-v2", findingStatus: "fixed",
+    },
+    build: dcpStage("dcp-build"), edit: dcpStage("dcp-edit"), repair: dcpStage("dcp-repair"),
+  },
+};
+fixture.providerDcpProject = {
+  ...structuredClone(fixture.projects[0]),
+  projectId: "provider-dcp-website",
+  buildRunId: "provider-dcp-build",
+  editRunId: "provider-dcp-edit",
+  bindingId: "provider-dcp-binding",
+  podUid: "provider-dcp-pod",
+  buildId: "provider-dcp-build-id",
+  sourceSnapshotUri: "runtime://snapshot/provider-dcp",
+  previewLeaseId: "provider-dcp-lease",
+  screenshotId: "provider-dcp-shot",
+  artifactUrl: "/artifacts/provider-dcp-website/current/",
+  artifactAccessAfterRelease: { authentication: "project-principal", projectId: "provider-dcp-website", httpStatus: 200, authenticated: true },
+  dependencyEvidence: { ...structuredClone(fixture.projects[0].dependencyEvidence), podUid: "provider-dcp-pod", pod: "provider-dcp-pod-name" },
+  reviewRepair: {
+    editRunId: "provider-dcp-edit",
+    reviewRunId: "provider-dcp-review",
+    repairRunId: "provider-dcp-repair",
+    findings: [{ findingId: "provider-dcp-finding", versionId: "provider-dcp-v2", severity: "blocking", repairable: true, status: "fixed" }],
+  },
+  designContextEnforced: {
+    lifecycle: {
+      buildRunId: "provider-dcp-build", editRunId: "provider-dcp-edit", reviewRunId: "provider-dcp-review", repairRunId: "provider-dcp-repair",
+      findingId: "provider-dcp-finding", candidateVersionId: "provider-dcp-v2", findingStatus: "fixed",
+    },
+    build: dcpStage("provider-dcp-build"), edit: dcpStage("provider-dcp-edit"), repair: dcpStage("provider-dcp-repair"),
+    reviewProvenance: {
+      source: "fixture-seeded", mutationProvider: "deepseek", reviewProvider: "deterministic-tool-sequence", repairProvider: "deepseek",
+    },
+  },
+};
 
 assert.deepEqual(validateReleaseEvidence(fixture), []);
 const dirty = structuredClone(fixture);
@@ -71,13 +134,40 @@ assert(validateReleaseEvidence(leaked).some(error => error.includes("credential-
 const missingComputedStyle = structuredClone(fixture);
 missingComputedStyle.projects[0].artifactAssertions.computedStyle.passed = false;
 assert(validateReleaseEvidence(missingComputedStyle).some(error => error.includes("computed-style")));
+const wrongDocsRoute = structuredClone(fixture);
+wrongDocsRoute.projects.find(project => project.kind === "docs").artifactAssertions.route = "/";
+assert(validateReleaseEvidence(wrongDocsRoute).some(error => error.includes("was not asserted at /docs/")));
 const missingRuntimeManifest = structuredClone(fixture);
 delete missingRuntimeManifest.images.runtime.manifestDigest;
 assert(validateReleaseEvidence(missingRuntimeManifest).some(error => error.includes("manifest digest")));
+const missingPreflightPull = structuredClone(fixture);
+missingPreflightPull.preflight.entries[0].pulled = false;
+assert(validateReleaseEvidence(missingPreflightPull).some(error => error.includes("preflight image")));
+const mismatchedPreflightLock = structuredClone(fixture);
+mismatchedPreflightLock.preflight.lockHash = "b".repeat(64);
+assert(validateReleaseEvidence(mismatchedPreflightLock).some(error => error.includes("preflight lockHash")));
 const leakedPreview = structuredClone(fixture);
 leakedPreview.projects[0].cancelCleanup.previewHttpStatusAfterCancel = 200;
 assert(validateReleaseEvidence(leakedPreview).some(error => error.includes("cancellation")));
+const anonymousArtifactProbe = structuredClone(fixture);
+anonymousArtifactProbe.projects[0].artifactAccessAfterRelease.authentication = "anonymous";
+assert(validateReleaseEvidence(anonymousArtifactProbe).some(error => error.includes("project principal")));
 const sequentialFixture = structuredClone(fixture);
 sequentialFixture.fixture.concurrent = false;
 assert(validateReleaseEvidence(sequentialFixture).some(error => error.includes("concurrent fixture")));
+const missingRepair = structuredClone(fixture);
+delete missingRepair.enforcedDcpFixture.designContextEnforced.repair;
+assert(validateReleaseEvidence(missingRepair).some(error => error.includes("repair diagnostics")));
+const unfixedFinding = structuredClone(fixture);
+unfixedFinding.enforcedDcpFixture.reviewRepair.findings[0].status = "repairing";
+assert(validateReleaseEvidence(unfixedFinding).some(error => error.includes("inconsistent")));
+const missingProviderDcp = structuredClone(fixture);
+delete missingProviderDcp.providerDcpProject;
+assert(validateReleaseEvidence(missingProviderDcp).some(error => error.includes("real-provider enforced DCP Website")));
+const fixtureRepairProvider = structuredClone(fixture);
+fixtureRepairProvider.providerDcpProject.designContextEnforced.reviewProvenance.repairProvider = "deterministic-tool-sequence";
+assert(validateReleaseEvidence(fixtureRepairProvider).some(error => error.includes("Review provenance")));
+const failedProviderDcpRepair = structuredClone(fixture);
+failedProviderDcpRepair.providerDcpProject.reviewRepair.findings[0].status = "repairing";
+assert(validateReleaseEvidence(failedProviderDcpRepair).some(error => error.includes("real-provider enforced DCP Review finding")));
 process.stdout.write("release evidence validator tests passed\n");

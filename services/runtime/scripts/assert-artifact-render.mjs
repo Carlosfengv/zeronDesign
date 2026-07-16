@@ -33,9 +33,10 @@ export function validateComputedStyleResult(result) {
   };
 }
 
-async function collectComputedStyles(url) {
+async function collectComputedStyles(url, headers) {
   const input = JSON.stringify({
     url,
+    ...(headers ? { headers } : {}),
     assertions: [
       { ruleId: "artifact-body-display", route: "/", selector: "body", property: "display" },
       { ruleId: "artifact-body-color", route: "/", selector: "body", property: "color" },
@@ -67,16 +68,19 @@ async function collectComputedStyles(url) {
   return result;
 }
 
-export async function assertArtifact({ url, expectedText }) {
+export async function assertArtifact({ url, expectedText, headers }) {
   if (typeof url !== "string" || !/^https?:\/\//.test(url)) throw new Error("url is required");
   if (typeof expectedText !== "string" || expectedText.length === 0) {
     throw new Error("expectedText is required");
   }
-  const response = await fetch(url);
+  if (headers !== undefined && (!headers || typeof headers !== "object" || Array.isArray(headers))) {
+    throw new Error("headers must be an object");
+  }
+  const response = await fetch(url, headers ? { headers } : undefined);
   if (!response.ok) throw new Error(`artifact returned HTTP ${response.status}`);
   const document = await response.text();
   if (!document.includes(expectedText)) throw new Error("artifact content assertion failed");
-  const computed = validateComputedStyleResult(await collectComputedStyles(url));
+  const computed = validateComputedStyleResult(await collectComputedStyles(url, headers));
   return {
     content: {
       expectedTextSha256: sha256(expectedText),

@@ -3,7 +3,8 @@ use super::*;
 
 pub(super) fn project_init_tool(workspace: Arc<dyn WorkspaceBackend>) -> Arc<dyn Tool> {
     Arc::new(ProjectInitTool {
-        initializer: Arc::new(ProjectInitializer::built_in(workspace)),
+        initializer: Arc::new(ProjectInitializer::built_in(workspace.clone())),
+        workspace,
     })
 }
 
@@ -17,6 +18,7 @@ pub(super) fn project_inspect_tool(workspace: Arc<dyn WorkspaceBackend>) -> Arc<
 
 struct ProjectInitTool {
     initializer: Arc<ProjectInitializer>,
+    workspace: Arc<dyn WorkspaceBackend>,
 }
 
 #[async_trait]
@@ -81,6 +83,7 @@ impl Tool for ProjectInitTool {
             )
             .await
             .map_err(|error| error.into_tool_error())?;
+        verify_design_context_style_contract(&*self.workspace, &ctx).await?;
 
         Ok(ToolResult::ok(json!({
             "appRoot": outcome.app_root,
@@ -91,6 +94,53 @@ impl Tool for ProjectInitTool {
             "designProfileTokenChanges": outcome.initial_token_changes,
         })))
     }
+}
+
+async fn verify_design_context_style_contract(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+) -> Result<(), ToolError> {
+    if ctx.run.design_context_manifest.is_none() {
+        return Ok(());
+    }
+    let expected = read_workspace_json(workspace, ctx, "inputs/template-style-contract.json")
+        .await
+        .ok_or_else(|| {
+            ToolError::typed_recoverable(
+                "DCP template style contract is missing after project.init",
+                "design_context.style_contract_missing",
+                json!({ "expectedPath": "inputs/template-style-contract.json" }),
+            )
+        })?;
+    let actual = read_workspace_json(workspace, ctx, "state/style-contract.json")
+        .await
+        .ok_or_else(|| {
+            ToolError::typed_recoverable(
+                "project.init did not create state/style-contract.json",
+                "design_context.style_contract_missing",
+                json!({ "actualPath": "state/style-contract.json" }),
+            )
+        })?;
+    let expected_identity = crate::style_contract::style_contract_identity(&expected);
+    let actual_identity = crate::style_contract::style_contract_identity(&actual);
+    let verified = expected_identity == actual_identity;
+    ctx.store
+        .set_run_design_context_style_contract_verified(&ctx.run.id, verified)
+        .await
+        .map_err(|error| {
+            ToolError::Terminal(format!("record style contract verification: {error}"))
+        })?;
+    if !verified {
+        return Err(ToolError::typed_recoverable(
+            "state/style-contract.json does not match the frozen Design Context Package",
+            "design_context.style_contract_mismatch",
+            json!({
+                "expected": expected_identity,
+                "actual": actual_identity,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 struct ProjectWritePageTool {

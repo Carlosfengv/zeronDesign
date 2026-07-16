@@ -30,6 +30,7 @@ async fn internal_template_build(
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
                 error: "internal template build requires service authorization".to_string(),
+                error_code: None,
             }),
         ));
     }

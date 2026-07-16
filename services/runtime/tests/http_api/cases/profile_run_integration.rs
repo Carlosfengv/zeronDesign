@@ -3,9 +3,11 @@ use super::*;
 #[tokio::test]
 async fn required_unsupported_extended_token_blocks_build_with_capability_state() {
     let store = RuntimeStore::new();
+    let mut config = public_auth_disabled_config();
+    config.enable_design_context_package = true;
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: public_auth_disabled_config(),
+        config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -114,6 +116,19 @@ async fn required_unsupported_extended_token_blocks_build_with_capability_state(
         event,
         AgentEvent::StateChanged { state, .. }
             if state == "needs_user_input:design_profile_capability_gap"
+    )));
+    assert!(store.events(run_id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded {
+            name,
+            value: 1,
+            metadata: Some(metadata),
+            ..
+        } if name == "design_context_capability_gap_total"
+            && metadata["requirement"] == "required"
+            && metadata["gapKind"] == "extended_token"
+            && metadata["surface"] == "website"
+            && metadata.get("unsupportedToken").is_none()
     )));
 }
 

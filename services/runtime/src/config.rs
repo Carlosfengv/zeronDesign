@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -6,6 +6,17 @@ use std::{env, net::SocketAddr, path::PathBuf};
 pub enum SandboxBackendMode {
     Kubernetes,
     PhaseAContract,
+}
+
+/// Exact, fail-closed scope for DCP enforcement. The global enforcement flag only
+/// permits this mechanism; an entry is still required for each project/profile
+/// revision that may enter enforced mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesignContextEnforcementAllowlistEntry {
+    pub project_id: String,
+    pub design_profile_id: String,
+    pub design_profile_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -168,6 +179,19 @@ pub struct RuntimeConfig {
     pub internal_admin_token: Option<String>,
     pub model_streaming: bool,
     pub model_strict_tools: bool,
+    pub enable_design_context_package: bool,
+    pub enable_design_context_enforcement: bool,
+    /// Runtime-owned browser worker bound into an enforced DCP Run.  This
+    /// deliberately lives on the config instance so isolated Runtime hosts and
+    /// tests do not have to mutate process-global environment after startup.
+    pub design_context_browser_executable: Option<PathBuf>,
+    /// Runtime-owned executable used to run the embedded browser evidence
+    /// collector. Its availability is part of the verifier capability probe.
+    pub design_context_browser_collector_executable: Option<PathBuf>,
+    /// JSON array of exact `{projectId, designProfileId, designProfileVersion}` entries.
+    /// It deliberately remains raw until validation so bad deployment config cannot
+    /// silently become an empty or permissive allowlist.
+    pub design_context_enforcement_allowlist_json: Option<String>,
     pub model_request_timeout_seconds: u64,
     pub repository_commit: String,
     pub repository_dirty: bool,
@@ -323,6 +347,16 @@ impl RuntimeConfig {
             model_strict_tools: env::var("MODEL_STRICT_TOOLS")
                 .ok()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            enable_design_context_package: truthy_env("RUNTIME_DESIGN_CONTEXT_PACKAGE_V1"),
+            enable_design_context_enforcement: truthy_env("RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1"),
+            design_context_browser_executable: optional_path_env("RUNTIME_BROWSER_EXECUTABLE"),
+            design_context_browser_collector_executable: optional_path_env(
+                "RUNTIME_BROWSER_COLLECTOR_EXECUTABLE",
+            )
+            .or_else(|| Some(PathBuf::from("node"))),
+            design_context_enforcement_allowlist_json: optional_string_env(
+                "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON",
+            ),
             model_request_timeout_seconds: env::var("MODEL_REQUEST_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -357,6 +391,13 @@ impl RuntimeConfig {
     }
 
     pub fn validate_startup(&self) -> Result<(), String> {
+        if self.enable_design_context_enforcement && !self.enable_design_context_package {
+            return Err(
+                "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1 requires RUNTIME_DESIGN_CONTEXT_PACKAGE_V1"
+                    .to_string(),
+            );
+        }
+        self.design_context_enforcement_allowlist()?;
         if self.work_runtime_backend_mode == WorkRuntimeBackendMode::Kubernetes {
             let prober = self.work_runtime_prober_image.as_deref().ok_or_else(|| {
                 "WORK_RUNTIME_PROBER_IMAGE is required for Kubernetes work runtime".to_string()
@@ -492,6 +533,51 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+
+    pub fn design_context_enforcement_allowed_for(
+        &self,
+        project_id: &str,
+        design_profile_id: &str,
+        design_profile_version: u32,
+    ) -> Result<bool, String> {
+        if !self.enable_design_context_enforcement {
+            return Ok(false);
+        }
+        Ok(self
+            .design_context_enforcement_allowlist()?
+            .iter()
+            .any(|entry| {
+                entry.project_id == project_id
+                    && entry.design_profile_id == design_profile_id
+                    && entry.design_profile_version == design_profile_version
+            }))
+    }
+
+    fn design_context_enforcement_allowlist(
+        &self,
+    ) -> Result<Vec<DesignContextEnforcementAllowlistEntry>, String> {
+        let Some(raw) = self.design_context_enforcement_allowlist_json.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let entries = serde_json::from_str::<Vec<DesignContextEnforcementAllowlistEntry>>(raw)
+            .map_err(|error| {
+                format!(
+                    "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON must be a JSON array of exact project/profile/revision entries: {error}"
+                )
+            })?;
+        for entry in &entries {
+            if entry.project_id.trim().is_empty()
+                || entry.design_profile_id.trim().is_empty()
+                || entry.design_profile_version == 0
+            {
+                return Err(
+                    "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON entries require non-empty projectId, designProfileId, and positive designProfileVersion"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(entries)
+    }
 }
 
 fn secret_env(name: &str) -> Option<String> {
@@ -587,6 +673,55 @@ mod tests {
         config.policy_profile = RuntimePolicyProfile::LocalE2e;
         config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
         config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn enforcement_flag_requires_design_context_master_flag() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.enable_design_context_package = false;
+        config.enable_design_context_enforcement = true;
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1 requires RUNTIME_DESIGN_CONTEXT_PACKAGE_V1"
+        );
+    }
+
+    #[test]
+    fn enforcement_allowlist_is_exact_and_empty_is_fail_closed() {
+        let mut config = phase_a_config();
+        config.enable_design_context_package = true;
+        config.enable_design_context_enforcement = true;
+        assert!(!config
+            .design_context_enforcement_allowed_for("project-1", "profile-1", 2)
+            .unwrap());
+
+        config.design_context_enforcement_allowlist_json = Some(
+            r#"[{"projectId":"project-1","designProfileId":"profile-1","designProfileVersion":2}]"#
+                .to_string(),
+        );
+        assert!(config
+            .design_context_enforcement_allowed_for("project-1", "profile-1", 2)
+            .unwrap());
+        assert!(!config
+            .design_context_enforcement_allowed_for("project-1", "profile-1", 3)
+            .unwrap());
+        assert!(!config
+            .design_context_enforcement_allowed_for("project-2", "profile-1", 2)
+            .unwrap());
+    }
+
+    #[test]
+    fn malformed_enforcement_allowlist_rejects_startup() {
+        let mut config = phase_a_config();
+        config.enable_design_context_package = true;
+        config.enable_design_context_enforcement = true;
+        config.design_context_enforcement_allowlist_json = Some("not-json".to_string());
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON"));
     }
 
     #[test]

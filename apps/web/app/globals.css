@@ -24,7 +24,7 @@ h1 { margin: 2px 0 0; font-size: 18px; }
 .panes { display: grid; grid-template-columns: minmax(360px, 42%) 1fr; min-height: 0; }
 .chat { min-height: 0; display: flex; flex-direction: column; justify-content: space-between; gap: 22px; padding: 28px; border-right: 1px solid #2c2b28; }
 .messages { min-height: 0; overflow: auto; display: grid; align-content: start; gap: 10px; padding-right: 4px; }
-.message, .brief-card, .permission-card { max-width: 92%; padding: 12px 14px; border: 1px solid #33322e; border-radius: 10px; background: #1a1a18; }
+.message, .brief-card, .permission-card, .design-context-card { max-width: 92%; padding: 12px 14px; border: 1px solid #33322e; border-radius: 10px; background: #1a1a18; }
 .message.user { justify-self: end; background: #2a2925; }
 .message small, .brief-card small, .permission-card small { color: #858178; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
 .message p, .brief-card p, .permission-card p { margin: 6px 0 0; color: #d0cbc1; line-height: 1.5; white-space: pre-wrap; }
@@ -38,6 +38,38 @@ h1 { margin: 2px 0 0; font-size: 18px; }
 .permission-buttons button:nth-child(2) { color: #e8e2d7; background: #454038; }
 .permission-buttons button:nth-child(3) { color: #f0d7d2; background: #5a302a; }
 .permission-error { color: #ef9f91 !important; font-size: 12px; }
+.design-context-card { max-width: 100%; border-color: #4a5862; background: #192025; }
+.design-context-card h3 { margin: 9px 0 8px; font-size: 14px; }
+.design-context-card small, .profile-sync-plan small { color: #9dabb4; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
+.design-context-card dl { display: grid; gap: 5px; margin: 10px 0; font-size: 11px; }
+.design-context-card dl div { display: grid; grid-template-columns: 92px 1fr; gap: 8px; }
+.design-context-card dt { color: #8b979f; }
+.design-context-card dd { margin: 0; color: #d4dce0; overflow-wrap: anywhere; }
+.context-warning { margin: 7px 0; color: #edc58e; font-size: 12px; line-height: 1.4; }
+.context-note { margin: 8px 0 0; color: #aeb8bf; font-size: 12px; line-height: 1.4; }
+.fidelity-outcome { display: grid; gap: 8px; margin: 12px 0; padding: 10px; border: 1px solid #41505a; border-radius: 8px; background: #151b1f; }
+.fidelity-outcome.failed { border-color: #7d5e47; background: #211b17; }
+.fidelity-outcome.passed { border-color: #3d6657; background: #15201c; }
+.fidelity-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fidelity-heading span { color: #aeb8bf; font-size: 10px; }
+.fidelity-outcome p { margin: 0; color: #bdc8ce; font-size: 11px; line-height: 1.45; }
+.fidelity-meta { color: #89979f !important; }
+.fidelity-rule-links { display: flex; flex-wrap: wrap; gap: 5px; }
+.fidelity-rule-links a, .fidelity-finding a { color: #edc58e; overflow-wrap: anywhere; }
+.fidelity-rule-links a { padding: 4px 6px; border: 1px solid #665644; border-radius: 5px; font: 10px ui-monospace, monospace; text-decoration: none; }
+.fidelity-finding { display: grid; gap: 6px; padding: 9px; border: 1px solid #574a40; border-radius: 6px; background: #191715; }
+.fidelity-finding h4 { margin: 0; font: 11px ui-monospace, monospace; }
+.fidelity-finding dl { margin: 0; }
+.fidelity-finding code { color: #d9e1e5; font-size: 10px; }
+.fidelity-reason { color: #e2b98b !important; }
+.fidelity-repair { display: grid; gap: 4px; padding-top: 8px; border-top: 1px solid #3b464d; }
+.fidelity-repair strong { color: #d7dfe2; font-size: 11px; }
+.profile-sync-plan { display: grid; gap: 8px; margin-top: 13px; padding-top: 12px; border-top: 1px solid #34414a; }
+.profile-sync-plan p { margin: 0; color: #ccd4d8; font-size: 12px; line-height: 1.45; }
+.profile-sync-plan fieldset { display: grid; gap: 5px; margin: 0; padding: 8px; border: 1px solid #44525d; border-radius: 7px; }
+.profile-sync-plan legend { padding: 0 4px; color: #d9e2e6; font: 11px ui-monospace, monospace; }
+.profile-sync-plan label { color: #bdc9cf; font-size: 12px; }
+.profile-sync-plan input { margin-right: 6px; }
 .empty-copy { max-width: 430px; margin-top: 7vh; }
 .empty-copy span { color: #8b877d; font-family: ui-monospace, monospace; font-size: 11px; }
 .empty-copy h2 { margin: 14px 0 12px; font-size: 30px; line-height: 1.05; letter-spacing: -.04em; }

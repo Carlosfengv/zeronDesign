@@ -5,10 +5,13 @@ STYLE_ONLY="${RUNTIME_E2E_STYLE_ONLY:-0}"
 LOG_DIR="${RUNTIME_E2E_LOG_DIR:-}"
 REQUIRE_COMPUTED_STYLE="${RUNTIME_E2E_REQUIRE_COMPUTED_STYLE:-0}"
 SUMMARY_WRITTEN=0
+APPROVAL_REFERENCE="${RUNTIME_PROVIDER_APPROVAL_ID:-}"
 
 export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
 export DEEPSEEK_E2E_MODEL="${DEEPSEEK_E2E_MODEL:-deepseek-chat}"
 export RUNTIME_E2E_NPM_REGISTRY="${RUNTIME_E2E_NPM_REGISTRY:-https://registry.npmjs.org/}"
+export RUNTIME_BROWSER_EXECUTABLE="${RUNTIME_BROWSER_EXECUTABLE:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+export RUNTIME_BROWSER_COLLECTOR_EXECUTABLE="${RUNTIME_BROWSER_COLLECTOR_EXECUTABLE:-$(command -v node || true)}"
 
 write_metadata() {
   if [[ -z "$LOG_DIR" ]]; then
@@ -22,6 +25,7 @@ write_metadata() {
     echo "deepseekBaseUrl=$DEEPSEEK_BASE_URL"
     echo "deepseekModel=$DEEPSEEK_E2E_MODEL"
     echo "deepseekApiKeyPresent=$([[ -n "${DEEPSEEK_API_KEY:-}" ]] && echo true || echo false)"
+    echo "providerApprovalReference=$APPROVAL_REFERENCE"
     echo "npmRegistry=$RUNTIME_E2E_NPM_REGISTRY"
     echo "artifactUrl=${RUNTIME_E2E_ARTIFACT_URL:-}"
     echo "styleProject=${RUNTIME_E2E_STYLE_PROJECT:-real-http-website}"
@@ -62,6 +66,7 @@ write_evidence_summary() {
 
   if [[ -f "$provider_log" ]]; then
     summary_args+=(--log "$provider_log")
+    summary_args+=(--require-approval-reference "$APPROVAL_REFERENCE")
   else
     summary_args+=(--provider-optional)
   fi
@@ -70,10 +75,22 @@ write_evidence_summary() {
     summary_args+=(--computed-style-log "$computed_style_log")
   fi
 
+  case "${REAL_PROVIDER_PROJECT_FILTER:-}" in
+    website)
+      summary_args+=(--project real-http-website)
+      ;;
+    docs)
+      summary_args+=(--project real-http-docs)
+      ;;
+  esac
+
   if [[ -n "${RUNTIME_E2E_ARTIFACT_URL:-}" || "$REQUIRE_COMPUTED_STYLE" == "1" ]]; then
     summary_args+=(--require-computed-style)
   fi
-
+  if [[ "${REAL_PROVIDER_PROJECT_FILTER:-}" != "docs" ]]; then
+    summary_args+=(--require-dcp-project real-http-website)
+    summary_args+=(--require-repair-project real-http-website)
+  fi
   if [[ -f "$provider_log" || -f "$computed_style_log" ]]; then
     SUMMARY_NODE="${RUNTIME_E2E_NODE:-node}"
     local summary_status=0
@@ -136,6 +153,20 @@ if [[ "$STYLE_ONLY" != "1" ]]; then
   if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
     echo "DEEPSEEK_API_KEY is required" >&2
     exit 1
+  fi
+  if [[ -z "$APPROVAL_REFERENCE" ]]; then
+    echo "RUNTIME_PROVIDER_APPROVAL_ID is required" >&2
+    exit 1
+  fi
+  if [[ "${REAL_PROVIDER_PROJECT_FILTER:-}" != "docs" ]]; then
+    if [[ ! -x "$RUNTIME_BROWSER_EXECUTABLE" ]]; then
+      echo "RUNTIME_BROWSER_EXECUTABLE is not executable: $RUNTIME_BROWSER_EXECUTABLE" >&2
+      exit 1
+    fi
+    if [[ -z "$RUNTIME_BROWSER_COLLECTOR_EXECUTABLE" || ! -x "$RUNTIME_BROWSER_COLLECTOR_EXECUTABLE" ]]; then
+      echo "RUNTIME_BROWSER_COLLECTOR_EXECUTABLE is not executable: $RUNTIME_BROWSER_COLLECTOR_EXECUTABLE" >&2
+      exit 1
+    fi
   fi
 
   run_with_optional_log provider-lifecycle.log \

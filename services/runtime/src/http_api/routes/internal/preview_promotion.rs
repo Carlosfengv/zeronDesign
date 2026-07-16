@@ -31,6 +31,7 @@ async fn internal_promote_preview(
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
                 error: "internal preview promotion requires service authorization".to_string(),
+                error_code: None,
             }),
         ));
     }
@@ -47,6 +48,7 @@ async fn internal_promote_preview(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: error.to_string(),
+                error_code: None,
             }),
         )
     })?;

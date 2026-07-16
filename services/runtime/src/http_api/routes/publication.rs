@@ -461,6 +461,7 @@ fn precondition_error(status: StatusCode, message: &str) -> (StatusCode, Json<Er
         status,
         Json(ErrorResponse {
             error: message.to_string(),
+            error_code: None,
         }),
     )
 }
@@ -474,6 +475,7 @@ fn validate_existing_publication_precondition(
             StatusCode::PRECONDITION_REQUIRED,
             Json(ErrorResponse {
                 error: "expectedCurrentReleaseId and If-Match are required".to_string(),
+                error_code: None,
             }),
         ));
     }

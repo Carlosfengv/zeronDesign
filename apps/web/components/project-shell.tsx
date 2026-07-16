@@ -6,6 +6,7 @@ import {
   type ConversationItem,
   type DeploymentStateResponse,
   type PublicationOperationResponse,
+  type ProfileTokenSyncOperationResponse,
   type ReleasePackagingResponse,
   type WorkRelease,
 } from "@zerondesign/shared";
@@ -40,6 +41,58 @@ type PublicationSnapshot = {
     status: string;
   } | null;
 };
+type FidelityAssertionSummary = {
+  ruleId: string;
+  recipeId: string | null;
+  priority: string;
+  kind: string;
+  route: string;
+  viewport: number | null;
+  selector: string | null;
+  property: string | null;
+  actualSummary: string | null;
+  expectedSummary: string | null;
+  comparator: string | null;
+  passed: boolean;
+  reason: string | null;
+};
+type FidelitySummary = {
+  status: "passed" | "failed";
+  checkedAt: string | null;
+  outputVersionId: string | null;
+  requiredFailedRuleIds: string[];
+  assertions: FidelityAssertionSummary[];
+  repairContext: { targets: string[]; instructions: string[] };
+};
+type DesignContextSnapshot = {
+  manifest: {
+    package: {
+      contentHash?: string | null;
+      effectiveProfileHash: string;
+      designProfileId: string;
+      designProfileVersion: number;
+      surface: "website" | "docs";
+      template: string;
+      effectiveCompatibilityMode?: string | null;
+      verificationPolicyId: string;
+      warnings: string[];
+    };
+    artifacts: Array<{ path: string; kind: string; sha256: string; requiredBeforeMutation: boolean }>;
+  };
+  diagnostics: {
+    gate: "ready" | "read_required";
+    readFiles: string[];
+    missingRequiredReads: string[];
+    materialization: { hash?: string | null; ready: boolean };
+    styleContract: { verified: boolean | null };
+    fidelity: FidelitySummary | null;
+  };
+  syncTarget: {
+    designProfileId: string;
+    designProfileVersion: number;
+    effectiveProfileHash: string;
+  } | null;
+};
 
 export function ProjectShell() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -52,6 +105,9 @@ export function ProjectShell() {
   const [versions, setVersions] = useState<VersionBookmark[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [publication, setPublication] = useState<PublicationSnapshot | null>(null);
+  const [designContext, setDesignContext] = useState<DesignContextSnapshot | null>(null);
+  const [profileSync, setProfileSync] = useState<ProfileTokenSyncOperationResponse | null>(null);
+  const [conflictDecisions, setConflictDecisions] = useState<Record<string, "keep_current" | "apply_target">>({});
   const [publishing, setPublishing] = useState(false);
   const eventSource = useRef<EventSource | null>(null);
   const resumedPublicationJob = useRef<string | null>(null);
@@ -84,6 +140,22 @@ export function ProjectShell() {
     const response = await fetch(`/api/projects/${project.id}/publication`, { cache: "no-store" });
     if (!response.ok) return;
     setPublication(await response.json());
+  }, []);
+
+  const loadDesignContext = useCallback(async (project: Project, runId: string) => {
+    const response = await fetch(
+      `/api/projects/${project.id}/runs/${encodeURIComponent(runId)}/design-context`,
+      { cache: "no-store" },
+    );
+    if (response.status === 404) {
+      setDesignContext(null);
+      setProfileSync(null);
+      return;
+    }
+    if (!response.ok) return;
+    setDesignContext(await response.json());
+    setProfileSync(null);
+    setConflictDecisions({});
   }, []);
 
   const connectEvents = useCallback((project: Project, runId: string) => {
@@ -141,13 +213,22 @@ export function ProjectShell() {
     setPreview(null);
     setVersions([]);
     setPublication(null);
+    setDesignContext(null);
+    setProfileSync(null);
+    setConflictDecisions({});
     if (!selected) return;
     void loadConversation(selected);
     void loadPreview(selected);
     void loadVersions(selected);
     void loadPublication(selected);
     if (selected.latestRunId) connectEvents(selected, selected.latestRunId);
-  }, [connectEvents, loadConversation, loadPreview, loadPublication, loadVersions, selected]);
+    if (selected.latestRunId) void loadDesignContext(selected, selected.latestRunId);
+  }, [connectEvents, loadConversation, loadDesignContext, loadPreview, loadPublication, loadVersions, selected]);
+
+  useEffect(() => {
+    if (!selected || !activeRunId) return;
+    void loadDesignContext(selected, activeRunId);
+  }, [activeRunId, loadDesignContext, selected]);
 
   useEffect(() => {
     const job = publication?.activeJob;
@@ -236,6 +317,65 @@ export function ProjectShell() {
     setProjects((current) => current.map((item) => item.id === project.id ? project : item));
     setPrompt("");
     setMessage(`Edit Run 已启动：${payload.runId}`);
+  }
+
+  async function planProfileSync() {
+    if (!selected || !designContext?.syncTarget || !designContext.manifest.package.contentHash) return;
+    try {
+      setMessage("正在读取实际 token 快照并生成 Profile Sync 三方 diff…");
+      const operation = await fetchJson<ProfileTokenSyncOperationResponse>(
+        `/api/projects/${selected.id}/runs/${encodeURIComponent(activeRunId ?? selected.latestRunId ?? "")}/profile-sync`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ idempotencyKey: crypto.randomUUID() }),
+        },
+      );
+      setProfileSync(operation);
+      setConflictDecisions({});
+      const conflicts = operation.items.filter((item) => item.state === "conflict").length;
+      setMessage(conflicts ? `发现 ${conflicts} 个 token 冲突，请逐项选择后确认` : "三方 diff 已就绪，可确认同步");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法创建 Profile Sync 计划");
+    }
+  }
+
+  async function confirmProfileSync() {
+    if (!selected || !profileSync) return;
+    const conflicts = profileSync.items.filter((item) => item.state === "conflict");
+    if (conflicts.some((item) => !conflictDecisions[item.token])) {
+      setMessage("请为每个冲突 token 选择保留当前值或应用 Profile 值");
+      return;
+    }
+    try {
+      setMessage("正在确认 Profile Sync；Runtime 会在 child Run 的模型启动前写入 token…");
+      const sourceRunId = activeRunId ?? selected.latestRunId;
+      if (!sourceRunId) throw new Error("缺少可同步的源 Run");
+      const operation = await fetchJson<ProfileTokenSyncOperationResponse>(
+        `/api/projects/${selected.id}/runs/${encodeURIComponent(sourceRunId)}/profile-sync/${encodeURIComponent(profileSync.operationId)}/confirm`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            planHash: profileSync.planHash,
+            conflictDecisions,
+            idempotencyKey: crypto.randomUUID(),
+          }),
+        },
+      );
+      setProfileSync(operation);
+      if (!operation.childRunId) {
+        setMessage(`Profile Sync 状态：${operation.status}`);
+        return;
+      }
+      const project = { ...selected, latestRunId: operation.childRunId };
+      setSelected(project);
+      setProjects((current) => current.map((item) => item.id === project.id ? project : item));
+      connectEvents(project, operation.childRunId);
+      setMessage("Profile Sync 已应用，已创建后续 Edit Run");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "确认 Profile Sync 失败");
+    }
   }
 
   async function cancelActiveRun() {
@@ -380,13 +520,18 @@ export function ProjectShell() {
           <button type="submit">新建项目</button>
         </form>
         <nav aria-label="项目列表">{projects.map((project) => (
-          <button className={selected?.id === project.id ? "project active" : "project"} key={project.id} onClick={() => setSelected(project)}>
+          <button
+            className={selected?.id === project.id ? "project active" : "project"}
+            data-project-id={project.id}
+            key={project.id}
+            onClick={() => setSelected(project)}
+          >
             <strong>{project.name}</strong><small>{project.kind} · {project.status}</small>
           </button>
         ))}</nav>
       </aside>
       <section className="workspace">
-        <header><div><small>WORKSPACE</small><h1>{selected?.name ?? "新项目"}</h1></div><div className="status">{message}</div></header>
+        <header><div><small>WORKSPACE</small><h1>{selected?.name ?? "新项目"}</h1></div><div className="status" data-testid="runtime-status">{message}</div></header>
         <div className="panes">
           <section className="chat">
             <div className="messages">
@@ -395,6 +540,15 @@ export function ProjectShell() {
                 ? <PermissionCard item={item} key={item.id} projectId={selected.id} onResolved={permissionResolved} />
                 : <article className={`message ${item.role ?? "system"}`} key={item.id}><small>{item.role ?? item.kind}</small><p>{item.text}</p></article>)}
               {brief && <article className="brief-card"><small>STRUCTURED BRIEF · {brief.status}</small><h3>{brief.brief.projectType} / {brief.brief.recommendedTemplate}</h3><p>{brief.brief.visualDirection}</p><p>受众：{brief.brief.audience}</p>{brief.status === "draft" && <button disabled={Boolean(activeRunId && activeRunId !== brief.runId)} onClick={confirmBrief}>确认 Brief</button>}{brief.status === "confirmed" && <button disabled={Boolean(activeRunId)} onClick={startBuild}>开始 Build</button>}</article>}
+              {selected && designContext && <DesignContextCard
+                context={designContext}
+                operation={profileSync}
+                conflictDecisions={conflictDecisions}
+                disabled={Boolean(activeRunId)}
+                onPlan={planProfileSync}
+                onDecision={(token, decision) => setConflictDecisions((current) => ({ ...current, [token]: decision }))}
+                onConfirm={confirmProfileSync}
+              />}
             </div>
             <form onSubmit={preview ? startEdit : startBrief}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={preview ? "描述要修改的文字、布局或视觉样式…" : "例如：为一个面向开发者的 API 平台创建简洁、专业的文档站…"} required disabled={!selected || Boolean(activeRunId)} /><div className="run-actions"><button type="submit" disabled={!selected || Boolean(activeRunId)}>{preview ? "应用修改" : "生成 Brief"}</button>{activeRunId && <button className="stop-run" type="button" onClick={cancelActiveRun}>停止当前 Run</button>}</div></form>
           </section>
@@ -406,6 +560,110 @@ export function ProjectShell() {
       </section>
     </main>
   );
+}
+
+function DesignContextCard({
+  context,
+  operation,
+  conflictDecisions,
+  disabled,
+  onPlan,
+  onDecision,
+  onConfirm,
+}: {
+  context: DesignContextSnapshot;
+  operation: ProfileTokenSyncOperationResponse | null;
+  conflictDecisions: Record<string, "keep_current" | "apply_target">;
+  disabled: boolean;
+  onPlan: () => Promise<void>;
+  onDecision: (token: string, decision: "keep_current" | "apply_target") => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const source = context.manifest.package;
+  const target = context.syncTarget;
+  const targetChanged = Boolean(target && (
+    target.designProfileId !== source.designProfileId
+    || target.designProfileVersion !== source.designProfileVersion
+    || target.effectiveProfileHash !== source.effectiveProfileHash
+  ));
+  const conflicts = operation?.items.filter((item) => item.state === "conflict") ?? [];
+
+  return (
+    <article className="design-context-card" data-testid="design-context-card">
+      <small>DESIGN CONTEXT · {context.diagnostics.gate === "ready" ? "READY" : "READ REQUIRED"}</small>
+      <h3>{source.designProfileId}@{source.designProfileVersion} · {source.template}</h3>
+      <dl>
+        <div><dt>DCP</dt><dd>{shortHash(source.contentHash)} · {context.diagnostics.materialization.ready ? "materialized" : "not materialized"}</dd></div>
+        <div><dt>Style contract</dt><dd>{context.diagnostics.styleContract.verified === true ? "verified" : context.diagnostics.styleContract.verified === false ? "failed" : "pending"}</dd></div>
+        <div><dt>Required reads</dt><dd>{context.diagnostics.readFiles.length} read / {context.diagnostics.missingRequiredReads.length} missing</dd></div>
+      </dl>
+      {context.diagnostics.missingRequiredReads.length > 0 && <p className="context-warning">缺少：{context.diagnostics.missingRequiredReads.join("、")}</p>}
+      {source.warnings.map((warning) => <p className="context-warning" key={warning}>{warning}</p>)}
+      <FidelityOutcome fidelity={context.diagnostics.fidelity} />
+      {targetChanged && !operation && <button data-testid="profile-sync-plan-trigger" disabled={disabled} onClick={() => void onPlan()}>查看最新 Profile 的三方 diff</button>}
+      {target && !targetChanged && <p className="context-note" data-testid="profile-sync-aligned">项目当前绑定的 Profile 已与此 Run 快照一致。</p>}
+      {operation && <div className="profile-sync-plan" data-testid="profile-sync-plan">
+        <small>PROFILE SYNC · {operation.status}</small>
+        <p>{operation.items.filter((item) => item.state === "apply_target").length} 项将应用；{conflicts.length} 项需要决议；{operation.items.filter((item) => item.state === "not_managed").length} 项不受管理。</p>
+        {conflicts.map((item) => <fieldset key={item.token}>
+          <legend>{item.token}</legend>
+          <label><input data-testid="profile-sync-keep-current" type="radio" name={item.token} checked={conflictDecisions[item.token] === "keep_current"} onChange={() => onDecision(item.token, "keep_current")} /> 保留当前值</label>
+          <label><input data-testid="profile-sync-apply-target" type="radio" name={item.token} checked={conflictDecisions[item.token] === "apply_target"} onChange={() => onDecision(item.token, "apply_target")} /> 应用 Profile 值</label>
+        </fieldset>)}
+        {operation.status === "planned" && <button data-testid="profile-sync-confirm" disabled={disabled} onClick={() => void onConfirm()}>确认并创建后续 Edit Run</button>}
+        {operation.childRunId && <p className="context-note">child Run：{operation.childRunId}</p>}
+      </div>}
+    </article>
+  );
+}
+
+function FidelityOutcome({ fidelity }: { fidelity: FidelitySummary | null }) {
+  if (!fidelity) {
+    return <section className="fidelity-outcome empty" data-testid="fidelity-outcome" data-status="not-run">
+      <small>FIDELITY · NOT RUN</small>
+      <p>此 Run 尚无 preview.publish 验证结果。</p>
+    </section>;
+  }
+  const failures = fidelity.assertions.filter((assertion) => !assertion.passed);
+  return <section className={`fidelity-outcome ${fidelity.status}`} data-testid="fidelity-outcome" data-status={fidelity.status}>
+    <div className="fidelity-heading">
+      <small>FIDELITY · {fidelity.status.toUpperCase()}</small>
+      <span>{fidelity.requiredFailedRuleIds.length} required failed</span>
+    </div>
+    {(fidelity.outputVersionId || fidelity.checkedAt) && <p className="fidelity-meta">
+      {fidelity.outputVersionId ? `Version ${fidelity.outputVersionId}` : "No promoted version"}
+      {fidelity.checkedAt ? ` · ${fidelity.checkedAt}` : ""}
+    </p>}
+    {fidelity.requiredFailedRuleIds.length > 0 && <div className="fidelity-rule-links" aria-label="Required fidelity failures">
+      {fidelity.requiredFailedRuleIds.map((ruleId) => <a href={`#${fidelityRuleAnchor(ruleId)}`} key={ruleId}>{ruleId}</a>)}
+    </div>}
+    {failures.map((assertion) => <article className="fidelity-finding" id={fidelityRuleAnchor(assertion.ruleId)} key={assertion.ruleId}>
+      <h4><a href={`#${fidelityRuleAnchor(assertion.ruleId)}`}>{assertion.ruleId}</a></h4>
+      <p>{assertion.recipeId ? `Recipe ${assertion.recipeId} · ` : ""}{assertion.priority} · {assertion.kind}</p>
+      <dl>
+        {assertion.selector && <div><dt>Element</dt><dd><code>{assertion.selector}</code></dd></div>}
+        {assertion.viewport !== null && <div><dt>Viewport</dt><dd>{assertion.viewport}px</dd></div>}
+        {assertion.property && <div><dt>Property</dt><dd><code>{assertion.property}</code></dd></div>}
+        {assertion.actualSummary && <div><dt>Current</dt><dd>{assertion.actualSummary}</dd></div>}
+        {assertion.expectedSummary && <div><dt>Target</dt><dd>{assertion.expectedSummary}</dd></div>}
+      </dl>
+      {assertion.reason && <p className="fidelity-reason">{assertion.reason}</p>}
+    </article>)}
+    {fidelity.status === "passed" && <p className="context-note">本次 Runtime fidelity 验证没有 required failure。</p>}
+    {(fidelity.repairContext.targets.length > 0 || fidelity.repairContext.instructions.length > 0) && <div className="fidelity-repair">
+      <strong>Repair context</strong>
+      {fidelity.repairContext.targets.length > 0 && <p>目标：{fidelity.repairContext.targets.join("、")}</p>}
+      {fidelity.repairContext.instructions.map((instruction) => <p key={instruction}>{instruction}</p>)}
+    </div>}
+  </section>;
+}
+
+function fidelityRuleAnchor(ruleId: string): string {
+  return `fidelity-rule-${ruleId.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+function shortHash(value?: string | null): string {
+  return value ? `${value.slice(0, 10)}…` : "unavailable";
 }
 
 function PermissionCard({

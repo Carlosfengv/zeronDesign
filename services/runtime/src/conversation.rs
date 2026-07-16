@@ -1,18 +1,30 @@
 use crate::{
+    design_context::{
+        frozen_run_design_context_manifest, validate_run_design_context_identity,
+        CompiledDesignContext, ProfileCompatibilityMode, ProfileEnforcementMode,
+        VerificationEnvironmentBinding,
+    },
+    profile_token_sync::{
+        resolve as resolve_profile_token_sync_plan,
+        resolved_target_tokens as resolved_profile_token_sync_targets, snapshot as token_snapshot,
+        ProfileTokenSyncOperation, TokenSyncResolution,
+    },
     profiles::policy,
     publication::PublicationStore,
     release::ReleaseStore,
     repair_loop::RepairAttempt,
+    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     types::{
         sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus,
         ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief, BriefStatus,
-        ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem, DesignProfile,
-        DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
-        OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
-        ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
-        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
-        ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus,
-        SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
+        ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
+        DesignContextEnforcementPolicy, DesignProfile, DesignProfileConversionReport,
+        DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex, OutboxDeliveryStatus,
+        PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus, ProjectAccessRecord,
+        ProjectRuntimeState, ProjectVersion, ProjectVersionStatus, ReviewFinding,
+        ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity, ReviewFindingStatus,
+        RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol,
+        MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
@@ -20,7 +32,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -53,6 +65,7 @@ pub struct RuntimeStore {
     project_version_log_path: Arc<PathBuf>,
     project_runtime_state_log_path: Arc<PathBuf>,
     project_access_log_path: Arc<PathBuf>,
+    design_context_enforcement_policy_log_path: Arc<PathBuf>,
     preview_lease_log_path: Arc<PathBuf>,
     channel_lease_log_path: Arc<PathBuf>,
     artifact_publish_log_path: Arc<PathBuf>,
@@ -95,6 +108,7 @@ struct RuntimeStoreInner {
     project_current_versions: HashMap<String, String>,
     project_runtime_states: HashMap<String, ProjectRuntimeState>,
     project_access_records: HashMap<String, ProjectAccessRecord>,
+    design_context_enforcement_policies: HashMap<String, DesignContextEnforcementPolicy>,
     preview_leases: HashMap<String, PreviewLeaseRecord>,
     channel_leases: HashMap<String, ChannelLeaseRecord>,
     artifact_publishes: HashMap<String, ArtifactPublishRecord>,
@@ -105,6 +119,7 @@ struct RuntimeStoreInner {
     design_profile_conversion_reports: HashMap<String, DesignProfileConversionReport>,
     design_source_artifacts: HashMap<String, DesignSourceArtifact>,
     project_design_profiles: HashMap<String, String>,
+    profile_token_sync_operations: HashMap<String, ProfileTokenSyncOperation>,
     run_scoped_resources: HashMap<String, RunScopedResources>,
     continue_interrupt_requests: HashSet<String>,
 }
@@ -218,39 +233,18 @@ fn conversion_report_key(design_profile_id: &str, version: u32) -> String {
 fn design_profile_capability_gaps(
     effective: &crate::types::EffectiveDesignProfile,
 ) -> (Vec<String>, Vec<String>) {
-    let supported = match effective.template.as_str() {
-        "astro-website" | "nextjs-website" => [
-            "font.display",
-            "font.mono",
-            "type.display.size",
-            "type.display.lineHeight",
-            "type.display.letterSpacing",
-            "type.body.letterSpacing",
-            "spacing.pageGutter",
-            "spacing.section",
-            "spacing.cardPadding",
-            "radius.input",
-            "radius.badge",
-            "radius.largeCard",
-            "gradient.display",
-            "gradient.ambient",
-            "shadow.cardStrong",
-        ]
-        .as_slice(),
-        "fumadocs-docs" | "docusaurus-docs" => [
-            "font.display",
-            "font.mono",
-            "type.display.letterSpacing",
-            "type.body.letterSpacing",
-            "spacing.pageGutter",
-            "spacing.section",
-            "radius.input",
-            "radius.badge",
-            "gradient.display",
-        ]
-        .as_slice(),
-        _ => &[],
-    };
+    let supported = TemplateId::parse(&effective.template)
+        .ok()
+        .and_then(|id| BuiltInTemplateRegistry::built_in().current(&id).ok())
+        .map(|template| {
+            template
+                .style
+                .tokens
+                .iter()
+                .map(|token| token.name)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut unsupported = effective
         .profile
         .get("extendedTokenMapping")
@@ -258,7 +252,7 @@ fn design_profile_capability_gaps(
         .map(|tokens| {
             tokens
                 .keys()
-                .filter(|token| !supported.contains(&token.as_str()))
+                .filter(|token| !supported.contains(token.as_str()))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -361,6 +355,9 @@ impl Default for RuntimeStore {
                 storage_root.join("project-runtime-states.jsonl"),
             ),
             project_access_log_path: Arc::new(storage_root.join("project-access.jsonl")),
+            design_context_enforcement_policy_log_path: Arc::new(
+                storage_root.join("design-context-enforcement-policies.jsonl"),
+            ),
             preview_lease_log_path: Arc::new(storage_root.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(storage_root.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(storage_root.join("artifact-publishes.jsonl")),
@@ -420,6 +417,9 @@ impl RuntimeStore {
                 checkpoint_dir.join("project-runtime-states.jsonl"),
             ),
             project_access_log_path: Arc::new(checkpoint_dir.join("project-access.jsonl")),
+            design_context_enforcement_policy_log_path: Arc::new(
+                checkpoint_dir.join("design-context-enforcement-policies.jsonl"),
+            ),
             preview_lease_log_path: Arc::new(checkpoint_dir.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(checkpoint_dir.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(checkpoint_dir.join("artifact-publishes.jsonl")),
@@ -479,6 +479,9 @@ impl RuntimeStore {
                 run_log_dir.join("project-runtime-states.jsonl"),
             ),
             project_access_log_path: Arc::new(run_log_dir.join("project-access.jsonl")),
+            design_context_enforcement_policy_log_path: Arc::new(
+                run_log_dir.join("design-context-enforcement-policies.jsonl"),
+            ),
             preview_lease_log_path: Arc::new(run_log_dir.join("preview-leases.jsonl")),
             channel_lease_log_path: Arc::new(run_log_dir.join("channel-leases.jsonl")),
             artifact_publish_log_path: Arc::new(run_log_dir.join("artifact-publishes.jsonl")),
@@ -590,6 +593,21 @@ impl RuntimeStore {
             design_source_required_section_ids: Vec::new(),
             design_source_read_section_hashes: Vec::new(),
             design_context_read_files: Vec::new(),
+            design_context_package_version: None,
+            design_context_content_hash: None,
+            design_context_artifact_manifest_hash: None,
+            design_context_materialization_hash: None,
+            design_context_compiler_version: None,
+            design_context_brief_hash: None,
+            design_context_verification_policy_id: None,
+            design_context_expected_app_root: None,
+            design_context_declared_enforcement_mode: None,
+            design_context_effective_compatibility_mode: None,
+            design_context_warnings: Vec::new(),
+            design_context_verification_environment: None,
+            design_context_style_contract_verified: None,
+            design_context_manifest: None,
+            design_context_artifacts: BTreeMap::new(),
             base_version_id,
             output_version_id: None,
             finding_ids: None,
@@ -645,6 +663,11 @@ impl RuntimeStore {
             .get(parent_run_id)
             .ok_or_else(|| anyhow!("parent run not found: {parent_run_id}"))?
             .clone();
+        if parent.design_context_manifest.is_some() {
+            frozen_run_design_context_manifest(&parent).map_err(|error| {
+                anyhow!("cannot create child run from invalid frozen DCP: {error}")
+            })?;
+        }
         let run_id = self.next_id("run");
         let profile_snapshot =
             policy::snapshot_for_profile(phase, &agent_profile, parent.checkpoint_id.clone());
@@ -689,6 +712,34 @@ impl RuntimeStore {
             design_source_required_section_ids: parent.design_source_required_section_ids.clone(),
             design_source_read_section_hashes: Vec::new(),
             design_context_read_files: Vec::new(),
+            design_context_package_version: parent.design_context_package_version.clone(),
+            design_context_content_hash: parent.design_context_content_hash.clone(),
+            design_context_artifact_manifest_hash: parent
+                .design_context_artifact_manifest_hash
+                .clone(),
+            // Materialization evidence belongs to a concrete sandbox/run binding.
+            // Child Edit/Repair runs inherit the DCP content, not the parent's
+            // proof that it was written into a different workspace.
+            design_context_materialization_hash: None,
+            design_context_compiler_version: parent.design_context_compiler_version.clone(),
+            design_context_brief_hash: parent.design_context_brief_hash.clone(),
+            design_context_verification_policy_id: parent
+                .design_context_verification_policy_id
+                .clone(),
+            design_context_expected_app_root: parent.design_context_expected_app_root.clone(),
+            design_context_declared_enforcement_mode: parent
+                .design_context_declared_enforcement_mode
+                .clone(),
+            design_context_effective_compatibility_mode: parent
+                .design_context_effective_compatibility_mode
+                .clone(),
+            design_context_warnings: parent.design_context_warnings.clone(),
+            design_context_verification_environment: parent
+                .design_context_verification_environment
+                .clone(),
+            design_context_style_contract_verified: None,
+            design_context_manifest: parent.design_context_manifest.clone(),
+            design_context_artifacts: parent.design_context_artifacts.clone(),
             base_version_id: parent
                 .output_version_id
                 .clone()
@@ -1267,6 +1318,324 @@ impl RuntimeStore {
         inner.design_profiles.get(&profile_id).cloned()
     }
 
+    pub async fn create_profile_token_sync_operation(
+        &self,
+        operation: ProfileTokenSyncOperation,
+    ) -> Result<ProfileTokenSyncOperation> {
+        if operation.id.trim().is_empty()
+            || operation.project_id.trim().is_empty()
+            || operation.source_run_id.trim().is_empty()
+            || operation.idempotency_key.trim().is_empty()
+            || operation.authorized_principal_id.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "profile token sync operation requires id, project, source run, principal, and idempotency key"
+            ));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        if let Some(existing) = inner
+            .profile_token_sync_operations
+            .values()
+            .find(|existing| {
+                existing.project_id == operation.project_id
+                    && existing.source_run_id == operation.source_run_id
+                    && existing.authorized_principal_id == operation.authorized_principal_id
+                    && existing.idempotency_key == operation.idempotency_key
+            })
+            .cloned()
+        {
+            if existing.target_design_profile_id != operation.target_design_profile_id
+                || existing.target_design_profile_version != operation.target_design_profile_version
+                || existing.target_effective_profile_hash != operation.target_effective_profile_hash
+                || existing.source_design_context_content_hash
+                    != operation.source_design_context_content_hash
+                || existing.plan.plan_hash != operation.plan.plan_hash
+            {
+                return Err(anyhow!(
+                    "profile token sync idempotency key is already bound to a different plan"
+                ));
+            }
+            return Ok(existing);
+        }
+        if inner
+            .profile_token_sync_operations
+            .contains_key(&operation.id)
+        {
+            return Err(anyhow!(
+                "profile token sync operation id already exists: {}",
+                operation.id
+            ));
+        }
+        inner
+            .profile_token_sync_operations
+            .insert(operation.id.clone(), operation.clone());
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&operation)?;
+        Ok(operation)
+    }
+
+    pub async fn profile_token_sync_operation(
+        &self,
+        operation_id: &str,
+    ) -> Option<ProfileTokenSyncOperation> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)
+            .ok()?;
+        inner
+            .profile_token_sync_operations
+            .get(operation_id)
+            .cloned()
+    }
+
+    pub async fn update_profile_token_sync_operation(
+        &self,
+        operation: ProfileTokenSyncOperation,
+    ) -> Result<ProfileTokenSyncOperation> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let existing = inner
+            .profile_token_sync_operations
+            .get(&operation.id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {}", operation.id))?;
+        if existing.project_id != operation.project_id
+            || existing.source_run_id != operation.source_run_id
+            || existing.plan.plan_hash != operation.plan.plan_hash
+            || existing.idempotency_key != operation.idempotency_key
+        {
+            return Err(anyhow!(
+                "profile token sync operation immutable identity fields changed"
+            ));
+        }
+        if existing.status.is_terminal() && existing.status != operation.status {
+            return Err(anyhow!(
+                "cannot transition terminal profile token sync operation"
+            ));
+        }
+        inner
+            .profile_token_sync_operations
+            .insert(operation.id.clone(), operation.clone());
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&operation)?;
+        Ok(operation)
+    }
+
+    pub async fn confirm_profile_token_sync_operation(
+        &self,
+        operation_id: &str,
+        plan_hash: &str,
+        decisions: BTreeMap<String, TokenSyncResolution>,
+        confirm_idempotency_key: String,
+    ) -> Result<ProfileTokenSyncOperation> {
+        if confirm_idempotency_key.trim().is_empty() {
+            return Err(anyhow!(
+                "profile token sync confirm idempotency key is required"
+            ));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let operation = inner
+            .profile_token_sync_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {operation_id}"))?;
+        if operation.plan.plan_hash != plan_hash {
+            return Err(anyhow!(
+                "profile token sync plan hash does not match operation"
+            ));
+        }
+        if operation.is_expired(Utc::now()) {
+            operation.status = crate::profile_token_sync::ProfileTokenSyncOperationStatus::Rejected;
+            operation.last_error = Some("profile token sync operation expired".to_string());
+            operation.updated_at = Utc::now();
+            let rejected = operation.clone();
+            drop(inner);
+            self.append_profile_token_sync_operation_snapshot(&rejected)?;
+            return Err(anyhow!("profile token sync operation expired"));
+        }
+        if matches!(
+            operation.status,
+            crate::profile_token_sync::ProfileTokenSyncOperationStatus::Confirmed
+                | crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying
+                | crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applied
+                | crate::profile_token_sync::ProfileTokenSyncOperationStatus::RecoveryRequired
+        ) {
+            if operation.conflict_decisions == decisions
+                && operation.confirm_idempotency_key.as_deref()
+                    == Some(confirm_idempotency_key.as_str())
+            {
+                return Ok(operation.clone());
+            }
+            return Err(anyhow!(
+                "profile token sync confirm idempotency key or decisions differ from the existing operation"
+            ));
+        }
+        if operation.status != crate::profile_token_sync::ProfileTokenSyncOperationStatus::Planned {
+            return Err(anyhow!(
+                "profile token sync operation cannot be confirmed from status {:?}",
+                operation.status
+            ));
+        }
+        operation.plan = resolve_profile_token_sync_plan(&operation.plan, &decisions)
+            .map_err(|error| anyhow!(error))?;
+        operation.conflict_decisions = decisions;
+        operation.confirm_idempotency_key = Some(confirm_idempotency_key);
+        operation.status = crate::profile_token_sync::ProfileTokenSyncOperationStatus::Confirmed;
+        operation.updated_at = Utc::now();
+        let confirmed = operation.clone();
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&confirmed)?;
+        Ok(confirmed)
+    }
+
+    pub async fn begin_profile_token_sync_apply(
+        &self,
+        operation_id: &str,
+        child_run_id: &str,
+    ) -> Result<ProfileTokenSyncOperation> {
+        if child_run_id.trim().is_empty() {
+            return Err(anyhow!("profile token sync apply requires a child run id"));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let operation = inner
+            .profile_token_sync_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {operation_id}"))?;
+        if operation.is_expired(Utc::now()) {
+            return Err(anyhow!("profile token sync operation expired"));
+        }
+        match operation.status {
+            crate::profile_token_sync::ProfileTokenSyncOperationStatus::Confirmed
+            | crate::profile_token_sync::ProfileTokenSyncOperationStatus::RecoveryRequired => {
+                operation.status =
+                    crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying;
+                operation.child_run_id = Some(child_run_id.to_string());
+                operation.updated_at = Utc::now();
+            }
+            crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying
+                if operation.child_run_id.as_deref() == Some(child_run_id) => {}
+            _ => {
+                return Err(anyhow!(
+                    "profile token sync operation cannot begin apply from status {:?}",
+                    operation.status
+                ))
+            }
+        }
+        let applying = operation.clone();
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&applying)?;
+        Ok(applying)
+    }
+
+    pub async fn reject_profile_token_sync_operation(
+        &self,
+        operation_id: &str,
+        error: impl Into<String>,
+    ) -> Result<ProfileTokenSyncOperation> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let operation = inner
+            .profile_token_sync_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {operation_id}"))?;
+        if operation.status.is_terminal() {
+            return Err(anyhow!(
+                "profile token sync operation is already terminal: {:?}",
+                operation.status
+            ));
+        }
+        if operation.status == crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying
+        {
+            return Err(anyhow!(
+                "applying profile token sync operation must enter recovery_required, not rejected"
+            ));
+        }
+        operation.status = crate::profile_token_sync::ProfileTokenSyncOperationStatus::Rejected;
+        operation.last_error = Some(error.into());
+        operation.updated_at = Utc::now();
+        let rejected = operation.clone();
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&rejected)?;
+        Ok(rejected)
+    }
+
+    pub async fn complete_profile_token_sync_apply(
+        &self,
+        operation_id: &str,
+        before_tokens: BTreeMap<String, String>,
+        after_tokens: BTreeMap<String, String>,
+    ) -> Result<ProfileTokenSyncOperation> {
+        let before = token_snapshot(before_tokens).map_err(|error| anyhow!(error))?;
+        let after = token_snapshot(after_tokens).map_err(|error| anyhow!(error))?;
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let operation = inner
+            .profile_token_sync_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {operation_id}"))?;
+        if operation.status != crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying
+        {
+            return Err(anyhow!(
+                "profile token sync operation is not applying: {:?}",
+                operation.status
+            ));
+        }
+        if before.hash != operation.plan.current.hash {
+            return Err(anyhow!(
+                "profile token sync current snapshot changed before apply completion"
+            ));
+        }
+        let mut expected_after = before.tokens.clone();
+        for (token, value) in
+            resolved_profile_token_sync_targets(&operation.plan).map_err(|error| anyhow!(error))?
+        {
+            expected_after.insert(token, value);
+        }
+        let expected_after = token_snapshot(expected_after).map_err(|error| anyhow!(error))?;
+        if after.hash != expected_after.hash {
+            return Err(anyhow!(
+                "profile token sync after snapshot does not match the confirmed plan"
+            ));
+        }
+        operation.before_tokens = Some(before);
+        operation.after_tokens = Some(after);
+        operation.status = crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applied;
+        operation.last_error = None;
+        operation.updated_at = Utc::now();
+        let applied = operation.clone();
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&applied)?;
+        Ok(applied)
+    }
+
+    pub async fn mark_profile_token_sync_recovery_required(
+        &self,
+        operation_id: &str,
+        error: impl Into<String>,
+    ) -> Result<ProfileTokenSyncOperation> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let operation = inner
+            .profile_token_sync_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow!("profile token sync operation not found: {operation_id}"))?;
+        if operation.status != crate::profile_token_sync::ProfileTokenSyncOperationStatus::Applying
+        {
+            return Err(anyhow!(
+                "profile token sync operation is not applying: {:?}",
+                operation.status
+            ));
+        }
+        operation.status =
+            crate::profile_token_sync::ProfileTokenSyncOperationStatus::RecoveryRequired;
+        operation.last_error = Some(error.into());
+        operation.updated_at = Utc::now();
+        let recovery_required = operation.clone();
+        drop(inner);
+        self.append_profile_token_sync_operation_snapshot(&recovery_required)?;
+        Ok(recovery_required)
+    }
+
     pub async fn resolve_design_profile(
         &self,
         project_id: &str,
@@ -1456,6 +1825,200 @@ impl RuntimeStore {
         Ok(run)
     }
 
+    pub async fn attach_run_design_context(
+        &self,
+        run_id: &str,
+        compiled: &CompiledDesignContext,
+        verification_environment: &VerificationEnvironmentBinding,
+    ) -> Result<AgentRun> {
+        let payload = &compiled.manifest.payload;
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.design_profile_id.as_deref() != Some(payload.design_profile_id.as_str())
+            || run.design_profile_effective_hash.as_deref()
+                != Some(payload.effective_profile_hash.as_str())
+        {
+            return Err(anyhow!(
+                "design context payload does not match the attached effective design profile"
+            ));
+        }
+        let mut candidate = run.clone();
+        candidate.design_context_package_version = Some(payload.schema_version.clone());
+        candidate.design_context_content_hash = Some(compiled.manifest.content_hash.clone());
+        candidate.design_context_artifact_manifest_hash =
+            Some(payload.artifact_manifest_hash.clone());
+        candidate.design_context_materialization_hash = None;
+        candidate.design_context_compiler_version = Some(payload.compiler_version.clone());
+        candidate.design_context_brief_hash = Some(payload.brief_hash.clone());
+        candidate.design_context_verification_policy_id =
+            Some(payload.verification_policy.policy_id.clone());
+        candidate.design_context_expected_app_root = Some(payload.expected_app_root.clone());
+        candidate.design_context_declared_enforcement_mode =
+            Some(match payload.declared_enforcement_mode {
+                ProfileEnforcementMode::Observe => "observe".to_string(),
+                ProfileEnforcementMode::Enforced => "enforced".to_string(),
+            });
+        candidate.design_context_effective_compatibility_mode =
+            Some(match payload.effective_compatibility_mode {
+                ProfileCompatibilityMode::Observe => "observe".to_string(),
+                ProfileCompatibilityMode::Enforced => "enforced".to_string(),
+            });
+        candidate.design_context_warnings = payload.warnings.clone();
+        candidate.design_context_verification_environment =
+            Some(serde_json::to_value(verification_environment)?);
+        candidate.design_context_style_contract_verified = None;
+        candidate.design_context_manifest = Some(serde_json::to_value(&compiled.manifest)?);
+        candidate.design_context_artifacts = compiled.files.clone();
+        validate_run_design_context_identity(&candidate, &compiled.manifest)
+            .map_err(|error| anyhow!("cannot attach invalid Design Context Package: {error}"))?;
+        candidate.updated_at = Utc::now();
+        *run = candidate.clone();
+        drop(inner);
+        self.append_run_snapshot(&candidate)?;
+        Ok(candidate)
+    }
+
+    /// Copies a frozen DCP from the Run that produced an immutable project
+    /// version into a new Edit Run.  Workspace observations deliberately do
+    /// not travel with the package: the child must materialize and reread the
+    /// DCP/style contract in its own restored workspace before it can mutate.
+    pub async fn inherit_run_design_context(
+        &self,
+        run_id: &str,
+        source_run_id: &str,
+        verification_environment: &VerificationEnvironmentBinding,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let source = inner
+            .runs
+            .get(source_run_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("source run not found: {source_run_id}"))?;
+        frozen_run_design_context_manifest(&source)
+            .map_err(|error| anyhow!(error))?
+            .ok_or_else(|| anyhow!("source run has no frozen design context package"))?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.project_id != source.project_id {
+            return Err(anyhow!(
+                "cannot inherit design context across projects: {} -> {}",
+                source.project_id,
+                run.project_id
+            ));
+        }
+        run.brief_version = source.brief_version.clone();
+        run.design_profile_id = source.design_profile_id.clone();
+        run.design_profile_version = source.design_profile_version;
+        run.design_profile_hash = source.design_profile_hash.clone();
+        run.design_profile_surface = source.design_profile_surface.clone();
+        run.design_profile_template = source.design_profile_template.clone();
+        run.design_profile_surface_override_hash =
+            source.design_profile_surface_override_hash.clone();
+        run.design_profile_template_override_hash =
+            source.design_profile_template_override_hash.clone();
+        run.design_profile_effective_hash = source.design_profile_effective_hash.clone();
+        run.design_profile_unsupported_extended_tokens =
+            source.design_profile_unsupported_extended_tokens.clone();
+        run.design_profile_blocking_capability_rule_ids =
+            source.design_profile_blocking_capability_rule_ids.clone();
+        run.design_fidelity_mode = source.design_fidelity_mode.clone();
+        run.design_source_artifact_id = source.design_source_artifact_id.clone();
+        run.design_source_hash = source.design_source_hash.clone();
+        run.design_source_size_bytes = source.design_source_size_bytes;
+        run.design_source_budget_bytes = source.design_source_budget_bytes;
+        run.design_source_bytes_read = 0;
+        run.design_source_sections = source.design_source_sections.clone();
+        run.design_source_required_section_ids = source.design_source_required_section_ids.clone();
+        run.design_source_read_section_hashes = Vec::new();
+        run.design_context_read_files = Vec::new();
+        run.design_context_package_version = source.design_context_package_version.clone();
+        run.design_context_content_hash = source.design_context_content_hash.clone();
+        run.design_context_artifact_manifest_hash =
+            source.design_context_artifact_manifest_hash.clone();
+        run.design_context_materialization_hash = None;
+        run.design_context_compiler_version = source.design_context_compiler_version.clone();
+        run.design_context_brief_hash = source.design_context_brief_hash.clone();
+        run.design_context_verification_policy_id =
+            source.design_context_verification_policy_id.clone();
+        run.design_context_expected_app_root = source.design_context_expected_app_root.clone();
+        run.design_context_declared_enforcement_mode =
+            source.design_context_declared_enforcement_mode.clone();
+        run.design_context_effective_compatibility_mode =
+            source.design_context_effective_compatibility_mode.clone();
+        run.design_context_warnings = source.design_context_warnings.clone();
+        run.design_context_verification_environment =
+            Some(serde_json::to_value(verification_environment)?);
+        run.design_context_style_contract_verified = None;
+        run.design_context_manifest = source.design_context_manifest.clone();
+        run.design_context_artifacts = source.design_context_artifacts.clone();
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn record_run_design_context_materialization(
+        &self,
+        run_id: &str,
+        materialization_hash: &str,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let manifest = frozen_run_design_context_manifest(run)
+            .map_err(|error| anyhow!(error))?
+            .ok_or_else(|| anyhow!("cannot record materialization without a frozen DCP"))?;
+        if materialization_hash != manifest.payload.artifact_manifest_hash {
+            return Err(anyhow!(
+                "materialization hash does not match the frozen DCP artifact manifest"
+            ));
+        }
+        run.design_context_materialization_hash = Some(materialization_hash.to_string());
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn set_run_design_context_style_contract_verified(
+        &self,
+        run_id: &str,
+        verified: bool,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        frozen_run_design_context_manifest(run)
+            .map_err(|error| anyhow!(error))?
+            .ok_or_else(|| anyhow!("cannot verify a style contract without a frozen DCP"))?;
+        if verified && run.design_context_materialization_hash.is_none() {
+            return Err(anyhow!(
+                "cannot verify a style contract before DCP materialization"
+            ));
+        }
+        run.design_context_style_contract_verified = Some(verified);
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
     pub async fn set_run_design_source_index(
         &self,
         run_id: &str,
@@ -1493,6 +2056,18 @@ impl RuntimeStore {
             .runs
             .get_mut(run_id)
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.design_context_manifest.is_some() {
+            frozen_run_design_context_manifest(run).map_err(|error| anyhow!(error))?;
+            if run.design_context_materialization_hash.is_none() {
+                return Err(anyhow!(
+                    "cannot record DCP reads before DCP materialization"
+                ));
+            }
+        } else if run.design_profile_id.is_none() {
+            return Err(anyhow!(
+                "cannot record design context reads without a DesignProfile"
+            ));
+        }
         if !run
             .design_context_read_files
             .iter()
@@ -2630,6 +3205,52 @@ impl RuntimeStore {
         append_jsonl(&path, profile)
     }
 
+    fn profile_token_sync_operation_log_path(&self) -> PathBuf {
+        self.design_profile_log_path()
+            .parent()
+            .expect("design profile log path has storage parent")
+            .join("profile-token-sync-operations.jsonl")
+    }
+
+    fn append_profile_token_sync_operation_snapshot(
+        &self,
+        operation: &ProfileTokenSyncOperation,
+    ) -> Result<()> {
+        let path = self.profile_token_sync_operation_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_synced(&path, operation)
+    }
+
+    fn read_profile_token_sync_operations(&self) -> Result<Vec<ProfileTokenSyncOperation>> {
+        let path = self.profile_token_sync_operation_log_path();
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut operations_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let operation: ProfileTokenSyncOperation = serde_json::from_str(&line)?;
+            operations_by_id.insert(operation.id.clone(), operation);
+        }
+        Ok(operations_by_id.into_values().collect())
+    }
+
+    fn hydrate_profile_token_sync_operations(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        for operation in self.read_profile_token_sync_operations()? {
+            inner
+                .profile_token_sync_operations
+                .insert(operation.id.clone(), operation);
+        }
+        Ok(())
+    }
+
     fn append_design_profile_draft_snapshot(&self, draft: &DesignProfileDraft) -> Result<()> {
         let path = self.design_profile_draft_log_path();
         if let Some(parent) = path.parent() {
@@ -3764,6 +4385,162 @@ impl RuntimeStore {
             .insert(project_id.to_string(), record.clone());
         self.append_project_access_snapshot(&record)?;
         Ok(record)
+    }
+
+    fn design_context_enforcement_policy_key(
+        project_id: &str,
+        design_profile_id: &str,
+        design_profile_version: u32,
+    ) -> String {
+        format!("{project_id}\u{1f}{design_profile_id}\u{1f}{design_profile_version}")
+    }
+
+    fn design_context_enforcement_policy_log_path(&self) -> PathBuf {
+        (*self.design_context_enforcement_policy_log_path).clone()
+    }
+
+    fn append_design_context_enforcement_policy_snapshot(
+        &self,
+        policy: &DesignContextEnforcementPolicy,
+    ) -> Result<()> {
+        let path = self.design_context_enforcement_policy_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl(&path, policy)
+    }
+
+    fn read_design_context_enforcement_policies(
+        &self,
+    ) -> Result<Vec<DesignContextEnforcementPolicy>> {
+        read_latest_jsonl_by_key(
+            &self.design_context_enforcement_policy_log_path,
+            |policy: &DesignContextEnforcementPolicy| {
+                Self::design_context_enforcement_policy_key(
+                    &policy.project_id,
+                    &policy.design_profile_id,
+                    policy.design_profile_version,
+                )
+            },
+        )
+    }
+
+    pub async fn get_design_context_enforcement_policy(
+        &self,
+        project_id: &str,
+        design_profile_id: &str,
+        design_profile_version: u32,
+    ) -> Option<DesignContextEnforcementPolicy> {
+        let key = Self::design_context_enforcement_policy_key(
+            project_id,
+            design_profile_id,
+            design_profile_version,
+        );
+        if let Some(policy) = self
+            .inner
+            .read()
+            .await
+            .design_context_enforcement_policies
+            .get(&key)
+            .cloned()
+        {
+            return Some(policy);
+        }
+        let policy = self
+            .read_design_context_enforcement_policies()
+            .ok()?
+            .into_iter()
+            .find(|policy| {
+                policy.project_id == project_id
+                    && policy.design_profile_id == design_profile_id
+                    && policy.design_profile_version == design_profile_version
+            })?;
+        self.inner
+            .write()
+            .await
+            .design_context_enforcement_policies
+            .insert(key, policy.clone());
+        Some(policy)
+    }
+
+    pub async fn upsert_design_context_enforcement_policy(
+        &self,
+        project_id: &str,
+        design_profile_id: &str,
+        design_profile_version: u32,
+        enabled: bool,
+        expected_revision: Option<u64>,
+        updated_by: String,
+    ) -> Result<DesignContextEnforcementPolicy> {
+        if project_id.trim().is_empty()
+            || design_profile_id.trim().is_empty()
+            || design_profile_version == 0
+            || updated_by.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "design context enforcement policy requires project, profile, positive revision, and updatedBy"
+            ));
+        }
+        let key = Self::design_context_enforcement_policy_key(
+            project_id,
+            design_profile_id,
+            design_profile_version,
+        );
+        let existing = self
+            .get_design_context_enforcement_policy(
+                project_id,
+                design_profile_id,
+                design_profile_version,
+            )
+            .await;
+        match (&existing, expected_revision) {
+            (None, Some(revision)) if revision != 0 => {
+                return Err(anyhow!(
+                    "design context enforcement policy does not exist at expected revision {revision}"
+                ));
+            }
+            (None, None) => {
+                return Err(anyhow!(
+                    "design context enforcement policy creation requires expectedRevision=0"
+                ));
+            }
+            (Some(current), Some(revision)) if current.revision != revision => {
+                return Err(anyhow!(
+                    "design context enforcement policy revision conflict: expected {revision}, current {}",
+                    current.revision
+                ));
+            }
+            (Some(_), None) => {
+                return Err(anyhow!(
+                    "design context enforcement policy update requires expectedRevision"
+                ));
+            }
+            _ => {}
+        }
+        let now = Utc::now();
+        let policy = DesignContextEnforcementPolicy {
+            project_id: project_id.to_string(),
+            design_profile_id: design_profile_id.to_string(),
+            design_profile_version,
+            enabled,
+            revision: existing
+                .as_ref()
+                .map(|current| current.revision + 1)
+                .unwrap_or(1),
+            updated_by,
+            created_at: existing
+                .as_ref()
+                .map(|current| current.created_at)
+                .unwrap_or(now),
+            updated_at: now,
+        };
+        self.inner
+            .write()
+            .await
+            .design_context_enforcement_policies
+            .insert(key, policy.clone());
+        self.append_design_context_enforcement_policy_snapshot(&policy)?;
+        Ok(policy)
     }
 
     #[allow(clippy::too_many_arguments)]

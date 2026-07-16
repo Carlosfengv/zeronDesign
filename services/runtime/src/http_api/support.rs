@@ -114,6 +114,7 @@ pub(in crate::http_api) fn require_design_source_authorization(
         StatusCode::UNAUTHORIZED,
         Json(ErrorResponse {
             error: "design source artifacts require service authorization".to_string(),
+            error_code: None,
         }),
     ))
 }

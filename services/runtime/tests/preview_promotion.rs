@@ -718,6 +718,127 @@ async fn build_run_complete_requires_promoted_preview() {
     );
 }
 
+#[tokio::test]
+async fn repair_run_complete_requires_new_version_and_fresh_runtime_source_snapshot() {
+    let store = RuntimeStore::new();
+    let build_run_id = create_run(&store, AgentPhase::Build).await;
+    let base = store
+        .create_project_version_candidate(
+            "project-1",
+            &build_run_id,
+            "http://preview.local/base".to_string(),
+            Some("shot-base".to_string()),
+            Some("runtime://source-snapshots/project-1/build-base".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &build_run_id,
+        &base.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    let repair = store
+        .create_run_with_context(
+            "project-1".to_string(),
+            AgentPhase::Repair,
+            "repair".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            None,
+            Some(base.id.clone()),
+        )
+        .await;
+
+    let without_output = executor()
+        .execute_calls(
+            store.clone(),
+            &repair.id,
+            vec![ToolCall::new(
+                "repair-complete-without-output",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Done" }),
+            )],
+        )
+        .await;
+    assert!(without_output[0].result.is_error);
+    assert!(tool_result_error_text(&without_output[0].result).contains("output_version_id"));
+
+    let stale = store
+        .create_project_version_candidate(
+            "project-1",
+            &repair.id,
+            "http://preview.local/stale-repair".to_string(),
+            Some("shot-stale-repair".to_string()),
+            base.source_snapshot_uri.clone(),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &repair.id,
+        &stale.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    store
+        .set_run_output_version(&repair.id, stale.id.clone())
+        .await
+        .unwrap();
+    let stale_snapshot = executor()
+        .execute_calls(
+            store.clone(),
+            &repair.id,
+            vec![ToolCall::new(
+                "repair-complete-stale-snapshot",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Done" }),
+            )],
+        )
+        .await;
+    assert!(stale_snapshot[0].result.is_error);
+    assert!(tool_result_error_text(&stale_snapshot[0].result)
+        .contains("fresh Runtime-owned source snapshot"));
+
+    let fresh = store
+        .create_project_version_candidate(
+            "project-1",
+            &repair.id,
+            "http://preview.local/fresh-repair".to_string(),
+            Some("shot-fresh-repair".to_string()),
+            Some("runtime://source-snapshots/project-1/build-repair".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-1",
+        &repair.id,
+        &fresh.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+    store
+        .set_run_output_version(&repair.id, fresh.id.clone())
+        .await
+        .unwrap();
+    let completed = executor()
+        .execute_calls(
+            store.clone(),
+            &repair.id,
+            vec![ToolCall::new(
+                "repair-complete-fresh-snapshot",
+                "run.complete",
+                json!({ "status": "completed", "summary": "Done" }),
+            )],
+        )
+        .await;
+    assert!(!completed[0].result.is_error);
+}
+
 #[test]
 fn preview_promote_is_not_registered_as_model_tool() {
     assert!(!control_plane_executor().has_tool("preview.promote"));

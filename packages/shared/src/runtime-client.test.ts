@@ -799,6 +799,107 @@ describe("runtime client", () => {
     });
   });
 
+  it("uses protected DCP diagnostics and Profile Sync control-plane routes", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const hash = "a".repeat(64);
+    const packageSummary = {
+      version: "design-context@1",
+      contentHash: hash,
+      artifactManifestHash: "b".repeat(64),
+      compilerVersion: "design-context-compiler@1",
+      briefHash: "c".repeat(64),
+      expectedAppRoot: "project",
+      declaredEnforcementMode: "enforced",
+      effectiveCompatibilityMode: "enforced",
+      verificationPolicyId: "website-verification@1",
+      warnings: [],
+      surface: "website",
+      template: "astro-website",
+      designProfileId: "profile-1",
+      designProfileVersion: 2,
+      effectiveProfileHash: "d".repeat(64),
+    } as const;
+    const operation = {
+      operationId: "profile-sync-1",
+      status: "planned",
+      expiresAt: timestamp,
+      planHash: "e".repeat(64),
+      sourceContentHash: hash,
+      targetDesignProfileId: "profile-1",
+      targetDesignProfileVersion: 2,
+      targetEffectiveProfileHash: "d".repeat(64),
+      styleContractIdentity: {
+        hash: "f".repeat(64), version: "runtime-style-contract@p3",
+        template: "astro-website", appRoot: "project", tokenMappings: { "color.primary": "--primary" },
+      },
+      snapshots: { baseHash: hash, currentHash: "b".repeat(64), targetHash: "c".repeat(64) },
+      items: [], conflictDecisions: {}, childRunId: null,
+    } as const;
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      const target = url.toString();
+      if (target.endsWith("design-context-manifest")) {
+        return { ok: true, status: 200, async json() { return { runId: "run-1", package: packageSummary, artifacts: [] }; } };
+      }
+      if (target.endsWith("design-context-diagnostics")) {
+        return {
+          ok: true, status: 200,
+          async json() {
+            return {
+              runId: "run-1", package: packageSummary, requiredReads: [], readFiles: [],
+              missingRequiredReads: [], gate: "ready", materialization: { hash: "m", ready: true },
+              styleContract: { verified: null },
+              verification: { policyId: "website-verification@1", registryVersion: "runtime-verifier-registry@1", capabilities: {} },
+              fidelity: {
+                status: "failed", checkedAt: "2026-07-15T00:00:00Z", outputVersionId: "version-1",
+                requiredFailedRuleIds: ["craft:responsive-layout:no-horizontal-overflow:375"],
+                assertions: [{
+                  ruleId: "craft:responsive-layout:no-horizontal-overflow:375", recipeId: "responsive-layout",
+                  priority: "required", kind: "viewport", route: "/", viewport: 375,
+                  selector: "html", property: "scrollWidth", actualSummary: "420px",
+                  expectedSummary: "375px", comparator: "less-than-or-equal", passed: false,
+                  reason: "Page width exceeds the required mobile viewport.",
+                }],
+                repairContext: { targets: ["project/src/styles/global.css"], instructions: ["Repair imported source."] },
+              },
+            };
+          },
+        };
+      }
+      return { ok: true, status: 200, async json() { return operation; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local", fetch: fetchImpl, publicPrincipalToken: "principal-token",
+    });
+
+    await client.getRunDesignContextManifest("run/1");
+    const diagnostics = await client.getRunDesignContextDiagnostics("run/1");
+    expect(diagnostics.fidelity?.assertions[0]).toMatchObject({
+      ruleId: "craft:responsive-layout:no-horizontal-overflow:375",
+      viewport: 375,
+      actualSummary: "420px",
+      expectedSummary: "375px",
+    });
+    await client.planDesignProfileSync("run/1", {
+      targetDesignProfileId: "profile-1", targetDesignProfileVersion: 2,
+      targetEffectiveProfileHash: "d".repeat(64), expectedSourceContentHash: hash,
+      idempotencyKey: "plan-key",
+    });
+    await client.confirmDesignProfileSync("run/1", "profile-sync/1", {
+      planHash: "e".repeat(64), conflictDecisions: {}, idempotencyKey: "confirm-key",
+    });
+
+    expect(calls.map((call) => call.url)).toEqual([
+      "http://runtime.local/runs/run%2F1/design-context-manifest",
+      "http://runtime.local/runs/run%2F1/design-context-diagnostics",
+      "http://runtime.local/runs/run%2F1/design-profile-sync-plan",
+      "http://runtime.local/runs/run%2F1/design-profile-sync-operations/profile-sync%2F1/confirm",
+    ]);
+    for (const call of calls) {
+      expect(call.init?.headers).toMatchObject({ authorization: "Bearer principal-token" });
+    }
+  });
+
   it("parses run event messages with the shared AgentEvent schema", () => {
     const message = parseRunEventMessage(
       JSON.stringify({

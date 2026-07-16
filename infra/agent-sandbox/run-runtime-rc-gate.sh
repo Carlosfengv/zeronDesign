@@ -40,6 +40,9 @@ if [[ "${rc_mode}" == "release" && -z "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; th
   printf 'release mode requires RUNTIME_PROVIDER_APPROVAL_ID\n' >&2
   exit 2
 fi
+evidence_dir="${RUNTIME_RC_EVIDENCE_DIR:-services/runtime/target/e2e-evidence/${cluster_name}}"
+mkdir -p "${evidence_dir}"
+preflight_evidence="${evidence_dir}/preflight.json"
 if [[ "${RUNTIME_RC_SKIP_PREFLIGHT:-0}" == "1" ]]; then
   if [[ "${rc_mode}" == "release" ]]; then
     printf 'RUNTIME_RC_SKIP_PREFLIGHT is not allowed in release mode\n' >&2
@@ -48,9 +51,11 @@ if [[ "${RUNTIME_RC_SKIP_PREFLIGHT:-0}" == "1" ]]; then
   printf 'Skipping preflight in audit mode by explicit request\n'
 else
   if [[ "${rc_mode}" == "release" ]]; then
-    PREFLIGHT_PREFETCH_IMAGES=1 bash infra/agent-sandbox/preflight-runtime-rc.sh
+    PREFLIGHT_PREFETCH_IMAGES=1 PREFLIGHT_EVIDENCE_PATH="${preflight_evidence}" \
+      bash infra/agent-sandbox/preflight-runtime-rc.sh
   else
-    bash infra/agent-sandbox/preflight-runtime-rc.sh
+    PREFLIGHT_PREFETCH_IMAGES=0 PREFLIGHT_EVIDENCE_PATH="${preflight_evidence}" \
+      bash infra/agent-sandbox/preflight-runtime-rc.sh
   fi
 fi
 
@@ -61,8 +66,6 @@ if [[ "${rc_mode}" == "release" && "${dirty_count}" != "0" ]]; then
   printf 'release mode requires a clean worktree; dirty files=%s\n' "${dirty_count}" >&2
   exit 2
 fi
-evidence_dir="${RUNTIME_RC_EVIDENCE_DIR:-services/runtime/target/e2e-evidence/${cluster_name}}"
-mkdir -p "${evidence_dir}"
 cluster_exists=false
 if "${K3D}" cluster list --no-headers 2>/dev/null | awk '{print $1}' | rg -Fxq "${cluster_name}"; then
   cluster_exists=true
@@ -88,6 +91,23 @@ for required in \
   secret/anydesign-workspace-channel-signer \
   deployment/anydesign-npm-proxy; do
   "${KUBECTL}" get "${required}" -n anydesign-runtime >/dev/null
+done
+"${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml >/dev/null
+for authorization in \
+  'get sandboxes.agents.x-k8s.io' \
+  'get sandboxtemplates.extensions.agents.x-k8s.io' \
+  'get sandboxwarmpools.extensions.agents.x-k8s.io' \
+  'create sandboxclaims.extensions.agents.x-k8s.io'; do
+  verb="${authorization%% *}"
+  resource="${authorization#* }"
+  allowed="$("${KUBECTL}" auth can-i "${verb}" "${resource}" \
+    -n anydesign-sandboxes \
+    --as=system:serviceaccount:anydesign-runtime:anydesign-runtime)"
+  if [[ "${allowed}" != "yes" ]]; then
+    printf 'Runtime ServiceAccount lacks required Kubernetes permission: %s %s\n' \
+      "${verb}" "${resource}" >&2
+    exit 3
+  fi
 done
 existing_rc_claims="$(${KUBECTL} get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
   | rg '/project-rc-' || true)"
@@ -129,6 +149,7 @@ port_forward_pid=""
 gate_id="$(date +%s)"
 provider_secret_created=false
 provider_secret_file=""
+dcp_runtime_flags_enabled=false
 gate_work_dir="$(mktemp -d)"
 active_recovery_evidence="${evidence_dir}/active-recovery.json"
 rm -f "${active_recovery_evidence}"
@@ -145,10 +166,18 @@ cleanup() {
     "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime \
       --timeout=120s >/dev/null 2>&1 || true
   fi
+  if [[ "${dcp_runtime_flags_enabled}" == "true" ]]; then
+    "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+      RUNTIME_DESIGN_CONTEXT_PACKAGE_V1- \
+      RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1- \
+      RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON- >/dev/null 2>&1 || true
+    "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime \
+      --timeout=120s >/dev/null 2>&1 || true
+  fi
   [[ -z "${provider_secret_file}" ]] || rm -f "${provider_secret_file}"
   if [[ -n "${gate_id}" ]]; then
     "${KUBECTL}" get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
-      | rg "/project-rc-(website|docs)-${gate_id}-" \
+      | rg "/project-rc-(website|docs)(-dcp-enforced(-dcp-provider)?)?-${gate_id}-" \
       | xargs -r "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null 2>&1 || true
   fi
   rm -rf "${principal_key_dir}"
@@ -216,8 +245,15 @@ rm -f "${runtime_image_archive}"
   --from-file="fixture-model-gateway.js=infra/agent-sandbox/runtime/fixture-model-gateway.js" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 "${KUBECTL}" apply -f infra/agent-sandbox/runtime/fixture-model-gateway.yaml
+"${KUBECTL}" set image deployment/fixture-model-gateway -n anydesign-runtime \
+  "gateway=${runtime_image}" >/dev/null
 sed "s|image: anydesign/runtime:dev|image: ${runtime_image}|" \
   infra/agent-sandbox/runtime/deployment.yaml | "${KUBECTL}" apply -f -
+"${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+  RUNTIME_DESIGN_CONTEXT_PACKAGE_V1=true \
+  RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1=true \
+  RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON- >/dev/null
+dcp_runtime_flags_enabled=true
 configure_deepseek_provider() {
   provider_secret_file="$(mktemp)"
   chmod 600 "${provider_secret_file}"
@@ -301,6 +337,33 @@ stop_runtime_port_forward() {
 }
 
 start_runtime_port_forward
+
+switch_runtime_provider() {
+  local mode="$1"
+  case "${mode}" in
+    fixture)
+      "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+        MODEL_PROVIDER=internal_gateway AGENT_MODEL- MODEL_STREAMING- >/dev/null
+      ;;
+    deepseek)
+      "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
+        MODEL_PROVIDER=deepseek AGENT_MODEL="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}" \
+        MODEL_STREAMING=true \
+        MODEL_REQUEST_TIMEOUT_SECONDS="${RUNTIME_RC_MODEL_REQUEST_TIMEOUT_SECONDS:-600}" >/dev/null
+      ;;
+    *)
+      printf 'unsupported Runtime provider switch: %s\n' "${mode}" >&2
+      return 2
+      ;;
+  esac
+  "${KUBECTL}" rollout restart deployment/anydesign-runtime -n anydesign-runtime >/dev/null
+  "${KUBECTL}" rollout status deployment/anydesign-runtime -n anydesign-runtime --timeout=300s >/dev/null
+  stop_runtime_port_forward
+  start_runtime_port_forward
+  runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime -o json \
+    | node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(0,"utf8")).items.find(p=>!p.metadata.deletionTimestamp&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));if(!p)process.exit(2);process.stdout.write(p.metadata.name)')"
+}
+
 version_json="$(curl --fail --silent "${base_url}/version")"
 node -e '
 const v=JSON.parse(process.argv[1]);
@@ -320,10 +383,54 @@ const kid=`ed25519-${crypto.createHash("sha256").update(publicDer).digest("hex")
 const now=Math.floor(Date.now()/1000);
 const encode=value=>Buffer.from(JSON.stringify(value)).toString("base64url");
 const header=encode({alg:"EdDSA",typ:"JWT",kid});
-const payload=encode({iss:"anydesign-bff",aud:"anydesign-runtime-public",sub:process.argv[3],jti:crypto.randomBytes(16).toString("hex"),iat:now,exp:now+120,projectId:process.argv[2],operations:["preview.read"]});
+const payload=encode({iss:"anydesign-bff",aud:"anydesign-runtime-public",sub:process.argv[3],jti:crypto.randomBytes(16).toString("hex"),iat:now,exp:now+120,projectId:process.argv[2],operations:["preview.read","project.read","project.write"]});
 const input=`${header}.${payload}`;
 process.stdout.write(`${input}.${crypto.sign(null,Buffer.from(input),key).toString("base64url")}`);
 ' "${principal_private_key}" "${project_id}" "${principal_id}"
+}
+
+configure_enforced_dcp_fixture() {
+  local project_id="$1"
+  local profile_payload created profile_id profile_version policy_payload policy
+  profile_payload="$(node -e '
+const projectId=process.argv[1];
+const profile={
+  status:"active",scope:{projectId},source:{kind:"manual"},
+  product:{name:"RC Enforced DCP",category:"runtime release gate",audience:["release operators"],primaryUseCases:["verify deployed website DCP"],productQualities:["deterministic","auditable"]},
+  brand:{voice:{tone:["clear","precise"],sentenceStyle:"technical",vocabulary:{prefer:["runtime","evidence"],avoid:["magic"]},writingRules:["Use concrete status text."]},messaging:{headlineStyle:"specific",bodyStyle:"concise",ctaStyle:"verb first",proofStyle:"evidence based",forbiddenClaims:["guaranteed"]}},
+  visual:{direction:"quiet operational interface",principles:["scan friendly"],moodKeywords:["calm"],avoidKeywords:["flashy"],composition:{},imagery:{},motion:{}},
+  tokens:{color:{},typography:{},radius:{},shadow:{},spacing:{}},
+  runtimeTokenMapping:{"color.background":"#ffffff","color.surface":"#f8fafc","color.surfaceStrong":"#e2e8f0","color.text":"#0f172a","color.muted":"#475569","color.primary":"#2563eb","color.primaryContrast":"#ffffff","color.border":"#cbd5e1","radius.card":"8px","radius.control":"6px","font.sans":"Inter, sans-serif","shadow.soft":"0 1px 2px rgba(15, 23, 42, 0.12)"},
+  components:{primitives:{button:{intent:"clear action",usage:["primary actions"],avoid:["overuse"]},input:{intent:"precise entry",usage:["forms"],avoid:["placeholder-only labels"]},card:{intent:"group repeated items",usage:["lists"],avoid:["nested cards"]},badge:{intent:"show status",usage:["statuses"],avoid:["decorative noise"]}}},
+  websiteContext:{enforcementMode:"enforced",craftPacks:["accessibility-baseline","responsive-layout"]},content:{},accessibility:{},
+  technical:{allowedTemplates:["astro-website"],preferredTemplates:{website:"astro-website"},cssStrategy:"runtime-style-contract",dependencyPolicy:{},filePolicy:{designProfilePath:"/workspace/inputs/design-profile.json",designMarkdownPath:"/workspace/inputs/design.md",styleContractPath:"/workspace/state/style-contract.json"}},
+  governance:{conflictBehavior:"ask"}
+};
+process.stdout.write(JSON.stringify({projectId,name:"RC Enforced DCP Profile",profile}));
+' "${project_id}")"
+  created="$(curl --fail --silent -X POST -H 'content-type: application/json' \
+    -d "${profile_payload}" "${base_url}/design-profiles")"
+  profile_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).designProfile.id)' "${created}")"
+  profile_version="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).designProfile.version))' "${created}")"
+  curl --fail --silent -X POST -H 'content-type: application/json' \
+    -d "$(node -e 'process.stdout.write(JSON.stringify({designProfileId:process.argv[1]}))' "${profile_id}")" \
+    "${base_url}/projects/${project_id}/design-profile" >/dev/null
+  policy_payload="$(node -e '
+process.stdout.write(JSON.stringify({designProfileId:process.argv[1],designProfileVersion:Number(process.argv[2]),enabled:true,expectedRevision:0,updatedBy:"runtime-rc-enforced-dcp-fixture"}));
+' "${profile_id}" "${profile_version}")"
+  policy="$(curl --fail --silent -X PUT \
+    -H 'content-type: application/json' \
+    -H 'x-anydesign-internal: true' \
+    -H "x-runtime-admin-token: ${admin_token}" \
+    -d "${policy_payload}" \
+    "${base_url}/internal/projects/${project_id}/design-context-enforcement")"
+  node -e '
+const policy=JSON.parse(process.argv[1]).policy;
+if(!policy?.enabled||policy.revision!==1||policy.designProfileId!==process.argv[2]||policy.designProfileVersion!==Number(process.argv[3]))process.exit(2);
+' "${policy}" "${profile_id}" "${profile_version}"
+  node -e '
+process.stdout.write(JSON.stringify({designProfileId:process.argv[1],designProfileVersion:Number(process.argv[2]),policyRevision:1},null,2));
+' "${profile_id}" "${profile_version}"
 }
 
 inject_active_preview_recovery() {
@@ -360,7 +467,8 @@ inject_active_preview_recovery() {
     printf 'Runtime restart did not replace the serving Pod\n' >&2
     return 1
   }
-  recovered_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+  recovered_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
+    "${base_url}/projects/${project_id}/runtime-state")"
   node -e '
 const before=JSON.parse(process.argv[1]);
 const after=JSON.parse(process.argv[2]);
@@ -402,7 +510,7 @@ fs.writeFileSync(process.argv[1],JSON.stringify({
 }
 
 capture_dependency_workspace_evidence() {
-  local project_json="$1"
+  local project_json="$1" proxy_host="anydesign-npm-proxy.anydesign-runtime.svc.cluster.local"
   local pod_uid pods_json record project_pod project_ip lock_hash request_count proxy_logs_file
   pod_uid="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).podUid)' "${project_json}")"
   pods_json="$(${KUBECTL} get pods -n anydesign-sandboxes -o json)"
@@ -413,6 +521,18 @@ if(!pod||pod.status.phase!=="Running")process.exit(2);
 process.stdout.write(`${pod.metadata.name}\t${pod.status.podIP||""}`);
 ' "${pods_json}" "${pod_uid}")"
   IFS=$'\t' read -r project_pod project_ip <<<"${record}"
+  ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+    "require('dns').lookup('${proxy_host}',e=>{if(e)throw e})"
+  ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+    "fetch('http://${proxy_host}:4873/-/ping').then(r=>{if(!r.ok)process.exit(2)})"
+  if ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+    "const t=setTimeout(()=>process.exit(0),4000);fetch('https://registry.npmjs.org/').then(()=>{clearTimeout(t);process.exit(3)}).catch(()=>{clearTimeout(t);process.exit(0)})"; then
+    :
+  else
+    printf 'direct public npm registry unexpectedly reachable from Runtime project Pod: pod=%s uid=%s\n' \
+      "${project_pod}" "${pod_uid}" >&2
+    return 1
+  fi
   lock_hash="$(${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- sh -lc '
 test -d /workspace/project/node_modules || exit 10
 for file in /workspace/project/package-lock.json /workspace/project/pnpm-lock.yaml; do
@@ -433,7 +553,8 @@ exit 11
   node -e '
 process.stdout.write(JSON.stringify({
   podUid:process.argv[1],pod:process.argv[2],podIp:process.argv[3],nodeModulesPresent:true,
-  lockfileSha256:process.argv[4],tarballRequestCount:Number(process.argv[5]),passed:true
+  lockfileSha256:process.argv[4],tarballRequestCount:Number(process.argv[5]),
+  networkChecks:{dnsResolved:true,proxyReachable:true,directNpmjsDenied:true},passed:true
 }));
 ' "${pod_uid}" "${project_pod}" "${project_ip}" "${lock_hash}" "${request_count}"
 }
@@ -445,25 +566,31 @@ run_fixture() {
   local expected_text="$3"
   local output_file="$4"
   local inject_recovery="${5:-false}"
+  local repair_expected_text="${6:-${expected_text}}"
   local brief_payload brief_run conversation brief_id build_payload build_run events artifact_url
-  local build_state base_version_id binding_id edit_payload edit_run release_data project_evidence artifact_status artifact_assertions dependency_evidence
+  local build_state base_version_id binding_id edit_payload edit_run release_data project_evidence artifact_status artifact_assertions artifact_assertion_path artifact_assertion_url dependency_evidence
+  local dcp_build_diagnostics dcp_edit_diagnostics dcp_repair_diagnostics
+  local edit_version_id review_payload review_run review_events finding_id repair_payload repair_run repair_events
   local edit_response edit_status
   local build_preview_lease_id
   local principal_token wrong_project_token anonymous_status cross_project_status preview_url preview_prefix owner_status
   local cancel_probe_payload cancel_probe_run cancel_probe_response cancelled_preview_status
-  local stage_timeout brief_wait_timeout brief_text edit_text confirmation_ready
+  local stage_timeout brief_wait_timeout brief_text edit_text build_expected_text confirmation_ready seeded_review_provider
+  seeded_review_provider=false
   stage_timeout=240
   brief_wait_timeout=120
   brief_text="Create a ${kind} RC fixture"
   edit_text="Apply the deterministic deployed RC edit."
+  build_expected_text="RC ${kind} Built"
   if [[ "${active_provider_mode}" == "deepseek" ]]; then
     stage_timeout="${RUNTIME_RC_REAL_STAGE_TIMEOUT_SECONDS:-1800}"
     brief_wait_timeout="${RUNTIME_RC_REAL_BRIEF_WAIT_SECONDS:-720}"
-    brief_text="Create a polished but compact ${kind} using the initialized Runtime template. The final edited artifact must contain the exact text ${expected_text}. Use only Runtime tools, build, open the preview, take a screenshot, report the candidate, and complete the run. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
-    edit_text="Edit the current ${kind} so the served artifact visibly contains the exact text ${expected_text}. Rebuild, start and inspect preview, take a nonblank screenshot, promote the candidate, then complete. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    brief_text="Create a polished but compact ${kind} using the initialized Runtime template. This Build-stage artifact must visibly contain the exact text ${build_expected_text}. Use only Runtime tools, build, open the preview, take a screenshot, report the candidate, and complete the run. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    edit_text="Edit the current ${kind} by replacing the visible Build-stage text ${build_expected_text} with the exact text ${expected_text}. Make and verify that source mutation before the first preview.publish call. Then inspect the preview, take a nonblank screenshot, promote the candidate, and complete. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
     if [[ "${kind}" == "docs" ]]; then
-      brief_text="Create a minimal Docs artifact from the initialized Fumadocs template. Keep existing structure and change only the smallest existing source needed. Do not create a full documentation set and do not submit any write over 2000 characters. The final edited artifact must contain the exact text ${expected_text}. Use fs.patch or fs.multi_patch after fs.read, then publish and complete."
-      edit_text="Make one minimal patch to the existing Docs source so the served artifact contains the exact text ${expected_text}. Do not rewrite whole files and do not submit any write over 2000 characters. Rebuild with preview.publish, verify the text, then complete."
+      build_expected_text="RC Docs Built"
+      brief_text="Create a minimal Docs artifact from the initialized Fumadocs template. Keep existing structure and change only the smallest existing source needed. Do not create a full documentation set and do not submit any write over 2000 characters. This Build-stage Docs artifact must contain the exact text ${build_expected_text}. Use fs.patch or fs.multi_patch after fs.read, then publish and complete."
+      edit_text="Before any preview.publish call, make one minimal source patch that replaces the exact text ${build_expected_text} with ${expected_text} on the authored Docs page. Do not rewrite whole files and do not submit any write over 2000 characters. Then publish, verify ${expected_text} at the served Docs route, and complete."
     fi
   fi
   curl --fail --silent -X PUT \
@@ -472,14 +599,18 @@ run_fixture() {
     -H "x-runtime-admin-token: ${admin_token}" \
     -d "{\"ownerPrincipalId\":\"${principal_id}\"}" \
     "${base_url}/internal/projects/${project_id}/access" >/dev/null
+  principal_token="$(issue_principal_token "${project_id}")"
   brief_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "$(node -e 'process.stdout.write(JSON.stringify({projectId:process.argv[1],phase:"brief",agentProfile:"brief",inputContext:{contentSources:[{id:"source-1",kind:"prompt",text:process.argv[2],readable:true}]}}))' "${project_id}" "${brief_text}")" \
     "${base_url}/runs")"
   brief_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${brief_payload}")"
   confirmation_ready=false
   for _ in $(seq 1 "${brief_wait_timeout}"); do
-    conversation="$(curl --fail --silent "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
+    principal_token="$(issue_principal_token "${project_id}")"
+    conversation="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
     if [[ "${conversation}" == *'"briefId"'* || "${conversation}" == *'"kind":"approval_request"'* || "${conversation}" == *"Requested brief confirmation"* || "${conversation}" == *"confirmation_requested"* || "${conversation}" == *"Confirm this deterministic"* ]]; then
       confirmation_ready=true
       break
@@ -491,13 +622,17 @@ run_fixture() {
       "${project_id}" "${brief_run}" "${conversation}" >&2
     exit 4
   fi
+  principal_token="$(issue_principal_token "${project_id}")"
   curl --fail --silent \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d '{"userMessage":"confirm"}' \
     "${base_url}/runs/${brief_run}/continue" >/dev/null
   brief_id=""
   for _ in $(seq 1 120); do
-    conversation="$(curl --fail --silent "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
+    principal_token="$(issue_principal_token "${project_id}")"
+    conversation="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
     brief_id="$(node -e '
 const c=JSON.parse(process.argv[1]);
 const item=[...c.items].reverse().find(x=>x.metadata&&x.metadata.briefId);
@@ -511,15 +646,25 @@ process.stdout.write(item?.metadata?.briefId||"");
       "${project_id}" "${brief_run}" "${conversation}" >&2
     exit 4
   fi
+  principal_token="$(issue_principal_token "${project_id}")"
   build_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "{\"projectId\":\"${project_id}\",\"phase\":\"build\",\"agentProfile\":\"build\",\"inputContext\":{\"briefId\":\"${brief_id}\"}}" \
     "${base_url}/runs")"
   build_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${build_payload}")"
-  events="$(curl --fail --silent --max-time "${stage_timeout}" "${base_url}/runs/${build_run}/events")"
+  events="$(curl --fail --silent --max-time "${stage_timeout}" \
+    -H "authorization: Bearer ${principal_token}" "${base_url}/runs/${build_run}/events")"
   if [[ "${events}" != *'"type":"run.completed"'* || "${events}" != *'"status":"completed"'* ]]; then
     printf 'Build did not complete: project=%s run=%s\n%s\n' "${project_id}" "${build_run}" "${events}" >&2
     exit 4
+  fi
+  # Provider SSE waits may outlive the deliberately short principal JWT.
+  principal_token="$(issue_principal_token "${project_id}")"
+  if [[ "${project_id}" == *"dcp-enforced"* ]]; then
+    dcp_build_diagnostics="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/runs/${build_run}/design-context-diagnostics")"
   fi
   build_preview_lease_id="$(node -e '
 for(const line of process.argv[1].split(/\r?\n/)){
@@ -531,17 +676,22 @@ for(const line of process.argv[1].split(/\r?\n/)){
 }
 process.exit(2);
 ' "${events}")"
-  build_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+  build_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
+    "${base_url}/projects/${project_id}/runtime-state")"
   base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
   binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
   if [[ "${inject_recovery}" == "true" && "${kind}" == "website" && ! -s "${active_recovery_evidence}" ]]; then
     inject_active_preview_recovery "${project_id}" "${build_state}" "${build_preview_lease_id}"
-    build_state="$(curl --fail --silent "${base_url}/projects/${project_id}/runtime-state")"
+    principal_token="$(issue_principal_token "${project_id}")"
+    build_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/runtime-state")"
     base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
     binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
   fi
+  principal_token="$(issue_principal_token "${project_id}")"
   edit_response="$(curl --silent --show-error --write-out $'\n%{http_code}' \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "{\"projectId\":\"${project_id}\",\"phase\":\"edit\",\"agentProfile\":\"edit\",\"inputContext\":{\"baseVersionId\":\"${base_version_id}\",\"sandboxBindingId\":\"${binding_id}\"}}" \
     "${base_url}/runs")"
   edit_status="${edit_response##*$'\n'}"
@@ -552,19 +702,112 @@ process.exit(2);
     exit 4
   fi
   edit_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${edit_payload}")"
+  principal_token="$(issue_principal_token "${project_id}")"
   curl --fail --silent \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "$(node -e 'process.stdout.write(JSON.stringify({userMessage:process.argv[1]}))' "${edit_text}")" \
     "${base_url}/runs/${edit_run}/continue" >/dev/null
-  events="$(curl --fail --silent --max-time "${stage_timeout}" "${base_url}/runs/${edit_run}/events")"
+  events="$(curl --fail --silent --max-time "${stage_timeout}" \
+    -H "authorization: Bearer ${principal_token}" "${base_url}/runs/${edit_run}/events")"
   if [[ "${events}" != *'"type":"run.completed"'* || "${events}" != *'"status":"completed"'* ]]; then
     printf 'Edit did not complete cleanly: project=%s run=%s\n%s\n' "${project_id}" "${edit_run}" "${events}" >&2
     exit 4
   fi
+  principal_token="$(issue_principal_token "${project_id}")"
+  if [[ "${project_id}" == *"dcp-enforced"* ]]; then
+    dcp_edit_diagnostics="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/runs/${edit_run}/design-context-diagnostics")"
+    edit_version_id="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/runtime-state" \
+      | node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).currentVersionId)')"
+    if [[ "${active_provider_mode}" == "deepseek" && "${project_id}" == *"dcp-provider"* ]]; then
+      # Seed only the Review finding deterministically. Build/Edit/Repair stay
+      # on the approved real Provider so the gate measures mutation compliance
+      # independently from stochastic finding discovery.
+      switch_runtime_provider fixture
+      seeded_review_provider=true
+      principal_token="$(issue_principal_token "${project_id}")"
+    fi
+    review_payload="$(curl --fail --silent \
+      -H 'content-type: application/json' \
+      -H "authorization: Bearer ${principal_token}" \
+      -d "$(node -e 'process.stdout.write(JSON.stringify({projectId:process.argv[1],phase:"review",agentProfile:"visual-review",inputContext:{parentRunId:process.argv[2]}}))' "${project_id}" "${edit_run}")" \
+      "${base_url}/runs")"
+    review_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${review_payload}")"
+    review_events="$(curl --fail --silent --max-time "${stage_timeout}" \
+      -H "authorization: Bearer ${principal_token}" "${base_url}/runs/${review_run}/events")"
+    if [[ "${review_events}" != *'"type":"run.completed"'* || "${review_events}" != *'"status":"completed"'* ]]; then
+      printf 'Review did not complete cleanly: project=%s run=%s\n%s\n' \
+        "${project_id}" "${review_run}" "${review_events}" >&2
+      exit 4
+    fi
+    if [[ "${seeded_review_provider}" == "true" ]]; then
+      switch_runtime_provider deepseek
+    fi
+    principal_token="$(issue_principal_token "${project_id}")"
+    finding_id="$(node -e '
+for(const line of process.argv[1].split(/\r?\n/)){
+  if(!line.startsWith("data: "))continue;
+  try{const event=JSON.parse(line.slice(6));if(event.type==="review.finding"&&event.severity==="blocking"){
+    process.stdout.write(event.findingId);process.exit(0);
+  }}catch{}
+}
+process.exit(2);
+' "${review_events}")"
+    repair_payload="$(curl --fail --silent \
+      -H 'content-type: application/json' \
+      -H "authorization: Bearer ${principal_token}" \
+      -d "$(node -e 'process.stdout.write(JSON.stringify({projectId:process.argv[1],phase:"repair",agentProfile:"repair",inputContext:{parentRunId:process.argv[2],findingIds:[process.argv[3]]}}))' "${project_id}" "${review_run}" "${finding_id}")" \
+      "${base_url}/runs")"
+    repair_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${repair_payload}")"
+    repair_events="$(curl --fail --silent --max-time "${stage_timeout}" \
+      -H "authorization: Bearer ${principal_token}" "${base_url}/runs/${repair_run}/events")"
+    if [[ "${repair_events}" != *'"type":"run.completed"'* || "${repair_events}" != *'"status":"completed"'* ]]; then
+      printf 'Repair did not complete cleanly: project=%s run=%s finding=%s\n%s\n' \
+        "${project_id}" "${repair_run}" "${finding_id}" "${repair_events}" >&2
+      exit 4
+    fi
+    principal_token="$(issue_principal_token "${project_id}")"
+    dcp_repair_diagnostics="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/runs/${repair_run}/design-context-diagnostics")"
+    node -e '
+const build=JSON.parse(process.argv[1]);
+const edit=JSON.parse(process.argv[2]);
+const repair=JSON.parse(process.argv[3]);
+for(const value of [build,edit,repair]) {
+  if(value.package?.effectiveCompatibilityMode!=="enforced") throw new Error("DCP fixture did not enter enforced mode");
+  if(value.gate!=="ready"||value.missingRequiredReads?.length!==0||value.materialization?.ready!==true||value.styleContract?.verified!==true) throw new Error("DCP required-read/materialization/style-contract gate is incomplete");
+  for(const capability of ["computed-style","a11y","viewport"]) if(value.verification?.capabilities?.[capability]?.available!==true) throw new Error(`DCP verifier is unavailable: ${capability}`);
+}
+if(new Set([build.runId,edit.runId,repair.runId]).size!==3) throw new Error("DCP Build/Edit/Repair run IDs must be distinct");
+if(new Set([build.package.contentHash,edit.package.contentHash,repair.package.contentHash]).size!==1) throw new Error("Edit/Repair did not inherit frozen DCP content hash");
+if(new Set([build.materialization.hash,edit.materialization.hash,repair.materialization.hash]).size!==1) throw new Error("DCP materialization hash changed across Build/Edit/Repair");
+for(const path of ["inputs/design-profile-usage.md","inputs/component-recipes.json","state/style-contract.json"]) if(!repair.readFiles?.includes(path)) throw new Error(`Repair did not read required DCP file: ${path}`);
+' "${dcp_build_diagnostics}" "${dcp_edit_diagnostics}" "${dcp_repair_diagnostics}"
+  fi
+  # Never reuse a token issued before a model/build wait for artifact access.
+  principal_token="$(issue_principal_token "${project_id}")"
   artifact_url="${base_url}/artifacts/${project_id}/current/"
-  artifact_assertions="$(node -e 'process.stdout.write(JSON.stringify({url:process.argv[1],expectedText:process.argv[2]}))' \
-    "${artifact_url}" "${expected_text}" \
+  artifact_assertion_path="/"
+  artifact_assertion_url="${artifact_url}"
+  if [[ "${kind}" == "docs" && "${active_provider_mode}" == "deepseek" ]]; then
+    # The initialized Fumadocs source renders authored content at /docs/;
+    # the root page is only its stable navigation shell.
+    artifact_assertion_path="/docs/"
+    artifact_assertion_url="${artifact_url}docs/"
+  fi
+  artifact_assertions="$(node -e 'process.stdout.write(JSON.stringify({url:process.argv[1],expectedText:process.argv[2],headers:{authorization:`Bearer ${process.argv[3]}`}}))' \
+    "${artifact_assertion_url}" "${repair_expected_text}" "${principal_token}" \
     | node services/runtime/scripts/assert-artifact-render.mjs)"
+  artifact_assertions="$(node -e '
+const evidence=JSON.parse(process.argv[1]);
+evidence.route=process.argv[2];
+process.stdout.write(JSON.stringify(evidence));
+' "${artifact_assertions}" "${artifact_assertion_path}")"
   project_evidence="$(curl --fail --silent \
     -H 'x-anydesign-internal: true' \
     -H "x-runtime-admin-token: ${admin_token}" \
@@ -579,6 +822,29 @@ const evidence=JSON.parse(process.argv[1]);
 evidence.dependencyEvidence=JSON.parse(process.argv[2]);
 process.stdout.write(JSON.stringify(evidence));
 ' "${project_evidence}" "${dependency_evidence}")"
+  if [[ "${project_id}" == *"dcp-enforced"* ]]; then
+    project_evidence="$(node -e '
+const evidence=JSON.parse(process.argv[1]);
+const [buildRunId,editRunId,reviewRunId,repairRunId,findingId,candidateVersionId]=process.argv.slice(2,8);
+const reviewRepair=evidence.reviewRepair;
+if(!reviewRepair||reviewRepair.editRunId!==editRunId||reviewRepair.reviewRunId!==reviewRunId||reviewRepair.repairRunId!==repairRunId) throw new Error("release evidence Review/Repair lineage mismatch");
+if(reviewRepair.findings?.length!==1) throw new Error("release evidence must contain exactly one repaired finding");
+const finding=reviewRepair.findings[0];
+if(finding.findingId!==findingId||finding.versionId!==candidateVersionId||finding.severity!=="blocking"||finding.repairable!==true||finding.status!=="fixed") throw new Error("release evidence repaired finding is incomplete");
+evidence.designContextEnforced={
+  lifecycle:{buildRunId,editRunId,reviewRunId,repairRunId,findingId,candidateVersionId,findingStatus:"fixed"},
+  build:JSON.parse(process.argv[8]),edit:JSON.parse(process.argv[9]),repair:JSON.parse(process.argv[10])
+};
+if(process.argv[11]==="true") evidence.designContextEnforced.reviewProvenance={
+  source:"fixture-seeded",
+  mutationProvider:"deepseek",
+  reviewProvider:"deterministic-tool-sequence",
+  repairProvider:"deepseek"
+};
+process.stdout.write(JSON.stringify(evidence));
+' "${project_evidence}" "${build_run}" "${edit_run}" "${review_run}" "${repair_run}" "${finding_id}" "${edit_version_id}" \
+      "${dcp_build_diagnostics}" "${dcp_edit_diagnostics}" "${dcp_repair_diagnostics}" "${seeded_review_provider}")"
+  fi
   principal_token="$(issue_principal_token "${project_id}")"
   wrong_project_token="$(issue_principal_token "wrong-${project_id}")"
   preview_url="${base_url}/previews/$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).previewLeaseId)' "${project_evidence}")/"
@@ -597,6 +863,7 @@ process.stdout.write(JSON.stringify(evidence));
   fi
   cancel_probe_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "$(node -e '
 process.stdout.write(JSON.stringify({
   projectId:process.argv[1],phase:"edit",agentProfile:"edit",
@@ -606,6 +873,7 @@ process.stdout.write(JSON.stringify({
     "${base_url}/runs")"
   cancel_probe_run="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).runId)' "${cancel_probe_payload}")"
   cancel_probe_response="$(curl --fail --silent -X POST \
+    -H "authorization: Bearer ${principal_token}" \
     "${base_url}/runs/${cancel_probe_run}/cancel")"
   node -e '
 const response=JSON.parse(process.argv[1]);
@@ -628,7 +896,12 @@ process.stdout.write(JSON.stringify(evidence));
     -H 'x-anydesign-internal: true' \
     -H "x-runtime-admin-token: ${admin_token}" \
     "${base_url}/internal/projects/${project_id}/release-sandbox")"
-  artifact_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "${artifact_url}")"
+  # Artifact routes remain principal-protected after Sandbox release. Refresh the
+  # deliberately short JWT and prove project-scoped availability, not anonymous
+  # access (which must continue to return 401).
+  principal_token="$(issue_principal_token "${project_id}")"
+  artifact_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "authorization: Bearer ${principal_token}" "${artifact_url}")"
   node -e '
 const evidence=JSON.parse(process.argv[1]);
 const released=JSON.parse(process.argv[2]);
@@ -636,6 +909,7 @@ evidence.kind=process.argv[3];
 evidence.artifactUrl=new URL(evidence.artifactUrl,process.argv[4]).toString();
 evidence.sandboxReleasedAt=released.releasedAt;
 evidence.artifactHttpStatusAfterRelease=Number(process.argv[5]);
+evidence.artifactAccessAfterRelease={authentication:"project-principal",projectId:evidence.projectId,httpStatus:Number(process.argv[5]),authenticated:true};
 evidence.artifactAssertions=JSON.parse(process.argv[6]);
 process.stdout.write(JSON.stringify(evidence));
 ' "${project_evidence}" "${release_data}" "${kind}" "${base_url}" "${artifact_status}" "${artifact_assertions}" \
@@ -660,6 +934,7 @@ fs.writeFileSync(process.argv[1],JSON.stringify({
 
 website=""
 docs=""
+provider_dcp=""
 if [[ "${project_filter}" != "all" ]]; then
   if [[ "${project_filter}" == "website" ]]; then
     website_file="${gate_work_dir}/website.json"
@@ -705,6 +980,19 @@ recovery_probe_file="${gate_work_dir}/recovery-probe.json"
 run_fixture "rc-website-${gate_id}-recovery" website 'RC Website Edited' \
   "${recovery_probe_file}" true
 
+dcp_project_id="rc-website-dcp-enforced-${gate_id}"
+dcp_fixture_policy="$(configure_enforced_dcp_fixture "${dcp_project_id}")"
+dcp_fixture_file="${gate_work_dir}/enforced-dcp-website.json"
+run_fixture "${dcp_project_id}" website 'RC Enforced DCP Website Repaired' \
+  "${dcp_fixture_file}" false
+dcp_fixture="$(node -e '
+const fixture=JSON.parse(process.argv[1]);
+const policy=JSON.parse(process.argv[2]);
+if(!fixture.designContextEnforced) throw new Error("missing enforced DCP fixture evidence");
+fixture.designContextEnforced.policy=policy;
+process.stdout.write(JSON.stringify(fixture));
+' "$(cat "${dcp_fixture_file}")" "${dcp_fixture_policy}")"
+
 if [[ "${provider_mode}" == "deepseek" ]]; then
   configure_deepseek_provider
   active_provider_mode="deepseek"
@@ -714,6 +1002,20 @@ if [[ "${provider_mode}" == "deepseek" ]]; then
   start_runtime_port_forward
   runtime_pod="$(${KUBECTL} get pods -n anydesign-runtime -l app=anydesign-runtime -o json \
     | node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(0,"utf8")).items.find(p=>!p.metadata.deletionTimestamp&&p.status.conditions?.some(c=>c.type==="Ready"&&c.status==="True"));if(!p)process.exit(2);process.stdout.write(p.metadata.name)')"
+  provider_dcp_project_id="rc-website-dcp-enforced-dcp-provider-${gate_id}"
+  provider_dcp_policy="$(configure_enforced_dcp_fixture "${provider_dcp_project_id}")"
+  provider_dcp_file="${gate_work_dir}/provider-dcp-website.json"
+  run_fixture "${provider_dcp_project_id}" website \
+    'RC Enforced DCP Provider Website Edited' "${provider_dcp_file}" false \
+    'RC Enforced DCP Provider Website Repaired'
+  provider_dcp="$(node -e '
+const project=JSON.parse(process.argv[1]);
+const policy=JSON.parse(process.argv[2]);
+if(!project.designContextEnforced) throw new Error("missing real-provider enforced DCP evidence");
+project.designContextEnforced.policy=policy;
+process.stdout.write(JSON.stringify(project));
+' "$(cat "${provider_dcp_file}")" "${provider_dcp_policy}")"
+  write_real_project_evidence dcp-website "${provider_dcp}"
   website_file="${gate_work_dir}/website.json"
   docs_file="${gate_work_dir}/docs.json"
   run_fixture "rc-website-${gate_id}-real" website 'RC Website Edited' "${website_file}" false
@@ -767,6 +1069,8 @@ const payload={
   runtimeManifestDigest:process.argv[22],
   fixture:JSON.parse(fs.readFileSync(process.argv[20],"utf8")),
   projects:[JSON.parse(process.argv[6]),JSON.parse(process.argv[7])],
+  enforcedDcpFixture:JSON.parse(process.argv[23]),
+  providerDcpProject:process.argv[24]?JSON.parse(process.argv[24]):null,
 };
 fs.writeFileSync(process.argv[1],JSON.stringify(payload,null,2)+"\n");
 ' "${evidence}" "${version_json}" "${runtime_pod}" "${runtime_image}" "${pod_image_id}" "${website}" "${docs}" \
@@ -781,7 +1085,7 @@ process.stdout.write(JSON.stringify({name:process.argv[2],kubeContext:process.ar
   "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
   "required" "true" "${provider_evidence_mode}" "${provider_model}" \
   "${RUNTIME_PROVIDER_APPROVAL_ID:-}" "${provider_credential_present}" "${fixture_evidence}" \
-  "${channel_evidence}" "${runtime_manifest_digest}"
+  "${channel_evidence}" "${runtime_manifest_digest}" "${dcp_fixture}" "${provider_dcp}"
 printf 'Runtime RC gate passed: %s\n' "${evidence}"
 
 npm_evidence="${evidence_dir}/npm-proxy.json"
@@ -799,6 +1103,7 @@ ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
 release_evidence="${evidence_dir}/release-evidence.json"
 aggregate_args=(
   --runtime "${evidence}"
+  --preflight "${preflight_evidence}"
   --channel "${channel_evidence}"
   --npm "${npm_evidence}"
   --recovery "${recovery_evidence}"

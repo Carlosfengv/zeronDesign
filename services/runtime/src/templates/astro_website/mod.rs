@@ -242,6 +242,13 @@ pub fn spec() -> TemplateSpec {
             structured_page_write: true,
             mdx_document_write: false,
             static_export: true,
+            supported_component_roles: &["navigation", "action", "content", "input"],
+            supported_craft_packs: &[
+                "accessibility-baseline",
+                "responsive-layout",
+                "form-states",
+                "anti-generic-ui",
+            ],
         },
         mutation_policy: MutationPolicySpec::ALLOW_ALL,
         style: StyleContractSpec {

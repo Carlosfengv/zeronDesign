@@ -3,10 +3,14 @@ import {
   ActivateDesignProfileRequest,
   ActivateDesignProfileResponseSchema,
   CancelRunResponseSchema,
+  ConfirmDesignProfileSyncRequest,
+  ConfirmDesignProfileSyncRequestSchema,
   BindProjectDesignProfileRequest,
   BriefResponseSchema,
   ContinueRunRequest,
   ContinueRunResponseSchema,
+  DesignContextDiagnosticsResponseSchema,
+  DesignContextManifestResponseSchema,
   ConversationListResponseSchema,
   CreateDesignSourceArtifactRequest,
   CreateReleaseRequest,
@@ -23,6 +27,8 @@ import {
   ImportDesignProfileRequest,
   ImportDesignProfileResponseSchema,
   ListDesignProfilesResponseSchema,
+  PlanDesignProfileSyncRequest,
+  PlanDesignProfileSyncRequestSchema,
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
   PublicationOperationResponseSchema,
@@ -30,6 +36,7 @@ import {
   ProjectAccessResponseSchema,
   ProjectDesignProfileResponseSchema,
   ProjectRuntimeStateResponseSchema,
+  ProfileTokenSyncOperationResponseSchema,
   ResolvePermissionRequest,
   ResolvePermissionResponseSchema,
   ReleasePackagingResponseSchema,
@@ -116,6 +123,21 @@ export type RuntimeClient = {
     request: ContinueRunRequest,
   ): Promise<z.output<typeof ContinueRunResponseSchema>>;
   cancelRun(runId: string): Promise<z.output<typeof CancelRunResponseSchema>>;
+  getRunDesignContextManifest(
+    runId: string,
+  ): Promise<z.output<typeof DesignContextManifestResponseSchema>>;
+  getRunDesignContextDiagnostics(
+    runId: string,
+  ): Promise<z.output<typeof DesignContextDiagnosticsResponseSchema>>;
+  planDesignProfileSync(
+    runId: string,
+    request: PlanDesignProfileSyncRequest,
+  ): Promise<z.output<typeof ProfileTokenSyncOperationResponseSchema>>;
+  confirmDesignProfileSync(
+    runId: string,
+    operationId: string,
+    request: ConfirmDesignProfileSyncRequest,
+  ): Promise<z.output<typeof ProfileTokenSyncOperationResponseSchema>>;
   createRelease(
     projectId: string,
     versionId: string,
@@ -271,6 +293,28 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       post(`/runs/${encodePathSegment(runId)}/continue`, request, ContinueRunResponseSchema),
     cancelRun: (runId) =>
       post(`/runs/${encodePathSegment(runId)}/cancel`, {}, CancelRunResponseSchema),
+    getRunDesignContextManifest: (runId) =>
+      get(
+        `/runs/${encodePathSegment(runId)}/design-context-manifest`,
+        DesignContextManifestResponseSchema,
+      ),
+    getRunDesignContextDiagnostics: (runId) =>
+      get(
+        `/runs/${encodePathSegment(runId)}/design-context-diagnostics`,
+        DesignContextDiagnosticsResponseSchema,
+      ),
+    planDesignProfileSync: (runId, request) =>
+      post(
+        `/runs/${encodePathSegment(runId)}/design-profile-sync-plan`,
+        PlanDesignProfileSyncRequestSchema.parse(request),
+        ProfileTokenSyncOperationResponseSchema,
+      ),
+    confirmDesignProfileSync: (runId, operationId, request) =>
+      post(
+        `/runs/${encodePathSegment(runId)}/design-profile-sync-operations/${encodePathSegment(operationId)}/confirm`,
+        ConfirmDesignProfileSyncRequestSchema.parse(request),
+        ProfileTokenSyncOperationResponseSchema,
+      ),
     createRelease: (projectId, versionId, request, idempotencyKey) =>
       requestJson(
         fetchImpl,

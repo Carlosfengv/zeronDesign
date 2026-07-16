@@ -4,6 +4,9 @@ metadata:
   name: anydesign-astro-website
   namespace: anydesign-sandboxes
 spec:
+  # The repository-owned NetworkPolicies are the only egress authority. The
+  # controller's Managed default adds a public-internet allow policy.
+  networkPolicyManagement: Unmanaged
   podTemplate:
     spec:
       serviceAccountName: anydesign-sandbox

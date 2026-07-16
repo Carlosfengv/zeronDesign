@@ -42,6 +42,7 @@ pub(in crate::http_api) async fn authenticate_candidate_preview(
                 status,
                 Json(ErrorResponse {
                     error: error.message().to_string(),
+                    error_code: None,
                 }),
             ));
         }

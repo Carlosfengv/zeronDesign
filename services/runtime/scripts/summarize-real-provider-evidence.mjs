@@ -9,6 +9,9 @@ function parseArgs(argv) {
     requireComputedStyle: false,
     computedStyleProject: "real-http-website",
     computedStyleStage: "edit",
+    requiredDcpProjects: [],
+    requiredRepairProjects: [],
+    requiredApprovalReference: null,
   };
   const requireValue = (arg, value) => {
     if (typeof value !== "string" || value.trim() === "" || value.startsWith("--")) {
@@ -54,6 +57,15 @@ function parseArgs(argv) {
       }
       args.requiredStages.push(requireValue(arg, next));
       index += 1;
+    } else if (arg === "--require-dcp-project") {
+      args.requiredDcpProjects.push(requireValue(arg, next));
+      index += 1;
+    } else if (arg === "--require-repair-project") {
+      args.requiredRepairProjects.push(requireValue(arg, next));
+      index += 1;
+    } else if (arg === "--require-approval-reference") {
+      args.requiredApprovalReference = requireValue(arg, next);
+      index += 1;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -66,6 +78,8 @@ function parseArgs(argv) {
   }
   args.requiredProjects = [...new Set(args.requiredProjects)];
   args.requiredStages = [...new Set(args.requiredStages)];
+  args.requiredDcpProjects = [...new Set(args.requiredDcpProjects)];
+  args.requiredRepairProjects = [...new Set(args.requiredRepairProjects)];
   return args;
 }
 
@@ -131,6 +145,10 @@ function isValidUrl(value) {
   } catch {
     return false;
   }
+}
+
+function isSha256(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function editArtifactTextAssertionPassed(evidence) {
@@ -269,7 +287,7 @@ function parseLog(text) {
   return summary;
 }
 
-function validateStage(record) {
+function validateStage(record, requireDcp, requiredApprovalReference) {
   const errors = [];
   if (!record.streamBegin) {
     errors.push("missing stream begin");
@@ -385,6 +403,17 @@ function validateStage(record) {
   for (const entry of record.evidence) {
     if (record.runId && entry.runId && entry.runId !== record.runId) {
       errors.push("evidence runId does not match stream runId");
+    }
+    if (requiredApprovalReference) {
+      if (!hasText(entry.provider?.name)) {
+        errors.push("provider name missing");
+      }
+      if (!hasText(entry.provider?.model)) {
+        errors.push("provider model missing");
+      }
+      if (entry.provider?.approvalReference !== requiredApprovalReference) {
+        errors.push("provider approvalReference does not match required approval");
+      }
     }
   }
 
@@ -633,8 +662,104 @@ function validateStage(record) {
     if (!editArtifactTextAssertionPassed(evidence)) {
       errors.push("edited artifact text assertion did not pass");
     }
-    if (!hasText(evidence.expectedArtifactText)) {
+  if (!hasText(evidence.expectedArtifactText)) {
       errors.push("edit expectedArtifactText missing");
+    }
+  }
+
+  if (record.stage === "repair") {
+    if (evidence.sourceSnapshotChanged !== true) {
+      errors.push("repair source snapshot did not change");
+    }
+    for (const field of [
+      "baseVersionId",
+      "repairedVersionId",
+      "baseSourceSnapshotUri",
+      "repairedSourceSnapshotUri",
+      "reviewRunId",
+      "findingId",
+      "candidateVersionId",
+    ]) {
+      if (!hasText(evidence[field])) errors.push(`repair ${field} missing`);
+    }
+    for (const field of ["baseSourceSnapshotUri", "repairedSourceSnapshotUri"]) {
+      if (hasText(evidence[field]) && !isValidUrl(evidence[field])) {
+        errors.push(`repair ${field} invalid`);
+      }
+    }
+    if (
+      hasText(evidence.baseVersionId) &&
+      hasText(evidence.repairedVersionId) &&
+      evidence.baseVersionId === evidence.repairedVersionId
+    ) {
+      errors.push("repair version did not change");
+    }
+    if (
+      hasText(evidence.baseSourceSnapshotUri) &&
+      hasText(evidence.repairedSourceSnapshotUri) &&
+      evidence.baseSourceSnapshotUri === evidence.repairedSourceSnapshotUri
+    ) {
+      errors.push("repair source snapshot URI did not change");
+    }
+    if (
+      hasText(evidence.repairedVersionId) &&
+      evidence.runtimeState?.currentVersionId &&
+      evidence.repairedVersionId !== evidence.runtimeState.currentVersionId
+    ) {
+      errors.push("repair repairedVersionId does not match runtime-state currentVersionId");
+    }
+    if (
+      hasText(evidence.repairedSourceSnapshotUri) &&
+      evidence.runtimeState?.sourceSnapshotUri &&
+      evidence.repairedSourceSnapshotUri !== evidence.runtimeState.sourceSnapshotUri
+    ) {
+      errors.push("repair repairedSourceSnapshotUri does not match runtime-state sourceSnapshotUri");
+    }
+    if (evidence.findingStatus !== "fixed") {
+      errors.push("repair findingStatus is not fixed");
+    }
+    if (evidence.findingSource !== "harness-seeded-review") {
+      errors.push("repair findingSource is not harness-seeded-review");
+    }
+    if (evidence.candidateVersionId !== evidence.baseVersionId) {
+      errors.push("repair candidateVersionId does not match baseVersionId");
+    }
+    if (evidence.artifactContainsExpectedText !== true) {
+      errors.push("repaired artifact text assertion did not pass");
+    }
+    if (!hasText(evidence.expectedArtifactText)) {
+      errors.push("repair expectedArtifactText missing");
+    }
+  }
+
+  if (requireDcp) {
+    const dcp = evidence.designContext;
+    if (!dcp || typeof dcp !== "object" || Array.isArray(dcp)) {
+      errors.push("DCP evidence missing");
+    } else {
+      for (const field of ["contentHash", "artifactManifestHash", "briefHash"]) {
+        if (!isSha256(dcp[field])) errors.push(`DCP ${field} must be sha256`);
+      }
+      if (!hasText(dcp.verificationPolicyId)) {
+        errors.push("DCP verificationPolicyId missing");
+      }
+      if (!['observe', 'enforced'].includes(dcp.effectiveCompatibilityMode)) {
+        errors.push("DCP effectiveCompatibilityMode invalid");
+      }
+      if (!Array.isArray(dcp.requiredReadPaths) || !Array.isArray(dcp.readFiles)) {
+        errors.push("DCP requiredReadPaths/readFiles missing");
+      } else {
+        const stageLabel = `${record.stage.slice(0, 1).toUpperCase()}${record.stage.slice(1)}`;
+        if (dcp.requiredReadPaths.length === 0) {
+          errors.push(`DCP ${stageLabel} requiredReadPaths missing`);
+        }
+        if (!dcp.requiredReadPaths.every(path => hasText(path) && dcp.readFiles.includes(path))) {
+          errors.push(`DCP ${stageLabel} required reads were not all recorded`);
+        }
+        if (record.stage === "repair" && dcp.effectiveCompatibilityMode !== "enforced") {
+          errors.push("DCP Repair effectiveCompatibilityMode is not enforced");
+        }
+      }
     }
   }
 
@@ -654,9 +779,39 @@ function validateSummary(summary, args) {
         errors.push(`${key}: missing stage`);
         continue;
       }
-      for (const error of validateStage(record)) {
+      for (const error of validateStage(
+        record,
+        args.requiredDcpProjects.includes(project),
+        args.requiredApprovalReference,
+      )) {
         errors.push(`${key}: ${error}`);
       }
+    }
+  }
+  for (const project of args.requiredRepairProjects) {
+    const key = stageKey(project, "repair");
+    const record = summary.stages[key];
+    if (!record) {
+      errors.push(`${key}: missing stage`);
+      continue;
+    }
+    for (const error of validateStage(
+      record,
+      args.requiredDcpProjects.includes(project),
+      args.requiredApprovalReference,
+    )) {
+      errors.push(`${key}: ${error}`);
+    }
+  }
+  for (const project of args.requiredDcpProjects) {
+    const build = summary.stages[stageKey(project, "build")]?.evidence.at(-1)?.evidence?.designContext;
+    const edit = summary.stages[stageKey(project, "edit")]?.evidence.at(-1)?.evidence?.designContext;
+    const repair = summary.stages[stageKey(project, "repair")]?.evidence.at(-1)?.evidence?.designContext;
+    if (build?.contentHash && edit?.contentHash && build.contentHash !== edit.contentHash) {
+      errors.push(`${project}: Edit DCP contentHash does not inherit the Build DCP`);
+    }
+    if (build?.contentHash && repair?.contentHash && build.contentHash !== repair.contentHash) {
+      errors.push(`${project}: Repair DCP contentHash does not inherit the Build DCP`);
     }
   }
   if (summary.malformedEvidenceLines > 0) {
@@ -759,6 +914,9 @@ function main() {
     requireComputedStyle: args.requireComputedStyle,
     requiredProjects: args.requiredProjects,
     requiredStages: args.requiredStages,
+    requiredDcpProjects: args.requiredDcpProjects,
+    requiredRepairProjects: args.requiredRepairProjects,
+    requiredApprovalReference: args.requiredApprovalReference,
     computedStyleTarget: {
       project: args.computedStyleProject,
       stage: args.computedStyleStage,

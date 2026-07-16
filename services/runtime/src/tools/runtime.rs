@@ -2,6 +2,7 @@ use crate::{
     agent_hooks::{PreToolUseHook, PreToolUseObservation},
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
+    design_context::frozen_run_design_context_manifest,
     model_gateway::ModelToolDefinition,
     permission::{PermissionEngine, PermissionReason, PermissionResult, PermissionRules},
     profiles::policy,
@@ -645,6 +646,36 @@ impl ToolExecutor {
             if let Some((message, error_kind, metadata)) =
                 design_context_read_gate(&ctx.run, tool.name(), &input)
             {
+                if matches!(
+                    error_kind.as_str(),
+                    "design_context.read_required" | "design_context.style_contract_unverified"
+                ) {
+                    let missing_file_count = metadata
+                        .get("missingFiles")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    let missing_section_count = metadata
+                        .get("missingSectionIds")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    record_design_context_metric(
+                        &store,
+                        &ctx.run,
+                        "design_context_required_read_block_total",
+                        1,
+                        json!({
+                            "tool": tool.name(),
+                            "reason": if error_kind == "design_context.read_required" {
+                                "read_required"
+                            } else {
+                                "style_contract_unverified"
+                            },
+                            "missingFileCount": missing_file_count,
+                            "missingSectionCount": missing_section_count,
+                        }),
+                    )
+                    .await;
+                }
                 store
                     .append_audit_record(
                         &ctx.project_id,
@@ -843,6 +874,26 @@ impl ToolExecutor {
                         result: ToolResult::error("tool aborted"),
                     },
                 };
+                if execution
+                    .result
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("errorKind"))
+                    .and_then(Value::as_str)
+                    == Some("design_verification_runtime_lost")
+                {
+                    record_design_context_metric(
+                        &store,
+                        &ctx.run,
+                        "design_context_verifier_unavailable_total",
+                        1,
+                        json!({
+                            "reason": "runtime_lost",
+                            "tool": tool.name(),
+                        }),
+                    )
+                    .await;
+                }
                 if !execution.result.is_error {
                     record_design_context_read(
                         &store,
@@ -1132,6 +1183,16 @@ fn design_context_read_gate(
     input: &Value,
 ) -> Option<(String, String, Value)> {
     run.design_profile_id.as_ref()?;
+    let dcp = match frozen_run_design_context_manifest(run) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            return Some((
+                message,
+                "design_context.integrity_failed".to_string(),
+                json!({ "runId": run.id }),
+            ));
+        }
+    };
     if tool_name == "fs.read" {
         let path = input
             .get("path")
@@ -1160,16 +1221,81 @@ fn design_context_read_gate(
         return None;
     }
 
-    let mut required_files = match run.phase {
-        AgentPhase::Build => vec![
-            "inputs/brief.md".to_string(),
-            "inputs/design.md".to_string(),
-            "inputs/design-profile.json".to_string(),
-        ],
-        AgentPhase::Edit => vec!["inputs/design.md".to_string()],
-        AgentPhase::Repair => vec!["inputs/design.md".to_string()],
-        _ => Vec::new(),
+    if let Some(manifest) = dcp.as_ref() {
+        if tool_name == "project.init" {
+            let requested_path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(manifest.payload.expected_app_root.as_str());
+            if requested_path != manifest.payload.expected_app_root {
+                return Some((
+                    format!(
+                        "project.init path must match the frozen DCP app root {}",
+                        manifest.payload.expected_app_root
+                    ),
+                    "project.app_root_mismatch".to_string(),
+                    json!({
+                        "expectedAppRoot": manifest.payload.expected_app_root,
+                        "receivedPath": requested_path,
+                    }),
+                ));
+            }
+            let requested_template = input.get("template").and_then(Value::as_str);
+            if requested_template != Some(manifest.payload.template.as_str()) {
+                return Some((
+                    format!(
+                        "project.init template must match the frozen DCP template {}",
+                        manifest.payload.template
+                    ),
+                    "project.template_mismatch".to_string(),
+                    json!({
+                        "expectedTemplate": manifest.payload.template,
+                        "receivedTemplate": requested_template,
+                    }),
+                ));
+            }
+        }
+    }
+
+    let mut required_files = match dcp.as_ref() {
+        Some(manifest) => manifest
+            .payload
+            .required_reads
+            .iter()
+            .filter(|requirement| requirement.phases.contains(&run.phase))
+            .map(|requirement| requirement.path.clone())
+            .collect::<Vec<_>>(),
+        None => match run.phase {
+            AgentPhase::Build => vec![
+                "inputs/brief.md".to_string(),
+                "inputs/design.md".to_string(),
+                "inputs/design-profile.json".to_string(),
+            ],
+            AgentPhase::Edit => vec!["inputs/design.md".to_string()],
+            AgentPhase::Repair => vec!["inputs/design.md".to_string()],
+            _ => Vec::new(),
+        },
     };
+    if dcp.is_some()
+        && tool_name != "project.init"
+        && matches!(
+            run.phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        )
+    {
+        if run.design_context_style_contract_verified != Some(true) {
+            return Some((
+                "state/style-contract.json must be verified against the frozen Design Context Package before Build/Edit/Repair mutations or publish"
+                    .to_string(),
+                "design_context.style_contract_unverified".to_string(),
+                json!({
+                    "styleContractPath": "state/style-contract.json",
+                    "verified": run.design_context_style_contract_verified,
+                }),
+            ));
+        }
+        required_files.push("state/style-contract.json".to_string());
+    }
     if run.design_fidelity_mode.as_deref() == Some("source_fallback") {
         if run.phase != AgentPhase::Edit {
             required_files.push("inputs/design-profile.json".to_string());
@@ -1261,6 +1387,9 @@ async fn record_design_context_read(
     if tool_name != "fs.read" || run.design_profile_id.is_none() {
         return;
     }
+    if run.design_context_manifest.is_some() && run.design_context_materialization_hash.is_none() {
+        return;
+    }
     let Some(path) = result.content.get("path").and_then(Value::as_str) else {
         return;
     };
@@ -1270,6 +1399,10 @@ async fn record_design_context_read(
         "inputs/brief.md"
             | "inputs/design.md"
             | "inputs/design-profile.json"
+            | "inputs/design-profile-usage.md"
+            | "inputs/component-recipes.json"
+            | "inputs/template-style-contract.json"
+            | "state/style-contract.json"
             | "inputs/design-source.md"
             | "inputs/design-source-index.json"
     ) {
@@ -1281,6 +1414,18 @@ async fn record_design_context_read(
             run.id
         );
         return;
+    }
+    if path == "state/style-contract.json" {
+        let verified = frozen_style_contract_read_is_verified(run, result);
+        if let Err(error) = store
+            .set_run_design_context_style_contract_verified(&run.id, verified)
+            .await
+        {
+            eprintln!(
+                "failed to record style contract verification for {}: {error}",
+                run.id
+            );
+        }
     }
     if path == "inputs/design-source.md"
         && run.design_fidelity_mode.as_deref() == Some("source_fallback")
@@ -1302,8 +1447,73 @@ async fn record_design_context_read(
                 "failed to record full design source read for {}: {error}",
                 run.id
             );
+        } else {
+            record_design_context_metric(
+                store,
+                run,
+                "design_context_source_sections_read",
+                hashes.len() as u64,
+                json!({
+                    "accessMode": "raw",
+                    "bytesRead": run.design_source_size_bytes.unwrap_or(0),
+                }),
+            )
+            .await;
         }
     }
+}
+
+pub(crate) async fn record_design_context_metric(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    name: &str,
+    value: u64,
+    mut metadata: Value,
+) {
+    if run.design_context_manifest.is_none() {
+        return;
+    }
+    let mode = match run.design_context_effective_compatibility_mode.as_deref() {
+        Some("enforced") => "enforced",
+        _ => "observe",
+    };
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("mode".to_string(), json!(mode));
+        object.insert("surface".to_string(), json!("website"));
+        object.insert(
+            "phase".to_string(),
+            serde_json::to_value(run.phase).unwrap_or_else(|_| json!("unknown")),
+        );
+    }
+    let _ = store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: name.to_string(),
+            value,
+            metadata: Some(metadata),
+            timestamp: Utc::now(),
+        })
+        .await;
+}
+
+fn frozen_style_contract_read_is_verified(run: &AgentRun, result: &ToolResult) -> bool {
+    let Some(expected) = run
+        .design_context_artifacts
+        .get("inputs/template-style-contract.json")
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    else {
+        return false;
+    };
+    let Some(actual) = result
+        .content
+        .get("text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    else {
+        return false;
+    };
+    crate::style_contract::style_contract_identity(&expected)
+        == crate::style_contract::style_contract_identity(&actual)
 }
 
 fn normalize_design_context_path(path: &str) -> String {
@@ -1430,5 +1640,309 @@ fn truncate_large_result_if_needed(
             "truncated": true,
             "fullResultUri": artifact_uri,
         })),
+    }
+}
+
+#[cfg(test)]
+mod design_context_gate_tests {
+    use super::*;
+    use crate::{
+        design_context::{
+            DesignContextArtifactManifest, DesignContextManifest, DesignContextPackagePayload,
+            DesignContextReadRequirement, ProfileCompatibilityMode, ProfileEnforcementMode,
+            VerificationPolicySnapshot,
+        },
+        types::AgentPhase,
+    };
+
+    fn manifest() -> DesignContextManifest {
+        let profile = json!({
+            "id": "profile-1",
+            "version": 1,
+            "scope": { "projectId": "project-1" },
+        });
+        let profile_text = String::from_utf8(crate::types::canonical_json_bytes(&profile)).unwrap();
+        let artifact_manifest = DesignContextArtifactManifest {
+            schema_version: "design-context-artifacts@1".to_string(),
+            artifacts: vec![crate::design_context::DesignContextArtifact {
+                path: "inputs/design-profile.json".to_string(),
+                kind: "profile".to_string(),
+                bytes: profile_text.len() as u64,
+                sha256: crate::types::sha256_hex(profile_text.as_bytes()),
+                required_before_mutation: true,
+            }],
+        };
+        let artifact_manifest_hash =
+            crate::types::canonical_json_hash(&serde_json::to_value(&artifact_manifest).unwrap());
+        let payload = DesignContextPackagePayload {
+            schema_version: "design-context@1".to_string(),
+            design_profile_id: "profile-1".to_string(),
+            design_profile_version: 1,
+            base_profile_hash: "base-hash".to_string(),
+            effective_profile_hash: crate::types::canonical_json_hash(&profile),
+            brief_hash: "brief-hash".to_string(),
+            brief_schema_version: "brief@1".to_string(),
+            surface: "website".to_string(),
+            template: "astro-website".to_string(),
+            template_manifest_sha256: "template-hash".to_string(),
+            expected_app_root: "project".to_string(),
+            compiler_version: "design-context-compiler@1".to_string(),
+            declared_enforcement_mode: ProfileEnforcementMode::Observe,
+            effective_compatibility_mode: ProfileCompatibilityMode::Observe,
+            verification_policy: VerificationPolicySnapshot {
+                policy_id: "website-verification@1".to_string(),
+                a11y_ruleset_version: "a11y@1".to_string(),
+                viewport_matrix_id: "viewport@1".to_string(),
+                required_verifier_kinds: Vec::new(),
+            },
+            artifact_manifest_hash,
+            resolved_runtime_tokens: BTreeMap::new(),
+            resolved_token_snapshot_hash: "tokens-hash".to_string(),
+            required_reads: vec![
+                read("inputs/brief.md"),
+                read("inputs/design-profile.json"),
+                read("inputs/design-profile-usage.md"),
+                read("inputs/component-recipes.json"),
+                read("inputs/template-style-contract.json"),
+            ],
+            craft_packs: Vec::new(),
+            layout_guidance: Vec::new(),
+            warnings: Vec::new(),
+        };
+        DesignContextManifest {
+            schema_version: "design-context-manifest@1".to_string(),
+            content_hash: crate::types::canonical_json_hash(
+                &serde_json::to_value(&payload).unwrap(),
+            ),
+            artifact_manifest,
+            payload,
+        }
+    }
+
+    fn read(path: &str) -> DesignContextReadRequirement {
+        DesignContextReadRequirement {
+            path: path.to_string(),
+            reason: "test".to_string(),
+            phases: vec![AgentPhase::Build],
+        }
+    }
+
+    async fn frozen_build_run() -> AgentRun {
+        let store = RuntimeStore::new();
+        let mut run = store
+            .create_run(
+                "project-1".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "test".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let manifest = manifest();
+        run.design_profile_id = Some(manifest.payload.design_profile_id.clone());
+        run.design_profile_version = Some(manifest.payload.design_profile_version);
+        run.design_profile_hash = Some(manifest.payload.base_profile_hash.clone());
+        run.design_profile_effective_hash = Some(manifest.payload.effective_profile_hash.clone());
+        run.design_profile_surface = Some(manifest.payload.surface.clone());
+        run.design_profile_template = Some(manifest.payload.template.clone());
+        run.design_context_package_version = Some(manifest.payload.schema_version.clone());
+        run.design_context_content_hash = Some(manifest.content_hash.clone());
+        run.design_context_artifact_manifest_hash =
+            Some(manifest.payload.artifact_manifest_hash.clone());
+        run.design_context_materialization_hash =
+            Some(manifest.payload.artifact_manifest_hash.clone());
+        run.design_context_compiler_version = Some(manifest.payload.compiler_version.clone());
+        run.design_context_brief_hash = Some(manifest.payload.brief_hash.clone());
+        run.design_context_verification_policy_id =
+            Some(manifest.payload.verification_policy.policy_id.clone());
+        run.design_context_expected_app_root = Some(manifest.payload.expected_app_root.clone());
+        run.design_context_declared_enforcement_mode = Some("observe".to_string());
+        run.design_context_effective_compatibility_mode = Some("observe".to_string());
+        run.design_context_warnings = manifest.payload.warnings.clone();
+        let profile = json!({
+            "id": "profile-1",
+            "version": 1,
+            "scope": { "projectId": "project-1" },
+        });
+        run.design_context_artifacts.insert(
+            "inputs/design-profile.json".to_string(),
+            String::from_utf8(crate::types::canonical_json_bytes(&profile)).unwrap(),
+        );
+        run.design_context_manifest = Some(serde_json::to_value(manifest).unwrap());
+        run
+    }
+
+    #[tokio::test]
+    async fn frozen_dcp_requires_bootstrap_reads_and_post_init_style_contract() {
+        let mut run = frozen_build_run().await;
+        let blocked = design_context_read_gate(
+            &run,
+            "project.init",
+            &json!({ "template": "astro-website" }),
+        )
+        .expect("bootstrap reads must be required");
+        assert_eq!(blocked.1, "design_context.read_required");
+        assert!(blocked.2["missingFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "inputs/template-style-contract.json"));
+
+        run.design_context_read_files = manifest()
+            .payload
+            .required_reads
+            .into_iter()
+            .map(|requirement| requirement.path)
+            .collect();
+        assert!(design_context_read_gate(
+            &run,
+            "project.init",
+            &json!({ "template": "astro-website" }),
+        )
+        .is_none());
+
+        let blocked = design_context_read_gate(
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/src/pages/index.astro" }),
+        )
+        .expect("post-init style contract must be verified first");
+        assert_eq!(blocked.1, "design_context.style_contract_unverified");
+
+        run.design_context_style_contract_verified = Some(true);
+        let blocked = design_context_read_gate(
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/src/pages/index.astro" }),
+        )
+        .expect("post-init style contract read must be required");
+        assert_eq!(blocked.1, "design_context.read_required");
+        assert_eq!(
+            blocked.2["missingFiles"],
+            json!(["state/style-contract.json"])
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_dcp_artifact_tamper_blocks_mutation_before_read_gate() {
+        let mut run = frozen_build_run().await;
+        run.design_context_artifacts.insert(
+            "inputs/design-profile.json".to_string(),
+            "{\"id\":\"tampered\",\"version\":1}".to_string(),
+        );
+
+        let blocked = design_context_read_gate(
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/src/pages/index.astro" }),
+        )
+        .expect("tampered frozen DCP must fail closed before mutation");
+        assert_eq!(blocked.1, "design_context.integrity_failed");
+        assert_eq!(blocked.2["runId"], run.id);
+    }
+
+    #[tokio::test]
+    async fn frozen_dcp_rejects_project_init_root_or_template_drift() {
+        let mut run = frozen_build_run().await;
+        run.design_context_read_files = manifest()
+            .payload
+            .required_reads
+            .into_iter()
+            .map(|requirement| requirement.path)
+            .collect();
+        assert_eq!(
+            design_context_read_gate(
+                &run,
+                "project.init",
+                &json!({ "template": "astro-website", "path": "site" }),
+            )
+            .unwrap()
+            .1,
+            "project.app_root_mismatch"
+        );
+        assert_eq!(
+            design_context_read_gate(
+                &run,
+                "project.init",
+                &json!({ "template": "fumadocs-docs" }),
+            )
+            .unwrap()
+            .1,
+            "project.template_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_requires_a_verified_style_contract_before_mutation() {
+        let mut run = frozen_build_run().await;
+        run.phase = AgentPhase::Edit;
+        run.design_context_read_files = manifest()
+            .payload
+            .required_reads
+            .into_iter()
+            .map(|requirement| requirement.path)
+            .chain(std::iter::once("state/style-contract.json".to_string()))
+            .collect();
+
+        let blocked = design_context_read_gate(
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/src/pages/index.astro" }),
+        )
+        .expect("Edit mutations must fail closed before contract verification");
+        assert_eq!(blocked.1, "design_context.style_contract_unverified");
+
+        run.design_context_style_contract_verified = Some(true);
+        assert!(design_context_read_gate(
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/src/pages/index.astro" }),
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_style_contract_read_matches_frozen_artifact() {
+        let mut run = frozen_build_run().await;
+        let expected = json!({
+            "version": 1,
+            "template": "astro-website",
+            "appRoot": "project",
+            "tokens": { "color.primary": "--color-primary" },
+        });
+        run.design_context_artifacts.insert(
+            "inputs/template-style-contract.json".to_string(),
+            serde_json::to_string(&expected).unwrap(),
+        );
+        let result = ToolResult::ok(json!({
+            "path": "/workspace/state/style-contract.json",
+            "text": serde_json::to_string(&expected).unwrap(),
+        }));
+        assert!(frozen_style_contract_read_is_verified(&run, &result));
+    }
+
+    #[tokio::test]
+    async fn style_contract_read_rejects_identity_drift() {
+        let mut run = frozen_build_run().await;
+        run.design_context_artifacts.insert(
+            "inputs/template-style-contract.json".to_string(),
+            json!({
+                "version": 1,
+                "template": "astro-website",
+                "appRoot": "project",
+                "tokens": { "color.primary": "--color-primary" },
+            })
+            .to_string(),
+        );
+        let result = ToolResult::ok(json!({
+            "path": "/workspace/state/style-contract.json",
+            "text": json!({
+                "version": 1,
+                "template": "astro-website",
+                "appRoot": "project",
+                "tokens": { "color.primary": "--wrong" },
+            }).to_string(),
+        }));
+        assert!(!frozen_style_contract_read_is_verified(&run, &result));
     }
 }

@@ -18,6 +18,8 @@ const RUN_START_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/ru
 const RUN_CONTINUE_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/runs/continue_run.rs");
 const RUN_CANCEL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/cancel.rs");
+const RUN_DESIGN_CONTEXT_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/runs/design_context.rs");
 const RUN_PERMISSION_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/runs/permission.rs");
 const SYSTEM_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/system.rs");
@@ -189,6 +191,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
     actual.extend(declared_routes("public", RUN_START_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_CONTINUE_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_CANCEL_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_DESIGN_CONTEXT_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_PERMISSION_ROUTES_SOURCE));
     actual.extend(declared_routes("public", SYSTEM_ROUTES_SOURCE));
     actual.extend(declared_routes("capture", CAPTURE_ROUTES_SOURCE));

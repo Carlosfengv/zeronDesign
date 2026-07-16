@@ -7,6 +7,10 @@ use super::{
 use crate::{
     config::PublicPrincipalAuthMode,
     conversation::RuntimeStore,
+    design_context::{
+        compile_website_design_context, frozen_run_design_context_manifest,
+        DesignContextCompileOptions, ProfileCompatibilityMode, VerifierRegistry,
+    },
     project::resolve_built_in_template_for_init,
     types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource},
 };
@@ -101,7 +105,10 @@ impl RunLifecycleService {
                 )
                 .await
         };
-        let run = if let Some(profile) = design_profile.as_ref() {
+        let inherited_frozen_dcp = run.design_context_manifest.is_some();
+        let run = if inherited_frozen_dcp {
+            run
+        } else if let Some(profile) = design_profile.as_ref() {
             let effective_target = if design_profile_conflict.is_none() {
                 design_profile_target.as_ref()
             } else {
@@ -134,7 +141,9 @@ impl RunLifecycleService {
         } else {
             run
         };
-        let run = if let Some(profile) = design_profile.as_ref() {
+        let run = if inherited_frozen_dcp {
+            run
+        } else if let Some(profile) = design_profile.as_ref() {
             let configured = self
                 .created_run_step(
                     &run,
@@ -165,39 +174,83 @@ impl RunLifecycleService {
         } else {
             run
         };
-        if let Some(profile) = design_profile.as_ref() {
-            if let Some((blocked_state, message)) =
-                self.design_profiles.prebuild_failure(&run, profile).await
+        let run = if self.config.enable_design_context_package && run.phase == AgentPhase::Edit {
+            match inherit_edit_design_context_from_base_version(self, &run).await {
+                Ok(inherited) => inherited,
+                Err(error) if is_verification_unavailable(&error) => {
+                    return block_for_verification_unavailable(self, &run, &error).await;
+                }
+                Err(error) => {
+                    return Err(self
+                        .compensate_created_run_error(
+                            &run,
+                            "design_context_inherit",
+                            design_profile_error(error),
+                        )
+                        .await)
+                }
+            }
+        } else if self.config.enable_design_context_package
+            && run.phase == AgentPhase::Build
+            && design_profile.is_some()
+        {
+            match compile_and_attach_design_context(self, &run, design_profile.as_ref().unwrap())
+                .await
             {
-                self.store
-                    .append_conversation_item(
-                        &run.project_id,
-                        Some(&run.id),
-                        "approval_request",
-                        Some("assistant"),
-                        &message,
-                        Some(json!({
-                            "state": blocked_state,
-                            "designProfileId": profile.id,
-                        })),
-                    )
-                    .await;
-                self.store
-                    .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
-                    .await
-                    .map_err(conflict_error)?;
-                self.store
-                    .append_event(AgentEvent::StateChanged {
-                        run_id: run.id.clone(),
-                        state: blocked_state,
-                        timestamp: Utc::now(),
-                    })
-                    .await
-                    .map_err(internal_error)?;
-                return Ok(RunLifecycleOutcome {
-                    run_id: run.id,
-                    status: "needs_user_input".to_string(),
-                });
+                Ok(attached) => attached,
+                Err(error) if is_verification_unavailable(&error) => {
+                    return block_for_verification_unavailable(self, &run, &error).await;
+                }
+                Err(error) => {
+                    return Err(self
+                        .compensate_created_run_error(
+                            &run,
+                            "design_context_attach",
+                            design_profile_error(error),
+                        )
+                        .await)
+                }
+            }
+        } else {
+            run
+        };
+        let inherited_edit_dcp =
+            run.phase == AgentPhase::Edit && run.design_context_manifest.is_some();
+        if !inherited_edit_dcp {
+            if let Some(profile) = design_profile.as_ref() {
+                if let Some((blocked_state, message)) =
+                    self.design_profiles.prebuild_failure(&run, profile).await
+                {
+                    self.store
+                        .append_conversation_item(
+                            &run.project_id,
+                            Some(&run.id),
+                            "approval_request",
+                            Some("assistant"),
+                            &message,
+                            Some(json!({
+                                "state": blocked_state,
+                                "designProfileId": profile.id,
+                            })),
+                        )
+                        .await;
+                    self.store
+                        .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+                        .await
+                        .map_err(conflict_error)?;
+                    self.store
+                        .append_event(AgentEvent::StateChanged {
+                            run_id: run.id.clone(),
+                            state: blocked_state,
+                            timestamp: Utc::now(),
+                        })
+                        .await
+                        .map_err(internal_error)?;
+                    return Ok(RunLifecycleOutcome {
+                        run_id: run.id,
+                        status: "needs_user_input".to_string(),
+                    });
+                }
             }
         }
         if !run.design_profile_unsupported_extended_tokens.is_empty() {
@@ -218,6 +271,30 @@ impl RunLifecycleService {
                     "effective profile versus template style contract",
                 )
                 .await;
+            if self.config.enable_design_context_package
+                && run.design_profile_surface.as_deref() == Some("website")
+            {
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::MetricRecorded {
+                        run_id: run.id.clone(),
+                        name: "design_context_capability_gap_total".to_string(),
+                        value: run.design_profile_unsupported_extended_tokens.len() as u64,
+                        metadata: Some(json!({
+                            "mode": "observe",
+                            "surface": "website",
+                            "phase": serde_json::to_value(run.phase).unwrap_or_else(|_| json!("unknown")),
+                            "requirement": if run.design_profile_blocking_capability_rule_ids.is_empty() {
+                                "optional"
+                            } else {
+                                "required"
+                            },
+                            "gapKind": "extended_token",
+                        })),
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+            }
         }
         if !run.design_profile_blocking_capability_rule_ids.is_empty() {
             self
@@ -252,37 +329,39 @@ impl RunLifecycleService {
                 status: "needs_user_input".to_string(),
             });
         }
-        if let Some(conflict_reason) = design_profile_conflict {
-            self.store
-                .append_conversation_item(
-                    &run.project_id,
-                    Some(&run.id),
-                    "approval_request",
-                    Some("assistant"),
-                    format!("DesignProfile conflict requires confirmation: {conflict_reason}"),
-                    Some(json!({
-                        "reason": conflict_reason,
-                        "designProfileId": run.design_profile_id.as_deref(),
-                        "state": "needs_user_input:design_profile_conflict",
-                    })),
-                )
-                .await;
-            self.store
-                .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
-                .await
-                .map_err(conflict_error)?;
-            self.store
-                .append_event(AgentEvent::StateChanged {
-                    run_id: run.id.clone(),
-                    state: "needs_user_input:design_profile_conflict".to_string(),
-                    timestamp: Utc::now(),
-                })
-                .await
-                .map_err(internal_error)?;
-            return Ok(RunLifecycleOutcome {
-                run_id: run.id,
-                status: "needs_user_input".to_string(),
-            });
+        if !inherited_edit_dcp {
+            if let Some(conflict_reason) = design_profile_conflict {
+                self.store
+                    .append_conversation_item(
+                        &run.project_id,
+                        Some(&run.id),
+                        "approval_request",
+                        Some("assistant"),
+                        format!("DesignProfile conflict requires confirmation: {conflict_reason}"),
+                        Some(json!({
+                            "reason": conflict_reason,
+                            "designProfileId": run.design_profile_id.as_deref(),
+                            "state": "needs_user_input:design_profile_conflict",
+                        })),
+                    )
+                    .await;
+                self.store
+                    .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+                    .await
+                    .map_err(conflict_error)?;
+                self.store
+                    .append_event(AgentEvent::StateChanged {
+                        run_id: run.id.clone(),
+                        state: "needs_user_input:design_profile_conflict".to_string(),
+                        timestamp: Utc::now(),
+                    })
+                    .await
+                    .map_err(internal_error)?;
+                return Ok(RunLifecycleOutcome {
+                    run_id: run.id,
+                    status: "needs_user_input".to_string(),
+                });
+            }
         }
         let run =
             if let Some(sandbox_binding_id) = request.input_context.sandbox_binding_id.as_deref() {
@@ -335,6 +414,269 @@ impl RunLifecycleService {
             status: "queued".to_string(),
         })
     }
+}
+
+async fn compile_and_attach_design_context(
+    service: &RunLifecycleService,
+    run: &AgentRun,
+    profile: &crate::types::DesignProfile,
+) -> anyhow::Result<AgentRun> {
+    let surface = run
+        .design_profile_surface
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("website DCP requires an effective profile surface"))?;
+    let template_id = run
+        .design_profile_template
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("website DCP requires an effective profile template"))?;
+    if surface != "website" {
+        return Ok(run.clone());
+    }
+    let brief_id = run
+        .brief_version
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("website DCP requires a confirmed brief"))?;
+    let brief = service
+        .store
+        .get_brief(brief_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("brief not found: {brief_id}"))?;
+    let template = resolve_built_in_template_for_init(template_id)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let effective = profile
+        .effective_for(surface, template_id)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if run.design_profile_effective_hash.as_deref()
+        != Some(effective.effective_profile_hash.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "effective design profile hash changed before DCP compilation"
+        ));
+    }
+    let persisted_policy = service
+        .store
+        .get_design_context_enforcement_policy(&run.project_id, &profile.id, profile.version)
+        .await;
+    let enforcement_enabled = match persisted_policy.as_ref() {
+        Some(policy) => policy.enabled,
+        None => service
+            .config
+            .design_context_enforcement_allowed_for(&run.project_id, &profile.id, profile.version)
+            .map_err(|error| anyhow::anyhow!(error))?,
+    };
+    let compiled = compile_website_design_context(
+        &effective,
+        &brief,
+        &template,
+        &DesignContextCompileOptions {
+            enforcement_enabled,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let verification_environment = VerifierRegistry::discover_with_executables(
+        service
+            .config
+            .design_context_browser_executable
+            .as_deref()
+            .and_then(|path| path.to_str()),
+        service
+            .config
+            .design_context_browser_collector_executable
+            .as_deref()
+            .and_then(|path| path.to_str()),
+    );
+    let attached = service
+        .store
+        .attach_run_design_context(&run.id, &compiled, &verification_environment)
+        .await?;
+    service
+        .store
+        .append_audit_record(
+            &run.project_id,
+            &run.id,
+            "design_context.enforcement_allowlist",
+            format!(
+                "projectId={} designProfileId={} designProfileVersion={} dcpContentHash={} policyRevision={} policyUpdatedBy={}",
+                run.project_id,
+                profile.id,
+                profile.version,
+                compiled.manifest.content_hash,
+                persisted_policy
+                    .as_ref()
+                    .map(|policy| policy.revision.to_string())
+                    .unwrap_or_else(|| "config".to_string()),
+                persisted_policy
+                    .as_ref()
+                    .map(|policy| policy.updated_by.as_str())
+                    .unwrap_or("config"),
+            ),
+            if enforcement_enabled {
+                "allow"
+            } else {
+                "observe"
+            },
+            if persisted_policy.is_some() {
+                "persistent policy overrides environment allowlist"
+            } else if service.config.enable_design_context_enforcement {
+                "global flag enabled; exact allowlist match required"
+            } else {
+                "global enforcement flag disabled"
+            },
+        )
+        .await;
+    ensure_enforced_verifiers_available(&compiled.manifest, &verification_environment)?;
+    Ok(attached)
+}
+
+pub(super) async fn inherit_edit_design_context_from_base_version(
+    service: &RunLifecycleService,
+    run: &AgentRun,
+) -> anyhow::Result<AgentRun> {
+    let base_version_id = run
+        .base_version_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("edit run missing baseVersionId for DCP inheritance"))?;
+    let version = service
+        .store
+        .get_project_version(base_version_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("base version not found: {base_version_id}"))?;
+    if version.project_id != run.project_id {
+        return Err(anyhow::anyhow!(
+            "base version belongs to a different project: {}",
+            version.project_id
+        ));
+    }
+    let source = service
+        .store
+        .get_run(&version.created_by_run_id)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "base version creator run not found: {}",
+                version.created_by_run_id
+            )
+        })?;
+    let Some(manifest) = frozen_run_design_context_manifest(&source)
+        .map_err(|error| anyhow::anyhow!("base version creator run has an invalid DCP: {error}"))?
+    else {
+        // Existing versions without a DCP retain their legacy Edit semantics.
+        return Ok(run.clone());
+    };
+    let verification_environment = VerifierRegistry::discover_with_executables(
+        service
+            .config
+            .design_context_browser_executable
+            .as_deref()
+            .and_then(|path| path.to_str()),
+        service
+            .config
+            .design_context_browser_collector_executable
+            .as_deref()
+            .and_then(|path| path.to_str()),
+    );
+    ensure_enforced_verifiers_available(&manifest, &verification_environment)?;
+    service
+        .store
+        .inherit_run_design_context(&run.id, &source.id, &verification_environment)
+        .await
+}
+
+async fn block_for_verification_unavailable(
+    service: &RunLifecycleService,
+    run: &AgentRun,
+    error: &anyhow::Error,
+) -> Result<RunLifecycleOutcome, RunLifecycleError> {
+    let message = error.to_string();
+    let missing_verifiers = message
+        .strip_prefix("design verification unavailable for enforced DCP:")
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    service
+        .store
+        .append_audit_record(
+            &run.project_id,
+            &run.id,
+            "design_context.verification_preflight",
+            "required verifier availability".to_string(),
+            "deny",
+            &message,
+        )
+        .await;
+    service
+        .store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "run_blocked",
+            Some("system"),
+            message,
+            Some(json!({ "state": "blocked:design_verification_unavailable" })),
+        )
+        .await;
+    service
+        .store
+        .update_run_status(&run.id, AgentRunStatus::Blocked)
+        .await
+        .map_err(conflict_error)?;
+    service
+        .store
+        .append_event(AgentEvent::StateChanged {
+            run_id: run.id.clone(),
+            state: "blocked:design_verification_unavailable".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await
+        .map_err(internal_error)?;
+    let _ = service
+        .store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: "design_context_verifier_unavailable_total".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "mode": "enforced",
+                "missingVerifierCount": missing_verifiers.len(),
+                "missingVerifiers": missing_verifiers,
+            })),
+            timestamp: Utc::now(),
+        })
+        .await;
+    Ok(RunLifecycleOutcome {
+        run_id: run.id.clone(),
+        status: "blocked".to_string(),
+    })
+}
+
+pub(super) fn ensure_enforced_verifiers_available(
+    manifest: &crate::design_context::DesignContextManifest,
+    verification_environment: &crate::design_context::VerificationEnvironmentBinding,
+) -> anyhow::Result<()> {
+    let unavailable =
+        verification_environment.missing_required_verifiers(&manifest.payload.verification_policy);
+    if manifest.payload.effective_compatibility_mode == ProfileCompatibilityMode::Enforced
+        && !unavailable.is_empty()
+    {
+        return Err(anyhow::anyhow!(
+            "design verification unavailable for enforced DCP: {}",
+            unavailable.join(",")
+        ));
+    }
+    Ok(())
+}
+
+fn is_verification_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .starts_with("design verification unavailable for enforced DCP:")
 }
 
 async fn validate_project_access_before_initial_run(
@@ -546,6 +888,13 @@ async fn validate_project_lifecycle_context(
                     "Edit run requires baseVersionId for lifecycle snapshot verification"
                 ))
             })?;
+        if let Some(base_version) = store.get_project_version(base_version_id).await {
+            if base_version.project_id != request.project_id {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "Edit run baseVersionId belongs to a different project"
+                )));
+            }
+        }
         let current = store
             .current_project_version(&request.project_id)
             .await

@@ -1,6 +1,7 @@
 mod cancel;
 mod continue_run;
 mod permission;
+mod profile_token_sync;
 mod start;
 mod start_failure;
 mod start_validation;

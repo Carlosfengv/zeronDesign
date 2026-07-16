@@ -48,7 +48,7 @@ bash infra/agent-sandbox/run-k8s-e2e.sh
 ```
 
 `SANDBOX_BASE_IMAGE` is an offline/local bootstrap override. The default remains
-`node:22-bookworm`.
+the reviewed immutable `node:22-bookworm` digest in `images.lock.json`.
 
 The runner builds the current checkout, adds a worktree content fingerprint when
 the tree is dirty, imports the image into k3d, and rejects Pod/image config digest

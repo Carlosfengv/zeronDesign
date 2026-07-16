@@ -25,6 +25,22 @@ pub struct TemplateCapabilities {
     pub structured_page_write: bool,
     pub mdx_document_write: bool,
     pub static_export: bool,
+    pub supported_component_roles: &'static [&'static str],
+    pub supported_craft_packs: &'static [&'static str],
+}
+
+impl TemplateCapabilities {
+    pub fn supports_component_role(&self, role: &str) -> bool {
+        self.supported_component_roles
+            .iter()
+            .any(|supported| *supported == role)
+    }
+
+    pub fn supports_craft_pack(&self, pack: &str) -> bool {
+        self.supported_craft_packs
+            .iter()
+            .any(|supported| *supported == pack)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
