@@ -55,6 +55,10 @@ run_step "shared package typecheck" \
 
 run_step "script syntax" \
   bash -n services/runtime/scripts/run-real-provider-http-lifecycle-e2e.sh
+run_step "runtime RC preflight registry policy syntax" \
+  node --check infra/agent-sandbox/test-preflight-registry-policy.mjs
+run_step "runtime RC preflight registry policy tests" \
+  node infra/agent-sandbox/test-preflight-registry-policy.mjs
 run_step "provider gate syntax" \
   bash -n services/runtime/scripts/run-runtime-harness-provider-gates.sh
 run_step "fumadocs smoke script syntax" \
@@ -78,6 +82,36 @@ run_step "design-context canary evidence validator syntax" \
   node --check services/runtime/scripts/validate-design-context-canary-evidence.mjs
 run_step "design-context canary evidence validator tests" \
   node services/runtime/scripts/test-design-context-canary-evidence-validator.mjs
+run_step "design-context canary ledger syntax" \
+  node --check services/runtime/scripts/design-context-canary-ledger.mjs
+run_step "design-context canary ledger tests syntax" \
+  node --check services/runtime/scripts/test-design-context-canary-ledger.mjs
+run_step "design-context canary ledger tests" \
+  node services/runtime/scripts/test-design-context-canary-ledger.mjs
+run_step "design-context canary metrics collector syntax" \
+  node --check services/runtime/scripts/collect-design-context-canary-metrics.mjs
+run_step "design-context canary metrics collector tests syntax" \
+  node --check services/runtime/scripts/test-design-context-canary-metrics-collector.mjs
+run_step "design-context canary metrics collector tests" \
+  node services/runtime/scripts/test-design-context-canary-metrics-collector.mjs
+run_step "design-context canary report syntax" \
+  node --check services/runtime/scripts/render-design-context-canary-report.mjs
+run_step "design-context canary report tests syntax" \
+  node --check services/runtime/scripts/test-design-context-canary-report.mjs
+run_step "design-context canary report tests" \
+  node services/runtime/scripts/test-design-context-canary-report.mjs
+run_step "design-context canary alert dispatcher syntax" \
+  node --check services/runtime/scripts/dispatch-design-context-canary-alerts.mjs
+run_step "design-context canary alert dispatcher tests syntax" \
+  node --check services/runtime/scripts/test-design-context-canary-alert-dispatcher.mjs
+run_step "design-context canary alert dispatcher tests" \
+  node services/runtime/scripts/test-design-context-canary-alert-dispatcher.mjs
+run_step "design-context canary rollback syntax" \
+  node --check services/runtime/scripts/run-design-context-canary-rollback.mjs
+run_step "design-context canary rollback tests syntax" \
+  node --check services/runtime/scripts/test-design-context-canary-rollback.mjs
+run_step "design-context canary rollback tests" \
+  node services/runtime/scripts/test-design-context-canary-rollback.mjs
 
 run_step "provider gate no-key failure" \
   bash -c 'set +e; RUNTIME_E2E_RUN_LOCAL_GATES=0 DEEPSEEK_API_KEY= RUNTIME_E2E_ENV_FILE= DEEPSEEK_API_KEY_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-no-key.out 2>/tmp/runtime-provider-no-key.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "DEEPSEEK_API_KEY is required" /tmp/runtime-provider-no-key.err'

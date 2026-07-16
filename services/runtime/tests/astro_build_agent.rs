@@ -308,6 +308,7 @@ async fn confirmed_docs_brief_generates_fumadocs_project_candidate_and_promoted_
     }
     let package_json = fs::read_to_string(workspace.join("project/package.json")).unwrap();
     assert!(package_json.contains("fumadocs-mdx"));
+    assert!(package_json.contains(r#""build": "fumadocs-mdx && next build --webpack""#));
     assert!(package_json.contains("fumadocs-ui"));
     assert!(package_json.contains("next"));
     assert!(package_json.contains("@tailwindcss/postcss"));

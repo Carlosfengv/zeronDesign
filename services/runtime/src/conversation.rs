@@ -18,13 +18,13 @@ use crate::{
         sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus,
         ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief, BriefStatus,
         ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
-        DesignContextEnforcementPolicy, DesignProfile, DesignProfileConversionReport,
-        DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex, OutboxDeliveryStatus,
-        PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus, ProjectAccessRecord,
-        ProjectRuntimeState, ProjectVersion, ProjectVersionStatus, ReviewFinding,
-        ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity, ReviewFindingStatus,
-        RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus, SandboxChannelProtocol,
-        MAX_DESIGN_SOURCE_BYTES,
+        DesignContextEnforcementBinding, DesignContextEnforcementPolicy, DesignProfile,
+        DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
+        OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
+        ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
+        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
+        ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus,
+        SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
@@ -603,6 +603,7 @@ impl RuntimeStore {
             design_context_expected_app_root: None,
             design_context_declared_enforcement_mode: None,
             design_context_effective_compatibility_mode: None,
+            design_context_enforcement_binding: None,
             design_context_warnings: Vec::new(),
             design_context_verification_environment: None,
             design_context_style_contract_verified: None,
@@ -733,6 +734,7 @@ impl RuntimeStore {
             design_context_effective_compatibility_mode: parent
                 .design_context_effective_compatibility_mode
                 .clone(),
+            design_context_enforcement_binding: parent.design_context_enforcement_binding.clone(),
             design_context_warnings: parent.design_context_warnings.clone(),
             design_context_verification_environment: parent
                 .design_context_verification_environment
@@ -861,6 +863,23 @@ impl RuntimeStore {
             .runs
             .insert(run.id.clone(), run.clone());
         Some(run)
+    }
+
+    pub async fn project_runs(&self, project_id: &str) -> Result<Vec<AgentRun>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let mut runs = inner
+            .runs
+            .values()
+            .filter(|run| run.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(runs)
     }
 
     pub async fn create_design_source_artifact(
@@ -1388,6 +1407,26 @@ impl RuntimeStore {
             .cloned()
     }
 
+    pub async fn project_profile_token_sync_operations(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProfileTokenSyncOperation>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_profile_token_sync_operations(&mut inner)?;
+        let mut operations = inner
+            .profile_token_sync_operations
+            .values()
+            .filter(|operation| operation.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        operations.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(operations)
+    }
+
     pub async fn update_profile_token_sync_operation(
         &self,
         operation: ProfileTokenSyncOperation,
@@ -1831,6 +1870,22 @@ impl RuntimeStore {
         compiled: &CompiledDesignContext,
         verification_environment: &VerificationEnvironmentBinding,
     ) -> Result<AgentRun> {
+        self.attach_run_design_context_with_enforcement_binding(
+            run_id,
+            compiled,
+            verification_environment,
+            None,
+        )
+        .await
+    }
+
+    pub async fn attach_run_design_context_with_enforcement_binding(
+        &self,
+        run_id: &str,
+        compiled: &CompiledDesignContext,
+        verification_environment: &VerificationEnvironmentBinding,
+        enforcement_binding: Option<DesignContextEnforcementBinding>,
+    ) -> Result<AgentRun> {
         let payload = &compiled.manifest.payload;
         let mut inner = self.inner.write().await;
         self.hydrate_persisted_runs(&mut inner)?;
@@ -1867,6 +1922,7 @@ impl RuntimeStore {
                 ProfileCompatibilityMode::Observe => "observe".to_string(),
                 ProfileCompatibilityMode::Enforced => "enforced".to_string(),
             });
+        candidate.design_context_enforcement_binding = enforcement_binding;
         candidate.design_context_warnings = payload.warnings.clone();
         candidate.design_context_verification_environment =
             Some(serde_json::to_value(verification_environment)?);
@@ -1952,6 +2008,7 @@ impl RuntimeStore {
             source.design_context_declared_enforcement_mode.clone();
         run.design_context_effective_compatibility_mode =
             source.design_context_effective_compatibility_mode.clone();
+        run.design_context_enforcement_binding = source.design_context_enforcement_binding.clone();
         run.design_context_warnings = source.design_context_warnings.clone();
         run.design_context_verification_environment =
             Some(serde_json::to_value(verification_environment)?);

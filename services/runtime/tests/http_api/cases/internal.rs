@@ -1,4 +1,12 @@
 use super::*;
+use anydesign_runtime::{
+    design_context::{
+        compile_website_design_context, DesignContextCompileOptions, VerifierRegistry,
+    },
+    templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
+    types::DesignContextEnforcementBinding,
+};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 
 #[tokio::test]
 async fn project_access_internal_route_requires_admin_and_persists_across_store_restart() {
@@ -34,6 +42,7 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
     let allowed = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
@@ -187,6 +196,249 @@ async fn design_context_enforcement_policy_requires_admin_uses_cas_and_survives_
     assert!(!policy.enabled);
     assert_eq!(policy.revision, 2);
     assert_eq!(policy.updated_by, "release-operator-2");
+}
+
+#[tokio::test]
+async fn design_context_canary_metrics_export_is_admin_only_and_aggregates_frozen_cohort() {
+    let store = RuntimeStore::new();
+    let mut config = phase_a_contract_config();
+    config.internal_admin_token = Some("admin-canary-metrics-token".to_string());
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config,
+        store: store.clone(),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let mut profile_request = design_profile_request("project-canary-1", vec!["astro-website"]);
+    profile_request["profile"]["websiteContext"] = json!({ "enforcementMode": "enforced" });
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/design-profiles")
+                .header("content-type", "application/json")
+                .body(Body::from(profile_request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), 32_768).await.unwrap()).unwrap();
+    let profile_id = created["designProfile"]["id"].as_str().unwrap();
+    let profile = store.get_design_profile(profile_id).await.unwrap();
+    let template = BuiltInTemplateRegistry::built_in()
+        .current(&TemplateId::parse("astro-website").unwrap())
+        .unwrap();
+    let now = Utc::now();
+    let baseline_started_at = now - ChronoDuration::hours(4);
+    let baseline_ended_at = now - ChronoDuration::hours(3);
+    let observation_started_at = now - ChronoDuration::hours(2);
+    let observation_ended_at = now;
+    let mut enforced_run_id = None;
+
+    for (mode, policy_revision, event_at, version_id) in [
+        (
+            "observe",
+            1_u64,
+            baseline_started_at + ChronoDuration::minutes(30),
+            "version-baseline",
+        ),
+        (
+            "enforced",
+            2_u64,
+            observation_started_at + ChronoDuration::minutes(30),
+            "version-enforced",
+        ),
+        (
+            "enforced",
+            3_u64,
+            observation_started_at + ChronoDuration::minutes(45),
+            "version-wrong-policy-revision",
+        ),
+    ] {
+        let run = store
+            .create_run(
+                "project-canary-1".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        store
+            .attach_run_effective_design_profile(
+                &run.id,
+                &profile,
+                Some("website"),
+                Some("astro-website"),
+            )
+            .await
+            .unwrap();
+        let dcp = compile_website_design_context(
+            &profile.effective_for("website", "astro-website").unwrap(),
+            &website_brief(),
+            &template,
+            &DesignContextCompileOptions {
+                enforcement_enabled: mode == "enforced",
+                ..DesignContextCompileOptions::default()
+            },
+        )
+        .unwrap();
+        store
+            .attach_run_design_context_with_enforcement_binding(
+                &run.id,
+                &dcp,
+                &VerifierRegistry::discover(),
+                Some(DesignContextEnforcementBinding {
+                    source: "persistent".to_string(),
+                    enabled: mode == "enforced",
+                    policy_revision: Some(policy_revision),
+                    policy_updated_by: Some("operator-1".to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+        store
+            .set_run_output_version(&run.id, version_id.to_string())
+            .await
+            .unwrap();
+        store
+            .append_event(AgentEvent::PreviewUpdated {
+                run_id: run.id.clone(),
+                url: format!("http://preview/{version_id}"),
+                version_id: version_id.to_string(),
+                screenshot_id: Some(format!("screenshot-{version_id}")),
+                timestamp: event_at,
+            })
+            .await
+            .unwrap();
+        if mode == "enforced" {
+            store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run.id.clone(),
+                    name: "design_context_verifier_unavailable_total".to_string(),
+                    value: 1,
+                    metadata: Some(json!({
+                        "mode": "enforced",
+                        "surface": "website",
+                        "reason": "worker_unavailable"
+                    })),
+                    timestamp: event_at,
+                })
+                .await
+                .unwrap();
+            if policy_revision == 2 {
+                enforced_run_id = Some(run.id.clone());
+                store
+                    .append_event(AgentEvent::MetricRecorded {
+                        run_id: run.id.clone(),
+                        name: format!("custom_high_cardinality_metric_{}", run.id),
+                        value: 1,
+                        metadata: Some(json!({
+                            "mode": "enforced",
+                            "surface": "website",
+                            "untrustedLabel": "must-not-be-exported"
+                        })),
+                        timestamp: event_at,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+            .update_run_status(&run.id, AgentRunStatus::Completed)
+            .await
+            .unwrap();
+    }
+
+    let query = format!(
+        "/internal/projects/project-canary-1/design-context-canary-metrics?designProfileId={profile_id}&designProfileVersion=1&observePolicyRevision=1&policyRevision=2&baselineStartedAt={}&baselineEndedAt={}&observationStartedAt={}&observationEndedAt={}&conclusionRecordedBy=operator-1",
+        baseline_started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        baseline_ended_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        observation_started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        observation_ended_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    );
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&query)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&query)
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-canary-metrics-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(allowed.into_body(), 128 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        body["schemaVersion"],
+        "design-context-canary-operational-export@1"
+    );
+    assert_eq!(body["source"]["kind"], "runtime-durable-store");
+    assert_eq!(body["publish"]["baselinePublishCount"], 1);
+    assert_eq!(body["publish"]["enforcedPublishCount"], 1);
+    assert_eq!(body["publish"]["samples"].as_array().unwrap().len(), 2);
+    assert_eq!(body["metrics"]["verifierUnavailableCount"], 1);
+    assert_eq!(body["metrics"]["verifierRuntimeLostCount"], 0);
+    assert_eq!(body["alertsTriggered"], true);
+    assert!(!body.to_string().contains("custom_high_cardinality_metric"));
+    assert!(!body.to_string().contains("must-not-be-exported"));
+    assert_eq!(
+        body["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["code"] == "verifier_unavailable")
+            .unwrap()["triggered"],
+        true
+    );
+
+    store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: enforced_run_id.unwrap(),
+            name: "design_context_required_read_block_total".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "mode": "observe",
+                "surface": "website",
+                "reason": "read_required"
+            })),
+            timestamp: observation_started_at + ChronoDuration::minutes(40),
+        })
+        .await
+        .unwrap();
+    let inconsistent = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&query)
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-canary-metrics-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inconsistent.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

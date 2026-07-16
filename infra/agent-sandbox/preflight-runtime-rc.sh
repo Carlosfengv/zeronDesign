@@ -40,6 +40,7 @@ node - "${lock_file}" "${PREFLIGHT_PREFETCH_IMAGES:-1}" "${evidence_path}" <<'NO
 const crypto = require("crypto");
 const fs = require("fs");
 const { spawnSync } = require("child_process");
+const { registryFallbackReason } = require("./infra/agent-sandbox/preflight-registry-policy.cjs");
 const lockRaw = fs.readFileSync(process.argv[2], "utf8");
 const lock = JSON.parse(lockRaw);
 const prefetchImages = process.argv[3] === "1";
@@ -56,20 +57,12 @@ const runDockerWithRetry = (args, timeout) => {
   }
   return result;
 };
-const resultText = result => `${result?.stderr || ""}\n${result?.stdout || ""}`;
-const fallbackReason = result => {
-  if (result?.error?.code === "ETIMEDOUT") return "timeout";
-  const text = resultText(result);
-  if (/429|Too Many Requests|pull rate limit/i.test(text)) return "rate_limited";
-  if (/unexpected EOF|connection reset|TLS handshake timeout/i.test(text)) return "transport_interrupted";
-  return null;
-};
 const runWithFallback = (argsForRef, canonicalRef, fallbackRef, timeout) => {
   const canonical = runDockerWithRetry(argsForRef(canonicalRef), timeout);
   if (!canonical.error && canonical.status === 0) {
     return { result: canonical, source: "canonical", selectedRef: canonicalRef, fallbackReason: null };
   }
-  const reason = fallbackReason(canonical);
+  const reason = registryFallbackReason(canonical);
   if (!fallbackRef || !reason) {
     return { result: canonical, source: "canonical", selectedRef: canonicalRef, fallbackReason: null };
   }

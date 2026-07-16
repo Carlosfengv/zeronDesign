@@ -13,7 +13,7 @@ use crate::{
     project::resolve_built_in_template_for_init,
     style_contract::read_contract_token_values,
     tools::control_plane::control_plane_executor_for_config,
-    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus},
+    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, DesignContextEnforcementBinding},
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -285,15 +285,15 @@ impl RunLifecycleService {
                 "target DesignProfile effective hash changed after planning"
             )));
         }
-        let enforcement_enabled = match self
+        let persisted_policy = self
             .store
             .get_design_context_enforcement_policy(
                 &source_run.project_id,
                 &target_profile.id,
                 target_profile.version,
             )
-            .await
-        {
+            .await;
+        let enforcement_enabled = match persisted_policy.as_ref() {
             Some(policy) => policy.enabled,
             None => self
                 .config
@@ -303,6 +303,20 @@ impl RunLifecycleService {
                     target_profile.version,
                 )
                 .map_err(|error| conflict(anyhow::anyhow!(error)))?,
+        };
+        let enforcement_binding = match persisted_policy.as_ref() {
+            Some(policy) => DesignContextEnforcementBinding {
+                source: "persistent".to_string(),
+                enabled: policy.enabled,
+                policy_revision: Some(policy.revision),
+                policy_updated_by: Some(policy.updated_by.clone()),
+            },
+            None => DesignContextEnforcementBinding {
+                source: "config".to_string(),
+                enabled: enforcement_enabled,
+                policy_revision: None,
+                policy_updated_by: None,
+            },
         };
         let compiled = compile_website_design_context(
             &effective,
@@ -367,7 +381,12 @@ impl RunLifecycleService {
             .map_err(conflict)?;
         let child = self
             .store
-            .attach_run_design_context(&child.id, &compiled, &verification_environment)
+            .attach_run_design_context_with_enforcement_binding(
+                &child.id,
+                &compiled,
+                &verification_environment,
+                Some(enforcement_binding),
+            )
             .await
             .map_err(conflict)?;
         self.store

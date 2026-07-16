@@ -21,7 +21,7 @@
   "packageManager": "npm@10.9.0",
   "private": true,
   "scripts": {
-    "build": "next build --webpack",
+    "build": "fumadocs-mdx && next build --webpack",
     "dev": "next dev --hostname 0.0.0.0",
     "preview": "serve out --listen 3000"
   },

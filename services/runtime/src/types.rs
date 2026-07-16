@@ -258,6 +258,8 @@ pub struct AgentRun {
     #[serde(default)]
     pub design_context_effective_compatibility_mode: Option<String>,
     #[serde(default)]
+    pub design_context_enforcement_binding: Option<DesignContextEnforcementBinding>,
+    #[serde(default)]
     pub design_context_warnings: Vec<String>,
     #[serde(default)]
     pub design_context_verification_environment: Option<Value>,
@@ -331,6 +333,18 @@ pub struct DesignContextEnforcementPolicy {
     pub updated_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Frozen rollout identity used when a Website DCP is compiled for one Run.
+/// Persistent policy revisions are auditable canary cohort identity; config
+/// allowlist decisions deliberately have no durable revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesignContextEnforcementBinding {
+    pub source: String,
+    pub enabled: bool,
+    pub policy_revision: Option<u64>,
+    pub policy_updated_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

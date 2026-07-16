@@ -105,6 +105,12 @@ export const DesignContextPackageSummarySchema = z.object({
   expectedAppRoot: z.string().min(1).nullish(),
   declaredEnforcementMode: z.string().min(1).nullish(),
   effectiveCompatibilityMode: z.string().min(1).nullish(),
+  enforcementPolicy: z.object({
+    source: z.enum(["persistent", "config"]),
+    enabled: z.boolean(),
+    policyRevision: z.number().int().positive().nullable(),
+    policyUpdatedBy: z.string().min(1).nullable(),
+  }).nullish(),
   verificationPolicyId: z.string().min(1),
   warnings: z.array(z.string()),
   surface: z.enum(["website", "docs"]),

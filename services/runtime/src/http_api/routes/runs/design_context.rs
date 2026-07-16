@@ -686,6 +686,7 @@ fn package_summary(run: &AgentRun, manifest: &DesignContextManifest) -> Value {
         "expectedAppRoot": run.design_context_expected_app_root,
         "declaredEnforcementMode": run.design_context_declared_enforcement_mode,
         "effectiveCompatibilityMode": run.design_context_effective_compatibility_mode,
+        "enforcementPolicy": run.design_context_enforcement_binding,
         "verificationPolicyId": manifest.payload.verification_policy.policy_id,
         "warnings": run.design_context_warnings,
         "surface": manifest.payload.surface,

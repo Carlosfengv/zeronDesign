@@ -74,6 +74,12 @@ type DesignContextSnapshot = {
       surface: "website" | "docs";
       template: string;
       effectiveCompatibilityMode?: string | null;
+      enforcementPolicy?: {
+        source: "persistent" | "config";
+        enabled: boolean;
+        policyRevision: number | null;
+        policyUpdatedBy: string | null;
+      } | null;
       verificationPolicyId: string;
       warnings: string[];
     };
@@ -594,6 +600,7 @@ function DesignContextCard({
       <h3>{source.designProfileId}@{source.designProfileVersion} · {source.template}</h3>
       <dl>
         <div><dt>DCP</dt><dd>{shortHash(source.contentHash)} · {context.diagnostics.materialization.ready ? "materialized" : "not materialized"}</dd></div>
+        <div><dt>Enforcement policy</dt><dd>{formatEnforcementPolicy(source.enforcementPolicy, source.effectiveCompatibilityMode)}</dd></div>
         <div><dt>Style contract</dt><dd>{context.diagnostics.styleContract.verified === true ? "verified" : context.diagnostics.styleContract.verified === false ? "failed" : "pending"}</dd></div>
         <div><dt>Required reads</dt><dd>{context.diagnostics.readFiles.length} read / {context.diagnostics.missingRequiredReads.length} missing</dd></div>
       </dl>
@@ -615,6 +622,15 @@ function DesignContextCard({
       </div>}
     </article>
   );
+}
+
+function formatEnforcementPolicy(
+  policy: DesignContextSnapshot["manifest"]["package"]["enforcementPolicy"],
+  effectiveMode?: string | null,
+) {
+  if (!policy) return `unbound · ${effectiveMode ?? "unknown"}`;
+  const revision = policy.policyRevision === null ? "config" : `r${policy.policyRevision}`;
+  return `${policy.source} ${revision} · ${policy.enabled ? "enabled" : "disabled"} · ${effectiveMode ?? "unknown"}`;
 }
 
 function FidelityOutcome({ fidelity }: { fidelity: FidelitySummary | null }) {

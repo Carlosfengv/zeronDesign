@@ -395,6 +395,11 @@ async fn public_runtime_enforced_dcp_build_collects_bound_browser_evidence() {
         run.design_context_effective_compatibility_mode.as_deref(),
         Some("enforced")
     );
+    let enforcement_binding = run.design_context_enforcement_binding.as_ref().unwrap();
+    assert_eq!(enforcement_binding.source, "config");
+    assert!(enforcement_binding.enabled);
+    assert_eq!(enforcement_binding.policy_revision, None);
+    assert_eq!(enforcement_binding.policy_updated_by, None);
     let environment = run
         .design_context_verification_environment
         .as_ref()
@@ -440,6 +445,15 @@ async fn public_runtime_enforced_dcp_build_collects_bound_browser_evidence() {
         serde_json::from_slice(&to_bytes(diagnostics.into_body(), 64 * 1024).await.unwrap())
             .unwrap();
     assert_eq!(diagnostics["fidelity"]["status"], json!("passed"));
+    assert_eq!(
+        diagnostics["package"]["enforcementPolicy"],
+        json!({
+            "source": "config",
+            "enabled": true,
+            "policyRevision": null,
+            "policyUpdatedBy": null,
+        })
+    );
     assert_eq!(diagnostics["fidelity"]["requiredFailedRuleIds"], json!([]));
     assert_eq!(
         diagnostics["fidelity"]["assertions"]

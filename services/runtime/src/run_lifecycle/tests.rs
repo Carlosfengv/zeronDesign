@@ -11,7 +11,7 @@ use crate::{
     },
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     types::{
-        AgentPhase, AgentRunStatus, Brief, DesignProfile, EffectiveDesignProfile,
+        AgentEvent, AgentPhase, AgentRunStatus, Brief, DesignProfile, EffectiveDesignProfile,
         SandboxBindingStatus, SandboxChannelProtocol,
     },
 };
@@ -649,6 +649,14 @@ async fn persistent_disabled_policy_overrides_matching_config_allowlist_and_reco
         run.design_context_effective_compatibility_mode.as_deref(),
         Some("observe")
     );
+    let enforcement_binding = run.design_context_enforcement_binding.as_ref().unwrap();
+    assert_eq!(enforcement_binding.source, "persistent");
+    assert!(!enforcement_binding.enabled);
+    assert_eq!(enforcement_binding.policy_revision, Some(1));
+    assert_eq!(
+        enforcement_binding.policy_updated_by.as_deref(),
+        Some("fixture-rollback")
+    );
     let run_id = run.id.clone();
     assert_eq!(launcher.launched.lock().unwrap().as_slice(), [run_id]);
     assert!(store.audit_records().await.iter().any(|record| {
@@ -660,6 +668,19 @@ async fn persistent_disabled_policy_overrides_matching_config_allowlist_and_reco
                 .input_summary
                 .contains("policyUpdatedBy=fixture-rollback")
     }));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded {
+            name,
+            value: 1,
+            metadata: Some(metadata),
+            ..
+        } if name == "design_context_package_compiled_total"
+            && metadata["mode"] == "observe"
+            && metadata["surface"] == "website"
+            && metadata["status"] == "passed"
+            && metadata["reason"] == "compiled"
+    )));
 }
 
 fn dcp_profile(project_id: &str) -> DesignProfile {

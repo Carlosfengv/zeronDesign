@@ -811,6 +811,12 @@ describe("runtime client", () => {
       expectedAppRoot: "project",
       declaredEnforcementMode: "enforced",
       effectiveCompatibilityMode: "enforced",
+      enforcementPolicy: {
+        source: "persistent",
+        enabled: true,
+        policyRevision: 3,
+        policyUpdatedBy: "operator-1",
+      },
       verificationPolicyId: "website-verification@1",
       warnings: [],
       surface: "website",
@@ -879,6 +885,12 @@ describe("runtime client", () => {
       viewport: 375,
       actualSummary: "420px",
       expectedSummary: "375px",
+    });
+    expect(diagnostics.package.enforcementPolicy).toEqual({
+      source: "persistent",
+      enabled: true,
+      policyRevision: 3,
+      policyUpdatedBy: "operator-1",
     });
     await client.planDesignProfileSync("run/1", {
       targetDesignProfileId: "profile-1", targetDesignProfileVersion: 2,

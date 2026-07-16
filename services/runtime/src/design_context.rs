@@ -569,6 +569,37 @@ pub fn validate_run_design_context_identity(
     {
         return Err("run cannot verify the style contract before DCP materialization".to_string());
     }
+    if let Some(binding) = run.design_context_enforcement_binding.as_ref() {
+        match binding.source.as_str() {
+            "persistent" => {
+                if binding.policy_revision.is_none_or(|revision| revision == 0)
+                    || binding
+                        .policy_updated_by
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(
+                        "persistent enforcement binding requires revision and updatedBy"
+                            .to_string(),
+                    );
+                }
+            }
+            "config" => {
+                if binding.policy_revision.is_some() || binding.policy_updated_by.is_some() {
+                    return Err(
+                        "config enforcement binding cannot claim a persistent policy revision"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => return Err("unsupported enforcement binding source".to_string()),
+        }
+        if payload.effective_compatibility_mode == ProfileCompatibilityMode::Enforced
+            && !binding.enabled
+        {
+            return Err("enforced DCP cannot have a disabled rollout binding".to_string());
+        }
+    }
     Ok(())
 }
 

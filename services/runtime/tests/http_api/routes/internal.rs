@@ -6,6 +6,14 @@ fn internal_route_family_is_frozen() {
             ("POST", "/internal/template-build"),
             ("POST", "/internal/previews/promote"),
             ("PUT", "/internal/projects/{project_id}/access"),
+            (
+                "GET",
+                "/internal/projects/{project_id}/design-context-canary-metrics",
+            ),
+            (
+                "PUT",
+                "/internal/projects/{project_id}/design-context-enforcement",
+            ),
             ("GET", "/internal/projects/{project_id}/release-evidence"),
             ("POST", "/internal/projects/{project_id}/release-sandbox"),
         ],

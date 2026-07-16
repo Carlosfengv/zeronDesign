@@ -159,6 +159,7 @@ function packageSummary() {
     version: "design-context@1", contentHash: HASH_A, artifactManifestHash: HASH_B,
     compilerVersion: "design-context-compiler@1", briefHash: HASH_C, expectedAppRoot: "project",
     declaredEnforcementMode: "enforced", effectiveCompatibilityMode: "enforced",
+    enforcementPolicy: { source: "persistent", enabled: true, policyRevision: 2, policyUpdatedBy: "smoke-operator" },
     verificationPolicyId: "website-verification@1", warnings: [], surface: "website",
     template: "astro-website", designProfileId: "profile-1", designProfileVersion: 2,
     effectiveProfileHash: simulateProfileDrift ? HASH_E : HASH_D,

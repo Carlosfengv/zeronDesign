@@ -115,6 +115,7 @@ fn status_payload(run: &AgentRun) -> Result<Value, ToolError> {
             "expectedAppRoot": run.design_context_expected_app_root,
             "declaredEnforcementMode": run.design_context_declared_enforcement_mode,
             "effectiveCompatibilityMode": run.design_context_effective_compatibility_mode,
+            "enforcementPolicy": run.design_context_enforcement_binding,
             "warnings": run.design_context_warnings,
         },
         "materialization": {

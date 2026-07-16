@@ -12,7 +12,10 @@ use crate::{
         DesignContextCompileOptions, ProfileCompatibilityMode, VerifierRegistry,
     },
     project::resolve_built_in_template_for_init,
-    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource},
+    types::{
+        AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource,
+        DesignContextEnforcementBinding,
+    },
 };
 use chrono::Utc;
 use serde_json::json;
@@ -465,7 +468,33 @@ async fn compile_and_attach_design_context(
             .design_context_enforcement_allowed_for(&run.project_id, &profile.id, profile.version)
             .map_err(|error| anyhow::anyhow!(error))?,
     };
-    let compiled = compile_website_design_context(
+    let enforcement_binding = match persisted_policy.as_ref() {
+        Some(policy) => DesignContextEnforcementBinding {
+            source: "persistent".to_string(),
+            enabled: policy.enabled,
+            policy_revision: Some(policy.revision),
+            policy_updated_by: Some(policy.updated_by.clone()),
+        },
+        None => DesignContextEnforcementBinding {
+            source: "config".to_string(),
+            enabled: enforcement_enabled,
+            policy_revision: None,
+            policy_updated_by: None,
+        },
+    };
+    let metric_mode = if enforcement_enabled
+        && effective
+            .profile
+            .get("websiteContext")
+            .and_then(|value| value.get("enforcementMode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("enforced")
+    {
+        "enforced"
+    } else {
+        "observe"
+    };
+    let compiled = match compile_website_design_context(
         &effective,
         &brief,
         &template,
@@ -473,8 +502,28 @@ async fn compile_and_attach_design_context(
             enforcement_enabled,
             ..Default::default()
         },
-    )
-    .map_err(|error| anyhow::anyhow!(error))?;
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            let _ = service
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run.id.clone(),
+                    name: "design_context_package_compiled_total".to_string(),
+                    value: 1,
+                    metadata: Some(json!({
+                        "mode": metric_mode,
+                        "surface": "website",
+                        "phase": "build",
+                        "status": "failed",
+                        "reason": "compiler_rejected",
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            return Err(anyhow::anyhow!(error));
+        }
+    };
     let verification_environment = VerifierRegistry::discover_with_executables(
         service
             .config
@@ -489,8 +538,29 @@ async fn compile_and_attach_design_context(
     );
     let attached = service
         .store
-        .attach_run_design_context(&run.id, &compiled, &verification_environment)
+        .attach_run_design_context_with_enforcement_binding(
+            &run.id,
+            &compiled,
+            &verification_environment,
+            Some(enforcement_binding),
+        )
         .await?;
+    let _ = service
+        .store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: "design_context_package_compiled_total".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "mode": metric_mode,
+                "surface": "website",
+                "phase": "build",
+                "status": "passed",
+                "reason": "compiled",
+            })),
+            timestamp: Utc::now(),
+        })
+        .await;
     service
         .store
         .append_audit_record(
