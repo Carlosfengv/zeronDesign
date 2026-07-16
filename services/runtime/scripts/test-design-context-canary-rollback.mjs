@@ -92,6 +92,23 @@ const baseUrl = `http://127.0.0.1:${address.port}`;
 const root = await mkdtemp(join(tmpdir(), "design-context-canary-rollback-"));
 try {
   const statePath = join(root, "rollback-state.json");
+  const occupiedStatePath = join(root, "occupied-rollback-state.json");
+  await writeFile(occupiedStatePath, "operator-owned\n", { mode: 0o600 });
+  const requestCountBeforeCollision = requests.length;
+  await assert.rejects(() => disableCanaryPolicy({
+    baseUrl,
+    projectId: cohort.projectId,
+    designProfileId: cohort.designProfileId,
+    designProfileVersion: cohort.designProfileVersion,
+    expectedRevision: cohort.policyRevision,
+    updatedBy: cohort.policyUpdatedBy,
+    statePath: occupiedStatePath,
+    adminToken: "admin-test-token",
+    recordedAt: "2026-07-15T00:59:00Z",
+  }), error => error?.code === "EEXIST");
+  assert.equal(requests.length, requestCountBeforeCollision, "state collision must fail before the Runtime CAS request");
+  assert.equal(await readFile(occupiedStatePath, "utf8"), "operator-owned\n");
+
   const state = await disableCanaryPolicy({
     baseUrl,
     projectId: cohort.projectId,

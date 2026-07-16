@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile, rm, writeFile } from "node:fs/promises";
 import { readCanaryLedger } from "./design-context-canary-ledger.mjs";
 
 function hasText(value) {
@@ -25,7 +25,7 @@ function requiredToken(value, name) {
 async function runtimeJson(url, init) {
   const response = await fetch(url, { ...init, signal: AbortSignal.timeout(120_000) });
   const text = await response.text();
-  if (!response.ok) throw new Error(`Runtime ${init?.method ?? "GET"} ${new URL(url).pathname} failed ${response.status}: ${text.slice(0, 500)}`);
+  if (!response.ok) throw new Error(`Runtime ${init?.method ?? "GET"} ${new URL(url).pathname} failed ${response.status}`);
   return JSON.parse(text);
 }
 
@@ -47,42 +47,55 @@ export async function disableCanaryPolicy({
   if (!positiveInteger(designProfileVersion) || !positiveInteger(expectedRevision)) {
     throw new Error("designProfileVersion and expectedRevision must be positive integers");
   }
-  const response = await runtimeJson(
-    new URL(`/internal/projects/${encodeURIComponent(projectId)}/design-context-enforcement`, baseUrl),
-    {
-      method: "PUT",
-      headers: {
-        "content-type": "application/json",
-        "x-anydesign-internal": "true",
-        "x-runtime-admin-token": adminToken,
+  // Reserve the evidence path before mutating Runtime. A stale/existing path must
+  // fail before the CAS request, otherwise the policy can be disabled without a
+  // writable audit state for the mandatory post-rollback verification.
+  const stateFile = await open(statePath, "wx", 0o600);
+  try {
+    const response = await runtimeJson(
+      new URL(`/internal/projects/${encodeURIComponent(projectId)}/design-context-enforcement`, baseUrl),
+      {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          "x-anydesign-internal": "true",
+          "x-runtime-admin-token": adminToken,
+        },
+        body: JSON.stringify({
+          designProfileId,
+          designProfileVersion,
+          enabled: false,
+          expectedRevision,
+          updatedBy,
+        }),
       },
-      body: JSON.stringify({
-        designProfileId,
-        designProfileVersion,
-        enabled: false,
-        expectedRevision,
-        updatedBy,
-      }),
-    },
-  );
-  const policy = response?.policy;
-  if (policy?.projectId !== projectId || policy?.designProfileId !== designProfileId
-    || policy?.designProfileVersion !== designProfileVersion || policy?.enabled !== false
-    || policy?.revision !== expectedRevision + 1 || policy?.updatedBy !== updatedBy) {
-    throw new Error("Runtime returned an unexpected disabled policy identity");
+    );
+    const policy = response?.policy;
+    if (policy?.projectId !== projectId || policy?.designProfileId !== designProfileId
+      || policy?.designProfileVersion !== designProfileVersion || policy?.enabled !== false
+      || policy?.revision !== expectedRevision + 1 || policy?.updatedBy !== updatedBy) {
+      throw new Error("Runtime returned an unexpected disabled policy identity");
+    }
+    const state = {
+      schemaVersion: "design-context-canary-rollback-state@1",
+      recordedAt,
+      projectId,
+      designProfileId,
+      designProfileVersion,
+      enforcedPolicyRevision: expectedRevision,
+      policyRevisionAfterRollback: policy.revision,
+      updatedBy,
+    };
+    await stateFile.writeFile(`${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8" });
+    await stateFile.sync();
+    return state;
+  } catch (error) {
+    await stateFile.close().catch(() => {});
+    await rm(statePath, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    await stateFile.close().catch(() => {});
   }
-  const state = {
-    schemaVersion: "design-context-canary-rollback-state@1",
-    recordedAt,
-    projectId,
-    designProfileId,
-    designProfileVersion,
-    enforcedPolicyRevision: expectedRevision,
-    policyRevisionAfterRollback: policy.revision,
-    updatedBy,
-  };
-  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-  return state;
 }
 
 function parseSseEvents(text) {
@@ -123,7 +136,7 @@ export async function verifyCanaryRollback({
     { headers: { authorization }, signal: AbortSignal.timeout(120_000) },
   );
   const eventsText = await eventsResponse.text();
-  if (!eventsResponse.ok) throw new Error(`Runtime events failed ${eventsResponse.status}: ${eventsText.slice(0, 500)}`);
+  if (!eventsResponse.ok) throw new Error(`Runtime events failed ${eventsResponse.status}`);
   const events = parseSseEvents(eventsText);
   const started = events.find(event => event.type === "run.started");
   const completed = events.find(event => event.type === "run.completed" && event.status === "completed");

@@ -73,6 +73,33 @@ struct SeedProfileSyncRequest {
     scenario: String,
 }
 
+fn resolve_web_app_root() -> PathBuf {
+    if let Some(repo_root) = std::env::var_os("ZERONDESIGN_REPO_ROOT") {
+        let candidate = PathBuf::from(repo_root).join("apps/web");
+        assert!(
+            candidate.join("package.json").is_file(),
+            "ZERONDESIGN_REPO_ROOT does not contain apps/web/package.json"
+        );
+        return candidate;
+    }
+
+    let current_dir =
+        std::env::current_dir().expect("could not resolve the current test directory");
+    if let Some(candidate) = current_dir
+        .ancestors()
+        .map(|ancestor| ancestor.join("apps/web"))
+        .find(|candidate| candidate.join("package.json").is_file())
+    {
+        return candidate;
+    }
+
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("Runtime manifest directory must be nested under the repository root")
+        .join("apps/web")
+}
+
 /// This is deliberately ignored in the ordinary Rust suite: it launches the
 /// real Next development server and a headless browser. It remains a
 /// single-command L4 gate, with a test-only seed handler mounted *outside* the
@@ -104,11 +131,7 @@ async fn bff_profile_sync_bff_to_real_runtime() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let app_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join("apps/web");
+    let app_root = resolve_web_app_root();
     let output = timeout(
         Duration::from_secs(210),
         Command::new("node")

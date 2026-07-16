@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile, appendFile, open, unlink } from "node:fs/promises";
+import { readFile, open, unlink } from "node:fs/promises";
 import {
   buildCanarySourceLedger,
   canarySha256,
@@ -245,6 +245,36 @@ async function loadSourceDocument(path) {
   return { raw, document: JSON.parse(raw), sha256: canarySha256(raw) };
 }
 
+async function writeExclusiveDurable(path, contents) {
+  const handle = await open(path, "wx", 0o600);
+  let completed = false;
+  try {
+    await handle.writeFile(contents, { encoding: "utf8" });
+    await handle.sync();
+    completed = true;
+  } finally {
+    await handle.close().catch(() => {});
+    if (!completed) await unlink(path).catch(() => {});
+  }
+}
+
+async function appendDurable(path, contents) {
+  const handle = await open(path, "r+");
+  try {
+    const { size } = await handle.stat();
+    const bytes = Buffer.from(contents, "utf8");
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, size + offset);
+      if (bytesWritten <= 0) throw new Error(`failed to append canary ledger: ${path}`);
+      offset += bytesWritten;
+    }
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 function sourcePayload(document, excludedKeys) {
   return Object.fromEntries(Object.entries(document).filter(([key]) => !excludedKeys.has(key)));
 }
@@ -313,7 +343,7 @@ export async function initializeCanaryLedger({ ledgerPath, configPath }) {
     payload,
     previousRecordHash: null,
   });
-  await writeFile(ledgerPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  await writeExclusiveDurable(ledgerPath, `${JSON.stringify(record)}\n`);
   return record;
 }
 
@@ -340,7 +370,7 @@ export async function appendCanaryEvent({ ledgerPath, eventPath }) {
       payload: document.payload,
       previousRecordHash: previous.recordHash,
     });
-    await appendFile(ledgerPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    await appendDurable(ledgerPath, `${JSON.stringify(record)}\n`);
     return record;
   });
 }
@@ -445,7 +475,7 @@ export async function finalizeCanaryLedger({ ledgerPath, outputPath, recordedAt 
   const evidence = assembleCanaryEvidence(records, recordedAt);
   const errors = validateDesignContextCanaryEvidence(evidence);
   if (errors.length) throw new Error(errors.map(error => `design-context canary evidence: ${error}`).join("\n"));
-  await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  await writeExclusiveDurable(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   return evidence;
 }
 
