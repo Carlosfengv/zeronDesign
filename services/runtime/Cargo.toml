@@ -31,5 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 kube = { version = "4", features = ["client", "rustls-tls", "ws"] }
+provider-gateway = { path = "../provider-gateway" }
 serde_yaml = "0.9"
 tower = { version = "0.5", features = ["util"] }

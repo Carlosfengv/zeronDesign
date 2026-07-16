@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, fs, net::SocketAddr, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +135,7 @@ pub struct RuntimeConfig {
     pub host: String,
     pub port: u16,
     pub model_gateway_url: String,
+    pub model_gateway_auth_token: Option<String>,
     pub model_provider: ModelProvider,
     pub agent_model: String,
     pub deepseek_api_key: Option<String>,
@@ -221,6 +222,8 @@ impl RuntimeConfig {
                 .unwrap_or(8080),
             model_gateway_url: env::var("MODEL_GATEWAY_URL")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+            model_gateway_auth_token: secret_env("MODEL_GATEWAY_AUTH_TOKEN")
+                .or_else(|| secret_file_env("MODEL_GATEWAY_AUTH_TOKEN_FILE")),
             model_provider,
             agent_model: agent_model_from_env(model_provider),
             deepseek_api_key: secret_env("DEEPSEEK_API_KEY"),
@@ -582,6 +585,14 @@ impl RuntimeConfig {
 
 fn secret_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn secret_file_env(name: &str) -> Option<String> {
+    let path = secret_env(name)?;
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn optional_string_env(name: &str) -> Option<String> {

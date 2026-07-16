@@ -40,6 +40,18 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
         "organizationId",
         command.input_context.organization_id.as_deref(),
     )?;
+    if let Some(model_resource_id) = command.input_context.model_resource_id.as_deref() {
+        if model_resource_id.len() > 128
+            || !model_resource_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(invalid_request(
+                "modelResourceId must use only letters, digits, '-', '_', '.', or ':'".to_string(),
+            ));
+        }
+        required("modelResourceId", model_resource_id)?;
+    }
     for finding_id in &command.input_context.finding_ids {
         if finding_id.trim().is_empty() {
             return Err(invalid_request(

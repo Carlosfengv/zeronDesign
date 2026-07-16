@@ -9,8 +9,8 @@ use crate::{
     },
     design_profile::render_design_profile_markdown,
     model_gateway::{
-        ModelClient, ModelRequest, ModelResponse, ToolCall, ToolInputParseFailure,
-        ToolInputTooLargeFailure,
+        ModelClient, ModelGatewayRequestError, ModelGatewayScope, ModelRequest, ModelResponse,
+        ToolCall, ToolInputParseFailure, ToolInputTooLargeFailure,
     },
     tools::{
         self,
@@ -87,6 +87,18 @@ impl AgentLoop {
             .update_run_status(run_id, AgentRunStatus::Running)
             .await?;
         let project_id = run.project_id.clone();
+        let project_access = self.store.get_project_access(&project_id).await;
+        let model_gateway_scope = ModelGatewayScope {
+            organization_id: project_access
+                .as_ref()
+                .and_then(|access| access.organization_id.clone())
+                .unwrap_or_else(|| "runtime-local".to_string()),
+            workspace_id: project_access
+                .as_ref()
+                .and_then(|access| access.workspace_id.clone())
+                .unwrap_or_else(|| "runtime-local".to_string()),
+            project_id: project_id.clone(),
+        };
         let _ = self
             .store
             .append_event(AgentEvent::RunStarted {
@@ -176,24 +188,40 @@ impl AgentLoop {
                 .tool_executor
                 .model_tool_snapshot(self.store.clone(), run_id)
                 .await;
-            match self
+            let model_turn = self
                 .model
-                .next_response(ModelRequest {
-                    run_id: run_id.to_string(),
-                    turn,
-                    model: current_run.model.clone(),
-                    phase: current_run.phase,
-                    agent_profile: current_run.agent_profile.clone(),
-                    system_prompt: system_prompt_for_run(
-                        &current_run,
-                        repair_target_context.as_deref(),
-                    ),
-                    messages: message_window.clone(),
-                    tools,
-                    deferred_tools,
-                })
-                .await
-            {
+                .next_response_scoped_with_execution(
+                    ModelRequest {
+                        run_id: run_id.to_string(),
+                        turn,
+                        model: current_run.model.clone(),
+                        phase: current_run.phase,
+                        agent_profile: current_run.agent_profile.clone(),
+                        system_prompt: system_prompt_for_run(
+                            &current_run,
+                            repair_target_context.as_deref(),
+                        ),
+                        messages: message_window.clone(),
+                        tools,
+                        deferred_tools,
+                    },
+                    model_gateway_scope.clone(),
+                )
+                .await;
+            if let Ok(turn_response) = &model_turn {
+                if let Some(snapshot) = &turn_response.execution {
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::ModelExecution {
+                            run_id: run_id.to_string(),
+                            turn,
+                            snapshot: serde_json::to_value(snapshot).unwrap_or_else(|_| json!({})),
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                }
+            }
+            match model_turn.map(|turn_response| turn_response.response) {
                 Ok(ModelResponse::ToolCalls(calls)) => {
                     if calls.is_empty() {
                         message_window.push(json!({
@@ -577,6 +605,9 @@ impl AgentLoop {
                     break;
                 }
                 Err(error) => {
+                    let retryable_gateway_failure = error
+                        .downcast_ref::<ModelGatewayRequestError>()
+                        .is_some_and(|failure| failure.retryable);
                     let error = error.to_string();
                     message_window.push(json!({
                         "role": "runtime",
@@ -585,8 +616,17 @@ impl AgentLoop {
                     }));
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
-                    self.finalize(run_id, AgentRunStatus::Failed, &error, &message_window)
-                        .await?;
+                    self.finalize(
+                        run_id,
+                        if retryable_gateway_failure {
+                            AgentRunStatus::Blocked
+                        } else {
+                            AgentRunStatus::Failed
+                        },
+                        &error,
+                        &message_window,
+                    )
+                    .await?;
                     break;
                 }
             }

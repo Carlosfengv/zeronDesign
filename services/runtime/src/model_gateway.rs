@@ -1,11 +1,15 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::Duration,
 };
@@ -20,6 +24,9 @@ use crate::{
 const MAX_STREAMING_TOOL_ARGUMENT_CHARS: usize = 96_000;
 const OPENAI_TRANSPORT_ATTEMPTS: u32 = 5;
 const OPENAI_TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const PROVIDER_GATEWAY_TURN_REQUEST_SCHEMA: &str = "provider-gateway-turn-request@1";
+const PROVIDER_GATEWAY_TRANSPORT_ATTEMPTS: u32 = 3;
+static GATEWAY_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -96,6 +103,68 @@ pub struct ModelRequest {
     pub deferred_tools: Vec<ModelToolDefinition>,
 }
 
+/// Trusted Runtime context used only when calling the internal Provider Gateway.
+/// Direct provider clients deliberately ignore it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelGatewayScope {
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub project_id: String,
+}
+
+/// Low-sensitivity execution record returned by the Provider Gateway. It is
+/// safe to persist in a Run event and deliberately excludes prompts, tool
+/// arguments, and provider credentials.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelExecutionSnapshot {
+    pub id: String,
+    pub model_resource_id: String,
+    pub model_resource_revision: u64,
+    pub provider_id: String,
+    pub physical_model: String,
+    pub selection_policy_id: String,
+    pub selection_policy_revision: u64,
+    pub capability_snapshot_hash: String,
+    pub selection_reason: String,
+    pub automatic_switch: Value,
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub provider_attempt_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelClientTurn {
+    pub response: ModelResponse,
+    pub execution: Option<ModelExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelGatewayRequestError {
+    pub status: u16,
+    pub code: String,
+    pub retryable: bool,
+    pub retry_after_ms: Option<u64>,
+}
+
+impl fmt::Display for ModelGatewayRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "model gateway request failed: status={} code={} retryable={} retry_after_ms={:?}",
+            reqwest::StatusCode::from_u16(self.status)
+                .map(|status| status.to_string())
+                .unwrap_or_else(|_| self.status.to_string()),
+            self.code,
+            self.retryable,
+            self.retry_after_ms
+        )
+    }
+}
+
+impl Error for ModelGatewayRequestError {}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelToolDefinition {
@@ -110,12 +179,32 @@ pub struct ModelToolDefinition {
 #[async_trait]
 pub trait ModelClient: Send + Sync {
     async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse>;
+
+    async fn next_response_scoped(
+        &self,
+        request: ModelRequest,
+        _scope: ModelGatewayScope,
+    ) -> Result<ModelResponse> {
+        self.next_response(request).await
+    }
+
+    async fn next_response_scoped_with_execution(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelClientTurn> {
+        Ok(ModelClientTurn {
+            response: self.next_response_scoped(request, scope).await?,
+            execution: None,
+        })
+    }
 }
 
 pub fn model_client_from_config(config: &RuntimeConfig) -> Result<ConfiguredModelClient> {
     match config.model_provider {
         ModelProvider::InternalGateway => Ok(ConfiguredModelClient::InternalGateway(
             HttpModelGatewayClient::new(config.model_gateway_url.clone())
+                .with_runtime_bearer_token(config.model_gateway_auth_token.clone())
                 .with_timeout(Duration::from_secs(config.model_request_timeout_seconds)),
         )),
         ModelProvider::DeepSeek => {
@@ -199,6 +288,35 @@ impl ModelClient for ConfiguredModelClient {
             Self::OpenAiCompatible(client) => client.next_response(request).await,
         }
     }
+
+    async fn next_response_scoped(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelResponse> {
+        match self {
+            Self::InternalGateway(client) => client.next_response_scoped(request, scope).await,
+            Self::OpenAiCompatible(client) => client.next_response(request).await,
+        }
+    }
+
+    async fn next_response_scoped_with_execution(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelClientTurn> {
+        match self {
+            Self::InternalGateway(client) => {
+                client
+                    .next_response_scoped_with_execution(request, scope)
+                    .await
+            }
+            Self::OpenAiCompatible(client) => Ok(ModelClientTurn {
+                response: client.next_response(request).await?,
+                execution: None,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +324,7 @@ pub struct HttpModelGatewayClient {
     endpoint: String,
     client: reqwest::Client,
     request_timeout: Duration,
+    runtime_bearer_token: Option<String>,
 }
 
 impl HttpModelGatewayClient {
@@ -216,6 +335,7 @@ impl HttpModelGatewayClient {
             endpoint,
             client: reqwest::Client::new(),
             request_timeout: Duration::from_secs(180),
+            runtime_bearer_token: None,
         }
     }
 
@@ -232,6 +352,11 @@ impl HttpModelGatewayClient {
         self
     }
 
+    pub fn with_runtime_bearer_token(mut self, token: Option<String>) -> Self {
+        self.runtime_bearer_token = token.filter(|token| !token.trim().is_empty());
+        self
+    }
+
     async fn execute(&self, request: ModelRequest) -> Result<ModelResponse> {
         let response = self
             .client
@@ -241,22 +366,184 @@ impl HttpModelGatewayClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            let code = body
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("gateway_request_failed");
+            let retryable = body
+                .get("error")
+                .and_then(|error| error.get("retryable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             return Err(anyhow!(
-                "model gateway request failed: status={} body={}",
+                "model gateway request failed: status={} code={} retryable={}",
                 status,
-                body
+                code,
+                retryable
             ));
         }
         let response = response.json::<ModelGatewayTurnResponse>().await?;
         Ok(response.into())
     }
+
+    async fn execute_scoped(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelClientTurn> {
+        let request_id = format!(
+            "runtime-{}-{}-{}",
+            request.run_id,
+            request.turn,
+            GATEWAY_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let phase = serde_json::to_value(request.phase)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "build".to_string());
+        let payload = json!({
+            "schemaVersion": PROVIDER_GATEWAY_TURN_REQUEST_SCHEMA,
+            "requestId": request_id,
+            "idempotencyKey": format!("{}:turn-{}", request.run_id, request.turn),
+            "deadlineAt": (Utc::now() + ChronoDuration::from_std(self.request_timeout).unwrap_or_else(|_| ChronoDuration::seconds(180))).to_rfc3339(),
+            "scope": {
+                "organizationId": scope.organization_id,
+                "workspaceId": scope.workspace_id,
+                "projectId": scope.project_id,
+                "runId": request.run_id,
+                "turn": request.turn,
+                "phase": phase,
+                "agentProfile": request.agent_profile,
+            },
+            "routing": {
+                "modelResourceId": explicit_model_resource_id(&request.model)
+                    .map(|id| Value::String(id.to_string()))
+                    .unwrap_or(Value::Null),
+                "requiredCapabilities": {
+                    "toolCalls": !request.tools.is_empty() || !request.deferred_tools.is_empty(),
+                    "strictToolSchema": false,
+                    "streaming": false,
+                    "vision": false,
+                }
+            },
+            "input": {
+                "systemPrompt": request.system_prompt,
+                "messages": request.messages,
+                "tools": request.tools,
+                "deferredTools": request.deferred_tools,
+            }
+        });
+        for attempt in 1..=PROVIDER_GATEWAY_TRANSPORT_ATTEMPTS {
+            let mut call = self
+                .client
+                .post(&self.endpoint)
+                .header(
+                    "idempotency-key",
+                    payload["idempotencyKey"].as_str().unwrap_or_default(),
+                )
+                .header(
+                    "x-request-id",
+                    payload["requestId"].as_str().unwrap_or_default(),
+                )
+                .json(&payload);
+            if let Some(token) = &self.runtime_bearer_token {
+                call = call.bearer_auth(token);
+            }
+            let response = call.send().await?;
+            let status = response.status();
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            if !status.is_success() {
+                let failure = ModelGatewayRequestError {
+                    status: status.as_u16(),
+                    code: body
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("gateway_request_failed")
+                        .to_string(),
+                    retryable: body
+                        .get("error")
+                        .and_then(|error| error.get("retryable"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    retry_after_ms: body
+                        .get("error")
+                        .and_then(|error| error.get("retryAfterMs"))
+                        .and_then(Value::as_u64),
+                };
+                if failure.retryable && attempt < PROVIDER_GATEWAY_TRANSPORT_ATTEMPTS {
+                    let fallback_delay = 250u64.saturating_mul(u64::from(attempt));
+                    tokio::time::sleep(Duration::from_millis(
+                        failure.retry_after_ms.unwrap_or(fallback_delay).min(5_000),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(anyhow::Error::new(failure));
+            }
+            if body.get("schemaVersion").and_then(Value::as_str)
+                == Some("provider-gateway-turn-response@1")
+            {
+                let response = serde_json::from_value::<VersionedGatewayTurnResponse>(body)?;
+                let execution = response.model_execution.clone();
+                return Ok(ModelClientTurn {
+                    response: response.into(),
+                    execution: Some(execution),
+                });
+            }
+            // Fixture and legacy gateway compatibility during the staged migration.
+            return Ok(ModelClientTurn {
+                response: serde_json::from_value::<ModelGatewayTurnResponse>(body)?.into(),
+                execution: None,
+            });
+        }
+        unreachable!("Provider Gateway transport attempts are at least one")
+    }
+}
+
+fn explicit_model_resource_id(model: &str) -> Option<&str> {
+    model.strip_prefix("resource:").filter(|id| !id.is_empty())
 }
 
 #[async_trait]
 impl ModelClient for HttpModelGatewayClient {
     async fn next_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         tokio::time::timeout(self.request_timeout, self.execute(request))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "model gateway turn timed out after {}ms",
+                    self.request_timeout.as_millis()
+                )
+            })?
+    }
+
+    async fn next_response_scoped(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelResponse> {
+        Ok(
+            tokio::time::timeout(self.request_timeout, self.execute_scoped(request, scope))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "model gateway turn timed out after {}ms",
+                        self.request_timeout.as_millis()
+                    )
+                })??
+                .response,
+        )
+    }
+
+    async fn next_response_scoped_with_execution(
+        &self,
+        request: ModelRequest,
+        scope: ModelGatewayScope,
+    ) -> Result<ModelClientTurn> {
+        tokio::time::timeout(self.request_timeout, self.execute_scoped(request, scope))
             .await
             .map_err(|_| {
                 anyhow!(
@@ -435,6 +722,18 @@ enum ModelGatewayTurnResponse {
     Error {
         error: String,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VersionedGatewayTurnResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    #[serde(default)]
+    tool_calls: Vec<ModelGatewayToolCall>,
+    #[serde(default)]
+    text: Option<String>,
+    model_execution: ModelExecutionSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1025,6 +1324,20 @@ impl From<ModelGatewayTurnResponse> for ModelResponse {
             }
             ModelGatewayTurnResponse::Text { text } => ModelResponse::TextOnly(text),
             ModelGatewayTurnResponse::Error { error } => ModelResponse::Error(error),
+        }
+    }
+}
+
+impl From<VersionedGatewayTurnResponse> for ModelResponse {
+    fn from(response: VersionedGatewayTurnResponse) -> Self {
+        match response.response_type.as_str() {
+            "tool_calls" => {
+                ModelResponse::ToolCalls(response.tool_calls.into_iter().map(Into::into).collect())
+            }
+            "text" => ModelResponse::TextOnly(response.text.unwrap_or_default()),
+            other => ModelResponse::Error(format!(
+                "unsupported provider gateway response type: {other}"
+            )),
         }
     }
 }

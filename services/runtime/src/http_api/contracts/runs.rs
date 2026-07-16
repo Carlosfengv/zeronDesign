@@ -26,6 +26,8 @@ pub struct StartRunInputContext {
     pub workspace_id: Option<String>,
     pub organization_id: Option<String>,
     #[serde(default)]
+    pub model_resource_id: Option<String>,
+    #[serde(default)]
     pub finding_ids: Vec<String>,
 }
 
@@ -45,6 +47,7 @@ impl From<StartRunRequest> for crate::run_lifecycle::StartRunCommand {
                 design_fidelity_mode: request.input_context.design_fidelity_mode,
                 workspace_id: request.input_context.workspace_id,
                 organization_id: request.input_context.organization_id,
+                model_resource_id: request.input_context.model_resource_id,
                 finding_ids: request.input_context.finding_ids,
             },
         }

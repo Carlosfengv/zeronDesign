@@ -1,6 +1,6 @@
 use anydesign_runtime::model_gateway::{
-    model_client_from_config, HttpModelGatewayClient, ModelClient, ModelRequest, ModelResponse,
-    ModelToolDefinition, OpenAiCompatibleModelClient,
+    model_client_from_config, HttpModelGatewayClient, ModelClient, ModelGatewayScope, ModelRequest,
+    ModelResponse, ModelToolDefinition, OpenAiCompatibleModelClient,
 };
 use anydesign_runtime::{
     config::{ModelProvider, RuntimeConfig},
@@ -10,12 +10,18 @@ use anydesign_runtime::{
 use axum::{
     body::Body,
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use futures::stream;
+use provider_gateway::{
+    router as provider_gateway_router, AutomaticSwitchPolicy, DirectSelectionPolicy, GatewayConfig,
+    GatewayService, ModelCandidate, ModelDefaults, ModelResource, ModelResourceKind,
+    ModelSelectionLimits, ModelSelectionPolicy, PolicyApplicability, PolicyScope, ProviderAuth,
+    ProviderCapabilities, ProviderEndpoint, MODEL_RESOURCE_SCHEMA, MODEL_SELECTION_POLICY_SCHEMA,
+};
 use serde_json::{json, Value};
 use std::{
     io,
@@ -81,6 +87,230 @@ async fn http_model_gateway_client_posts_turn_request_and_maps_tool_calls() {
 }
 
 #[tokio::test]
+async fn http_model_gateway_client_posts_versioned_scoped_turn_request() {
+    let captured_request = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/v1/agent/turn", post(capture_versioned_turn_request))
+        .with_state(captured_request.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = HttpModelGatewayClient::new(base_url)
+        .with_runtime_bearer_token(Some("runtime-token".to_string()));
+
+    let response = client
+        .next_response_scoped(
+            ModelRequest {
+                run_id: "run-1".to_string(),
+                turn: 2,
+                model: "internal-balanced".to_string(),
+                phase: AgentPhase::Build,
+                agent_profile: "website-builder".to_string(),
+                system_prompt: "Use the provided tools.".to_string(),
+                messages: vec![],
+                tools: vec![],
+                deferred_tools: vec![],
+            },
+            ModelGatewayScope {
+                organization_id: "org-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                project_id: "project-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let request = captured_request.lock().await.clone().unwrap();
+    assert_eq!(request["schemaVersion"], "provider-gateway-turn-request@1");
+    assert_eq!(request["scope"]["organizationId"], "org-1");
+    assert_eq!(request["scope"]["workspaceId"], "workspace-1");
+    assert_eq!(request["scope"]["projectId"], "project-1");
+    assert_eq!(request["scope"]["runId"], "run-1");
+    assert_eq!(request["routing"]["modelResourceId"], Value::Null);
+    assert_eq!(
+        response,
+        ModelResponse::TextOnly("gateway text".to_string())
+    );
+}
+
+#[tokio::test]
+async fn http_model_gateway_client_passes_explicit_model_resource_to_gateway_policy() {
+    let captured_request = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/v1/agent/turn", post(capture_versioned_turn_request))
+        .with_state(captured_request.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = HttpModelGatewayClient::new(base_url);
+
+    client
+        .next_response_scoped(
+            ModelRequest {
+                run_id: "run-1".to_string(),
+                turn: 3,
+                model: "resource:quality-edit-model".to_string(),
+                phase: AgentPhase::Edit,
+                agent_profile: "website-editor".to_string(),
+                system_prompt: "Use the provided tools.".to_string(),
+                messages: vec![],
+                tools: vec![],
+                deferred_tools: vec![],
+            },
+            ModelGatewayScope {
+                organization_id: "org-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                project_id: "project-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let request = captured_request.lock().await.clone().unwrap();
+    assert_eq!(request["routing"]["modelResourceId"], "quality-edit-model");
+    assert!(request["routing"].get("endpoint").is_none());
+    assert!(request["routing"].get("apiKey").is_none());
+}
+
+#[tokio::test]
+async fn runtime_gateway_provider_round_trip_preserves_governed_selection_boundary() {
+    let captured_provider_request = Arc::new(Mutex::new(None));
+    let provider = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(capture_cross_service_provider_request),
+        )
+        .with_state(captured_provider_request.clone());
+    let provider_url = spawn_gateway(provider).await;
+    let secret_path = std::env::temp_dir().join(format!(
+        "provider-gateway-runtime-contract-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&secret_path, "provider-test-key").unwrap();
+    unsafe { std::env::set_var("PROVIDER_GATEWAY_ALLOW_LOOPBACK", "true") };
+
+    let resource = ModelResource {
+        schema_version: MODEL_RESOURCE_SCHEMA.to_string(),
+        id: "edit-model".to_string(),
+        display_name: "Governed edit model".to_string(),
+        kind: ModelResourceKind::OpenaiCompatible,
+        enabled: true,
+        revision: 3,
+        endpoint: ProviderEndpoint {
+            base_url: provider_url,
+            chat_completions_path: "/v1/chat/completions".to_string(),
+        },
+        auth: ProviderAuth {
+            auth_type: "bearer".to_string(),
+            secret_ref: format!("file:{}", secret_path.display()),
+        },
+        physical_model: "provider-edit-physical".to_string(),
+        capabilities: ProviderCapabilities {
+            tool_calls: true,
+            strict_tool_schema: false,
+            streaming: false,
+            vision: false,
+        },
+        defaults: ModelDefaults::default(),
+    };
+    let policy = ModelSelectionPolicy {
+        schema_version: MODEL_SELECTION_POLICY_SCHEMA.to_string(),
+        id: "website-edit-policy".to_string(),
+        revision: 2,
+        scope: PolicyScope {
+            organization_ids: vec!["org-1".to_string()],
+            workspace_ids: vec!["workspace-1".to_string()],
+            project_ids: vec!["project-1".to_string()],
+        },
+        applies_to: PolicyApplicability {
+            phases: vec!["edit".to_string()],
+            agent_profiles: vec!["website-editor".to_string()],
+        },
+        candidates: vec![ModelCandidate {
+            model_resource_id: "edit-model".to_string(),
+            priority: 10,
+            weight: 100,
+        }],
+        automatic_switch: AutomaticSwitchPolicy::default(),
+        direct_selection: DirectSelectionPolicy {
+            allowed_model_resource_ids: vec!["edit-model".to_string()],
+        },
+        limits: ModelSelectionLimits::default(),
+    };
+    let gateway = GatewayService::new(GatewayConfig {
+        listen: "127.0.0.1:0".to_string(),
+        database_url: Some(":memory:".to_string()),
+        runtime_bearer_token: Some("runtime-contract-token".to_string()),
+        admin_bearer_token: None,
+        resources: vec![resource],
+        policies: vec![policy],
+    })
+    .unwrap();
+    let gateway_url = spawn_gateway(provider_gateway_router(gateway)).await;
+    let client = HttpModelGatewayClient::new(gateway_url)
+        .with_runtime_bearer_token(Some("runtime-contract-token".to_string()))
+        .with_timeout(Duration::from_secs(5));
+
+    let turn = client
+        .next_response_scoped_with_execution(
+            ModelRequest {
+                run_id: "run-contract-1".to_string(),
+                turn: 1,
+                model: "resource:edit-model".to_string(),
+                phase: AgentPhase::Edit,
+                agent_profile: "website-editor".to_string(),
+                system_prompt: "Apply a focused visual edit.".to_string(),
+                messages: vec![json!({ "role": "user", "content": "adjust spacing" })],
+                tools: vec![],
+                deferred_tools: vec![],
+            },
+            ModelGatewayScope {
+                organization_id: "org-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                project_id: "project-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        turn.response,
+        ModelResponse::TextOnly("provider ok".to_string())
+    );
+    let execution = turn.execution.unwrap();
+    assert_eq!(execution.model_resource_id, "edit-model");
+    assert_eq!(execution.model_resource_revision, 3);
+    assert_eq!(execution.physical_model, "provider-edit-physical");
+    assert_eq!(execution.selection_policy_id, "website-edit-policy");
+    assert_eq!(execution.selection_policy_revision, 2);
+    assert_eq!(execution.selection_reason, "explicit_resource");
+    assert_eq!(
+        execution.provider_request_id.as_deref(),
+        Some("provider-request-contract-1")
+    );
+    assert_eq!(execution.provider_attempt_count, 1);
+
+    let (headers, provider_body): (HeaderMap, Value) =
+        captured_provider_request.lock().await.clone().unwrap();
+    assert_eq!(provider_body["model"], "provider-edit-physical");
+    assert_eq!(
+        headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer provider-test-key"
+    );
+    assert!(headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("runtime-run-contract-1-1-")));
+    assert!(provider_body.get("scope").is_none());
+    assert!(provider_body
+        .to_string()
+        .contains("Apply a focused visual edit."));
+    assert!(!provider_body.to_string().contains("runtime-contract-token"));
+    let _ = std::fs::remove_file(secret_path);
+    unsafe { std::env::remove_var("PROVIDER_GATEWAY_ALLOW_LOOPBACK") };
+}
+
+#[tokio::test]
 async fn http_model_gateway_client_reports_non_success_status() {
     let app = Router::new().route("/v1/agent/turn", post(failing_turn_request));
     let base_url = spawn_gateway(app).await;
@@ -104,7 +334,41 @@ async fn http_model_gateway_client_reports_non_success_status() {
 
     assert!(error.contains("model gateway request failed"));
     assert!(error.contains("503 Service Unavailable"));
-    assert!(error.contains("gateway unavailable"));
+    assert!(error.contains("code=gateway_request_failed"));
+    assert!(!error.contains("gateway unavailable"));
+}
+
+#[tokio::test]
+async fn http_model_gateway_client_retries_retryable_gateway_failures() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/agent/turn", post(retryable_gateway_then_success))
+        .with_state(calls.clone());
+    let base_url = spawn_gateway(app).await;
+    let client = HttpModelGatewayClient::new(base_url).with_timeout(Duration::from_secs(2));
+    let response = client
+        .next_response_scoped(
+            ModelRequest {
+                run_id: "run-retryable".to_string(),
+                turn: 1,
+                model: "internal-balanced".to_string(),
+                phase: AgentPhase::Build,
+                agent_profile: "website-builder".to_string(),
+                system_prompt: "retry safely".to_string(),
+                messages: vec![],
+                tools: vec![],
+                deferred_tools: vec![],
+            },
+            ModelGatewayScope {
+                organization_id: "org-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                project_id: "project-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(response, ModelResponse::TextOnly("recovered".to_string()));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -865,6 +1129,100 @@ async fn capture_invalid_tool_arguments_completion(Json(_body): Json<Value>) -> 
 
 async fn failing_turn_request() -> (StatusCode, &'static str) {
     (StatusCode::SERVICE_UNAVAILABLE, "gateway unavailable")
+}
+
+async fn retryable_gateway_then_success(State(calls): State<Arc<AtomicUsize>>) -> Response {
+    if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "schemaVersion": "provider-gateway-error@1",
+                "requestId": "gateway-retry",
+                "error": {
+                    "code": "gateway_overloaded",
+                    "message": "retry later",
+                    "retryable": true,
+                    "retryAfterMs": 1
+                }
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "schemaVersion": "provider-gateway-turn-response@1",
+        "requestId": "gateway-retry",
+        "type": "text",
+        "toolCalls": [],
+        "text": "recovered",
+        "finishReason": "stop",
+        "modelExecution": {
+            "id": "model-execution-retry",
+            "modelResourceId": "balanced",
+            "modelResourceRevision": 1,
+            "providerId": "balanced",
+            "physicalModel": "physical",
+            "selectionPolicyId": "default",
+            "selectionPolicyRevision": 1,
+            "capabilitySnapshotHash": "hash",
+            "selectionReason": "automatic_selection",
+            "automaticSwitch": { "used": false }
+        },
+        "usage": {
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cachedInputTokens": 0
+        },
+        "provider": { "requestId": null, "attemptCount": 1 }
+    }))
+    .into_response()
+}
+
+async fn capture_versioned_turn_request(
+    State(captured): State<Arc<Mutex<Option<Value>>>>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    *captured.lock().await = Some(request);
+    Json(json!({
+        "schemaVersion": "provider-gateway-turn-response@1",
+        "requestId": "gateway-request-1",
+        "type": "text",
+        "toolCalls": [],
+        "text": "gateway text",
+        "finishReason": "stop",
+        "modelExecution": {
+            "id": "model-execution-1",
+            "modelResourceId": "deepseek-design-balanced",
+            "modelResourceRevision": 1,
+            "providerId": "deepseek-design-balanced",
+            "physicalModel": "deepseek-chat",
+            "selectionPolicyId": "website-default",
+            "selectionPolicyRevision": 1,
+            "capabilitySnapshotHash": "hash",
+            "selectionReason": "automatic_selection",
+            "automaticSwitch": { "used": false }
+        },
+        "usage": {},
+        "provider": { "attemptCount": 1 }
+    }))
+}
+
+async fn capture_cross_service_provider_request(
+    State(captured): State<Arc<Mutex<Option<(HeaderMap, Value)>>>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
+    *captured.lock().await = Some((headers, request));
+    (
+        [("x-request-id", "provider-request-contract-1")],
+        Json(json!({
+            "choices": [{
+                "message": { "content": "provider ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
+        })),
+    )
+        .into_response()
 }
 
 async fn spawn_gateway(app: Router) -> String {

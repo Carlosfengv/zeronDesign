@@ -39,6 +39,7 @@ pub struct StartRunContext {
     pub design_fidelity_mode: Option<String>,
     pub workspace_id: Option<String>,
     pub organization_id: Option<String>,
+    pub model_resource_id: Option<String>,
     pub finding_ids: Vec<String>,
 }
 
@@ -70,6 +71,10 @@ impl RunLifecycleService {
             inherited_build_content_sources(&self.store, &request).await,
             request.input_context.content_sources.clone(),
         );
+        let selected_model = selected_run_model(
+            &self.config.agent_model,
+            request.input_context.model_resource_id.as_deref(),
+        );
         let run = if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
             if request.phase == AgentPhase::Repair {
                 self.store
@@ -78,7 +83,7 @@ impl RunLifecycleService {
                         &request.input_context.finding_ids,
                         None,
                         request.agent_profile,
-                        self.config.agent_model.clone(),
+                        selected_model.clone(),
                     )
                     .await
                     .map_err(repair_run_error)?
@@ -88,7 +93,7 @@ impl RunLifecycleService {
                         parent_run_id,
                         request.phase,
                         request.agent_profile,
-                        self.config.agent_model.clone(),
+                        selected_model.clone(),
                         None,
                         request.input_context.finding_ids,
                     )
@@ -101,7 +106,7 @@ impl RunLifecycleService {
                     request.project_id,
                     request.phase,
                     request.agent_profile,
-                    self.config.agent_model.clone(),
+                    selected_model,
                     content_sources,
                     request.input_context.brief_id,
                     request.input_context.base_version_id,
@@ -988,6 +993,12 @@ async fn validate_project_lifecycle_context(
     }
 
     Ok(())
+}
+
+fn selected_run_model(default_model: &str, model_resource_id: Option<&str>) -> String {
+    model_resource_id
+        .map(|id| format!("resource:{id}"))
+        .unwrap_or_else(|| default_model.to_string())
 }
 
 fn is_mutable_phase(phase: AgentPhase) -> bool {

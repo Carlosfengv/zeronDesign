@@ -1625,6 +1625,15 @@ pub enum AgentEvent {
         metadata: Option<Value>,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "model.execution", rename_all = "camelCase")]
+    ModelExecution {
+        run_id: String,
+        turn: u32,
+        /// Provider Gateway's low-sensitivity execution snapshot. It contains
+        /// model routing metadata only; never prompts, tool arguments, or keys.
+        snapshot: Value,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "permission.requested", rename_all = "camelCase")]
     PermissionRequested {
         run_id: String,
@@ -1698,6 +1707,7 @@ impl AgentEvent {
             | Self::ChunkReceived { run_id, .. }
             | Self::ChunkCommitted { run_id, .. }
             | Self::MetricRecorded { run_id, .. }
+            | Self::ModelExecution { run_id, .. }
             | Self::PermissionRequested { run_id, .. }
             | Self::PermissionDenied { run_id, .. }
             | Self::StateChanged { run_id, .. }
