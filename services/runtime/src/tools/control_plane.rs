@@ -1144,11 +1144,64 @@ impl Tool for RunCompleteTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "status": string_schema("completed, partial, blocked, failed, or cancelled"),
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "partial", "blocked", "failed", "cancelled"],
+                    "description": "Terminal run status"
+                },
                 "summary": string_schema("Completion summary")
             }),
             &[],
         )
+    }
+
+    async fn validate_input(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> Result<Value, ValidationError> {
+        let Some(object) = input.as_object() else {
+            return Err(ValidationError::with_kind(
+                "run.complete input must be an object",
+                "tool.input_schema_invalid",
+            ));
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "status" | "summary"))
+        {
+            return Err(ValidationError::with_kind(
+                format!("run.complete does not accept field: {key}"),
+                "tool.input_schema_invalid",
+            ));
+        }
+        if let Some(status) = object.get("status") {
+            let Some(status) = status.as_str() else {
+                return Err(ValidationError::with_kind(
+                    "run.complete status must be a string",
+                    "tool.input_schema_invalid",
+                ));
+            };
+            if !matches!(
+                status,
+                "completed" | "partial" | "blocked" | "failed" | "cancelled"
+            ) {
+                return Err(ValidationError::with_kind(
+                    format!("unsupported run.complete status: {status}"),
+                    "tool.input_schema_invalid",
+                ));
+            }
+        }
+        if object
+            .get("summary")
+            .is_some_and(|summary| !summary.is_string())
+        {
+            return Err(ValidationError::with_kind(
+                "run.complete summary must be a string",
+                "tool.input_schema_invalid",
+            ));
+        }
+        Ok(input)
     }
 
     async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
@@ -1168,7 +1221,7 @@ impl Tool for RunCompleteTool {
             .unwrap_or_else(|| ctx.run.clone());
         let requests_completed_status = matches!(
             input.get("status").and_then(Value::as_str),
-            None | Some("completed" | "success")
+            None | Some("completed")
         );
         let mut candidate_to_promote = None;
         if matches!(

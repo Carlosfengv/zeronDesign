@@ -35,12 +35,12 @@ pub async fn report_progress(
 
 pub async fn complete(input: &Value) -> Result<Value> {
     let status = match input.get("status").and_then(Value::as_str) {
-        Some("completed" | "success") | None => "completed",
+        Some("completed") | None => "completed",
         Some("partial") => "partial",
         Some("blocked") => "blocked",
         Some("failed") => "failed",
         Some("cancelled") => "cancelled",
-        Some(_) => "completed",
+        Some(status) => return Err(anyhow::anyhow!("unsupported completion status: {status}")),
     };
     let summary = input
         .get("summary")
@@ -48,4 +48,21 @@ pub async fn complete(input: &Value) -> Result<Value> {
         .unwrap_or("Run completed.")
         .to_string();
     Ok(json!({ "status": status, "summary": summary }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn complete_rejects_unknown_status_instead_of_coercing_to_completed() {
+        let error = complete(&json!({
+            "status": "complete",
+            "summary": "typo must not complete the run"
+        }))
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported completion status"));
+    }
 }
