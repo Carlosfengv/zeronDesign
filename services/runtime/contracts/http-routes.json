@@ -63,6 +63,8 @@
     { "surface": "public", "path": "/permissions/{permission_id}/decision", "methods": ["POST"], "authorization": "project_principal_write_when_required", "bodyLimit": "axum-default-json", "featureFlag": null, "response": "json" },
     { "surface": "capture", "path": "/preview-captures/{lease_id}", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" },
     { "surface": "capture", "path": "/preview-captures/{lease_id}/", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" },
-    { "surface": "capture", "path": "/preview-captures/{lease_id}/{*preview_path}", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" }
+    { "surface": "capture", "path": "/preview-captures/{lease_id}/{*preview_path}", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" },
+    { "surface": "capture", "path": "/", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" },
+    { "surface": "capture", "path": "/{*preview_path}", "methods": ["GET"], "authorization": "capture_listener_only", "bodyLimit": "none", "featureFlag": null, "response": "proxy-private-no-store" }
   ]
 }
