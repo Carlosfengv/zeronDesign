@@ -404,6 +404,47 @@ impl AgentLoop {
             }
             self.append_run_user_messages_to_window(&project_id, run_id, &mut message_window)
                 .await;
+            if let Some((approved_call, approved_result)) =
+                self.execute_approved_permission(run_id).await
+            {
+                update_progress_state(
+                    &mut progress_state,
+                    std::slice::from_ref(&approved_call),
+                    std::slice::from_ref(&approved_result),
+                );
+                upsert_approved_tool_exchange(
+                    &mut message_window,
+                    turn,
+                    &approved_call,
+                    &approved_result,
+                );
+                self.save_turn_checkpoint(run_id, turn, &message_window)
+                    .await?;
+                let completion = (!approved_result.is_error
+                    && approved_result.tool_name == "run.complete")
+                    .then(|| {
+                        (
+                            status_from_value(&approved_result.content),
+                            approved_result
+                                .content
+                                .get("summary")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Run completed.")
+                                .to_string(),
+                        )
+                    });
+                results.push(approved_result);
+                if let Some((status, summary)) = completion {
+                    self.finalize(run_id, status, &summary, &message_window)
+                        .await?;
+                    return Ok(results);
+                }
+                let current_status = self.store.get_run(run_id).await.map(|run| run.status);
+                if current_status == Some(AgentRunStatus::NeedsUserInput) {
+                    return Ok(results);
+                }
+                continue;
+            }
             self.save_checkpoint(
                 run_id,
                 &message_window,
@@ -1536,6 +1577,14 @@ impl AgentLoop {
         tool_call: ToolCall,
     ) -> Result<()> {
         let tool_use_id = tool_call.id.clone();
+        let execution_tool_use_id = format!(
+            "{}:{}",
+            tool_use_id,
+            canonical_json_hash(&json!({
+                "tool": tool_call.name,
+                "input": tool_call.input,
+            }))
+        );
         self.record_tool_starts(&run.id, std::slice::from_ref(&tool_call))
             .await;
         let execution = self
@@ -1543,7 +1592,7 @@ impl AgentLoop {
             .execute(
                 self.store.clone(),
                 &run.id,
-                &tool_use_id,
+                &execution_tool_use_id,
                 &tool_call.name,
                 tool_call.input.clone(),
             )
@@ -1611,6 +1660,29 @@ impl AgentLoop {
             messages.push(self.record_tool_result(run_id, result).await);
         }
         messages
+    }
+
+    async fn execute_approved_permission(
+        &self,
+        run_id: &str,
+    ) -> Option<(ToolCall, ToolResultMessage)> {
+        let permission = self
+            .store
+            .approved_permissions_for_run(run_id)
+            .await
+            .into_iter()
+            .next()?;
+        let permission_id = permission.id.clone();
+        let tool_use_id = permission.tool_use_id?;
+        let input = permission.requested_input?;
+        let call = ToolCall::new(tool_use_id, permission.tool, input);
+        let result = self
+            .execute_recorded_tools(run_id, vec![call.clone()])
+            .await
+            .into_iter()
+            .next()?;
+        let _ = self.store.consume_approved_permission(&permission_id).await;
+        Some((call, result))
     }
 
     async fn execute_tools_with_observation_budget(
@@ -2064,12 +2136,16 @@ impl AgentLoop {
         let Ok(text) = serde_json::to_string_pretty(&health) else {
             return;
         };
+        let tool_use_id = format!(
+            "bootstrap:state/run-health.json:{}",
+            sha256_hex(text.as_bytes())
+        );
         let _ = self
             .tool_executor
             .execute(
                 self.store.clone(),
                 &run.id,
-                "bootstrap:state/run-health.json",
+                &tool_use_id,
                 "fs.write",
                 json!({ "path": "state/run-health.json", "text": text }),
             )
@@ -2600,19 +2676,26 @@ impl AgentLoop {
         message_window: &mut Vec<Value>,
     ) {
         let conversation_items = self.store.conversation_items(project_id).await;
-        let mut existing_user_texts = message_window
-            .iter()
-            .filter(|message| message["role"] == "user")
-            .filter_map(|message| message["text"].as_str())
-            .map(str::to_string)
-            .collect::<std::collections::HashSet<_>>();
+        let last_consumed_id = last_consumed_conversation_item_id(message_window);
+        let start_index = match last_consumed_id.as_deref() {
+            Some(last_consumed_id) => {
+                let Some(index) = conversation_items
+                    .iter()
+                    .position(|item| item.id == last_consumed_id)
+                else {
+                    return;
+                };
+                index + 1
+            }
+            None => 0,
+        };
         let pending_user_messages = conversation_items
             .into_iter()
+            .skip(start_index)
             .filter(|item| item.run_id.as_deref() == Some(run_id))
             .filter(|item| item.kind == "user_message")
             .filter(|item| item.role.as_deref() == Some("user"))
             .filter(|item| item.visibility == "user")
-            .filter(|item| existing_user_texts.insert(item.text.clone()))
             .collect::<Vec<_>>();
         for item in pending_user_messages {
             message_window.push(json!({
@@ -2655,6 +2738,7 @@ impl AgentLoop {
             .take(compacted_count)
             .cloned()
             .collect::<Vec<_>>();
+        let last_consumed_conversation_item_id = last_consumed_conversation_item_id(message_window);
         let run = self
             .store
             .get_run(run_id)
@@ -2682,6 +2766,7 @@ impl AgentLoop {
             ),
             "contextPath": "state/context.md",
             "compactedMessages": compacted_count,
+            "lastConsumedConversationItemId": last_consumed_conversation_item_id,
         });
         message_window.clear();
         message_window.push(summary);
@@ -2694,6 +2779,70 @@ impl AgentLoop {
         .await?;
         Ok(())
     }
+}
+
+fn last_consumed_conversation_item_id(message_window: &[Value]) -> Option<String> {
+    message_window.iter().rev().find_map(|message| {
+        message
+            .get("conversationItemId")
+            .or_else(|| message.get("lastConsumedConversationItemId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn upsert_approved_tool_exchange(
+    message_window: &mut Vec<Value>,
+    turn: u32,
+    call: &ToolCall,
+    result: &ToolResultMessage,
+) {
+    let tool_result = json!({
+        "role": "tool",
+        "turn": turn,
+        "toolUseId": result.tool_use_id,
+        "toolName": result.tool_name,
+        "isError": result.is_error,
+        "content": result.content,
+        "metadata": result.metadata,
+    });
+    let has_matching_assistant_call = message_window.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|candidate| {
+                        candidate.get("id").and_then(Value::as_str) == Some(call.id.as_str())
+                    })
+                })
+    });
+    if has_matching_assistant_call {
+        if let Some(existing) = message_window.iter_mut().rev().find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("toolUseId").and_then(Value::as_str) == Some(call.id.as_str())
+        }) {
+            *existing = tool_result;
+        } else {
+            message_window.push(tool_result);
+        }
+        return;
+    }
+    message_window.retain(|message| {
+        !(message.get("role").and_then(Value::as_str) == Some("tool")
+            && message.get("toolUseId").and_then(Value::as_str) == Some(call.id.as_str()))
+    });
+    message_window.push(json!({
+        "role": "assistant",
+        "turn": turn,
+        "text": "",
+        "toolCalls": [{
+            "id": call.id,
+            "name": call.name,
+            "input": call.input,
+        }],
+    }));
+    message_window.push(tool_result);
 }
 
 fn positive_u32_env(name: &str, default: u32) -> u32 {
@@ -3588,8 +3737,8 @@ fn status_from_value(content: &Value) -> AgentRunStatus {
         Some("blocked") => AgentRunStatus::Blocked,
         Some("failed") => AgentRunStatus::Failed,
         Some("cancelled") => AgentRunStatus::Cancelled,
-        Some("completed" | "success") | None => AgentRunStatus::Completed,
-        Some(_) => AgentRunStatus::Completed,
+        Some("completed") | None => AgentRunStatus::Completed,
+        Some(_) => AgentRunStatus::Failed,
     }
 }
 

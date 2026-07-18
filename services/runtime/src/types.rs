@@ -1824,6 +1824,30 @@ pub struct PendingPermission {
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Started,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecutionRecord {
+    pub run_id: String,
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input_hash: String,
+    pub status: ToolExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_content: Option<Value>,
+    #[serde(default)]
+    pub result_is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_metadata: Option<Value>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTask {

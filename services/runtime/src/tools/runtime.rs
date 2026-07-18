@@ -1,12 +1,15 @@
 use crate::{
     agent_hooks::{PreToolUseHook, PreToolUseObservation},
     config::RuntimePolicyProfile,
-    conversation::RuntimeStore,
+    conversation::{RuntimeStore, ToolExecutionCompletion, ToolExecutionReservation},
     design_context::frozen_run_design_context_manifest,
     model_gateway::ModelToolDefinition,
     permission::{PermissionEngine, PermissionReason, PermissionResult, PermissionRules},
     profiles::policy,
-    types::{AgentEvent, AgentPhase, AgentRun, AgentRunStatus, TranscriptMode},
+    types::{
+        canonical_json_hash, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, PendingPermission,
+        TranscriptMode,
+    },
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -592,7 +595,7 @@ impl ToolExecutor {
             };
         };
         let approved_permission = store
-            .approved_permission_for_tool(run_id, tool.name())
+            .approved_permission_for_tool(run_id, tool.name(), tool_use_id, &input)
             .await;
         let input = approved_permission
             .as_ref()
@@ -817,29 +820,99 @@ impl ToolExecutor {
 
         match audited_permission {
             PermissionResult::Allow { updated_input, .. } => {
-                if let Some(permission) = approved_permission.as_ref() {
-                    match store.consume_approved_permission(&permission.id).await {
-                        Ok(true) => {}
-                        Ok(false) => {
+                let progress = ProgressSink::new(run_id, tool_use_id, store.clone());
+                let tracked_input = updated_input.clone();
+                let input_hash = (!tool.is_read_only(&tracked_input)).then(|| {
+                    canonical_json_hash(&json!({
+                        "tool": tool.name(),
+                        "input": tracked_input.clone(),
+                    }))
+                });
+                if let Some(input_hash) = input_hash.as_deref() {
+                    match store
+                        .reserve_tool_execution(run_id, tool_use_id, tool.name(), input_hash)
+                        .await
+                    {
+                        Ok(ToolExecutionReservation::Reserved) => {}
+                        Ok(ToolExecutionReservation::Replay(record)) => {
+                            if let Some(error) = consume_permission_after_execution(
+                                &store,
+                                approved_permission.as_ref(),
+                            )
+                            .await
+                            {
+                                return ToolExecution { result: error };
+                            }
+                            let Some(content) = record.result_content else {
+                                ctx.store
+                                    .update_run_status(&ctx.run.id, AgentRunStatus::Failed)
+                                    .await
+                                    .ok();
+                                return ToolExecution {
+                                    result: ToolResult::typed_error(
+                                        "persisted tool result is missing content",
+                                        "tool.execution_record_corrupt",
+                                        false,
+                                        json!({
+                                            "tool": tool.name(),
+                                            "toolUseId": tool_use_id,
+                                        }),
+                                    ),
+                                };
+                            };
                             return ToolExecution {
-                                result: ToolResult::error_with_recoverable(
-                                    "permission approval was already consumed",
-                                    true,
+                                result: ToolResult {
+                                    content,
+                                    is_error: record.result_is_error,
+                                    metadata: record.result_metadata,
+                                },
+                            };
+                        }
+                        Ok(ToolExecutionReservation::InDoubt(_)) => {
+                            pause_run_for_uncertain_tool_execution(
+                                &store,
+                                &ctx.run,
+                                tool.name(),
+                                tool_use_id,
+                                "A previous execution started but did not durably record its result",
+                            )
+                            .await;
+                            return ToolExecution {
+                                result: uncertain_tool_execution_result(tool.name(), tool_use_id),
+                            };
+                        }
+                        Ok(ToolExecutionReservation::Conflict(_)) => {
+                            ctx.store
+                                .update_run_status(&ctx.run.id, AgentRunStatus::Failed)
+                                .await
+                                .ok();
+                            return ToolExecution {
+                                result: ToolResult::typed_error(
+                                    "tool_use_id was reused with a different tool or input",
+                                    "tool.execution_identity_conflict",
+                                    false,
+                                    json!({
+                                        "tool": tool.name(),
+                                        "toolUseId": tool_use_id,
+                                    }),
                                 ),
                             };
                         }
                         Err(error) => {
+                            pause_run_for_uncertain_tool_execution(
+                                &store,
+                                &ctx.run,
+                                tool.name(),
+                                tool_use_id,
+                                &format!("Tool execution could not be durably reserved: {error}"),
+                            )
+                            .await;
                             return ToolExecution {
-                                result: ToolResult::error_with_recoverable(
-                                    format!("failed to consume permission approval: {error}"),
-                                    true,
-                                ),
+                                result: uncertain_tool_execution_result(tool.name(), tool_use_id),
                             };
                         }
                     }
                 }
-                let progress = ProgressSink::new(run_id, tool_use_id, store.clone());
-                let tracked_input = updated_input.clone();
                 let execution = match tool.call(updated_input, ctx.clone(), progress).await {
                     Ok(result) => ToolExecution {
                         result: truncate_large_result_if_needed(
@@ -923,7 +996,48 @@ impl ToolExecutor {
                     )
                     .await;
                 }
-                execution
+                let persistence = if let Some(input_hash) = input_hash.as_deref() {
+                    store
+                        .complete_tool_execution(
+                            run_id,
+                            tool_use_id,
+                            tool.name(),
+                            input_hash,
+                            ToolExecutionCompletion {
+                                content: execution.result.content.clone(),
+                                is_error: execution.result.is_error,
+                                metadata: execution.result.metadata.clone(),
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                match persistence {
+                    Ok(_) => {
+                        if let Some(error) =
+                            consume_permission_after_execution(&store, approved_permission.as_ref())
+                                .await
+                        {
+                            return ToolExecution { result: error };
+                        }
+                        execution
+                    }
+                    Err(error) => {
+                        pause_run_for_uncertain_tool_execution(
+                            &store,
+                            &ctx.run,
+                            tool.name(),
+                            tool_use_id,
+                            &format!("Tool result could not be durably recorded: {error}"),
+                        )
+                        .await;
+                        ToolExecution {
+                            result: uncertain_tool_execution_result(tool.name(), tool_use_id),
+                        }
+                    }
+                }
             }
             PermissionResult::Ask {
                 message, reason, ..
@@ -1062,6 +1176,77 @@ impl ToolExecutor {
             )
             .await;
     }
+}
+
+async fn consume_permission_after_execution(
+    store: &RuntimeStore,
+    permission: Option<&PendingPermission>,
+) -> Option<ToolResult> {
+    let permission = permission?;
+    match store.consume_approved_permission(&permission.id).await {
+        Ok(true) => None,
+        Ok(false) => Some(ToolResult::error_with_recoverable(
+            "permission approval was already consumed",
+            true,
+        )),
+        Err(error) => Some(ToolResult::error_with_recoverable(
+            format!("failed to consume permission approval: {error}"),
+            true,
+        )),
+    }
+}
+
+async fn pause_run_for_uncertain_tool_execution(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    tool_use_id: &str,
+    reason: &str,
+) {
+    if !run.status.is_terminal() {
+        store
+            .update_run_status(&run.id, AgentRunStatus::NeedsUserInput)
+            .await
+            .ok();
+    }
+    let _ = store
+        .append_event(AgentEvent::StateChanged {
+            run_id: run.id.clone(),
+            state: "needs_user_input:tool_execution_in_doubt".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await;
+    store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "tool_execution_in_doubt",
+            Some("system"),
+            format!(
+                "Execution outcome for {tool_name} is uncertain and requires reconciliation before retrying."
+            ),
+            Some(json!({
+                "tool": tool_name,
+                "toolUseId": tool_use_id,
+                "reason": reason,
+            })),
+        )
+        .await;
+}
+
+fn uncertain_tool_execution_result(tool_name: &str, tool_use_id: &str) -> ToolResult {
+    ToolResult::typed_error(
+        format!(
+            "Execution outcome for {tool_name} is uncertain; the Runtime will not replay this tool call automatically"
+        ),
+        "tool.execution_in_doubt",
+        false,
+        json!({
+            "tool": tool_name,
+            "toolUseId": tool_use_id,
+            "requiresReconciliation": true,
+        }),
+    )
 }
 
 fn candidate_freeze_blocks(tool_name: &str) -> bool {

@@ -794,6 +794,48 @@ async fn latest_checkpoint_for_run_uses_most_recent_saved_checkpoint() {
 }
 
 #[tokio::test]
+async fn latest_checkpoint_for_run_recovers_file_written_before_run_pointer() {
+    let checkpoint_dir = unique_temp_dir("checkpoints-orphan-recovery");
+    let store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+    let run_id = create_run(&store).await;
+    let checkpoint = AgentCheckpoint {
+        id: "checkpoint-written-before-run-pointer".to_string(),
+        run_id: run_id.clone(),
+        project_id: "project-1".to_string(),
+        phase: AgentPhase::Brief,
+        message_window: vec![json!({ "role": "system", "text": "recover me" })],
+        conversation_range: None,
+        task_list: vec![],
+        workspace_snapshot_uri: None,
+        build_result: None,
+        brief_version: None,
+        design_version: None,
+        last_known_preview_url: None,
+        context_summary: "checkpoint file persisted before run pointer".to_string(),
+        created_at: Utc::now(),
+    };
+    fs::write(
+        store.checkpoint_path(&checkpoint.id),
+        serde_json::to_string_pretty(&checkpoint).unwrap(),
+    )
+    .unwrap();
+    assert!(store
+        .get_run(&run_id)
+        .await
+        .unwrap()
+        .checkpoint_id
+        .is_none());
+    drop(store);
+
+    let reopened = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+    let recovered = reopened.latest_checkpoint_for_run(&run_id).await.unwrap();
+
+    assert_eq!(recovered.id, checkpoint.id);
+    assert_eq!(recovered.message_window, checkpoint.message_window);
+    fs::remove_dir_all(checkpoint_dir).unwrap();
+}
+
+#[tokio::test]
 async fn agent_loop_saves_checkpoint_after_each_turn_transcript() {
     let checkpoint_dir = unique_temp_dir("checkpoints-each-turn");
     let store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);

@@ -12,13 +12,14 @@ use anydesign_runtime::{
     tools::{
         control_plane::control_plane_executor,
         runtime::{
-            InterruptBehavior, ProgressSink, Tool, ToolContext, ToolError, ToolExecutor, ToolResult,
+            InterruptBehavior, ProgressSink, Tool, ToolContext, ToolError, ToolExecutor,
+            ToolResult, ValidationError,
         },
         streaming::StreamingToolExecutor,
     },
     types::{
-        AgentCheckpoint, AgentEvent, AgentPhase, AgentRunStatus, Brief, ContentSource,
-        DesignProfile, ReviewFindingCategory, ReviewFindingSeverity,
+        canonical_json_hash, AgentCheckpoint, AgentEvent, AgentPhase, AgentRunStatus, Brief,
+        ContentSource, DesignProfile, ReviewFindingCategory, ReviewFindingSeverity,
     },
 };
 use anyhow::anyhow;
@@ -2435,6 +2436,334 @@ async fn agent_loop_includes_run_user_messages_in_model_context() {
 }
 
 #[tokio::test]
+async fn agent_loop_preserves_distinct_user_messages_with_identical_text() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "duplicate-message-project".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    for _ in 0..2 {
+        store
+            .append_conversation_item(
+                &run.project_id,
+                Some(&run.id),
+                "user_message",
+                Some("user"),
+                "继续",
+                None,
+            )
+            .await;
+    }
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::ToolCalls(vec![ToolCall::new(
+            "duplicate-message-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Duplicate messages preserved" }),
+        )])],
+        captured_requests.clone(),
+    );
+
+    AgentLoop::new(store, Arc::new(model))
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    let duplicate_count = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message["role"] == "user" && message["text"] == "继续")
+        .count();
+    assert_eq!(duplicate_count, 2);
+}
+
+#[tokio::test]
+async fn agent_loop_merges_persisted_conversation_before_appending_after_restart() {
+    let storage = unique_temp_dir("agent-loop-conversation-restart");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "conversation-restart-project".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "user_message",
+            Some("user"),
+            "message consumed before restart",
+            None,
+        )
+        .await;
+    let consumed = store
+        .conversation_items(&run.project_id)
+        .await
+        .into_iter()
+        .find(|item| item.text == "message consumed before restart")
+        .unwrap();
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "conversation-restart-checkpoint".to_string(),
+            run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            message_window: vec![json!({
+                "role": "user",
+                "kind": "user_message",
+                "conversationItemId": consumed.id,
+                "text": consumed.text,
+            })],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "conversation cursor before restart".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = RuntimeStore::with_checkpoint_dir(&storage);
+    reopened
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "user_message",
+            Some("user"),
+            "message appended after restart",
+            None,
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::TextOnly("message received".to_string())],
+        captured_requests.clone(),
+    );
+
+    AgentLoop::new(reopened, Arc::new(model))
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert!(!requests.is_empty());
+    assert!(requests.iter().any(|request| request
+        .messages
+        .iter()
+        .any(|message| message["text"] == "message appended after restart")));
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn approved_permission_replaces_prior_tool_error_before_model_resume() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "approved-resume-project".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let input = json!({ "value": "approved-value" });
+    let permission = store
+        .create_tool_permission_request(
+            &run.project_id,
+            &run.id,
+            "test.approved_resume",
+            Some("approved-resume-tool-use"),
+            Some(input.clone()),
+        )
+        .await;
+    store
+        .resolve_permission(&permission.id, "allow")
+        .await
+        .unwrap();
+    store
+        .update_run_status(&run.id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "approved-resume-checkpoint".to_string(),
+            run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            message_window: vec![json!({
+                "role": "tool",
+                "turn": 1,
+                "toolUseId": "approved-resume-tool-use",
+                "toolName": "test.approved_resume",
+                "isError": true,
+                "content": { "error": "approval required" },
+            })],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "waiting for approval".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let calls = Arc::new(ApprovedResumeTool::default());
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::TextOnly("approval observed".to_string())],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(vec![calls.clone()], PermissionRules::default());
+
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 1);
+    assert!(store
+        .pending_permission(&permission.id)
+        .await
+        .unwrap()
+        .consumed_at
+        .is_some());
+    let requests = captured_requests.lock().await;
+    assert!(!requests.is_empty());
+    let tool_results = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message["toolUseId"] == "approved-resume-tool-use")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0]["isError"], false);
+    assert_eq!(tool_results[0]["content"]["approved"], "approved-value");
+}
+
+#[tokio::test]
+async fn rejected_approved_input_is_consumed_and_reported_once_to_model() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "rejected-approved-resume-project".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let input = json!({ "value": "invalid" });
+    let permission = store
+        .create_tool_permission_request(
+            &run.project_id,
+            &run.id,
+            "test.rejecting_approved_resume",
+            Some("rejected-approved-tool-use"),
+            Some(input.clone()),
+        )
+        .await;
+    store
+        .resolve_permission(&permission.id, "allow")
+        .await
+        .unwrap();
+    store
+        .update_run_status(&run.id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "rejected-approved-checkpoint".to_string(),
+            run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            message_window: vec![
+                json!({
+                    "role": "assistant",
+                    "turn": 1,
+                    "text": "",
+                    "toolCalls": [{
+                        "id": "rejected-approved-tool-use",
+                        "name": "test.rejecting_approved_resume",
+                        "input": input,
+                    }],
+                }),
+                json!({
+                    "role": "tool",
+                    "turn": 1,
+                    "toolUseId": "rejected-approved-tool-use",
+                    "toolName": "test.rejecting_approved_resume",
+                    "isError": true,
+                    "content": { "error": "approval required" },
+                }),
+            ],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "waiting for approval".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::TextOnly(
+            "validation error observed".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![Arc::new(RejectingApprovedResumeTool)],
+        PermissionRules::default(),
+    );
+
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    assert!(store
+        .pending_permission(&permission.id)
+        .await
+        .unwrap()
+        .consumed_at
+        .is_some());
+    let requests = captured_requests.lock().await;
+    assert!(!requests.is_empty());
+    let tool_results = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message["toolUseId"] == "rejected-approved-tool-use")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0]["isError"], true);
+    assert!(tool_results[0]["content"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("approved input is invalid"));
+}
+
+#[tokio::test]
 async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
     let workspace = unique_temp_dir("agent-loop-compact");
     let store = RuntimeStore::new();
@@ -2445,6 +2774,16 @@ async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
             "export".to_string(),
             "internal-balanced".to_string(),
             vec![],
+        )
+        .await;
+    store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "user_message",
+            Some("user"),
+            "Original instruction must not be resurrected after compaction",
+            None,
         )
         .await;
     let mut responses = Vec::new();
@@ -2460,10 +2799,14 @@ async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
         "run.complete",
         json!({ "status": "completed", "summary": "Compacted run completed" }),
     )]));
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
     let executor = control_plane_executor().with_workspace_root(&workspace);
     let loop_runner = AgentLoop::with_tool_executor(
         store.clone(),
-        Arc::new(MockModelClient::new(responses)),
+        Arc::new(RecordingModelClient::new(
+            responses,
+            captured_requests.clone(),
+        )),
         executor,
     )
     .with_limits(AgentLoopLimits {
@@ -2486,6 +2829,22 @@ async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
     assert!(context.contains("tool-missing-6"));
     assert!(context.contains("Compacted messages:"));
     assert!(context.chars().count() > 48_000);
+    let requests = captured_requests.lock().await;
+    let instruction_presence = requests
+        .iter()
+        .map(|request| {
+            request.messages.iter().any(|message| {
+                message["text"] == "Original instruction must not be resurrected after compaction"
+            })
+        })
+        .collect::<Vec<_>>();
+    let first_absent = instruction_presence
+        .iter()
+        .position(|present| !present)
+        .expect("old user instruction should eventually compact out of the active window");
+    assert!(instruction_presence[first_absent..]
+        .iter()
+        .all(|present| !present));
     let events = store.events(&run.id).await;
     assert!(events
         .iter()
@@ -3141,6 +3500,289 @@ async fn streaming_tool_executor_uses_extended_deadline_for_build_tools() {
 }
 
 #[tokio::test]
+async fn tool_execution_result_is_replayed_durably_and_identity_conflicts_fail_closed() {
+    let storage = unique_temp_dir("tool-execution-ledger");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "tool-ledger-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let tool = Arc::new(SequencedChunkCommitTool::default());
+    let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
+    let input = json!({ "path": "project/src/pages/index.astro" });
+
+    let first = executor
+        .execute(
+            store.clone(),
+            &run.id,
+            "durable-tool-use-1",
+            "fs.commit_chunks",
+            input.clone(),
+        )
+        .await;
+    assert!(!first.result.is_error);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    drop(store);
+
+    let mut ledger = std::fs::OpenOptions::new()
+        .append(true)
+        .open(storage.join("tool-executions.jsonl"))
+        .unwrap();
+    std::io::Write::write_all(&mut ledger, b"{\"truncated\"").unwrap();
+    drop(ledger);
+
+    let reopened = RuntimeStore::with_checkpoint_dir(&storage);
+    let replay = executor
+        .execute(
+            reopened.clone(),
+            &run.id,
+            "durable-tool-use-1",
+            "fs.commit_chunks",
+            input,
+        )
+        .await;
+    assert!(!replay.result.is_error);
+    assert_eq!(replay.result.content["replayed"], true);
+    assert!(replay.result.content["resultDigest"].is_string());
+    assert_eq!(
+        replay.result.metadata.as_ref().unwrap()["durableProjection"],
+        true
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    assert!(fs::read(storage.join("tool-executions.jsonl"))
+        .unwrap()
+        .ends_with(b"\n"));
+
+    let conflict = executor
+        .execute(
+            reopened.clone(),
+            &run.id,
+            "durable-tool-use-1",
+            "fs.commit_chunks",
+            json!({ "path": "project/src/pages/other.astro" }),
+        )
+        .await;
+    assert!(conflict.result.is_error);
+    assert_eq!(
+        conflict.result.metadata.as_ref().unwrap()["errorKind"],
+        "tool.execution_identity_conflict"
+    );
+    assert_eq!(
+        reopened.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Failed
+    );
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn failed_mutation_result_is_replayed_without_reexecution() {
+    let storage = unique_temp_dir("failed-tool-execution-ledger");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "failed-tool-ledger-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let tool = Arc::new(FailedMutationTool::default());
+    let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
+    let input = json!({ "path": "project/src/pages/index.astro" });
+
+    let first = executor
+        .execute(
+            store.clone(),
+            &run.id,
+            "failed-mutation-tool-use",
+            "test.failed_mutation",
+            input.clone(),
+        )
+        .await;
+    assert!(first.result.is_error);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    drop(store);
+
+    let reopened = RuntimeStore::with_checkpoint_dir(&storage);
+    let replay = executor
+        .execute(
+            reopened,
+            &run.id,
+            "failed-mutation-tool-use",
+            "test.failed_mutation",
+            input,
+        )
+        .await;
+
+    assert!(replay.result.is_error);
+    assert_eq!(replay.result.content["replayed"], true);
+    assert_eq!(
+        replay.result.metadata.as_ref().unwrap()["errorKind"],
+        "test.mutation_failed"
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn tool_execution_ledger_omits_raw_output_and_uses_private_permissions() {
+    let storage = unique_temp_dir("secret-tool-execution-ledger");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "secret-tool-ledger-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![Arc::new(SecretOutputMutationTool)],
+        PermissionRules::default(),
+    );
+
+    let first = executor
+        .execute(
+            store.clone(),
+            &run.id,
+            "secret-output-tool-use",
+            "test.secret_output_mutation",
+            json!({}),
+        )
+        .await;
+    assert!(!first.result.is_error);
+    let ledger_path = store.tool_execution_log_path();
+    let ledger = fs::read_to_string(&ledger_path).unwrap();
+    assert!(!ledger.contains("secret-sentinel"));
+    assert!(!ledger.contains("abcdefghijklmnop"));
+    assert!(ledger.contains("resultDigest"));
+    assert!(ledger.contains("original output was omitted"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&ledger_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    drop(store);
+
+    let replay = executor
+        .execute(
+            RuntimeStore::with_checkpoint_dir(&storage),
+            &run.id,
+            "secret-output-tool-use",
+            "test.secret_output_mutation",
+            json!({}),
+        )
+        .await;
+    assert!(!replay
+        .result
+        .content
+        .to_string()
+        .contains("secret-sentinel"));
+    assert_eq!(replay.result.content["replayed"], true);
+    assert!(replay.result.content["resultDigest"].is_string());
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn read_only_tool_results_are_not_persisted_in_execution_ledger() {
+    let storage = unique_temp_dir("read-only-tool-ledger");
+    fs::create_dir_all(storage.join("project")).unwrap();
+    fs::write(storage.join("project/source.txt"), "private source text").unwrap();
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "read-only-ledger-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new_with_workspace_root(
+        sandbox_tools(),
+        PermissionRules::default(),
+        &storage,
+    );
+
+    let result = executor
+        .execute(
+            store.clone(),
+            &run.id,
+            "read-tool-use-1",
+            "fs.read",
+            json!({ "path": "project/source.txt" }),
+        )
+        .await;
+
+    assert!(!result.result.is_error);
+    assert!(!store.tool_execution_log_path().exists());
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
+async fn in_doubt_mutation_is_paused_without_reexecution() {
+    let storage = unique_temp_dir("in-doubt-tool-ledger");
+    let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let run = store
+        .create_run(
+            "in-doubt-ledger-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let tool = Arc::new(SequencedChunkCommitTool::default());
+    let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
+    let input = json!({ "path": "project/src/pages/index.astro" });
+    let input_hash = canonical_json_hash(&json!({
+        "tool": "fs.commit_chunks",
+        "input": input.clone(),
+    }));
+    store
+        .reserve_tool_execution(
+            &run.id,
+            "in-doubt-tool-use-1",
+            "fs.commit_chunks",
+            &input_hash,
+        )
+        .await
+        .unwrap();
+
+    let result = executor
+        .execute(
+            store.clone(),
+            &run.id,
+            "in-doubt-tool-use-1",
+            "fs.commit_chunks",
+            input,
+        )
+        .await;
+
+    assert!(result.result.is_error);
+    assert_eq!(
+        result.result.metadata.as_ref().unwrap()["errorKind"],
+        "tool.execution_in_doubt"
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::NeedsUserInput
+    );
+    fs::remove_dir_all(storage).unwrap();
+}
+
+#[tokio::test]
 async fn agent_loop_idle_watchdog_structurally_stops_stalled_model_request() {
     let store = RuntimeStore::new();
     let run = store
@@ -3393,17 +4035,17 @@ async fn chunk_commit_sha_resets_no_progress_when_repair_reuses_the_same_path() 
         vec![Arc::new(SequencedChunkCommitTool::default())],
         PermissionRules::default(),
     );
-    let repeated_commit = || {
+    let repeated_commit = |tool_use_id| {
         ModelResponse::ToolCalls(vec![ToolCall::new(
-            "commit-repair",
+            tool_use_id,
             "fs.commit_chunks",
             json!({ "path": "project/src/pages/index.astro" }),
         )])
     };
     let model = MockModelClient::new(vec![
-        repeated_commit(),
-        repeated_commit(),
-        repeated_commit(),
+        repeated_commit("commit-repair-1"),
+        repeated_commit("commit-repair-2"),
+        repeated_commit("commit-repair-3"),
     ]);
     AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
         .with_limits(AgentLoopLimits {
@@ -4123,6 +4765,164 @@ impl Tool for SuccessfulMutationTool {
 #[derive(Default)]
 struct SequencedChunkCommitTool {
     calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ApprovedResumeTool {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Tool for ApprovedResumeTool {
+    fn name(&self) -> &'static str {
+        "test.approved_resume"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, _input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Ask {
+            message: "approval required".to_string(),
+            reason: PermissionReason::Other {
+                reason: "test approval".to_string(),
+            },
+            suggestions: None,
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolResult::ok(json!({ "approved": input["value"] })))
+    }
+}
+
+struct RejectingApprovedResumeTool;
+
+#[async_trait]
+impl Tool for RejectingApprovedResumeTool {
+    fn name(&self) -> &'static str {
+        "test.rejecting_approved_resume"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn validate_input(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Result<Value, ValidationError> {
+        Err(ValidationError::with_kind(
+            "approved input is invalid",
+            "tool.input_schema_invalid",
+        ))
+    }
+
+    async fn check_permission(&self, _input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Ask {
+            message: "approval required".to_string(),
+            reason: PermissionReason::Other {
+                reason: "test approval".to_string(),
+            },
+            suggestions: None,
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        panic!("validation failure must prevent tool execution")
+    }
+}
+
+#[derive(Default)]
+struct FailedMutationTool {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Tool for FailedMutationTool {
+    fn name(&self) -> &'static str {
+        "test.failed_mutation"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ToolError::typed_recoverable(
+            "mutation failed after side effect",
+            "test.mutation_failed",
+            json!({ "stage": "after_side_effect" }),
+        ))
+    }
+}
+
+struct SecretOutputMutationTool;
+
+#[async_trait]
+impl Tool for SecretOutputMutationTool {
+    fn name(&self) -> &'static str {
+        "test.secret_output_mutation"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "stdout": concat!(
+                "API_KEY=ship-secret-sentinel Bearer abcdefghijklmnop\n",
+                "AWS_SECRET_ACCESS_KEY=aws-secret-sentinel\n",
+                "DATABASE_URL=postgres://user:database-secret-sentinel@host/db\n",
+                "JWT=eyJhbGciOiJIUzI1NiJ9.jwt-secret-sentinel.signature\n",
+                "-----BEGIN PRIVATE KEY-----\npem-secret-sentinel\n-----END PRIVATE KEY-----"
+            ),
+            "apiKey": "nested-secret-sentinel",
+        })))
+    }
 }
 
 struct SuccessfulChunkStageTool;

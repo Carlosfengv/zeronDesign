@@ -16,16 +16,16 @@ use crate::{
     repair_loop::RepairAttempt,
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     types::{
-        sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus,
-        ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief, BriefStatus,
-        ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
+        canonical_json_hash, sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun,
+        AgentRunStatus, ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief,
+        BriefStatus, ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
         DesignContextEnforcementBinding, DesignContextEnforcementPolicy, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
         OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
         ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
         ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
         ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus,
-        SandboxChannelProtocol, MAX_DESIGN_SOURCE_BYTES,
+        SandboxChannelProtocol, ToolExecutionRecord, ToolExecutionStatus, MAX_DESIGN_SOURCE_BYTES,
     },
 };
 use anyhow::{anyhow, Result};
@@ -83,6 +83,7 @@ pub struct RuntimeStore {
     design_source_artifact_log_path: Arc<PathBuf>,
     design_source_blob_dir: Arc<PathBuf>,
     audit_log_path: Arc<PathBuf>,
+    tool_execution_log_path: Arc<PathBuf>,
     publication_store: Arc<PublicationStore>,
     release_store: Arc<ReleaseStore>,
 }
@@ -102,6 +103,8 @@ struct RuntimeStoreInner {
     acceptance_contracts: HashMap<String, AcceptanceContract>,
     audit_records: Vec<AuditRecord>,
     pending_permissions: HashMap<String, PendingPermission>,
+    tool_executions: HashMap<(String, String), ToolExecutionRecord>,
+    tool_executions_hydrated: bool,
     review_findings: HashMap<String, ReviewFinding>,
     project_review_findings: HashMap<String, Vec<String>>,
     repair_attempts: Vec<RepairAttempt>,
@@ -193,6 +196,21 @@ pub struct RunScopedResources {
     pub temporary_hooks: Vec<String>,
     pub read_file_cache_entries: Vec<String>,
     pub sandbox_locks: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ToolExecutionReservation {
+    Reserved,
+    Replay(ToolExecutionRecord),
+    InDoubt(ToolExecutionRecord),
+    Conflict(ToolExecutionRecord),
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolExecutionCompletion {
+    pub content: Value,
+    pub is_error: bool,
+    pub metadata: Option<Value>,
 }
 
 impl RunScopedResources {
@@ -396,6 +414,7 @@ impl Default for RuntimeStore {
             ),
             design_source_blob_dir: Arc::new(storage_root.join("design-source-artifacts")),
             audit_log_path: Arc::new(storage_root.join("audit-log.jsonl")),
+            tool_execution_log_path: Arc::new(storage_root.join("tool-executions.jsonl")),
             publication_store,
             release_store,
         }
@@ -458,6 +477,7 @@ impl RuntimeStore {
             ),
             design_source_blob_dir: Arc::new(checkpoint_dir.join("design-source-artifacts")),
             audit_log_path: Arc::new(checkpoint_dir.join("audit-log.jsonl")),
+            tool_execution_log_path: Arc::new(checkpoint_dir.join("tool-executions.jsonl")),
             checkpoint_dir: Arc::new(checkpoint_dir),
             publication_store,
             release_store,
@@ -484,6 +504,7 @@ impl RuntimeStore {
             ids: Arc::new(AtomicU64::new(next_id)),
             checkpoint_dir: Arc::new(checkpoint_dir),
             audit_log_path: Arc::new(run_log_dir.join("audit-log.jsonl")),
+            tool_execution_log_path: Arc::new(run_log_dir.join("tool-executions.jsonl")),
             run_state_log_path: Arc::new(run_log_dir.join("runs.jsonl")),
             brief_log_path: Arc::new(run_log_dir.join("briefs.jsonl")),
             conversation_log_dir: Arc::new(run_log_dir.join("conversation-items")),
@@ -3161,13 +3182,26 @@ impl RuntimeStore {
             .await
             .conversation_items
             .get(project_id)
-            .cloned();
-        match memory_items {
-            Some(items) if !items.is_empty() => items,
-            _ => self
-                .read_conversation_log_items(project_id)
-                .unwrap_or_default(),
+            .cloned()
+            .unwrap_or_default();
+        let mut items = self
+            .read_conversation_log_items(project_id)
+            .unwrap_or_default();
+        let mut seen = items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<HashSet<_>>();
+        for item in memory_items {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
         }
+        items.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        items
     }
 
     pub fn conversation_log_path(&self, project_id: &str) -> PathBuf {
@@ -3739,6 +3773,139 @@ impl RuntimeStore {
         Ok(())
     }
 
+    pub fn tool_execution_log_path(&self) -> PathBuf {
+        (*self.tool_execution_log_path).clone()
+    }
+
+    fn append_tool_execution_snapshot(&self, execution: &ToolExecutionRecord) -> Result<()> {
+        let path = self.tool_execution_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        append_jsonl_data_synced(&path, execution)
+    }
+
+    fn read_tool_executions(&self) -> Result<Vec<ToolExecutionRecord>> {
+        let path = self.tool_execution_log_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut executions = HashMap::new();
+        let chunks = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let mut valid_bytes = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+            if line.iter().all(u8::is_ascii_whitespace) {
+                valid_bytes += chunk.len();
+                continue;
+            }
+            let execution: ToolExecutionRecord = match serde_json::from_slice(line) {
+                Ok(execution) => execution,
+                Err(_) if index + 1 == chunks.len() && !bytes.ends_with(b"\n") => {
+                    truncate_jsonl_tail(&path, valid_bytes as u64)?;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            valid_bytes += chunk.len();
+            executions.insert(
+                (execution.run_id.clone(), execution.tool_use_id.clone()),
+                execution,
+            );
+        }
+        Ok(executions.into_values().collect())
+    }
+
+    fn hydrate_tool_executions(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        if inner.tool_executions_hydrated {
+            return Ok(());
+        }
+        for execution in self.read_tool_executions()? {
+            inner.tool_executions.insert(
+                (execution.run_id.clone(), execution.tool_use_id.clone()),
+                execution,
+            );
+        }
+        inner.tool_executions_hydrated = true;
+        Ok(())
+    }
+
+    pub async fn reserve_tool_execution(
+        &self,
+        run_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+    ) -> Result<ToolExecutionReservation> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_tool_executions(&mut inner)?;
+        let key = (run_id.to_string(), tool_use_id.to_string());
+        if let Some(existing) = inner.tool_executions.get(&key).cloned() {
+            if existing.tool_name != tool_name || existing.input_hash != input_hash {
+                return Ok(ToolExecutionReservation::Conflict(existing));
+            }
+            return Ok(match existing.status {
+                ToolExecutionStatus::Completed => ToolExecutionReservation::Replay(existing),
+                ToolExecutionStatus::Started => ToolExecutionReservation::InDoubt(existing),
+            });
+        }
+        let execution = ToolExecutionRecord {
+            run_id: run_id.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            tool_name: tool_name.to_string(),
+            input_hash: input_hash.to_string(),
+            status: ToolExecutionStatus::Started,
+            result_content: None,
+            result_is_error: false,
+            result_metadata: None,
+            updated_at: Utc::now(),
+        };
+        self.append_tool_execution_snapshot(&execution)?;
+        inner.tool_executions.insert(key, execution);
+        Ok(ToolExecutionReservation::Reserved)
+    }
+
+    pub async fn complete_tool_execution(
+        &self,
+        run_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        result: ToolExecutionCompletion,
+    ) -> Result<ToolExecutionRecord> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_tool_executions(&mut inner)?;
+        let key = (run_id.to_string(), tool_use_id.to_string());
+        let existing =
+            inner.tool_executions.get(&key).cloned().ok_or_else(|| {
+                anyhow!("tool execution was not reserved: {run_id}/{tool_use_id}")
+            })?;
+        if existing.tool_name != tool_name || existing.input_hash != input_hash {
+            return Err(anyhow!(
+                "tool execution identity changed for {run_id}/{tool_use_id}"
+            ));
+        }
+        if existing.status == ToolExecutionStatus::Completed {
+            return Ok(existing);
+        }
+        let result = durable_tool_execution_completion(result);
+        let completed = ToolExecutionRecord {
+            status: ToolExecutionStatus::Completed,
+            result_content: Some(result.content),
+            result_is_error: result.is_error,
+            result_metadata: result.metadata,
+            updated_at: Utc::now(),
+            ..existing
+        };
+        self.append_tool_execution_snapshot(&completed)?;
+        inner.tool_executions.insert(key, completed.clone());
+        Ok(completed)
+    }
+
     pub fn review_finding_log_path(&self) -> PathBuf {
         (*self.review_finding_log_path).clone()
     }
@@ -3963,6 +4130,8 @@ impl RuntimeStore {
         &self,
         run_id: &str,
         tool: &str,
+        tool_use_id: &str,
+        requested_input: &Value,
     ) -> Option<PendingPermission> {
         let persisted = self.read_pending_permissions().ok().unwrap_or_default();
         let mut inner = self.inner.write().await;
@@ -3978,11 +4147,40 @@ impl RuntimeStore {
             .filter(|permission| {
                 permission.run_id == run_id
                     && permission.tool == tool
+                    && permission.tool_use_id.as_deref() == Some(tool_use_id)
+                    && permission.requested_input.as_ref().is_some_and(|input| {
+                        canonical_json_hash(input) == canonical_json_hash(requested_input)
+                    })
                     && permission.status == "allow"
                     && permission.consumed_at.is_none()
             })
             .max_by_key(|permission| permission.resolved_at)
             .cloned()
+    }
+
+    pub async fn approved_permissions_for_run(&self, run_id: &str) -> Vec<PendingPermission> {
+        let persisted = self.read_pending_permissions().ok().unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        for permission in persisted {
+            inner
+                .pending_permissions
+                .entry(permission.id.clone())
+                .or_insert(permission);
+        }
+        let mut permissions = inner
+            .pending_permissions
+            .values()
+            .filter(|permission| {
+                permission.run_id == run_id
+                    && permission.status == "allow"
+                    && permission.consumed_at.is_none()
+                    && permission.tool_use_id.is_some()
+                    && permission.requested_input.is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        permissions.sort_by_key(|permission| permission.resolved_at);
+        permissions
     }
 
     pub async fn consume_approved_permission(&self, permission_id: &str) -> Result<bool> {
@@ -4262,6 +4460,34 @@ impl RuntimeStore {
         Ok(())
     }
 
+    pub async fn ensure_initial_checkpoint(&self, run_id: &str) -> Result<AgentCheckpoint> {
+        if let Some(checkpoint) = self.latest_checkpoint_for_run(run_id).await {
+            return Ok(checkpoint);
+        }
+        let run = self
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found for initial checkpoint: {run_id}"))?;
+        let checkpoint = AgentCheckpoint {
+            id: self.next_id("checkpoint"),
+            run_id: run.id.clone(),
+            project_id: run.project_id,
+            phase: run.phase,
+            message_window: Vec::new(),
+            conversation_range: None,
+            task_list: Vec::new(),
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: run.brief_version,
+            design_version: run.design_version,
+            last_known_preview_url: None,
+            context_summary: "Run created and ready for session launch.".to_string(),
+            created_at: Utc::now(),
+        };
+        self.save_checkpoint(checkpoint.clone()).await?;
+        Ok(checkpoint)
+    }
+
     pub async fn get_checkpoint(&self, checkpoint_id: &str) -> Option<AgentCheckpoint> {
         if let Some(checkpoint) = self
             .inner
@@ -4290,16 +4516,36 @@ impl RuntimeStore {
             .cloned();
         match checkpoint_id {
             Some(checkpoint_id) => self.get_checkpoint(&checkpoint_id).await,
-            None => self
-                .get_run(run_id)
-                .await
-                .and_then(|run| run.checkpoint_id)
-                .and_then(|checkpoint_id| {
-                    fs::read_to_string(self.checkpoint_path(&checkpoint_id))
-                        .ok()
-                        .and_then(|json| serde_json::from_str(&json).ok())
-                }),
+            None => {
+                let referenced = self
+                    .get_run(run_id)
+                    .await
+                    .and_then(|run| run.checkpoint_id)
+                    .and_then(|checkpoint_id| {
+                        fs::read_to_string(self.checkpoint_path(&checkpoint_id))
+                            .ok()
+                            .and_then(|json| serde_json::from_str(&json).ok())
+                    });
+                referenced.or_else(|| self.latest_checkpoint_file_for_run(run_id))
+            }
         }
+    }
+
+    fn latest_checkpoint_file_for_run(&self, run_id: &str) -> Option<AgentCheckpoint> {
+        fs::read_dir(&*self.checkpoint_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+            .filter_map(|json| serde_json::from_str::<AgentCheckpoint>(&json).ok())
+            .filter(|checkpoint| checkpoint.run_id == run_id)
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
     }
 
     pub fn checkpoint_path(&self, checkpoint_id: &str) -> PathBuf {
@@ -6191,6 +6437,102 @@ fn append_jsonl_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+fn append_jsonl_data_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let existed = path.exists();
+    let mut line = serde_json::to_string(value)?;
+    line.push('\n');
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(line.as_bytes())?;
+    file.sync_data()?;
+    if !existed {
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn durable_tool_execution_completion(result: ToolExecutionCompletion) -> ToolExecutionCompletion {
+    let status = result
+        .content
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| {
+            matches!(
+                *status,
+                "completed" | "partial" | "blocked" | "failed" | "cancelled"
+            )
+        });
+    let digest = canonical_json_hash(&json!({
+        "content": result.content.clone(),
+        "isError": result.is_error,
+        "metadata": result.metadata.clone(),
+    }));
+    let mut content = serde_json::Map::from_iter([
+        ("replayed".to_string(), Value::Bool(true)),
+        ("resultDigest".to_string(), Value::String(digest.clone())),
+        (
+            "summary".to_string(),
+            Value::String(if result.is_error {
+                "The original tool error output was omitted from the durable execution ledger."
+                    .to_string()
+            } else {
+                "The tool completed before restart; original output was omitted from the durable execution ledger."
+                    .to_string()
+            }),
+        ),
+    ]);
+    if let Some(status) = status {
+        content.insert("status".to_string(), Value::String(status.to_string()));
+    }
+    let mut metadata = serde_json::Map::from_iter([
+        ("durableProjection".to_string(), Value::Bool(true)),
+        ("resultDigest".to_string(), Value::String(digest)),
+    ]);
+    if let Some(recoverable) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("recoverable"))
+        .and_then(Value::as_bool)
+    {
+        metadata.insert("recoverable".to_string(), Value::Bool(recoverable));
+    }
+    if let Some(error_kind) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("errorKind"))
+        .and_then(Value::as_str)
+        .filter(|error_kind| {
+            error_kind.len() <= 128
+                && error_kind.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+                })
+        })
+    {
+        metadata.insert(
+            "errorKind".to_string(),
+            Value::String(error_kind.to_string()),
+        );
+    }
+    ToolExecutionCompletion {
+        content: Value::Object(content),
+        is_error: result.is_error,
+        metadata: Some(Value::Object(metadata)),
+    }
 }
 
 fn truncate_jsonl_tail(path: &Path, valid_bytes: u64) -> Result<()> {

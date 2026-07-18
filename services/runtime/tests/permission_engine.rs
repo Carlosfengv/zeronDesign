@@ -449,6 +449,61 @@ async fn headless_permission_request_hook_can_allow_and_update_input() {
 }
 
 #[tokio::test]
+async fn approved_permission_is_bound_to_tool_use_id_and_requested_input() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "permission-binding-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let requested_input = json!({ "path": "project/index.html", "text": "approved" });
+    let permission = store
+        .create_tool_permission_request(
+            &run.project_id,
+            &run.id,
+            "fs.write",
+            Some("approved-tool-use"),
+            Some(requested_input.clone()),
+        )
+        .await;
+    store
+        .resolve_permission(&permission.id, "allow")
+        .await
+        .unwrap();
+
+    assert!(store
+        .approved_permission_for_tool(&run.id, "fs.write", "different-tool-use", &requested_input,)
+        .await
+        .is_none());
+    assert!(store
+        .approved_permission_for_tool(
+            &run.id,
+            "fs.write",
+            "approved-tool-use",
+            &json!({ "path": "project/other.html", "text": "approved" }),
+        )
+        .await
+        .is_none());
+    assert_eq!(
+        store
+            .approved_permission_for_tool(
+                &run.id,
+                "fs.write",
+                "approved-tool-use",
+                &requested_input,
+            )
+            .await
+            .unwrap()
+            .id,
+        permission.id
+    );
+}
+
+#[tokio::test]
 async fn api_approved_updated_input_is_validated_executed_and_consumed_once() {
     let storage = unique_temp_dir("approved-permission-restart");
     let store = RuntimeStore::with_checkpoint_dir(&storage);
@@ -478,9 +533,9 @@ async fn api_approved_updated_input_is_validated_executed_and_consumed_once() {
         .execute(
             store.clone(),
             &run_id,
-            "tool-retried",
+            "tool-original",
             "test.approval_echo",
-            json!({ "path": "project/model-retry.txt" }),
+            json!({ "path": "project/requested.txt" }),
         )
         .await;
 
