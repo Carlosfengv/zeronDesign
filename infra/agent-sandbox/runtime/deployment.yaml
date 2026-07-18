@@ -17,6 +17,8 @@ metadata:
   namespace: anydesign-runtime
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: anydesign-runtime
@@ -41,9 +43,37 @@ spec:
             - name: MODEL_PROVIDER
               value: internal_gateway
             - name: MODEL_REQUEST_TIMEOUT_SECONDS
-              value: "180"
-            - name: MODEL_GATEWAY_URL
-              value: http://fixture-model-gateway.anydesign-runtime.svc.cluster.local:9000
+              value: "390"
+            - name: RUNTIME_AGENT_MAX_TURNS
+              value: "20"
+            - name: RUNTIME_AGENT_MAX_TOOL_CALLS
+              value: "60"
+            - name: RUNTIME_AGENT_MAX_INPUT_TOKENS
+              value: "200000"
+            - name: RUNTIME_AGENT_MAX_OUTPUT_TOKENS
+              value: "40000"
+            - name: RUNTIME_AGENT_MAX_CONSECUTIVE_PROTOCOL_ERRORS
+              value: "3"
+            - name: RUNTIME_AGENT_TOTAL_TIMEOUT_SECONDS
+              value: "1800"
+            - name: RUNTIME_AGENT_IDLE_TIMEOUT_SECONDS
+              value: "420"
+            - name: RUNTIME_AGENT_MAX_NO_PROGRESS_TURNS
+              value: "5"
+            - name: RUNTIME_AGENT_MAX_READ_TOOL_CALLS
+              value: "36"
+            - name: RUNTIME_AGENT_MAX_SEARCH_TOOL_CALLS
+              value: "8"
+            - name: RUNTIME_AGENT_MAX_REPAIR_READ_TOOL_CALLS
+              value: "6"
+            - name: RUNTIME_AGENT_MAX_REPAIR_SEARCH_TOOL_CALLS
+              value: "2"
+            - name: RUNTIME_TOOL_CALL_DEADLINE_MS
+              value: "120000"
+            - name: RUNTIME_BUILD_TOOL_CALL_DEADLINE_MS
+              value: "300000"
+            - name: RUNTIME_MAX_ACCEPTANCE_REPAIR_CYCLES
+              value: "3"
             - name: SANDBOX_BACKEND_MODE
               value: kubernetes
             - name: RUNTIME_POLICY_PROFILE

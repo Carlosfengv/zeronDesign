@@ -1,0 +1,12 @@
+spec:
+  template:
+    spec:
+      containers:
+        - name: runtime
+          env:
+            - name: MODEL_PROVIDER
+              value: internal_gateway
+            - name: MODEL_GATEWAY_URL
+              value: http://fixture-model-gateway.anydesign-runtime.svc.cluster.local:9000
+            - name: MODEL_GATEWAY_AUTH_TOKEN
+              $patch: delete

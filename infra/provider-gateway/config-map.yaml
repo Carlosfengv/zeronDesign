@@ -9,6 +9,8 @@ data:
       "resources": [],
       "policies": []
     }
-# Replace this ConfigMap through GitOps with an approved configuration derived
-# from model-resources.example.json. The empty default intentionally fails the
+# Replace this ConfigMap through GitOps with an approved environment-specific
+# declaration. Local governed DeepSeek runs use the no-secret authoritative file
+# model-resources.deepseek-v4-pro.json; model-resources.example.json remains a
+# generic example only. The empty production default intentionally fails the
 # Gateway readiness/startup check instead of enabling an unreviewed provider.

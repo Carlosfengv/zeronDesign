@@ -1,0 +1,168 @@
+name: Generation Reliability
+
+"on":
+  pull_request:
+    paths:
+      - "services/runtime/**"
+      - "services/provider-gateway/**"
+      - "infra/agent-sandbox/**"
+      - "infra/provider-gateway/**"
+      - "infra/generation-reliability/**"
+      - ".github/workflows/generation-reliability.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "services/runtime/**"
+      - "services/provider-gateway/**"
+      - "infra/agent-sandbox/**"
+      - "infra/provider-gateway/**"
+      - "infra/generation-reliability/**"
+      - ".github/workflows/generation-reliability.yml"
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+    inputs:
+      provider_mode:
+        description: Provider used by the deployed Website/Docs matrix
+        required: true
+        default: fixture
+        type: choice
+        options:
+          - fixture
+          - real
+      rc_mode:
+        description: Audit accepts a dirty/local build; release requires clean real-provider evidence
+        required: true
+        default: audit
+        type: choice
+        options:
+          - audit
+          - release
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify generation gate contract
+        run: bash infra/generation-reliability/check-contract.sh
+      - name: Verify Run token budgets
+        run: cargo test --manifest-path services/runtime/Cargo.toml --test agent_loop token_budget
+      - name: Verify protocol fuse
+        run: cargo test --manifest-path services/runtime/Cargo.toml --test agent_loop protocol
+      - name: Verify failed Candidate repair convergence
+        run: |
+          cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_tools \
+            preview_publish_rejects_unchanged_source_after_failed_generation_validation -- --exact
+          cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_tools \
+            preview_publish_rejects_candidate_that_fails_frozen_brief_acceptance -- --exact
+      - name: Verify persisted Run WAL hot path
+        run: |
+          cargo test --manifest-path services/runtime/Cargo.toml --test checkpoint \
+            persisted_runs_are_hydrated_once_per_store_instance -- --exact
+          cargo test --manifest-path services/runtime/Cargo.toml --test checkpoint \
+            truncated_run_wal_tail_is_repaired_before_restart_continues_writing -- --exact
+      - name: Verify production Candidate promotion boundary
+        run: >-
+          cargo test --manifest-path services/runtime/Cargo.toml --test preview_promotion
+          production_retires_manual_candidate_reporting_before_it_can_promote
+      - name: Verify Provider usage boundary
+        run: >-
+          cargo test --manifest-path services/runtime/Cargo.toml --test model_gateway
+          runtime_gateway_provider_round_trip_preserves_governed_selection_boundary
+
+  fixture-k3d:
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'schedule' || vars.ENABLE_SCHEDULED_REAL_PROVIDER != 'true') &&
+      (github.event_name != 'workflow_dispatch' || inputs.provider_mode != 'real')
+    needs: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned k3d
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-amd64 \
+            --output /tmp/k3d
+          chmod +x /tmp/k3d
+          sudo mv /tmp/k3d /usr/local/bin/k3d
+          k3d version
+      - name: Locate Chromium
+        run: |
+          browser="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+          test -x "${browser}"
+          printf 'RUNTIME_BROWSER_EXECUTABLE=%s\n' "${browser}" >>"${GITHUB_ENV}"
+      - name: Run Website and Docs fixture matrix
+        env:
+          GENERATION_MATRIX_MODE: fixture
+          GENERATION_MATRIX_BOOTSTRAP: always
+          GENERATION_MATRIX_SKIP_PREFLIGHT: "1"
+          GENERATION_MATRIX_EVIDENCE_DIR: services/runtime/target/e2e-evidence/ci-fixture
+        run: bash infra/generation-reliability/run-k3d-matrix.sh
+      - name: Upload generation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generation-fixture-evidence
+          path: services/runtime/target/e2e-evidence/ci-fixture
+          if-no-files-found: error
+
+  real-provider-k3d:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.provider_mode == 'real') ||
+      (github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_REAL_PROVIDER == 'true')
+    needs: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned k3d
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux-amd64 \
+            --output /tmp/k3d
+          chmod +x /tmp/k3d
+          sudo mv /tmp/k3d /usr/local/bin/k3d
+          k3d version
+      - name: Locate Chromium
+        run: |
+          browser="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
+          test -x "${browser}"
+          printf 'RUNTIME_BROWSER_EXECUTABLE=%s\n' "${browser}" >>"${GITHUB_ENV}"
+      - name: Run real-provider Website and Docs matrix
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
+          DEEPSEEK_E2E_MODEL: ${{ vars.DEEPSEEK_E2E_MODEL }}
+          GENERATION_MATRIX_MODE: real
+          GENERATION_MATRIX_RC_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.rc_mode || 'audit' }}
+          GENERATION_MATRIX_BOOTSTRAP: always
+          GENERATION_MATRIX_EVIDENCE_DIR: services/runtime/target/e2e-evidence/ci-real
+          RUNTIME_RC_REAL_TOTAL_TOKEN_CEILING: ${{ vars.REAL_PROVIDER_TOTAL_TOKEN_CEILING || '5000000' }}
+        run: bash infra/generation-reliability/run-k3d-matrix.sh
+      - name: Upload generation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generation-real-provider-evidence-${{ github.run_id }}
+          path: services/runtime/target/e2e-evidence/ci-real
+          if-no-files-found: error

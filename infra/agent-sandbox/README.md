@@ -65,8 +65,9 @@ Two gates then run:
 
 Evidence is written under `services/runtime/target/e2e-evidence/` and is checked
 for required fields, cross-project screenshot identity, event order, and
-secret-like values. Fixture evidence does not replace the separately approved
-real-provider release gate.
+secret-like values. Fixture evidence does not replace the real-provider release
+gate; that gate is credential-controlled and does not require a separate human
+approval reference.
 
 ## Run the deployed Runtime RC fixture gate
 
@@ -82,6 +83,19 @@ directory, builds offline in Docker, imports the image into k3d, deploys the
 Runtime and deterministic HTTP model gateway, then cross-checks `/version`, Pod
 image ref, and container imageID. Evidence is written to
 `services/runtime/target/e2e-evidence/runtime-rc-*.json`.
+
+For the normal Website/Docs generation reliability workflow, use the unified
+entry point:
+
+```bash
+bash infra/generation-reliability/run-k3d-matrix.sh
+```
+
+It bootstraps or reuses the k3d environment, runs the deployed Runtime RC gate
+for both surfaces, validates the five Run budgets, emits one matrix summary,
+and captures redacted cluster diagnostics on failure. Real Provider credentials
+can be supplied through `GENERATION_PROVIDER_ENV_FILE`; they are never accepted
+as command-line arguments.
 
 `RUNTIME_RC_REUSE_IMAGE=<ref>` may be used only to rerun the HTTP fixture driver
 against an already-built image; the same commit, image ref, and imageID checks

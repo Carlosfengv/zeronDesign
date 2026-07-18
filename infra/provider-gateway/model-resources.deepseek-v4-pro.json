@@ -4,8 +4,8 @@
   "resources": [
     {
       "schemaVersion": "model-resource@1",
-      "id": "deepseek-design-balanced",
-      "displayName": "DeepSeek Design Balanced",
+      "id": "deepseek-v4-pro",
+      "displayName": "DeepSeek V4 Pro",
       "kind": "openai_compatible",
       "enabled": true,
       "revision": 4,
@@ -15,7 +15,7 @@
       },
       "auth": {
         "type": "bearer",
-        "secretRef": "db:deepseek-design-balanced"
+        "secretRef": "file:/var/run/secrets/deepseek/api-key"
       },
       "physicalModel": "deepseek-v4-pro",
       "capabilities": {
@@ -27,7 +27,7 @@
       "defaults": {
         "requestTimeoutMs": 120000,
         "maxAttempts": 3,
-        "maxConcurrentRequests": 8,
+        "maxConcurrentRequests": 4,
         "temperature": 0.2
       }
     }
@@ -35,26 +35,26 @@
   "policies": [
     {
       "schemaVersion": "model-selection-policy@1",
-      "id": "website-generation-default",
+      "id": "local-deepseek-v4-pro-default",
       "revision": 3,
       "scope": {
-        "organizationIds": ["org-1"],
-        "workspaceIds": ["workspace-1"],
+        "organizationIds": [],
+        "workspaceIds": [],
         "projectIds": []
       },
       "appliesTo": {
-        "phases": ["build", "edit", "repair"],
+        "phases": ["brief", "build", "edit", "repair"],
         "agentProfiles": []
       },
       "candidates": [
         {
-          "modelResourceId": "deepseek-design-balanced",
+          "modelResourceId": "deepseek-v4-pro",
           "priority": 10,
           "weight": 100
         }
       ],
       "directSelection": {
-        "allowedModelResourceIds": ["deepseek-design-balanced"]
+        "allowedModelResourceIds": ["deepseek-v4-pro"]
       },
       "automaticSwitch": {
         "enabled": false,
@@ -62,7 +62,7 @@
         "maxModelSwitchesPerTurn": 0
       },
       "limits": {
-        "maxConcurrentTurns": 8,
+        "maxConcurrentTurns": 4,
         "dailyInputTokens": 100000000
       }
     }

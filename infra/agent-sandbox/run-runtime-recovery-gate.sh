@@ -8,6 +8,7 @@ namespace="${ANYDESIGN_E2E_NAMESPACE:-anydesign-sandboxes}"
 evidence_path="${RECOVERY_EVIDENCE_PATH:-${ROOT_DIR}/services/runtime/target/e2e-evidence/recovery-${cluster_name}.json}"
 active_recovery_evidence="${ACTIVE_RECOVERY_EVIDENCE_PATH:?ACTIVE_RECOVERY_EVIDENCE_PATH is required}"
 runtime_evidence_file="${RECOVERY_RUNTIME_EVIDENCE_FILE:?RECOVERY_RUNTIME_EVIDENCE_FILE is required}"
+baseline_file="${RECOVERY_BASELINE_FILE:-}"
 cd "${ROOT_DIR}"
 
 context="$(${KUBECTL} config current-context)"
@@ -16,10 +17,18 @@ if [[ "${context}" != "k3d-${cluster_name}" ]]; then
   exit 2
 fi
 
-cargo test --manifest-path services/runtime/Cargo.toml \
+cargo test --manifest-path services/runtime/Cargo.toml --lib \
   channel_manager::tests::pod_uid_change_retires_ready_lease_before_reacquiring -- --exact
 cargo test --manifest-path services/runtime/Cargo.toml --test checkpoint \
   runtime_restart_reacquires_ready_sandbox_before_resuming_checkpoint -- --exact
+cargo test --manifest-path services/runtime/Cargo.toml --test checkpoint \
+  persisted_runs_are_hydrated_once_per_store_instance -- --exact
+cargo test --manifest-path services/runtime/Cargo.toml --test checkpoint \
+  truncated_run_wal_tail_is_repaired_before_restart_continues_writing -- --exact
+cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_tools \
+  preview_publish_rejects_unchanged_source_after_failed_generation_validation -- --exact
+cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_tools \
+  preview_publish_rejects_candidate_that_fails_frozen_brief_acceptance -- --exact
 cargo test --manifest-path services/runtime/Cargo.toml --test preview_promotion \
   promotion_wal_recovers_current_run_publish_and_pending_outbox_once -- --exact
 cargo test --manifest-path services/runtime/Cargo.toml --test preview_promotion \
@@ -68,15 +77,46 @@ for(const project of projects){
 }
 ' "${runtime_evidence_file}"
 
-claim_count="$(${KUBECTL} get sandboxclaims.extensions.agents.x-k8s.io \
-  -n "${namespace}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+baseline_json='{"claimNames":[],"protectedSandboxNames":[]}'
+if [[ -n "${baseline_file}" ]]; then
+  [[ -s "${baseline_file}" ]] || {
+    printf 'recovery baseline file is missing or empty: %s\n' "${baseline_file}" >&2
+    exit 2
+  }
+  baseline_json="$(cat "${baseline_file}")"
+fi
+current_claims_json="$(${KUBECTL} get sandboxclaims.extensions.agents.x-k8s.io \
+  -n "${namespace}" -o json)"
+claim_audit="$(node -e '
+const baseline=JSON.parse(process.argv[1]);
+const current=JSON.parse(process.argv[2]).items.map(item=>item.metadata.name).sort();
+const expected=new Set(baseline.claimNames||[]);
+const unexpected=current.filter(name=>!expected.has(name));
+process.stdout.write(JSON.stringify({
+  baselineClaimCount:expected.size,
+  currentClaimCount:current.length,
+  unexpectedClaimNames:unexpected,
+  unexpectedClaimCount:unexpected.length,
+}));
+' "${baseline_json}" "${current_claims_json}")"
+claim_count="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).unexpectedClaimCount))' \
+  "${claim_audit}")"
 if [[ "${claim_count}" != "0" ]]; then
-  printf 'orphan audit failed: %s SandboxClaims remain\n' "${claim_count}" >&2
+  printf 'orphan audit failed: unexpected SandboxClaims remain: %s\n' \
+    "$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).unexpectedClaimNames.join(\",\"))' "${claim_audit}")" >&2
   exit 5
 fi
+protected_sandboxes="$(node -e '
+const baseline=JSON.parse(process.argv[1]);
+process.stdout.write((baseline.protectedSandboxNames||[]).join("\n"));
+' "${baseline_json}")"
 preview_process_count=0
 while IFS= read -r pod; do
   [[ -n "${pod}" ]] || continue
+  if [[ -n "${protected_sandboxes}" ]] \
+    && printf '%s\n' "${protected_sandboxes}" | rg -Fxq "${pod}"; then
+    continue
+  fi
   if ${KUBECTL} exec -n "${namespace}" "${pod}" -- ps -eo args 2>/dev/null \
     | rg '/opt/anydesign/bootstrap/static-preview-server\.js' >/dev/null; then
     preview_process_count=$((preview_process_count + 1))
@@ -91,6 +131,7 @@ mkdir -p "$(dirname "${evidence_path}")"
 node -e '
 const fs=require("fs");
 const active=JSON.parse(fs.readFileSync(process.argv[8],"utf8"));
+const claimAudit=JSON.parse(process.argv[9]);
 fs.writeFileSync(process.argv[1],JSON.stringify({
   schemaVersion:"runtime-recovery-gate@2",
   cluster:process.argv[2],
@@ -106,10 +147,17 @@ fs.writeFileSync(process.argv[1],JSON.stringify({
     {scenario:"cas-before-event",injectionPoint:"promotion-outbox",result:"pass",orphanCount:0},
     {scenario:"run-cancel",injectionPoint:"active-preview-process",result:"pass",orphanCount:0},
   ],
-  orphanAudit:{claimCount:Number(process.argv[9]),previewProcessCount:Number(process.argv[10]),result:"pass"},
+  orphanAudit:{
+    claimCount:claimAudit.unexpectedClaimCount,
+    baselineClaimCount:claimAudit.baselineClaimCount,
+    currentClaimCount:claimAudit.currentClaimCount,
+    unexpectedClaimNames:claimAudit.unexpectedClaimNames,
+    previewProcessCount:Number(process.argv[10]),
+    result:"pass"
+  },
   checks:{channelLease:true,checkpointResume:true,promotionWal:true,promotionReconcile:true,runCancel:true,portForwardReconnect:true,orphanAudit:true},
   result:"pass"
 },null,2)+"\n");
 ' "${evidence_path}" "${cluster_name}" "${context}" "${old_pod}" "${old_uid}" "${new_pod}" "${new_uid}" \
-  "${active_recovery_evidence}" "${claim_count}" "${preview_process_count}"
+  "${active_recovery_evidence}" "${claim_audit}" "${preview_process_count}"
 printf 'Runtime recovery gate passed: %s\n' "${evidence_path}"

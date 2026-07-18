@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: provider-gateway-sqlite-migration
+  namespace: provider-system
+  labels:
+    app.kubernetes.io/name: provider-gateway
+    app.kubernetes.io/component: migration
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: migration
+      image: zerondesign/provider-gateway:k3d-local
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -lc
+        - sleep 3600
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/provider-gateway
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: provider-gateway-sqlite

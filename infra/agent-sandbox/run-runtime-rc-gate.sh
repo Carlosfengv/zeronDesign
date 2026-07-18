@@ -32,12 +32,44 @@ if [[ "${provider_mode}" == "deepseek" && -z "${DEEPSEEK_API_KEY:-}" ]]; then
   printf 'DEEPSEEK_API_KEY is required for the DeepSeek provider gate\n' >&2
   exit 2
 fi
+real_provider_total_token_ceiling="${RUNTIME_RC_REAL_TOTAL_TOKEN_CEILING:-5000000}"
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  if [[ ! "${real_provider_total_token_ceiling}" =~ ^[0-9]+$ ]] \
+    || (( real_provider_total_token_ceiling < 1 || real_provider_total_token_ceiling > 5000000 )); then
+    printf 'RUNTIME_RC_REAL_TOTAL_TOKEN_CEILING must be an integer from 1 to 5000000\n' >&2
+    exit 2
+  fi
+fi
+real_provider_reserved_runs=0
+real_provider_per_run_safety_ceiling=0
+reserve_real_provider_run() {
+  local phase="$1"
+  local project_id="$2"
+  local next_reserved_runs next_reserved_tokens
+  [[ "${active_provider_mode:-fixture}" == "deepseek" ]] || return 0
+  next_reserved_runs=$((real_provider_reserved_runs + 1))
+  next_reserved_tokens=$((next_reserved_runs * real_provider_per_run_safety_ceiling))
+  if (( next_reserved_tokens > real_provider_total_token_ceiling )); then
+    printf 'real Provider total token reservation exhausted before %s: project=%s runs=%s reserved=%s ceiling=%s\n' \
+      "${phase}" "${project_id}" "${next_reserved_runs}" "${next_reserved_tokens}" \
+      "${real_provider_total_token_ceiling}" >&2
+    return 2
+  fi
+  real_provider_reserved_runs="${next_reserved_runs}"
+}
+if [[ "${RUNTIME_RC_TOKEN_BUDGET_SELF_TEST:-0}" == "1" ]]; then
+  active_provider_mode=deepseek
+  real_provider_per_run_safety_ceiling=240000
+  reserve_real_provider_run first self-test
+  if reserve_real_provider_run second self-test 2>/dev/null; then
+    printf 'real Provider token reservation self-test did not fail closed\n' >&2
+    exit 2
+  fi
+  printf 'Runtime RC real Provider token reservation self-test passed\n'
+  exit 0
+fi
 if [[ "${rc_mode}" == "release" && "${provider_mode}" != "deepseek" ]]; then
   printf 'release mode requires RUNTIME_RC_PROVIDER_MODE=deepseek\n' >&2
-  exit 2
-fi
-if [[ "${rc_mode}" == "release" && -z "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
-  printf 'release mode requires RUNTIME_PROVIDER_APPROVAL_ID\n' >&2
   exit 2
 fi
 evidence_dir="${RUNTIME_RC_EVIDENCE_DIR:-services/runtime/target/e2e-evidence/${cluster_name}}"
@@ -48,6 +80,23 @@ if [[ "${RUNTIME_RC_SKIP_PREFLIGHT:-0}" == "1" ]]; then
     printf 'RUNTIME_RC_SKIP_PREFLIGHT is not allowed in release mode\n' >&2
     exit 2
   fi
+  node - "${preflight_evidence}" infra/agent-sandbox/images.lock.json <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const [out, lockFile] = process.argv.slice(2);
+const lockRaw = fs.readFileSync(lockFile);
+fs.writeFileSync(out, `${JSON.stringify({
+  schemaVersion: "runtime-rc-preflight-skipped@1",
+  recordedAt: new Date().toISOString(),
+  lockHash: crypto.createHash("sha256").update(lockRaw).digest("hex"),
+  prefetchImages: false,
+  entries: [],
+  passed: false,
+  skipped: true,
+  reason: "explicit-audit-skip",
+  errors: [],
+}, null, 2)}\n`);
+NODE
   printf 'Skipping preflight in audit mode by explicit request\n'
 else
   if [[ "${rc_mode}" == "release" ]]; then
@@ -152,7 +201,24 @@ provider_secret_file=""
 dcp_runtime_flags_enabled=false
 gate_work_dir="$(mktemp -d)"
 active_recovery_evidence="${evidence_dir}/active-recovery.json"
+recovery_baseline_file="${gate_work_dir}/recovery-baseline.json"
 rm -f "${active_recovery_evidence}"
+"${KUBECTL}" get sandboxclaims.extensions.agents.x-k8s.io \
+  -n anydesign-sandboxes -o json \
+  | node -e '
+const fs = require("node:fs");
+const claims = JSON.parse(fs.readFileSync(0, "utf8")).items;
+const claimNames = claims.map(claim => claim.metadata.name).sort();
+const protectedSandboxNames = claims
+  .map(claim => claim.status?.sandbox?.name)
+  .filter(Boolean)
+  .sort();
+fs.writeFileSync(process.argv[1], `${JSON.stringify({
+  schemaVersion: "runtime-recovery-baseline@1",
+  claimNames,
+  protectedSandboxNames,
+}, null, 2)}\n`);
+' "${recovery_baseline_file}"
 cleanup() {
   if [[ -n "${port_forward_pid}" ]]; then
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
@@ -249,6 +315,9 @@ rm -f "${runtime_image_archive}"
   "gateway=${runtime_image}" >/dev/null
 sed "s|image: anydesign/runtime:dev|image: ${runtime_image}|" \
   infra/agent-sandbox/runtime/deployment.yaml | "${KUBECTL}" apply -f -
+"${KUBECTL}" patch deployment anydesign-runtime -n anydesign-runtime \
+  --type=strategic \
+  --patch-file infra/agent-sandbox/runtime/fixture-gateway-env-patch.yaml >/dev/null
 "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
   RUNTIME_DESIGN_CONTEXT_PACKAGE_V1=true \
   RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1=true \
@@ -315,12 +384,16 @@ start_runtime_port_forward() {
     "${runtime_port}:8080" >/tmp/anydesign-runtime-rc-port-forward.log 2>&1 &
   port_forward_pid=$!
   for _ in $(seq 1 60); do
-    if curl --fail --silent "${base_url}/health" >/dev/null 2>&1; then
-      return 0
-    fi
     if ! kill -0 "${port_forward_pid}" >/dev/null 2>&1; then
       cat /tmp/anydesign-runtime-rc-port-forward.log >&2
       return 1
+    fi
+    if curl --fail --silent "${base_url}/health" >/dev/null 2>&1; then
+      if ! kill -0 "${port_forward_pid}" >/dev/null 2>&1; then
+        cat /tmp/anydesign-runtime-rc-port-forward.log >&2
+        return 1
+      fi
+      return 0
     fi
     sleep 1
   done
@@ -365,12 +438,25 @@ switch_runtime_provider() {
 }
 
 version_json="$(curl --fail --silent "${base_url}/version")"
-node -e '
-const v=JSON.parse(process.argv[1]);
-if(v.repositoryCommit!==process.argv[2]||v.imageRef!==process.argv[3]) {
-  throw new Error(`Runtime version mismatch: ${JSON.stringify(v)}`);
-}
-' "${version_json}" "${git_sha}" "${runtime_image}"
+node infra/agent-sandbox/verify-runtime-version.mjs \
+  "${version_json}" "${git_sha}" "${git_full_sha}" "${runtime_image}"
+
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  runtime_max_input_tokens="$(${KUBECTL} get deployment anydesign-runtime -n anydesign-runtime \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RUNTIME_AGENT_MAX_INPUT_TOKENS")].value}')"
+  runtime_max_output_tokens="$(${KUBECTL} get deployment anydesign-runtime -n anydesign-runtime \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RUNTIME_AGENT_MAX_OUTPUT_TOKENS")].value}')"
+  if [[ ! "${runtime_max_input_tokens}" =~ ^[0-9]+$ || ! "${runtime_max_output_tokens}" =~ ^[0-9]+$ ]]; then
+    printf 'real Provider gate requires numeric Runtime input/output token budgets\n' >&2
+    exit 2
+  fi
+  real_provider_per_run_safety_ceiling=$((runtime_max_input_tokens + runtime_max_output_tokens))
+  if (( real_provider_per_run_safety_ceiling > real_provider_total_token_ceiling )); then
+    printf 'real Provider per-Run safety ceiling exceeds total token ceiling: perRun=%s total=%s\n' \
+      "${real_provider_per_run_safety_ceiling}" "${real_provider_total_token_ceiling}" >&2
+    exit 2
+  fi
+fi
 
 issue_principal_token() {
   local project_id="$1"
@@ -585,8 +671,8 @@ run_fixture() {
   if [[ "${active_provider_mode}" == "deepseek" ]]; then
     stage_timeout="${RUNTIME_RC_REAL_STAGE_TIMEOUT_SECONDS:-1800}"
     brief_wait_timeout="${RUNTIME_RC_REAL_BRIEF_WAIT_SECONDS:-720}"
-    brief_text="Create a polished but compact ${kind} using the initialized Runtime template. This Build-stage artifact must visibly contain the exact text ${build_expected_text}. Use only Runtime tools, build, open the preview, take a screenshot, report the candidate, and complete the run. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
-    edit_text="Edit the current ${kind} by replacing the visible Build-stage text ${build_expected_text} with the exact text ${expected_text}. Make and verify that source mutation before the first preview.publish call. Then inspect the preview, take a nonblank screenshot, promote the candidate, and complete. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    brief_text="Create a polished but compact ${kind} using the initialized Runtime template. This Build-stage artifact must visibly contain the exact text ${build_expected_text}. Use only Runtime tools, make the source changes, call preview.publish to build and validate the candidate, then call run.complete. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
+    edit_text="Edit the current ${kind} by replacing the visible Build-stage text ${build_expected_text} with the exact text ${expected_text}. Make and verify that source mutation before the first preview.publish call. Then call preview.publish to validate the candidate and call run.complete only after it succeeds. Never rewrite an existing large file with fs.write; use fs.patch or fs.multi_patch after reading it."
     if [[ "${kind}" == "docs" ]]; then
       build_expected_text="RC Docs Built"
       brief_text="Create a minimal Docs artifact from the initialized Fumadocs template. Keep existing structure and change only the smallest existing source needed. Do not create a full documentation set and do not submit any write over 2000 characters. This Build-stage Docs artifact must contain the exact text ${build_expected_text}. Use fs.patch or fs.multi_patch after fs.read, then publish and complete."
@@ -600,6 +686,7 @@ run_fixture() {
     -d "{\"ownerPrincipalId\":\"${principal_id}\"}" \
     "${base_url}/internal/projects/${project_id}/access" >/dev/null
   principal_token="$(issue_principal_token "${project_id}")"
+  reserve_real_provider_run brief "${project_id}"
   brief_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
     -H "authorization: Bearer ${principal_token}" \
@@ -647,6 +734,7 @@ process.stdout.write(item?.metadata?.briefId||"");
     exit 4
   fi
   principal_token="$(issue_principal_token "${project_id}")"
+  reserve_real_provider_run build "${project_id}"
   build_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
     -H "authorization: Bearer ${principal_token}" \
@@ -689,6 +777,7 @@ process.exit(2);
     binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
   fi
   principal_token="$(issue_principal_token "${project_id}")"
+  reserve_real_provider_run edit "${project_id}"
   edit_response="$(curl --silent --show-error --write-out $'\n%{http_code}' \
     -H 'content-type: application/json' \
     -H "authorization: Bearer ${principal_token}" \
@@ -725,12 +814,13 @@ process.exit(2);
       | node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).currentVersionId)')"
     if [[ "${active_provider_mode}" == "deepseek" && "${project_id}" == *"dcp-provider"* ]]; then
       # Seed only the Review finding deterministically. Build/Edit/Repair stay
-      # on the approved real Provider so the gate measures mutation compliance
+      # on the real Provider so the gate measures mutation compliance
       # independently from stochastic finding discovery.
       switch_runtime_provider fixture
       seeded_review_provider=true
       principal_token="$(issue_principal_token "${project_id}")"
     fi
+    reserve_real_provider_run review "${project_id}"
     review_payload="$(curl --fail --silent \
       -H 'content-type: application/json' \
       -H "authorization: Bearer ${principal_token}" \
@@ -748,6 +838,7 @@ process.exit(2);
       switch_runtime_provider deepseek
     fi
     principal_token="$(issue_principal_token "${project_id}")"
+    reserve_real_provider_run repair "${project_id}"
     finding_id="$(node -e '
 for(const line of process.argv[1].split(/\r?\n/)){
   if(!line.startsWith("data: "))continue;
@@ -861,6 +952,7 @@ process.stdout.write(JSON.stringify(evidence));
       "${anonymous_status}" "${cross_project_status}" "${owner_status}" >&2
     exit 5
   fi
+  reserve_real_provider_run cancel_probe "${project_id}"
   cancel_probe_payload="$(curl --fail --silent \
     -H 'content-type: application/json' \
     -H "authorization: Bearer ${principal_token}" \
@@ -928,7 +1020,7 @@ fs.writeFileSync(process.argv[1],JSON.stringify({
   project:JSON.parse(process.argv[2]),
 },null,2)+"\n");
 ' "${evidence_dir}/real-provider-${kind}.json" "${project_json}" \
-    "$([[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]] && printf approved-real || printf real-audit)" \
+    "real" \
     "${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
 }
 
@@ -1039,6 +1131,27 @@ if [[ -z "${website}" || -z "${docs}" ]]; then
   exit 6
 fi
 
+real_provider_budget_evidence=""
+if [[ "${provider_mode}" == "deepseek" ]]; then
+  real_provider_budget_evidence="${evidence_dir}/real-provider-token-budget.json"
+  node - "${real_provider_budget_evidence}" "${real_provider_total_token_ceiling}" \
+    "${real_provider_per_run_safety_ceiling}" "${real_provider_reserved_runs}" <<'NODE'
+const fs = require("node:fs");
+const [output, total, perRun, runs] = process.argv.slice(2);
+const evidence = {
+  schemaVersion: "runtime-rc-real-provider-token-budget@1",
+  recordedAt: new Date().toISOString(),
+  totalTokenCeiling: Number(total),
+  perRunSafetyCeiling: Number(perRun),
+  reservedRunCount: Number(runs),
+  reservedTokens: Number(perRun) * Number(runs),
+};
+evidence.withinCeiling = evidence.reservedTokens <= evidence.totalTokenCeiling;
+if (!evidence.withinCeiling) throw new Error("real Provider reservations exceed the total ceiling");
+fs.writeFileSync(output, `${JSON.stringify(evidence, null, 2)}\n`);
+NODE
+fi
+
 evidence="${evidence_dir}/runtime-rc-${image_tag}.json"
 provider_evidence_mode="fixture"
 provider_model="deterministic-tool-sequence"
@@ -1046,11 +1159,7 @@ provider_credential_present=false
 if [[ "${provider_mode}" == "deepseek" ]]; then
   provider_model="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
   provider_credential_present=true
-  if [[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
-    provider_evidence_mode="approved-real"
-  else
-    provider_evidence_mode="real-audit"
-  fi
+  provider_evidence_mode="real"
 fi
 node -e '
 const fs=require("fs");
@@ -1061,7 +1170,12 @@ const payload={
   images:{runtime:{ref:process.argv[4],configDigest:process.argv[5],manifestDigest:process.argv[22],reportedCommit:JSON.parse(process.argv[2]).repositoryCommit}},
   transport:JSON.parse(fs.readFileSync(process.argv[21],"utf8")).transport,
   auth:{principalMode:process.argv[14],projectOwnershipVerified:process.argv[15]==="true",channelJwtVerified:true},
-  provider:{mode:process.argv[16],model:process.argv[17],approvalReference:process.argv[18]||null,credentialPresent:process.argv[19]==="true"},
+  provider:{
+    mode:process.argv[16],
+    model:process.argv[17],
+    credentialPresent:process.argv[19]==="true",
+    tokenBudget:process.argv[25]?JSON.parse(fs.readFileSync(process.argv[25],"utf8")):null,
+  },
   runtimeVersion:JSON.parse(process.argv[2]),
   runtimePod:process.argv[3],
   runtimeImage:process.argv[4],
@@ -1084,8 +1198,9 @@ process.stdout.write(JSON.stringify({name:process.argv[2],kubeContext:process.ar
   "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime' | shasum -a 256 | awk '{print $1}')" \
   "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
   "required" "true" "${provider_evidence_mode}" "${provider_model}" \
-  "${RUNTIME_PROVIDER_APPROVAL_ID:-}" "${provider_credential_present}" "${fixture_evidence}" \
-  "${channel_evidence}" "${runtime_manifest_digest}" "${dcp_fixture}" "${provider_dcp}"
+  "" "${provider_credential_present}" "${fixture_evidence}" \
+  "${channel_evidence}" "${runtime_manifest_digest}" "${dcp_fixture}" "${provider_dcp}" \
+  "${real_provider_budget_evidence}"
 printf 'Runtime RC gate passed: %s\n' "${evidence}"
 
 npm_evidence="${evidence_dir}/npm-proxy.json"
@@ -1098,6 +1213,7 @@ ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
   RECOVERY_EVIDENCE_PATH="${recovery_evidence}" \
   ACTIVE_RECOVERY_EVIDENCE_PATH="${active_recovery_evidence}" \
   RECOVERY_RUNTIME_EVIDENCE_FILE="${evidence}" \
+  RECOVERY_BASELINE_FILE="${recovery_baseline_file}" \
   bash infra/agent-sandbox/run-runtime-recovery-gate.sh
 
 release_evidence="${evidence_dir}/release-evidence.json"
@@ -1113,9 +1229,6 @@ aggregate_args=(
 )
 if [[ -n "${RUNTIME_RC_PROVIDER_EVIDENCE:-}" ]]; then
   aggregate_args+=(--provider "${RUNTIME_RC_PROVIDER_EVIDENCE}")
-fi
-if [[ -n "${RUNTIME_PROVIDER_APPROVAL_ID:-}" ]]; then
-  aggregate_args+=(--approval-reference "${RUNTIME_PROVIDER_APPROVAL_ID}")
 fi
 node services/runtime/scripts/aggregate-release-evidence.mjs "${aggregate_args[@]}"
 if [[ "${rc_mode}" == "release" ]]; then

@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "generation-real-provider-suite@1",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro"
+  },
+  "approval": {
+    "required": false
+  },
+  "budget": {
+    "totalTokens": 20000000,
+    "maxRunsPerCase": 2,
+    "perRun": {
+      "maxTurns": 60,
+      "maxToolCalls": 180,
+      "maxInputTokens": 2000000,
+      "maxOutputTokens": 200000
+    }
+  },
+  "cases": [
+    {
+      "id": "zenova-agent-cloud",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "ZStack Zenova 企业智能体云产品页",
+      "expectedRoute": "/",
+      "expectedText": "让 AI 成为可治理的企业生产力",
+      "prompt": "请帮我做一个 ZStack Zenova 企业智能体云的中文产品官网单页，主要面向能源、油气和大型企业客户。首屏标题用“让 AI 成为可治理的企业生产力”，介绍私有化与信创兼容、业务系统接入、安全治理、智能体模板复用和运营度量，并用一个简单的四层架构说明从算力、模型、智能体到业务的关系。整体采用深海蓝和青绿色，专业、克制，兼顾电脑和手机浏览。"
+    },
+    {
+      "id": "oilfield-operations-dashboard",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "油田智能运营驾驶舱",
+      "expectedRoute": "/",
+      "expectedText": "今日生产态势",
+      "prompt": "请做一个油田智能运营驾驶舱页面，给生产调度人员查看当天的产量、设备健康、HSE 风险和智能体任务。页面标题是“今日生产态势”，包含几个关键指标、一张产量趋势图、风险告警和任务列表即可。数据使用清楚标注的演示数据，整体专业、清晰，适合笔记本和大屏查看。"
+    },
+    {
+      "id": "ai-governance-console",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "企业 AI 治理控制台",
+      "expectedRoute": "/",
+      "expectedText": "AI 运营与治理中心",
+      "prompt": "请设计一个面向平台管理员的企业 AI 治理控制台，页面标题为“AI 运营与治理中心”。我希望能一眼看到模型调用趋势、部门用量、敏感数据拦截、异常调用和智能体活跃情况，并能浏览模型资源、权限策略和最近审计事件。使用本地演示数据，采用清爽的浅色企业后台风格，桌面和移动端都能正常查看。"
+    },
+    {
+      "id": "agent-cloud-quickstart",
+      "kind": "docs",
+      "locale": "zh-CN",
+      "title": "企业智能体云快速开始文档",
+      "expectedRoute": "/docs/",
+      "expectedText": "10 分钟完成首个企业智能体",
+      "prompt": "请写一份企业智能体云的中文快速开始文档，标题是“10 分钟完成首个企业智能体”。按实际操作顺序说明准备工作、配置模型、连接一个业务系统、设置最小权限、创建并测试智能体，以及在哪里查看用量和审计记录。示例不要出现真实密钥，使用环境变量或占位符，并补充几条常见问题。"
+    },
+    {
+      "id": "private-ai-security-runbook",
+      "kind": "docs",
+      "locale": "zh-CN",
+      "title": "私有化 AI 安全运行手册",
+      "expectedRoute": "/docs/",
+      "expectedText": "私有化 AI 安全运行手册",
+      "prompt": "请创建一份给运维和安全团队使用的中文文档，标题为“私有化 AI 安全运行手册”。重点说明数据分级、最小权限、密钥轮换、敏感数据拦截、审计、故障降级和应急停用流程，并给出一个不含真实凭据的 Kubernetes Secret 示例和一份简洁的事件响应清单。内容要方便值班人员快速查阅。"
+    }
+  ]
+}
