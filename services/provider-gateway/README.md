@@ -75,6 +75,15 @@ remain available independently.
 
 For GitOps-managed resources, `POST /configuration/reconcile` rereads `PROVIDER_GATEWAY_CONFIG_FILE`, validates the complete mounted configuration, and creates a new revision only for resources or policies whose non-revision fields changed. It is Admin-token/idempotency/change-context protected, records the configuration digest in audit, and refreshes only future turns; it never rewrites existing execution snapshots. The reconcile call is deliberately explicit so a ConfigMap mount update alone cannot silently change routing.
 
+The local k3d DeepSeek source of truth is
+`infra/provider-gateway/model-resources.deepseek-v4-pro.json`. It contains only a
+mounted file Secret reference, never the credential. Apply and verify it with
+`infra/provider-gateway/reconcile-k3d-model-resources.sh`; the script annotates
+the Deployment with the configuration digest, performs an audited reconcile,
+and fails unless the database current resource and policy revisions exactly
+match the declaration. Set `PROVIDER_GATEWAY_RUN_READINESS_PROBE=1` for the
+minimal paid Provider probe used by real release evidence.
+
 `POST /model-resources/{id}/validate` reruns schema, URL, and DNS policy checks on the current resource revision and records a low-sensitivity validation audit event. `POST /model-resources/{id}/readiness` requires `expectedRevision`, the normal Admin change context, and an idempotency key; it sends a fixed minimal `Reply with READY.` probe, applies the normal DNS/circuit/bulkhead defenses, and audits only the resource version, Provider request ID, and usage summary.
 
 Model resource endpoints are validated for HTTPS (outside tests), safe URL shape, and literal private/loopback/metadata IP addresses. Before every real Provider call, Gateway resolves the endpoint and rejects private, loopback, link-local, and metadata IP results. The Provider HTTP client never follows redirects. Production deployment must still enforce the approved-host egress policy as a second line of defense; this MVP does not claim that a preflight DNS lookup alone prevents DNS rebinding.

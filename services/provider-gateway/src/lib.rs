@@ -539,7 +539,10 @@ impl GatewayApiError {
         self.envelope.error.retryable
             && matches!(
                 self.envelope.error.code.as_str(),
-                "provider_rate_limited" | "provider_unavailable" | "provider_timeout"
+                "provider_rate_limited"
+                    | "provider_unavailable"
+                    | "provider_timeout"
+                    | "provider_response_invalid"
             )
     }
 }
@@ -1848,6 +1851,8 @@ impl GatewayService {
                     if error.is_retryable_upstream()
                         && attempt < resource.defaults.max_attempts =>
                 {
+                    self.record_provider_error(resource, request, attempt, &error)
+                        .await;
                     self.record_upstream_attempt(
                         resource,
                         if attempt == 1 { "initial" } else { "retry" },
@@ -1868,6 +1873,8 @@ impl GatewayService {
                     tokio::time::sleep(delay).await;
                 }
                 Err(error) => {
+                    self.record_provider_error(resource, request, attempt, &error)
+                        .await;
                     self.record_upstream_attempt(
                         resource,
                         if attempt == 1 { "initial" } else { "retry" },
@@ -1902,6 +1909,29 @@ impl GatewayService {
         ));
     }
 
+    async fn record_provider_error(
+        &self,
+        resource: &ModelResource,
+        request: &GatewayTurnRequest,
+        attempt: u32,
+        error: &GatewayApiError,
+    ) {
+        let _ = self.inner.storage.lock().await.audit_event(
+            "provider_attempt.failed",
+            &resource.id,
+            &json!({
+                "requestId": request.request_id,
+                "runId": request.scope.run_id,
+                "phase": request.scope.phase,
+                "attempt": attempt,
+                "code": error.envelope.error.code,
+                "message": error.envelope.error.message,
+                "providerRequestId": error.envelope.error.provider_request_id,
+                "retryable": error.envelope.error.retryable,
+            }),
+        );
+    }
+
     async fn call_openai_compatible_once(
         &self,
         resource: &ModelResource,
@@ -1913,7 +1943,8 @@ impl GatewayService {
             resource.endpoint.base_url.trim_end_matches('/'),
             ensure_leading_slash(&resource.endpoint.chat_completions_path)
         );
-        let body = openai_request_body(request, resource)?;
+        let tool_aliases = ProviderToolAliasMap::from_request(request)?;
+        let body = openai_request_body(request, resource, &tool_aliases)?;
         // Runtime's deadline is the authoritative bound for a logical turn.
         // A resource may tighten it, but may never extend it.
         let timeout = provider_call_timeout(resource, request)?;
@@ -1955,6 +1986,11 @@ impl GatewayService {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
         if !status.is_success() {
+            let rejection_detail = response
+                .text()
+                .await
+                .ok()
+                .and_then(|body| provider_rejection_detail(&body));
             let error = if status.as_u16() == 429 {
                 GatewayApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -1976,7 +2012,13 @@ impl GatewayService {
                     StatusCode::BAD_GATEWAY,
                     request.request_id.clone(),
                     "provider_response_invalid",
-                    "Selected provider rejected the normalized request",
+                    rejection_detail
+                        .map(|detail| {
+                            format!("Selected provider rejected the normalized request: {detail}")
+                        })
+                        .unwrap_or_else(|| {
+                            "Selected provider rejected the normalized request".to_string()
+                        }),
                     false,
                 )
             };
@@ -1993,7 +2035,7 @@ impl GatewayService {
                 request.request_id.clone(),
                 "provider_response_invalid",
                 "Selected provider returned an invalid response",
-                false,
+                true,
             )
             .with_provider_request_id(provider_request_id.clone())
         })?;
@@ -2004,7 +2046,7 @@ impl GatewayService {
                 .filter(|value| !value.trim().is_empty())
                 .map(ToOwned::to_owned)
         });
-        parse_openai_response(value, provider_request_id, request)
+        parse_openai_response(value, provider_request_id, request, &tool_aliases)
     }
 }
 
@@ -2407,7 +2449,7 @@ async fn reserve_admin_write<T: DeserializeOwned>(
                 "admin",
                 "idempotency_key_required",
                 "Admin write operations require Idempotency-Key",
-                false,
+                true,
             )
         })?;
     let request_hash = sha256_json(payload).map_err(|_| {
@@ -2416,7 +2458,7 @@ async fn reserve_admin_write<T: DeserializeOwned>(
             "admin",
             "invalid_admin_request",
             "Admin request cannot be hashed",
-            false,
+            true,
         )
     })?;
     let key = format!("{operation}:{idempotency_key}");
@@ -4177,8 +4219,9 @@ fn ensure_leading_slash(path: &str) -> String {
 fn openai_request_body(
     request: &GatewayTurnRequest,
     resource: &ModelResource,
+    tool_aliases: &ProviderToolAliasMap,
 ) -> std::result::Result<Value, GatewayApiError> {
-    let messages = normalize_messages(request).map_err(|message| {
+    let messages = normalize_messages(request, tool_aliases).map_err(|message| {
         GatewayApiError::new(
             StatusCode::BAD_REQUEST,
             request.request_id.clone(),
@@ -4192,16 +4235,25 @@ fn openai_request_body(
         .tools
         .iter()
         .map(|tool| {
-            json!({
+            let provider_name = tool_aliases.provider_name(&tool.name).ok_or_else(|| {
+                GatewayApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    request.request_id.clone(),
+                    "invalid_turn_request",
+                    "Tool alias mapping is incomplete",
+                    false,
+                )
+            })?;
+            Ok(json!({
                 "type": "function",
                 "function": {
-                    "name": tool.name,
+                    "name": provider_name,
                     "parameters": tool.input_json_schema.as_ref().unwrap_or(&tool.input_schema),
                     "strict": resource.capabilities.strict_tool_schema,
                 }
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<std::result::Result<Vec<_>, GatewayApiError>>()?;
     let mut body = json!({
         "model": resource.physical_model,
         "messages": messages,
@@ -4210,18 +4262,28 @@ fn openai_request_body(
     if let Some(temperature) = resource.defaults.temperature {
         body["temperature"] = json!(temperature);
     }
+    if resource.endpoint.base_url.contains("deepseek.com") {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
     Ok(body)
 }
 
-fn normalize_messages(request: &GatewayTurnRequest) -> std::result::Result<Vec<Value>, String> {
+fn normalize_messages(
+    request: &GatewayTurnRequest,
+    tool_aliases: &ProviderToolAliasMap,
+) -> std::result::Result<Vec<Value>, String> {
     let mut messages = vec![json!({ "role": "system", "content": request.input.system_prompt })];
-    for message in &request.input.messages {
+    let mut pending_tool_call_ids = HashSet::new();
+    let mut index = 0;
+    while index < request.input.messages.len() {
+        let message = &request.input.messages[index];
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| "Every message requires a role".to_string())?;
         if role == "assistant" {
             if let Some(tool_calls) = message.get("toolCalls").and_then(Value::as_array) {
+                pending_tool_call_ids.clear();
                 let tool_calls = tool_calls
                     .iter()
                     .map(|call| {
@@ -4233,15 +4295,21 @@ fn normalize_messages(request: &GatewayTurnRequest) -> std::result::Result<Vec<V
                             .get("name")
                             .and_then(Value::as_str)
                             .ok_or_else(|| "assistant tool call requires name".to_string())?;
+                        let provider_name = tool_aliases
+                            .provider_name(name)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| provider_tool_alias(name));
                         let input = call.get("input").cloned().unwrap_or_else(|| json!({}));
+                        pending_tool_call_ids.insert(id.to_string());
                         Ok(json!({
                             "id": id,
                             "type": "function",
-                            "function": { "name": name, "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()) }
+                            "function": { "name": provider_name, "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string()) }
                         }))
                     })
                     .collect::<std::result::Result<Vec<_>, String>>()?;
                 messages.push(json!({ "role": "assistant", "tool_calls": tool_calls }));
+                index += 1;
                 continue;
             }
         }
@@ -4250,19 +4318,58 @@ fn normalize_messages(request: &GatewayTurnRequest) -> std::result::Result<Vec<V
                 .get("toolUseId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "tool message requires toolUseId".to_string())?;
+            if !pending_tool_call_ids.contains(call_id) {
+                let mut orphan_calls = Vec::new();
+                let mut orphan_index = index;
+                while orphan_index < request.input.messages.len() {
+                    let orphan = &request.input.messages[orphan_index];
+                    if orphan.get("role").and_then(Value::as_str) != Some("tool") {
+                        break;
+                    }
+                    let id = orphan
+                        .get("toolUseId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "tool message requires toolUseId".to_string())?;
+                    let name = orphan
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            "orphaned compacted tool message requires toolName".to_string()
+                        })?;
+                    let provider_name = tool_aliases
+                        .provider_name(name)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| provider_tool_alias(name));
+                    orphan_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": provider_name,
+                            "arguments": "{}"
+                        }
+                    }));
+                    pending_tool_call_ids.insert(id.to_string());
+                    orphan_index += 1;
+                }
+                messages.push(json!({ "role": "assistant", "tool_calls": orphan_calls }));
+            }
             let content = message.get("content").cloned().unwrap_or(Value::Null);
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": content_to_string(&content),
             }));
+            pending_tool_call_ids.remove(call_id);
+            index += 1;
             continue;
         }
+        pending_tool_call_ids.clear();
         let content = message
             .get("content")
             .or_else(|| message.get("text"))
             .ok_or_else(|| "message requires content or text".to_string())?;
         messages.push(json!({ "role": role, "content": content_to_string(content) }));
+        index += 1;
     }
     Ok(messages)
 }
@@ -4272,6 +4379,227 @@ fn content_to_string(content: &Value) -> String {
         .as_str()
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| serde_json::to_string(content).unwrap_or_default())
+}
+
+fn provider_rejection_detail(body: &str) -> Option<String> {
+    const MAX_DETAIL_CHARS: usize = 320;
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let mut parts = Vec::new();
+    for key in ["type", "code", "message"] {
+        if let Some(value) = error.get(key).and_then(Value::as_str) {
+            let sanitized = redact_provider_error_secrets(
+                &value
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>(),
+            );
+            if !sanitized.trim().is_empty() {
+                parts.push(format!("{key}={sanitized}"));
+            }
+        }
+    }
+    let mut detail = parts.join(" ");
+    if detail.is_empty() {
+        return None;
+    }
+    if detail.chars().count() > MAX_DETAIL_CHARS {
+        detail = detail.chars().take(MAX_DETAIL_CHARS).collect();
+        detail.push('…');
+    }
+    Some(detail)
+}
+
+fn redact_provider_error_secrets(value: &str) -> String {
+    let mut redacted = redact_token_after_prefix(value, "sk-", "[REDACTED_API_KEY]", true);
+    for prefix in ["bearer ", "api_key=", "api-key=", "apikey="] {
+        redacted = redact_token_after_prefix(&redacted, prefix, "[REDACTED]", false);
+    }
+    redacted
+}
+
+fn redact_token_after_prefix(
+    value: &str,
+    prefix: &str,
+    replacement: &str,
+    include_prefix: bool,
+) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let prefix_lowercase = prefix.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = lowercase[cursor..].find(&prefix_lowercase) {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        let token_start = start + prefix.len();
+        let mut token_end = token_start;
+        for (offset, character) in value[token_start..].char_indices() {
+            if character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '"' | '\'' | ',' | ';' | '&' | ')' | ']' | '}')
+            {
+                break;
+            }
+            token_end = token_start + offset + character.len_utf8();
+        }
+        if token_end == token_start {
+            output.push_str(&value[start..token_start]);
+            cursor = token_start;
+            continue;
+        }
+        if !include_prefix {
+            output.push_str(&value[start..token_start]);
+        }
+        output.push_str(replacement);
+        cursor = token_end;
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+#[derive(Debug, Clone)]
+struct ProviderToolAliasMap {
+    runtime_to_provider: HashMap<String, String>,
+    provider_to_runtime: HashMap<String, String>,
+}
+
+impl ProviderToolAliasMap {
+    fn from_request(request: &GatewayTurnRequest) -> std::result::Result<Self, GatewayApiError> {
+        let mut runtime_to_provider = HashMap::new();
+        let mut provider_to_runtime = HashMap::new();
+        for tool in request
+            .input
+            .tools
+            .iter()
+            .chain(&request.input.deferred_tools)
+        {
+            if runtime_to_provider.contains_key(&tool.name) {
+                continue;
+            }
+            let provider_name = provider_tool_alias(&tool.name);
+            if let Some(existing) = provider_to_runtime.get(&provider_name) {
+                if existing != &tool.name {
+                    return Err(GatewayApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        request.request_id.clone(),
+                        "invalid_turn_request",
+                        "Tool aliases are not unique for this request",
+                        false,
+                    ));
+                }
+            }
+            runtime_to_provider.insert(tool.name.clone(), provider_name.clone());
+            provider_to_runtime.insert(provider_name, tool.name.clone());
+        }
+        for message in &request.input.messages {
+            let historical_names = message
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|call| call.get("name").and_then(Value::as_str))
+                .chain(message.get("toolName").and_then(Value::as_str));
+            for historical_name in historical_names {
+                let provider_name = provider_tool_alias(historical_name);
+                if let Some(existing) = provider_to_runtime.get(&provider_name) {
+                    if existing != historical_name {
+                        return Err(GatewayApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            request.request_id.clone(),
+                            "invalid_turn_request",
+                            "Historical tool aliases are not unique for this request",
+                            false,
+                        ));
+                    }
+                } else {
+                    provider_to_runtime.insert(provider_name, historical_name.to_string());
+                }
+            }
+        }
+        Ok(Self {
+            runtime_to_provider,
+            provider_to_runtime,
+        })
+    }
+
+    fn provider_name(&self, runtime_name: &str) -> Option<&str> {
+        self.runtime_to_provider
+            .get(runtime_name)
+            .map(String::as_str)
+    }
+
+    fn runtime_name<'a>(&'a self, provider_name: &'a str) -> Option<&'a str> {
+        self.provider_to_runtime
+            .get(provider_name)
+            .map(String::as_str)
+            .or_else(|| {
+                self.runtime_to_provider
+                    .contains_key(provider_name)
+                    .then_some(provider_name)
+            })
+            .or_else(|| {
+                let compatible_name = provider_name
+                    .split_once("__")
+                    .filter(|(_, suffix)| {
+                        (8..=64).contains(&suffix.len())
+                            && suffix
+                                .chars()
+                                .all(|character| character.is_ascii_hexdigit())
+                    })
+                    .map(|(prefix, _)| prefix)
+                    .unwrap_or(provider_name);
+                let mut matches = self
+                    .runtime_to_provider
+                    .keys()
+                    .filter(|runtime_name| provider_tool_prefix(runtime_name) == compatible_name);
+                let candidate = matches.next()?;
+                matches.next().is_none().then_some(candidate.as_str())
+            })
+    }
+}
+
+/// Preserve a readable portion of the Runtime tool name while appending a
+/// stable digest. The digest makes names that normalize to the same provider
+/// prefix distinct, and the final alias remains within the common 64-character
+/// OpenAI-compatible function-name limit.
+fn provider_tool_alias(runtime_name: &str) -> String {
+    const HASH_HEX_BYTES: usize = 16;
+
+    let prefix = provider_tool_prefix(runtime_name);
+    let digest = format!("{:x}", Sha256::digest(runtime_name.as_bytes()));
+    format!("{prefix}__{}", &digest[..HASH_HEX_BYTES])
+}
+
+fn provider_tool_prefix(runtime_name: &str) -> String {
+    const MAX_PREFIX_BYTES: usize = 45;
+
+    let mut prefix = runtime_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    prefix.truncate(MAX_PREFIX_BYTES);
+    let prefix = prefix.trim_matches('_');
+    if prefix.is_empty() {
+        "tool".to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn request_tool_names(request: &GatewayTurnRequest) -> HashSet<&str> {
+    request
+        .input
+        .tools
+        .iter()
+        .chain(&request.input.deferred_tools)
+        .map(|tool| tool.name.as_str())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -4288,6 +4616,7 @@ fn parse_openai_response(
     value: Value,
     provider_request_id: Option<String>,
     request: &GatewayTurnRequest,
+    tool_aliases: &ProviderToolAliasMap,
 ) -> std::result::Result<ProviderTurn, GatewayApiError> {
     let choice = value
         .get("choices")
@@ -4299,7 +4628,7 @@ fn parse_openai_response(
                 request.request_id.clone(),
                 "provider_response_invalid",
                 "Selected provider returned no choices",
-                false,
+                true,
             )
             .with_provider_request_id(provider_request_id.clone())
         })?;
@@ -4309,11 +4638,11 @@ fn parse_openai_response(
             request.request_id.clone(),
             "provider_response_invalid",
             "Selected provider response did not include a message",
-            false,
+            true,
         )
         .with_provider_request_id(provider_request_id.clone())
     })?;
-    let tool_calls = message
+    let mut tool_calls = message
         .get("tool_calls")
         .and_then(Value::as_array)
         .map(|calls| {
@@ -4326,10 +4655,10 @@ fn parse_openai_response(
                             request.request_id.clone(),
                             "provider_response_invalid",
                             "Selected provider returned a tool call without id",
-                            false,
+                            true,
                         )
                     })?;
-                    let name = call
+                    let provider_name = call
                         .get("function")
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
@@ -4339,9 +4668,25 @@ fn parse_openai_response(
                                 request.request_id.clone(),
                                 "provider_response_invalid",
                                 "Selected provider returned a tool call without name",
-                                false,
+                                true,
                             )
                         })?;
+                    let name = tool_aliases.runtime_name(provider_name).ok_or_else(|| {
+                        let returned_name = provider_name
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(96)
+                            .collect::<String>();
+                        GatewayApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            request.request_id.clone(),
+                            "provider_tool_policy_violation",
+                            format!(
+                                "Selected provider returned an unknown tool call: {returned_name}"
+                            ),
+                            false,
+                        )
+                    })?;
                     let raw_arguments = call
                         .get("function")
                         .and_then(|function| function.get("arguments"))
@@ -4351,7 +4696,7 @@ fn parse_openai_response(
                         return Err(GatewayApiError::new(
                             StatusCode::BAD_GATEWAY,
                             request.request_id.clone(),
-                            "provider_response_invalid",
+                            "provider_response_too_large",
                             "Selected provider returned oversized tool arguments",
                             false,
                         ));
@@ -4362,7 +4707,7 @@ fn parse_openai_response(
                             request.request_id.clone(),
                             "provider_response_invalid",
                             "Selected provider returned invalid tool arguments",
-                            false,
+                            true,
                         )
                     })?;
                     Ok(GatewayToolCall {
@@ -4375,24 +4720,36 @@ fn parse_openai_response(
         })
         .transpose()?
         .unwrap_or_default();
-    let allowed_tool_names = request
-        .input
-        .tools
-        .iter()
-        .chain(&request.input.deferred_tools)
-        .map(|tool| tool.name.as_str())
-        .collect::<HashSet<_>>();
+    let allowed_tool_names = request_tool_names(request);
     let mut tool_call_ids = HashSet::new();
-    if tool_calls.iter().any(|call| {
-        !allowed_tool_names.contains(call.name.as_str())
-            || !tool_call_ids.insert(call.id.as_str())
-            || !json_within_limits(&call.input, 0)
-    }) {
+    let unavailable_historical_tool_requested = tool_calls
+        .iter()
+        .any(|call| !allowed_tool_names.contains(call.name.as_str()));
+    if unavailable_historical_tool_requested {
+        tool_calls.clear();
+    }
+    if tool_calls
+        .iter()
+        .any(|call| !tool_call_ids.insert(call.id.as_str()))
+    {
         return Err(GatewayApiError::new(
             StatusCode::BAD_GATEWAY,
             request.request_id.clone(),
             "provider_response_invalid",
-            "Selected provider returned an unknown, duplicate, or oversized tool call",
+            "Selected provider returned duplicate tool call ids",
+            true,
+        )
+        .with_provider_request_id(provider_request_id.clone()));
+    }
+    if tool_calls
+        .iter()
+        .any(|call| !json_within_limits(&call.input, 0))
+    {
+        return Err(GatewayApiError::new(
+            StatusCode::BAD_GATEWAY,
+            request.request_id.clone(),
+            "provider_response_too_large",
+            "Selected provider returned oversized tool call input",
             false,
         )
         .with_provider_request_id(provider_request_id.clone()));
@@ -4402,6 +4759,14 @@ fn parse_openai_response(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .filter(|value| !value.is_empty());
+    let text = if unavailable_historical_tool_requested {
+        Some(
+            "[runtime_tool_policy_recovery] The requested observation tool is no longer available because its repair budget is exhausted. Use only the currently available source-mutation tools, then call preview.publish."
+                .to_string(),
+        )
+    } else {
+        text
+    };
     if text
         .as_ref()
         .is_some_and(|value| value.len() > MAX_JSON_STRING_BYTES)
@@ -4409,7 +4774,7 @@ fn parse_openai_response(
         return Err(GatewayApiError::new(
             StatusCode::BAD_GATEWAY,
             request.request_id.clone(),
-            "provider_response_invalid",
+            "provider_response_too_large",
             "Selected provider returned oversized text",
             false,
         )
@@ -4421,7 +4786,7 @@ fn parse_openai_response(
             request.request_id.clone(),
             "provider_response_invalid",
             "Selected provider returned neither text nor tool calls",
-            false,
+            true,
         ));
     }
     let usage = value.get("usage").ok_or_else(|| {
@@ -4430,7 +4795,7 @@ fn parse_openai_response(
             request.request_id.clone(),
             "provider_response_invalid",
             "Selected provider response did not include token usage",
-            false,
+            true,
         )
         .with_provider_request_id(provider_request_id.clone())
     })?;
@@ -4443,7 +4808,7 @@ fn parse_openai_response(
                 request.request_id.clone(),
                 "provider_response_invalid",
                 "Selected provider response did not include valid input token usage",
-                false,
+                true,
             )
             .with_provider_request_id(provider_request_id.clone())
         })?;
@@ -4456,18 +4821,22 @@ fn parse_openai_response(
                 request.request_id.clone(),
                 "provider_response_invalid",
                 "Selected provider response did not include valid output token usage",
-                false,
+                true,
             )
             .with_provider_request_id(provider_request_id.clone())
         })?;
     Ok(ProviderTurn {
         tool_calls,
         text,
-        finish_reason: choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("stop")
-            .to_string(),
+        finish_reason: if unavailable_historical_tool_requested {
+            "tool_policy_recovery".to_string()
+        } else {
+            choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("stop")
+                .to_string()
+        },
         usage: Usage {
             input_tokens,
             output_tokens,
@@ -4577,6 +4946,430 @@ mod tests {
                 deferred_tools: vec![],
             },
         }
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            input_json_schema: None,
+        }
+    }
+
+    #[test]
+    fn provider_tool_aliases_are_legal_bounded_and_collision_resistant() {
+        let dotted = provider_tool_alias("project.write_page");
+        let underscored = provider_tool_alias("project_write_page");
+        let unicode = provider_tool_alias("文档.写入");
+
+        for alias in [&dotted, &underscored, &unicode] {
+            assert!(alias.len() <= 64);
+            assert!(alias.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ));
+        }
+        assert_ne!(dotted, underscored);
+        assert_ne!(dotted, unicode);
+    }
+
+    #[test]
+    fn provider_rejection_detail_extracts_bounded_non_secret_fields() {
+        let detail = provider_rejection_detail(
+            r#"{"error":{"type":"invalid_request_error","code":"bad_tool_history","message":"invalid sk-example-secret tool history"}}"#,
+        )
+        .unwrap();
+
+        assert!(detail.contains("type=invalid_request_error"));
+        assert!(detail.contains("code=bad_tool_history"));
+        assert!(detail.contains("[REDACTED_API_KEY]"));
+        assert!(!detail.contains("sk-example-secret"));
+        assert!(!detail.contains("example-secret"));
+    }
+
+    #[test]
+    fn provider_rejection_detail_redacts_bearer_and_query_credentials() {
+        let detail = provider_rejection_detail(
+            r#"{"error":{"message":"Authorization: Bearer top.secret.value api_key=query-secret&mode=test"}}"#,
+        )
+        .unwrap();
+
+        assert!(!detail.contains("top.secret.value"));
+        assert!(!detail.contains("query-secret"));
+        assert!(detail.contains("Bearer [REDACTED]"));
+        assert!(detail.contains("api_key=[REDACTED]"));
+    }
+
+    #[test]
+    fn provider_tool_aliases_round_trip_across_definitions_history_and_response() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("project.write_page"), tool("project_write_page")];
+        turn_request.input.messages = vec![json!({
+            "role": "assistant",
+            "toolCalls": [{
+                "id": "call-history",
+                "name": "project.write_page",
+                "input": { "title": "Hello" }
+            }]
+        })];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let dotted_alias = aliases.provider_name("project.write_page").unwrap();
+        let underscored_alias = aliases.provider_name("project_write_page").unwrap();
+        assert_ne!(dotted_alias, underscored_alias);
+
+        let body = openai_request_body(
+            &turn_request,
+            &resource("allowed", "http://example.test".into()),
+            &aliases,
+        )
+        .unwrap();
+        assert_eq!(body["tools"][0]["function"]["name"], dotted_alias);
+        assert_eq!(body["tools"][1]["function"]["name"], underscored_alias);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            dotted_alias
+        );
+
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": dotted_alias,
+                            "arguments": "{\"title\":\"Hello\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+        let parsed = parse_openai_response(response, None, &turn_request, &aliases).unwrap();
+        assert_eq!(parsed.tool_calls[0].name, "project.write_page");
+        assert_eq!(parsed.tool_calls[0].input, json!({ "title": "Hello" }));
+    }
+
+    #[test]
+    fn historical_tool_calls_do_not_require_the_tool_to_remain_available() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("fs.write")];
+        turn_request.input.messages = vec![
+            json!({
+                "role": "assistant",
+                "toolCalls": [{
+                    "id": "call-old-read",
+                    "name": "fs.read",
+                    "input": { "path": "project/page.tsx" }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "toolUseId": "call-old-read",
+                "toolName": "fs.read",
+                "content": { "text": "historical source" }
+            }),
+        ];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+
+        let body = openai_request_body(
+            &turn_request,
+            &resource("allowed", "http://example.test".into()),
+            &aliases,
+        )
+        .unwrap();
+
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            provider_tool_alias("fs.read")
+        );
+        assert_eq!(body["messages"][2]["tool_call_id"], "call-old-read");
+    }
+
+    #[test]
+    fn unavailable_historical_tool_call_becomes_safe_text_recovery() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("fs.write")];
+        turn_request.input.messages = vec![
+            json!({
+                "role": "assistant",
+                "toolCalls": [{
+                    "id": "call-old-read",
+                    "name": "fs.read",
+                    "input": { "path": "project/page.tsx" }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "toolUseId": "call-old-read",
+                "toolName": "fs.read",
+                "content": { "text": "historical source" }
+            }),
+        ];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-unavailable-read",
+                        "function": {
+                            "name": provider_tool_alias("fs.read"),
+                            "arguments": "{\"path\":\"project/page.tsx\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let parsed = parse_openai_response(response, None, &turn_request, &aliases).unwrap();
+
+        assert!(parsed.tool_calls.is_empty());
+        assert_eq!(parsed.finish_reason, "tool_policy_recovery");
+        assert!(parsed
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("Use only the currently available source-mutation tools"));
+    }
+
+    #[test]
+    fn deepseek_requests_disable_stateful_thinking_for_tool_history() {
+        let turn_request = request(Some("allowed"));
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let mut deepseek = resource("allowed", "https://api.deepseek.com".into());
+        deepseek.physical_model = "deepseek-v4-pro".to_string();
+
+        let body = openai_request_body(&turn_request, &deepseek, &aliases).unwrap();
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn compacted_orphan_tool_results_get_a_minimal_preceding_assistant_call() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("fs.read"), tool("fs.list")];
+        turn_request.input.messages = vec![
+            json!({
+                "role": "tool",
+                "toolUseId": "call-read",
+                "toolName": "fs.read",
+                "content": {"path":"project/src/index.astro","text":"hello"}
+            }),
+            json!({
+                "role": "tool",
+                "toolUseId": "call-list",
+                "toolName": "fs.list",
+                "content": {"entries":[]}
+            }),
+            json!({"role":"assistant","content":"Continuing after compaction."}),
+        ];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+
+        let messages = normalize_messages(&turn_request, &aliases).unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-read");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-list");
+        assert_eq!(messages[4]["role"], "assistant");
+    }
+
+    #[test]
+    fn provider_response_accepts_an_exact_requested_runtime_tool_name() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("project.init")];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": "project.init",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let parsed = parse_openai_response(response, None, &turn_request, &aliases).unwrap();
+
+        assert_eq!(parsed.tool_calls[0].name, "project.init");
+    }
+
+    #[test]
+    fn provider_response_accepts_a_unique_compatible_tool_prefix() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("project.init"), tool("preview.publish")];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": "project_init",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let parsed = parse_openai_response(response, None, &turn_request, &aliases).unwrap();
+
+        assert_eq!(parsed.tool_calls[0].name, "project.init");
+    }
+
+    #[test]
+    fn provider_response_accepts_a_unique_prefix_with_a_mistyped_hash() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("content.read_source")];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": "content_read_source__31eae3fbda93af37",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let parsed = parse_openai_response(response, None, &turn_request, &aliases).unwrap();
+
+        assert_eq!(parsed.tool_calls[0].name, "content.read_source");
+    }
+
+    #[test]
+    fn provider_response_rejects_an_ambiguous_compatible_tool_prefix() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("project.write.page"), tool("project_write.page")];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": "project_write_page",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let error = parse_openai_response(response, None, &turn_request, &aliases).unwrap_err();
+
+        assert_eq!(error.code(), "provider_tool_policy_violation");
+        assert!(!error.is_retryable_upstream());
+    }
+
+    #[test]
+    fn provider_response_still_rejects_an_unrequested_runtime_tool_name() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.tools = vec![tool("project.init")];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call-provider",
+                        "function": {
+                            "name": "project.delete",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        });
+
+        let error = parse_openai_response(response, None, &turn_request, &aliases).unwrap_err();
+
+        assert_eq!(error.code(), "provider_tool_policy_violation");
+        assert!(!error.is_retryable_upstream());
+    }
+
+    #[test]
+    fn provider_retry_classification_matrix_is_fail_closed_for_policy_errors() {
+        for (code, retryable, expected) in [
+            ("provider_unavailable", true, true),
+            ("provider_timeout", true, true),
+            ("provider_rate_limited", true, true),
+            ("provider_response_invalid", true, true),
+            ("provider_response_invalid", false, false),
+            ("provider_tool_policy_violation", true, false),
+            ("provider_tool_policy_violation", false, false),
+            ("provider_response_too_large", true, false),
+            ("provider_response_too_large", false, false),
+        ] {
+            let error = GatewayApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "classification-request",
+                code,
+                "low sensitivity test error",
+                retryable,
+            );
+            assert_eq!(
+                error.is_retryable_upstream(),
+                expected,
+                "unexpected retry classification for {code} retryable={retryable}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_history_preserves_tools_missing_from_the_current_request() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.messages = vec![json!({
+            "role": "assistant",
+            "toolCalls": [{
+                "id": "call-history",
+                "name": "project.write_page",
+                "input": {}
+            }]
+        })];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let messages = normalize_messages(&turn_request, &aliases).unwrap();
+        let historical_name = messages[1]["tool_calls"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(historical_name, provider_tool_alias("project.write_page"));
+        assert_eq!(
+            aliases
+                .provider_to_runtime
+                .get(historical_name)
+                .map(String::as_str),
+            Some("project.write_page")
+        );
+        assert!(!aliases
+            .runtime_to_provider
+            .contains_key("project.write_page"));
     }
 
     #[tokio::test]
@@ -4985,6 +5778,69 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(response.provider.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn retries_a_structurally_invalid_provider_response_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(invalid_response_then_success))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unsafe { env::set_var("PROVIDER_GATEWAY_TEST_KEY", "test-key") };
+        let mut configured_resource = resource("allowed", format!("http://{address}"));
+        configured_resource.defaults.max_attempts = 2;
+        let service = GatewayService::new(GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(":memory:".to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: None,
+            resources: vec![configured_resource],
+            policies: vec![policy()],
+        })
+        .unwrap();
+
+        let response = service
+            .execute_turn(request(Some("allowed")))
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response.provider.attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_an_unknown_provider_tool_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(unknown_tool_then_success))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unsafe { env::set_var("PROVIDER_GATEWAY_TEST_KEY", "test-key") };
+        let mut configured_resource = resource("allowed", format!("http://{address}"));
+        configured_resource.defaults.max_attempts = 2;
+        let service = GatewayService::new(GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(":memory:".to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: None,
+            resources: vec![configured_resource],
+            policies: vec![policy()],
+        })
+        .unwrap();
+
+        let error = service
+            .execute_turn(request(Some("allowed")))
+            .await
+            .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error.code(), "provider_tool_policy_violation");
+        assert!(!error.is_retryable_upstream());
     }
 
     #[tokio::test]
@@ -5748,6 +6604,8 @@ mod tests {
 
     #[test]
     fn rejects_provider_tool_call_outside_runtime_registry() {
+        let turn_request = request(Some("allowed"));
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
         let response = json!({
             "choices": [{
                 "message": {
@@ -5759,12 +6617,9 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        assert_eq!(
-            parse_openai_response(response, None, &request(Some("allowed")))
-                .unwrap_err()
-                .code(),
-            "provider_response_invalid"
-        );
+        let error = parse_openai_response(response, None, &turn_request, &aliases).unwrap_err();
+        assert_eq!(error.code(), "provider_tool_policy_violation");
+        assert!(!error.is_retryable_upstream());
     }
 
     async fn mock_openai(
@@ -5836,6 +6691,59 @@ mod tests {
         Json(json!({
             "choices": [{
                 "message": { "content": "recovered" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        }))
+        .into_response()
+    }
+
+    async fn invalid_response_then_success(
+        State(calls): State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Json(json!({
+                "choices": [{
+                    "message": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+            }))
+            .into_response();
+        }
+        Json(json!({
+            "choices": [{
+                "message": { "content": "recovered" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+        }))
+        .into_response()
+    }
+
+    async fn unknown_tool_then_success(
+        State(calls): State<Arc<AtomicUsize>>,
+        Json(_body): Json<Value>,
+    ) -> Response {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "unsafe-call",
+                            "function": { "name": "unrequested_tool", "arguments": "{}" }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
+            }))
+            .into_response();
+        }
+        Json(json!({
+            "choices": [{
+                "message": { "content": "must not be reached" },
                 "finish_reason": "stop"
             }],
             "usage": { "prompt_tokens": 4, "completion_tokens": 2 }
