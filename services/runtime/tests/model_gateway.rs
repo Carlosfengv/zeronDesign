@@ -31,6 +31,7 @@ use std::{
     },
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::Mutex,
     time::{sleep, Duration},
@@ -277,6 +278,10 @@ async fn runtime_gateway_provider_round_trip_preserves_governed_selection_bounda
         turn.response,
         ModelResponse::TextOnly("provider ok".to_string())
     );
+    let usage = turn.usage.unwrap();
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.output_tokens, 4);
+    assert_eq!(usage.cached_input_tokens, 0);
     let execution = turn.execution.unwrap();
     assert_eq!(execution.model_resource_id, "edit-model");
     assert_eq!(execution.model_resource_revision, 3);
@@ -368,6 +373,39 @@ async fn http_model_gateway_client_retries_retryable_gateway_failures() {
         .await
         .unwrap();
     assert_eq!(response, ModelResponse::TextOnly("recovered".to_string()));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn http_model_gateway_client_retries_internal_transport_errors() {
+    let (base_url, calls) = spawn_flaky_transport_gateway().await;
+    let client = HttpModelGatewayClient::new(base_url).with_timeout(Duration::from_secs(3));
+    let response = client
+        .next_response_scoped(
+            ModelRequest {
+                run_id: "run-transport-retry".to_string(),
+                turn: 1,
+                model: "internal-balanced".to_string(),
+                phase: AgentPhase::Build,
+                agent_profile: "website-builder".to_string(),
+                system_prompt: "retry an internal transport interruption".to_string(),
+                messages: vec![],
+                tools: vec![],
+                deferred_tools: vec![],
+            },
+            ModelGatewayScope {
+                organization_id: "org-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                project_id: "project-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response,
+        ModelResponse::TextOnly("transport recovered".to_string())
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
@@ -1175,6 +1213,62 @@ async fn retryable_gateway_then_success(State(calls): State<Arc<AtomicUsize>>) -
         "provider": { "requestId": null, "attemptCount": 1 }
     }))
     .into_response()
+}
+
+async fn spawn_flaky_transport_gateway() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let attempt = server_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 3 {
+                drop(socket);
+                continue;
+            }
+
+            let mut request = vec![0u8; 64 * 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = json!({
+                "schemaVersion": "provider-gateway-turn-response@1",
+                "requestId": "gateway-transport-retry",
+                "type": "text",
+                "toolCalls": [],
+                "text": "transport recovered",
+                "finishReason": "stop",
+                "modelExecution": {
+                    "id": "model-execution-transport-retry",
+                    "modelResourceId": "balanced",
+                    "modelResourceRevision": 1,
+                    "providerId": "balanced",
+                    "physicalModel": "physical",
+                    "selectionPolicyId": "default",
+                    "selectionPolicyRevision": 1,
+                    "capabilitySnapshotHash": "hash",
+                    "selectionReason": "automatic_selection",
+                    "automaticSwitch": { "used": false }
+                },
+                "usage": {
+                    "inputTokens": 1,
+                    "outputTokens": 1,
+                    "cachedInputTokens": 0
+                },
+                "provider": { "requestId": null, "attemptCount": 1 }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+            break;
+        }
+    });
+    (format!("http://{address}"), calls)
 }
 
 async fn capture_versioned_turn_request(

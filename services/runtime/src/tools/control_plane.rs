@@ -1,9 +1,11 @@
 use crate::{
+    acceptance_contract::AcceptanceContractDraft,
     channel_manager::ChannelManager,
     config::{RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     permission::{PermissionReason, PermissionResult, RuleSource},
-    project::resolve_built_in_template_for_init,
+    preview::complete_candidate_preview,
+    project::{resolve_built_in_template_for_init, resolve_built_in_template_for_state},
     repair_loop::{
         normalize_error_key, record_repair_attempt, RepairActionSignature, RepairLoopDecision,
         RepairLoopStopReason,
@@ -481,6 +483,17 @@ impl Tool for BriefWriteDraftTool {
                 },
                 "assumptions": { "type": "array", "items": { "type": "string" } },
                 "missingInformation": { "type": "array", "items": { "type": "string" } }
+                ,"acceptanceCriteria": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "locale": string_schema("Expected content locale, for example zh-CN"),
+                        "requiredRoutes": { "type": "array", "items": { "type": "string" } },
+                        "requiredText": { "type": "array", "items": { "type": "string" } },
+                        "forbiddenText": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["requiredRoutes", "requiredText", "forbiddenText"]
+                }
             }),
             &[
                 "projectType",
@@ -491,6 +504,7 @@ impl Tool for BriefWriteDraftTool {
                 "recommendedTemplate",
                 "assumptions",
                 "missingInformation",
+                "acceptanceCriteria",
             ],
         )
     }
@@ -508,6 +522,20 @@ impl Tool for BriefWriteDraftTool {
         _ctx: &ToolContext,
     ) -> Result<Value, ValidationError> {
         let input = brief::normalize_draft_input(input);
+        let acceptance: AcceptanceContractDraft =
+            serde_json::from_value(input.get("acceptanceCriteria").cloned().ok_or_else(|| {
+                ValidationError::new("brief.write_draft requires acceptanceCriteria")
+            })?)
+            .map_err(|error| {
+                ValidationError::new(format!(
+                    "brief.write_draft received invalid acceptanceCriteria: {error}"
+                ))
+            })?;
+        acceptance.validate().map_err(|error| {
+            ValidationError::new(format!(
+                "brief.write_draft acceptance validation failed: {error}"
+            ))
+        })?;
         let brief: Brief = serde_json::from_value(input.clone()).map_err(|error| {
             ValidationError::new(format!(
                 "brief.write_draft received invalid brief JSON: {error}"
@@ -1133,13 +1161,23 @@ impl Tool for RunCompleteTool {
         ctx: ToolContext,
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
+        let active_run = ctx
+            .store
+            .get_run(&ctx.run.id)
+            .await
+            .unwrap_or_else(|| ctx.run.clone());
+        let requests_completed_status = matches!(
+            input.get("status").and_then(Value::as_str),
+            None | Some("completed" | "success")
+        );
+        let mut candidate_to_promote = None;
         if matches!(
-            ctx.run.phase,
+            active_run.phase,
             AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
         ) {
-            let Some(version_id) = ctx.run.output_version_id.as_deref() else {
+            let Some(version_id) = active_run.output_version_id.as_deref() else {
                 return Ok(ToolResult::error(
-                    "No output_version_id set. Build/Edit/Repair must promote a preview before completing.",
+                    "No output_version_id set. Build/Edit/Repair must prepare a validated candidate before completing.",
                 ));
             };
             let Some(version) = ctx.store.get_project_version(version_id).await else {
@@ -1147,13 +1185,21 @@ impl Tool for RunCompleteTool {
                     "Output version not found: {version_id}"
                 )));
             };
-            if version.status != ProjectVersionStatus::Promoted {
-                return Ok(ToolResult::error(
-                    "Preview has not been promoted. Emit preview.updated before completing the run.",
-                ));
+            match version.status {
+                ProjectVersionStatus::Candidate => {
+                    if requests_completed_status {
+                        candidate_to_promote = Some(version.id.clone());
+                    }
+                }
+                ProjectVersionStatus::Promoted => {}
+                ProjectVersionStatus::Failed => {
+                    return Ok(ToolResult::error(
+                        "Output candidate failed validation and cannot be promoted.",
+                    ));
+                }
             }
-            if ctx.run.phase == AgentPhase::Repair {
-                let Some(base_version_id) = ctx.run.base_version_id.as_deref() else {
+            if active_run.phase == AgentPhase::Repair {
+                let Some(base_version_id) = active_run.base_version_id.as_deref() else {
                     return Ok(ToolResult::error(
                         "Repair run has no base_version_id and cannot prove a fresh repair candidate.",
                     ));
@@ -1181,18 +1227,29 @@ impl Tool for RunCompleteTool {
                         "Repair output must reference a fresh Runtime-owned source snapshot. Make a real source mutation and use preview.publish.",
                     ));
                 }
-                let preview_updated = ctx.store.events(&ctx.run.id).await.iter().any(|event| {
-                    matches!(
-                        event,
-                        AgentEvent::PreviewUpdated {
-                            version_id: updated_version_id,
-                            ..
-                        } if updated_version_id == version_id
-                    )
-                });
-                if !preview_updated {
+                let preview_evidence =
+                    ctx.store
+                        .events(&ctx.run.id)
+                        .await
+                        .iter()
+                        .any(|event| match event {
+                            AgentEvent::PreviewCandidate {
+                                version_id: candidate_version_id,
+                                ..
+                            } if version.status == ProjectVersionStatus::Candidate => {
+                                candidate_version_id == version_id
+                            }
+                            AgentEvent::PreviewUpdated {
+                                version_id: updated_version_id,
+                                ..
+                            } if version.status == ProjectVersionStatus::Promoted => {
+                                updated_version_id == version_id
+                            }
+                            _ => false,
+                        });
+                if !preview_evidence {
                     return Ok(ToolResult::error(
-                        "Repair output has no matching preview.updated event. Use preview.publish before run.complete.",
+                        "Repair output has no matching candidate or promoted preview evidence. Use preview.publish before run.complete.",
                     ));
                 }
             }
@@ -1212,9 +1269,9 @@ impl Tool for RunCompleteTool {
             }
         }
         if matches!(
-            ctx.run.phase,
+            active_run.phase,
             AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
-        ) && ctx.run.design_profile_id.is_some()
+        ) && active_run.design_profile_id.is_some()
         {
             let fidelity_reports = ctx
                 .store
@@ -1272,6 +1329,44 @@ impl Tool for RunCompleteTool {
                         .join(", ")
                 )));
             }
+        }
+        if let Some(candidate_version_id) = candidate_to_promote {
+            let summary = input
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Run completed.");
+            let project_state = active_run.project_state_snapshot.as_ref().ok_or_else(|| {
+                ToolError::Recoverable(
+                    "run.complete cannot resolve the generation contract because project state is missing"
+                        .to_string(),
+                )
+            })?;
+            let template = resolve_built_in_template_for_state(project_state).map_err(|error| {
+                ToolError::Recoverable(format!(
+                    "run.complete cannot resolve the frozen project template: {error}"
+                ))
+            })?;
+            let generation_contract = template.generation_contract().map_err(|error| {
+                ToolError::Terminal(format!(
+                    "run.complete resolved an invalid generation contract: {error}"
+                ))
+            })?;
+            complete_candidate_preview(
+                &ctx.store,
+                &ctx.runtime_storage_dir,
+                &ctx.project_id,
+                &ctx.run.id,
+                &candidate_version_id,
+                &generation_contract,
+                template.version.as_str(),
+                summary,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::Recoverable(format!(
+                    "validated candidate could not be atomically completed and promoted: {error}"
+                ))
+            })?;
         }
         let value = run::complete(&input)
             .await

@@ -1,4 +1,5 @@
 use crate::{
+    acceptance_contract::{AcceptanceContract, AcceptanceContractDraft},
     design_context::{
         frozen_run_design_context_manifest, validate_run_design_context_identity,
         CompiledDesignContext, ProfileCompatibilityMode, ProfileEnforcementMode,
@@ -89,6 +90,7 @@ pub struct RuntimeStore {
 #[derive(Debug, Default)]
 struct RuntimeStoreInner {
     runs: HashMap<String, AgentRun>,
+    persisted_runs_hydrated: bool,
     events: HashMap<String, Vec<AgentEvent>>,
     event_broadcasters: HashMap<String, broadcast::Sender<SequencedAgentEvent>>,
     conversation_items: HashMap<String, Vec<ConversationItem>>,
@@ -97,6 +99,7 @@ struct RuntimeStoreInner {
     brief_statuses: HashMap<String, BriefStatus>,
     brief_run_ids: HashMap<String, String>,
     brief_content_sources: HashMap<String, Vec<ContentSource>>,
+    acceptance_contracts: HashMap<String, AcceptanceContract>,
     audit_records: Vec<AuditRecord>,
     pending_permissions: HashMap<String, PendingPermission>,
     review_findings: HashMap<String, ReviewFinding>,
@@ -111,6 +114,7 @@ struct RuntimeStoreInner {
     design_context_enforcement_policies: HashMap<String, DesignContextEnforcementPolicy>,
     preview_leases: HashMap<String, PreviewLeaseRecord>,
     channel_leases: HashMap<String, ChannelLeaseRecord>,
+    channel_leases_hydrated: bool,
     artifact_publishes: HashMap<String, ArtifactPublishRecord>,
     outbox_events: HashMap<String, RuntimeOutboxEvent>,
     sandbox_bindings: HashMap<String, SandboxBinding>,
@@ -149,6 +153,8 @@ struct BriefSnapshot {
     project_id: String,
     status: BriefStatus,
     brief: Brief,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acceptance_contract: Option<AcceptanceContract>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +167,14 @@ struct ArtifactPromotionCommit {
     run: AgentRun,
     publish: ArtifactPublishRecord,
     outbox: RuntimeOutboxEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_outbox: Option<RuntimeOutboxEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_binding: Option<SandboxBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    review_findings: Vec<ReviewFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_permissions: Vec<PendingPermission>,
     committed_at: chrono::DateTime<Utc>,
 }
 
@@ -2662,7 +2676,12 @@ impl RuntimeStore {
         {
             return sources;
         }
-        if let Some(run_id) = self.inner.read().await.brief_run_ids.get(brief_id).cloned() {
+        // Drop the read guard before content_sources() can hydrate the recovered
+        // Brief run and take the write lock. Keeping the temporary guard alive
+        // across the if-let body deadlocks only after a Runtime restart, when
+        // the content-source cache is still cold.
+        let cached_run_id = { self.inner.read().await.brief_run_ids.get(brief_id).cloned() };
+        if let Some(run_id) = cached_run_id {
             let sources = self.content_sources(&run_id).await;
             self.inner
                 .write()
@@ -2715,14 +2734,18 @@ impl RuntimeStore {
             "contentHierarchy": brief.content_hierarchy.clone(),
             "missingInformation": brief.missing_information.clone(),
         });
+        let content_sources = self.content_sources(run_id).await;
+        let acceptance_contract =
+            AcceptanceContract::compile(&brief_id, &brief, &content_sources, None)
+                .map_err(|error| anyhow!("cannot compile legacy acceptance contract: {error}"))?;
         let snapshot = BriefSnapshot {
             brief_id: brief_id.clone(),
             run_id: run_id.to_string(),
             project_id: run.project_id.clone(),
             status: BriefStatus::Confirmed,
             brief: brief.clone(),
+            acceptance_contract: Some(acceptance_contract.clone()),
         };
-        let content_sources = self.content_sources(run_id).await;
         let mut inner = self.inner.write().await;
         inner.briefs.insert(brief_id.clone(), brief);
         inner
@@ -2734,6 +2757,9 @@ impl RuntimeStore {
         inner
             .brief_content_sources
             .insert(brief_id.clone(), content_sources);
+        inner
+            .acceptance_contracts
+            .insert(brief_id.clone(), acceptance_contract);
         drop(inner);
         self.append_brief_snapshot(&snapshot)?;
         self.set_run_brief_version(run_id, brief_id.clone()).await?;
@@ -2767,20 +2793,34 @@ impl RuntimeStore {
     }
 
     pub async fn write_brief_draft(&self, run_id: &str, brief: Brief) -> Result<String> {
+        self.write_brief_draft_with_acceptance(run_id, brief, None)
+            .await
+    }
+
+    pub async fn write_brief_draft_with_acceptance(
+        &self,
+        run_id: &str,
+        brief: Brief,
+        acceptance_draft: Option<AcceptanceContractDraft>,
+    ) -> Result<String> {
         brief.validate_for_runtime().map_err(|err| anyhow!(err))?;
         let brief_id = self.next_id("brief");
         let run = self
             .get_run(run_id)
             .await
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let content_sources = self.content_sources(run_id).await;
+        let acceptance_contract =
+            AcceptanceContract::compile(&brief_id, &brief, &content_sources, acceptance_draft)
+                .map_err(|error| anyhow!("cannot compile acceptance contract: {error}"))?;
         let snapshot = BriefSnapshot {
             brief_id: brief_id.clone(),
             run_id: run_id.to_string(),
             project_id: run.project_id,
             status: BriefStatus::Draft,
             brief: brief.clone(),
+            acceptance_contract: Some(acceptance_contract.clone()),
         };
-        let content_sources = self.content_sources(run_id).await;
         let mut inner = self.inner.write().await;
         inner.briefs.insert(brief_id.clone(), brief);
         inner
@@ -2792,6 +2832,9 @@ impl RuntimeStore {
         inner
             .brief_content_sources
             .insert(brief_id.clone(), content_sources);
+        inner
+            .acceptance_contracts
+            .insert(brief_id.clone(), acceptance_contract);
         drop(inner);
         self.append_brief_snapshot(&snapshot)?;
         self.set_run_brief_version(run_id, brief_id.clone()).await?;
@@ -2807,14 +2850,20 @@ impl RuntimeStore {
             .get_brief(brief_id)
             .await
             .ok_or_else(|| anyhow!("brief not found: {brief_id}"))?;
+        let content_sources = self.content_sources(run_id).await;
+        let acceptance_contract = match self.get_acceptance_contract(brief_id).await {
+            Some(contract) => contract,
+            None => AcceptanceContract::compile(brief_id, &brief, &content_sources, None)
+                .map_err(|error| anyhow!("cannot compile legacy acceptance contract: {error}"))?,
+        };
         let snapshot = BriefSnapshot {
             brief_id: brief_id.to_string(),
             run_id: run_id.to_string(),
             project_id: run.project_id.clone(),
             status: BriefStatus::Confirmed,
             brief: brief.clone(),
+            acceptance_contract: Some(acceptance_contract.clone()),
         };
-        let content_sources = self.content_sources(run_id).await;
         let brief_checkpoint_summary = json!({
             "projectType": brief.project_type.clone(),
             "recommendedTemplate": brief.recommended_template.clone(),
@@ -2834,6 +2883,9 @@ impl RuntimeStore {
             inner
                 .brief_content_sources
                 .insert(brief_id.to_string(), content_sources);
+            inner
+                .acceptance_contracts
+                .insert(brief_id.to_string(), acceptance_contract);
         }
         self.append_brief_snapshot(&snapshot)?;
         self.save_checkpoint(AgentCheckpoint {
@@ -2880,7 +2932,33 @@ impl RuntimeStore {
         inner
             .briefs
             .insert(brief_id.to_string(), snapshot.brief.clone());
+        if let Some(contract) = snapshot.acceptance_contract {
+            inner
+                .acceptance_contracts
+                .insert(brief_id.to_string(), contract);
+        }
         Some(snapshot.brief)
+    }
+
+    pub async fn get_acceptance_contract(&self, brief_id: &str) -> Option<AcceptanceContract> {
+        if let Some(contract) = self
+            .inner
+            .read()
+            .await
+            .acceptance_contracts
+            .get(brief_id)
+            .cloned()
+        {
+            return Some(contract);
+        }
+        let snapshot = self.read_brief_snapshot(brief_id).ok().flatten()?;
+        let contract = snapshot.acceptance_contract?;
+        self.inner
+            .write()
+            .await
+            .acceptance_contracts
+            .insert(brief_id.to_string(), contract.clone());
+        Some(contract)
     }
 
     pub async fn brief_status(&self, brief_id: &str) -> Option<BriefStatus> {
@@ -2905,6 +2983,11 @@ impl RuntimeStore {
         inner
             .brief_run_ids
             .insert(brief_id.to_string(), snapshot.run_id);
+        if let Some(contract) = snapshot.acceptance_contract {
+            inner
+                .acceptance_contracts
+                .insert(brief_id.to_string(), contract);
+        }
         Some(snapshot.status)
     }
 
@@ -4236,7 +4319,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, run)
+        append_jsonl_synced(&path, run)
     }
 
     fn read_run(&self, run_id: &str) -> Result<Option<AgentRun>> {
@@ -4244,24 +4327,50 @@ impl RuntimeStore {
     }
 
     fn read_runs(&self) -> Result<Vec<AgentRun>> {
-        let file = match fs::File::open(self.run_state_log_path()) {
-            Ok(file) => file,
+        let path = self.run_state_log_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
         let mut runs_by_id = HashMap::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let chunks = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let mut valid_bytes = 0usize;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+            if line.iter().all(u8::is_ascii_whitespace) {
+                valid_bytes += chunk.len();
                 continue;
             }
-            let run: AgentRun = serde_json::from_str(&line)?;
-            runs_by_id.insert(run.id.clone(), run);
+            let run: AgentRun = match serde_json::from_slice(line) {
+                Ok(run) => run,
+                Err(_) if index + 1 == chunks.len() && !bytes.ends_with(b"\n") => {
+                    truncate_jsonl_tail(&path, valid_bytes as u64)?;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            valid_bytes += chunk.len();
+            match runs_by_id.entry(run.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(run);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if run_snapshot_is_newer(&run, entry.get()) {
+                        entry.insert(run);
+                    }
+                }
+            }
         }
         Ok(runs_by_id.into_values().collect())
     }
 
     fn hydrate_persisted_runs(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        if inner.persisted_runs_hydrated {
+            return Ok(());
+        }
         for run in self.read_runs()? {
             match inner.runs.entry(run.id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -4274,6 +4383,7 @@ impl RuntimeStore {
                 }
             }
         }
+        inner.persisted_runs_hydrated = true;
         Ok(())
     }
 
@@ -4865,9 +4975,13 @@ impl RuntimeStore {
     }
 
     fn hydrate_channel_leases(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
+        if inner.channel_leases_hydrated {
+            return Ok(());
+        }
         for lease in self.read_channel_leases()? {
             inner.channel_leases.insert(lease.id.clone(), lease);
         }
+        inner.channel_leases_hydrated = true;
         Ok(())
     }
 
@@ -4949,6 +5063,24 @@ impl RuntimeStore {
         let mut commits = self.read_promotion_commits()?;
         commits.sort_by_key(|commit| commit.committed_at);
         for commit in commits {
+            if let Some(binding) = commit.sandbox_binding {
+                inner.sandbox_bindings.insert(binding.id.clone(), binding);
+            }
+            for finding in commit.review_findings {
+                let finding_ids = inner
+                    .project_review_findings
+                    .entry(finding.project_id.clone())
+                    .or_default();
+                if !finding_ids.contains(&finding.id) {
+                    finding_ids.push(finding.id.clone());
+                }
+                inner.review_findings.insert(finding.id.clone(), finding);
+            }
+            for permission in commit.pending_permissions {
+                inner
+                    .pending_permissions
+                    .insert(permission.id.clone(), permission);
+            }
             inner
                 .project_current_versions
                 .insert(commit.project_id.clone(), commit.version.id.clone());
@@ -4975,6 +5107,12 @@ impl RuntimeStore {
                 .outbox_events
                 .entry(commit.outbox.id.clone())
                 .or_insert(commit.outbox);
+            if let Some(outbox) = commit.completion_outbox {
+                inner
+                    .outbox_events
+                    .entry(outbox.id.clone())
+                    .or_insert(outbox);
+            }
         }
         for event in self.read_outbox_events()? {
             inner.outbox_events.insert(event.id.clone(), event);
@@ -5157,6 +5295,59 @@ impl RuntimeStore {
         publish_id: &str,
         expected_current_version_id: Option<&str>,
     ) -> Result<(ProjectVersion, RuntimeOutboxEvent)> {
+        let (version, preview_outbox, _) = self
+            .commit_artifact_promotion_cas_inner(
+                project_id,
+                run_id,
+                version_id,
+                publish_id,
+                expected_current_version_id,
+                None,
+            )
+            .await?;
+        Ok((version, preview_outbox))
+    }
+
+    pub async fn complete_artifact_promotion_cas(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+        publish_id: &str,
+        expected_current_version_id: Option<&str>,
+        summary: &str,
+    ) -> Result<(ProjectVersion, RuntimeOutboxEvent, RuntimeOutboxEvent)> {
+        let (version, preview_outbox, completion_outbox) = self
+            .commit_artifact_promotion_cas_inner(
+                project_id,
+                run_id,
+                version_id,
+                publish_id,
+                expected_current_version_id,
+                Some(summary),
+            )
+            .await?;
+        Ok((
+            version,
+            preview_outbox,
+            completion_outbox
+                .ok_or_else(|| anyhow!("completed promotion is missing completion outbox"))?,
+        ))
+    }
+
+    async fn commit_artifact_promotion_cas_inner(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        version_id: &str,
+        publish_id: &str,
+        expected_current_version_id: Option<&str>,
+        completion_summary: Option<&str>,
+    ) -> Result<(
+        ProjectVersion,
+        RuntimeOutboxEvent,
+        Option<RuntimeOutboxEvent>,
+    )> {
         let persisted_current = self
             .read_current_project_version(project_id)?
             .map(|version| version.id);
@@ -5186,7 +5377,9 @@ impl RuntimeStore {
                         .get(&outbox_id)
                         .cloned()
                         .ok_or_else(|| anyhow!("promoted artifact is missing outbox event"))?;
-                    return Ok((version, outbox));
+                    let completion_outbox =
+                        completed_promotion_outbox(&inner, run_id, completion_summary)?;
+                    return Ok((version, outbox, completion_outbox));
                 }
             }
         }
@@ -5235,7 +5428,8 @@ impl RuntimeStore {
                 .get(&outbox_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("promoted artifact is missing outbox event"))?;
-            return Ok((version, outbox));
+            let completion_outbox = completed_promotion_outbox(&inner, run_id, completion_summary)?;
+            return Ok((version, outbox, completion_outbox));
         }
         if version.status != ProjectVersionStatus::Candidate {
             return Err(anyhow!("only candidate versions can be promoted"));
@@ -5251,6 +5445,58 @@ impl RuntimeStore {
         version.status = ProjectVersionStatus::Promoted;
         version.promoted_at = Some(now);
         run.output_version_id = Some(version_id.to_string());
+        let mut sandbox_binding = None;
+        let mut review_findings = Vec::new();
+        let mut pending_permissions = Vec::new();
+        if completion_summary.is_some() {
+            if run.status.is_terminal() && run.status != AgentRunStatus::Completed {
+                return Err(anyhow!(
+                    "cannot complete promotion for terminal run status {:?}",
+                    run.status
+                ));
+            }
+            run.status = AgentRunStatus::Completed;
+            if run.completed_at.is_none() {
+                run.completed_at = Some(now);
+            }
+            inner.run_scoped_resources.remove(run_id);
+            inner.continue_interrupt_requests.remove(run_id);
+            if let Some(sandbox_binding_id) = run.sandbox_id.as_deref() {
+                let has_active_run = inner.runs.values().any(|other| {
+                    other.id != run_id
+                        && other.sandbox_id.as_deref() == Some(sandbox_binding_id)
+                        && !other.status.is_terminal()
+                });
+                if !has_active_run {
+                    if let Some(binding) = inner.sandbox_bindings.get_mut(sandbox_binding_id) {
+                        if binding.status == SandboxBindingStatus::Busy {
+                            binding.status = SandboxBindingStatus::Idle;
+                            binding.last_seen_at = now;
+                            sandbox_binding = Some(binding.clone());
+                        }
+                    }
+                }
+            }
+            self.hydrate_pending_permissions(&mut inner)?;
+            for permission in inner.pending_permissions.values_mut() {
+                if permission.run_id == run_id && permission.status == "pending" {
+                    permission.status = "expired".to_string();
+                    permission.resolved_at = Some(now);
+                    pending_permissions.push(permission.clone());
+                }
+            }
+            if run.phase == AgentPhase::Repair {
+                self.hydrate_review_findings(&mut inner)?;
+                if let Some(finding_ids) = run.finding_ids.as_ref() {
+                    for finding_id in finding_ids {
+                        if let Some(finding) = inner.review_findings.get_mut(finding_id) {
+                            finding.status = ReviewFindingStatus::Fixed;
+                            review_findings.push(finding.clone());
+                        }
+                    }
+                }
+            }
+        }
         run.updated_at = now;
         publish.status = ArtifactPublishStatus::Promoted;
         publish.revision += 1;
@@ -5271,6 +5517,21 @@ impl RuntimeStore {
             created_at: now,
             delivered_at: None,
         };
+        let completion_outbox = completion_summary.map(|summary| RuntimeOutboxEvent {
+            id: run_completed_outbox_id(run_id),
+            project_id: project_id.to_string(),
+            run_id: run_id.to_string(),
+            event: AgentEvent::RunCompleted {
+                run_id: run_id.to_string(),
+                status: "completed".to_string(),
+                summary: summary.to_string(),
+                timestamp: now,
+            },
+            status: OutboxDeliveryStatus::Pending,
+            delivery_attempts: 0,
+            created_at: now,
+            delivered_at: None,
+        });
         let commit = ArtifactPromotionCommit {
             id: format!("promotion:{project_id}:{version_id}"),
             project_id: project_id.to_string(),
@@ -5279,6 +5540,10 @@ impl RuntimeStore {
             run: run.clone(),
             publish: publish.clone(),
             outbox: outbox.clone(),
+            completion_outbox: completion_outbox.clone(),
+            sandbox_binding: sandbox_binding.clone(),
+            review_findings: review_findings.clone(),
+            pending_permissions: pending_permissions.clone(),
             committed_at: now,
         };
         if let Some(parent) = self.promotion_commit_log_path.parent() {
@@ -5298,11 +5563,25 @@ impl RuntimeStore {
         inner
             .outbox_events
             .insert(outbox.id.clone(), outbox.clone());
+        if let Some(completion_outbox) = completion_outbox.as_ref() {
+            inner
+                .outbox_events
+                .insert(completion_outbox.id.clone(), completion_outbox.clone());
+        }
         drop(inner);
         self.append_project_version_snapshot(&version).ok();
         self.append_run_snapshot(&run).ok();
         self.append_artifact_publish_snapshot(&publish).ok();
-        Ok((version, outbox))
+        if let Some(binding) = sandbox_binding.as_ref() {
+            self.append_sandbox_binding_snapshot(binding).ok();
+        }
+        for finding in &review_findings {
+            self.append_review_finding_snapshot(finding).ok();
+        }
+        for permission in &pending_permissions {
+            self.append_pending_permission_snapshot(permission).ok();
+        }
+        Ok((version, outbox, completion_outbox))
     }
 
     pub async fn dispatch_outbox_event(&self, outbox_id: &str) -> Result<RuntimeOutboxEvent> {
@@ -5318,15 +5597,11 @@ impl RuntimeStore {
         if outbox.status == OutboxDeliveryStatus::Delivered {
             return Ok(outbox);
         }
-        let already_persisted = self.events(&outbox.run_id).await.iter().any(|event| {
-            matches!(
-                (event, &outbox.event),
-                (
-                    AgentEvent::PreviewUpdated { version_id: left, .. },
-                    AgentEvent::PreviewUpdated { version_id: right, .. }
-                ) if left == right
-            )
-        });
+        let already_persisted = self
+            .events(&outbox.run_id)
+            .await
+            .iter()
+            .any(|event| outbox_event_already_persisted(event, &outbox.event));
         outbox.delivery_attempts += 1;
         if !already_persisted {
             if let Err(error) = self.append_event(outbox.event.clone()).await {
@@ -5374,6 +5649,13 @@ impl RuntimeStore {
                 .collect::<Vec<_>>()
         };
         for mut publish in recoverable_publishes {
+            let completion_coupled = self.get_run(&publish.run_id).await.is_some_and(|run| {
+                run.output_version_id.as_deref() == Some(publish.version_id.as_str())
+                    && run.status != AgentRunStatus::Completed
+            });
+            if completion_coupled {
+                continue;
+            }
             if publish.status == ArtifactPublishStatus::ReconcileRequired {
                 publish = self
                     .transition_artifact_publish(
@@ -5852,6 +6134,34 @@ impl RuntimeStore {
     }
 }
 
+fn outbox_event_already_persisted(persisted: &AgentEvent, pending: &AgentEvent) -> bool {
+    match (persisted, pending) {
+        (
+            AgentEvent::PreviewUpdated {
+                run_id: persisted_run_id,
+                version_id: persisted_version_id,
+                ..
+            },
+            AgentEvent::PreviewUpdated {
+                run_id: pending_run_id,
+                version_id: pending_version_id,
+                ..
+            },
+        ) => persisted_run_id == pending_run_id && persisted_version_id == pending_version_id,
+        (
+            AgentEvent::RunCompleted {
+                run_id: persisted_run_id,
+                ..
+            },
+            AgentEvent::RunCompleted {
+                run_id: pending_run_id,
+                ..
+            },
+        ) => persisted_run_id == pending_run_id,
+        _ => false,
+    }
+}
+
 fn checkpoint_path(checkpoint_dir: &Path, checkpoint_id: &str) -> PathBuf {
     checkpoint_dir.join(format!("{checkpoint_id}.json"))
 }
@@ -5876,6 +6186,16 @@ fn append_jsonl_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     line.push('\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn truncate_jsonl_tail(path: &Path, valid_bytes: u64) -> Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(valid_bytes)?;
     file.sync_all()?;
     if let Some(parent) = path.parent() {
         fs::File::open(parent)?.sync_all()?;
@@ -5929,9 +6249,18 @@ fn artifact_publish_transition_allowed(
                 ArtifactPublishStatus::GarbageCollectable
             ) | (
                 ArtifactPublishStatus::Validating,
+                ArtifactPublishStatus::Ready
+            ) | (
+                ArtifactPublishStatus::Ready,
                 ArtifactPublishStatus::Promoting
             ) | (
                 ArtifactPublishStatus::Validating,
+                ArtifactPublishStatus::Promoting
+            ) | (
+                ArtifactPublishStatus::Validating,
+                ArtifactPublishStatus::GarbageCollectable
+            ) | (
+                ArtifactPublishStatus::Ready,
                 ArtifactPublishStatus::GarbageCollectable
             ) | (
                 ArtifactPublishStatus::Promoting,
@@ -5974,6 +6303,26 @@ fn channel_lease_transition_allowed(from: ChannelLeaseStatus, to: ChannelLeaseSt
 
 fn preview_updated_outbox_id(project_id: &str, version_id: &str) -> String {
     format!("preview.updated:{project_id}:{version_id}")
+}
+
+fn run_completed_outbox_id(run_id: &str) -> String {
+    format!("run.completed:{run_id}")
+}
+
+fn completed_promotion_outbox(
+    inner: &RuntimeStoreInner,
+    run_id: &str,
+    completion_summary: Option<&str>,
+) -> Result<Option<RuntimeOutboxEvent>> {
+    completion_summary
+        .map(|_| {
+            inner
+                .outbox_events
+                .get(&run_completed_outbox_id(run_id))
+                .cloned()
+                .ok_or_else(|| anyhow!("completed promotion is missing completion outbox"))
+        })
+        .transpose()
 }
 
 fn default_storage_root() -> PathBuf {

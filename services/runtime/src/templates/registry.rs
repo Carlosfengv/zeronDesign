@@ -122,8 +122,13 @@ impl BuiltInTemplateRegistry {
     }
 
     pub fn built_in() -> Self {
-        Self::new([astro_website::spec(), fumadocs_docs::spec()])
-            .expect("built-in template registry must be valid")
+        Self::new(vec![
+            astro_website::spec(),
+            fumadocs_docs::legacy_p3_spec(),
+            fumadocs_docs::legacy_p4_spec(),
+            fumadocs_docs::spec(),
+        ])
+        .expect("built-in template registry must be valid")
     }
 }
 

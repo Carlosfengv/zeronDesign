@@ -1,9 +1,11 @@
 use anydesign_runtime::{
-    agent_loop::AgentLoop,
+    agent_loop::{AgentLoop, AgentLoopLimits},
+    config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::{
-        MockModelClient, ModelClient, ModelRequest, ModelResponse, OpenAiCompatibleModelClient,
-        ToolCall, ToolInputParseFailure, ToolInputTooLargeFailure,
+        MockModelClient, ModelClient, ModelClientTurn, ModelGatewayScope, ModelRequest,
+        ModelResponse, ModelTokenUsage, OpenAiCompatibleModelClient, ToolCall,
+        ToolInputParseFailure, ToolInputTooLargeFailure,
     },
     permission::{PermissionReason, PermissionResult, PermissionRules},
     tools::sandbox::sandbox_tools,
@@ -12,17 +14,27 @@ use anydesign_runtime::{
         runtime::{
             InterruptBehavior, ProgressSink, Tool, ToolContext, ToolError, ToolExecutor, ToolResult,
         },
+        streaming::StreamingToolExecutor,
     },
     types::{
-        AgentEvent, AgentPhase, AgentRunStatus, Brief, ContentSource, DesignProfile,
-        ReviewFindingCategory, ReviewFindingSeverity,
+        AgentCheckpoint, AgentEvent, AgentPhase, AgentRunStatus, Brief, ContentSource,
+        DesignProfile, ReviewFindingCategory, ReviewFindingSeverity,
     },
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Value};
-use std::{collections::VecDeque, fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Mutex, task::JoinHandle};
 
 fn design_profile_fixture(project_id: &str) -> DesignProfile {
@@ -1072,6 +1084,493 @@ async fn three_consecutive_empty_turns_transition_to_partial() {
 }
 
 #[tokio::test]
+async fn tool_policy_recovery_text_is_reprompted_and_does_not_trip_empty_turn_fuse() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "tool-policy-recovery-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let recovery = "[runtime_tool_policy_recovery] unavailable observation tool".to_string();
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::TextOnly(recovery.clone()),
+            ModelResponse::TextOnly(recovery.clone()),
+            ModelResponse::TextOnly(recovery),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "repair-source",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [] }),
+            )]),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![Arc::new(SuccessfulMutationTool)],
+        PermissionRules::default(),
+    );
+    let results = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 4,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    assert!(results
+        .iter()
+        .any(|result| result.tool_use_id == "repair-source" && !result.is_error));
+    assert!(captured_requests.lock().await[1]
+        .messages
+        .iter()
+        .any(|message| message.get("kind").and_then(Value::as_str)
+            == Some("runtime_tool_policy_recovery")));
+    assert!(!store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunCompleted { summary, .. }
+            if summary == "No tool calls for 3 consecutive turns"
+    )));
+}
+
+#[tokio::test]
+async fn model_turn_budget_stops_the_run_before_unbounded_iteration() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-turn-budget".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let model = MockModelClient::new(vec![
+        ModelResponse::TextOnly("turn one".to_string()),
+        ModelResponse::TextOnly("turn two".to_string()),
+        ModelResponse::TextOnly("must not be requested".to_string()),
+    ]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_turns: 2,
+        max_tool_calls: 60,
+        ..AgentLoopLimits::default()
+    });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    let run = store.get_run(&run.id).await.unwrap();
+    assert_eq!(run.status, AgentRunStatus::Partial);
+    assert!(store.events(&run.id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::RunCompleted { summary, .. }
+                if summary.contains("model-turn budget") && summary.contains("limit=2")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn tool_call_budget_preserves_tool_result_pairing_and_stops_execution() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-tool-budget".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let model = MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
+        ToolCall::new("budget-tool-1", "not.registered", json!({})),
+        ToolCall::new("budget-tool-2", "not.registered", json!({})),
+    ])]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_turns: 20,
+        max_tool_calls: 1,
+        ..AgentLoopLimits::default()
+    });
+
+    let results = loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.is_error));
+    assert!(results.iter().all(|result| {
+        result.content["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("tool-call budget exhausted"))
+    }));
+    assert_eq!(
+        store
+            .events(&run.id)
+            .await
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+}
+
+#[tokio::test]
+async fn input_token_budget_stops_before_tool_execution_and_preserves_pairing() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-input-token-budget".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let model = UsageModelClient::new(vec![(
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "token-budget-tool",
+            "not.registered",
+            json!({}),
+        )]),
+        ModelTokenUsage {
+            input_tokens: 11,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        },
+    )]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_input_tokens: 10,
+        max_output_tokens: 100,
+        ..AgentLoopLimits::default()
+    });
+
+    let results = loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].tool_use_id, "token-budget-tool");
+    assert!(results[0].is_error);
+    assert!(results[0].content["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("token budget exhausted")));
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelUsage {
+            turn: 1,
+            input_tokens: 11,
+            output_tokens: 1,
+            estimated: false,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn output_token_budget_stops_text_response_run() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-output-token-budget".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let model = UsageModelClient::new(vec![(
+        ModelResponse::TextOnly("large response".to_string()),
+        ModelTokenUsage {
+            input_tokens: 1,
+            output_tokens: 11,
+            cached_input_tokens: 0,
+        },
+    )]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_input_tokens: 100,
+        max_output_tokens: 10,
+        ..AgentLoopLimits::default()
+    });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    assert!(store.events(&run.id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::RunCompleted { summary, .. }
+                if summary.contains("output_used=11") && summary.contains("output_limit=10")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn recovered_token_usage_is_counted_once_per_model_turn() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-recovered-token-budget".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_event(AgentEvent::ModelUsage {
+            run_id: run.id.clone(),
+            turn: 1,
+            input_tokens: 8,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            estimated: false,
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "checkpoint-token-budget".to_string(),
+            run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            message_window: vec![json!({
+                "role": "assistant",
+                "turn": 1,
+                "text": "persisted turn",
+            })],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "persisted token usage".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let model = UsageModelClient::new(vec![(
+        ModelResponse::TextOnly("turn two".to_string()),
+        ModelTokenUsage {
+            input_tokens: 5,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        },
+    )]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_input_tokens: 10,
+        max_output_tokens: 100,
+        ..AgentLoopLimits::default()
+    });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert!(store.events(&run.id).await.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::RunCompleted { summary, .. }
+                if summary.contains("input_used=13") && summary.contains("input_limit=10")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn mixed_recoverable_protocol_errors_open_the_shared_fuse() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-protocol-fuse".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let model = UsageModelClient::new(vec![
+        (
+            ModelResponse::ToolInputParseFailed {
+                parsed_calls: vec![],
+                failures: vec![ToolInputParseFailure {
+                    tool_call_id: "protocol-parse".to_string(),
+                    tool_name: "fs.write".to_string(),
+                    raw_len: 120,
+                    raw_sha256: "parse-hash".to_string(),
+                    ends_with_json_close: false,
+                    bracket_balance: 1,
+                    quote_closed: false,
+                    likely_truncated: true,
+                }],
+            },
+            ModelTokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            },
+        ),
+        (
+            ModelResponse::ToolInputTooLarge {
+                parsed_calls: vec![],
+                failures: vec![ToolInputTooLargeFailure {
+                    tool_call_id: "protocol-large".to_string(),
+                    tool_name: "fs.write".to_string(),
+                    input_chars: 100_000,
+                    max_input_chars: 96_000,
+                    raw_sha256: "large-hash".to_string(),
+                }],
+            },
+            ModelTokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+            },
+        ),
+    ]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_consecutive_protocol_errors: 2,
+        ..AgentLoopLimits::default()
+    });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    let events = store.events(&run.id).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ModelProtocolError { .. }))
+            .count(),
+        2
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelProtocolError {
+            turn: 2,
+            consecutive: 2,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::RunCompleted { summary, .. }
+                if summary.contains("protocol error fuse opened")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn protocol_error_fuse_restores_consecutive_count_after_restart() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-recovered-protocol-fuse".to_string(),
+            AgentPhase::Export,
+            "export".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_event(AgentEvent::ModelUsage {
+            run_id: run.id.clone(),
+            turn: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            estimated: false,
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .append_event(AgentEvent::ModelProtocolError {
+            run_id: run.id.clone(),
+            turn: 1,
+            kind: "tool_input_json_parse_failed".to_string(),
+            consecutive: 1,
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "checkpoint-protocol-fuse".to_string(),
+            run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            message_window: vec![json!({
+                "role": "system",
+                "turn": 1,
+                "text": "recover after protocol error",
+            })],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "persisted protocol error".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let model = UsageModelClient::new(vec![(
+        ModelResponse::ToolInputTooLarge {
+            parsed_calls: vec![],
+            failures: vec![ToolInputTooLargeFailure {
+                tool_call_id: "protocol-recovered-large".to_string(),
+                tool_name: "fs.write".to_string(),
+                input_chars: 100_000,
+                max_input_chars: 96_000,
+                raw_sha256: "recovered-large-hash".to_string(),
+            }],
+        },
+        ModelTokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        },
+    )]);
+    let loop_runner = AgentLoop::new(store.clone(), Arc::new(model)).with_limits(AgentLoopLimits {
+        max_consecutive_protocol_errors: 2,
+        ..AgentLoopLimits::default()
+    });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelProtocolError {
+            turn: 2,
+            consecutive: 2,
+            ..
+        }
+    )));
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+}
+
+#[tokio::test]
 async fn model_error_marks_run_failed() {
     let store = RuntimeStore::new();
     let run = store
@@ -1966,7 +2465,15 @@ async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
         store.clone(),
         Arc::new(MockModelClient::new(responses)),
         executor,
-    );
+    )
+    .with_limits(AgentLoopLimits {
+        max_turns: 50,
+        max_tool_calls: 50,
+        max_input_tokens: 10_000_000,
+        max_output_tokens: 1_000_000,
+        max_no_progress_turns: 100,
+        ..AgentLoopLimits::default()
+    });
 
     loop_runner.run(&run.id).await.unwrap();
 
@@ -2026,6 +2533,19 @@ async fn terminal_tool_error_marks_tool_failed_as_not_recoverable() {
         })
         .expect("terminal tool failure should emit tool.failed");
     assert!(!failed);
+    let completed = store
+        .events(&run.id)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            anydesign_runtime::types::AgentEvent::RunCompleted {
+                status, summary, ..
+            } => Some((status, summary)),
+            _ => None,
+        })
+        .expect("terminal tool failure should close the event stream");
+    assert_eq!(completed.0, "failed");
+    assert!(completed.1.contains("sandbox channel disconnected"));
 }
 
 #[tokio::test]
@@ -2197,7 +2717,12 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>ok</title>');";
             json!({ "status": "completed", "summary": "Astro preview promoted" }),
         ),
     ])]);
-    let executor = control_plane_executor().with_workspace_root(&workspace);
+    let executor = control_plane_executor()
+        .with_policy_profile_and_registry(
+            RuntimePolicyProfile::LocalE2e,
+            "https://registry.internal.example/npm/",
+        )
+        .with_workspace_root(&workspace);
     let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
 
     let results = loop_runner.run(&run.id).await.unwrap();
@@ -2357,7 +2882,12 @@ fs.writeFileSync('dist/index.html','<!doctype html><title>chunked</title>'+sourc
         ),
     ]);
     let model = MockModelClient::new(vec![ModelResponse::ToolCalls(calls)]);
-    let executor = control_plane_executor().with_workspace_root(&workspace);
+    let executor = control_plane_executor()
+        .with_policy_profile_and_registry(
+            RuntimePolicyProfile::LocalE2e,
+            "https://registry.internal.example/npm/",
+        )
+        .with_workspace_root(&workspace);
     let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
 
     let results = loop_runner.run(&run.id).await.unwrap();
@@ -2547,6 +3077,1374 @@ async fn real_deepseek_design_md_website_generation_e2e() {
     }
 }
 
+#[tokio::test]
+async fn streaming_tool_executor_enforces_runtime_wall_clock_deadline() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "deadline-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(vec![Arc::new(SlowTool)], PermissionRules::default());
+    let started = tokio::time::Instant::now();
+    let results = StreamingToolExecutor::new(executor)
+        .with_tool_call_deadline(Duration::from_millis(25))
+        .execute_calls(
+            store,
+            &run.id,
+            vec![ToolCall::new("slow-tool-1", "test.slow", json!({}))],
+        )
+        .await;
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(results.len(), 1);
+    assert!(results[0].result.is_error);
+    assert_eq!(
+        results[0].result.metadata.as_ref().unwrap()["errorKind"],
+        "tool.deadline_exceeded"
+    );
+    assert_eq!(
+        results[0].result.metadata.as_ref().unwrap()["cancelled"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn streaming_tool_executor_uses_extended_deadline_for_build_tools() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "build-deadline-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(vec![Arc::new(SlowBuildTool)], PermissionRules::default());
+    let results = StreamingToolExecutor::new(executor)
+        .with_tool_call_deadline(Duration::from_millis(25))
+        .with_build_tool_call_deadline(Duration::from_millis(250))
+        .execute_calls(
+            store,
+            &run.id,
+            vec![ToolCall::new("slow-build-1", "project.build", json!({}))],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+}
+
+#[tokio::test]
+async fn agent_loop_idle_watchdog_structurally_stops_stalled_model_request() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "idle-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let loop_runner =
+        AgentLoop::new(store.clone(), Arc::new(SlowModelClient)).with_limits(AgentLoopLimits {
+            idle_timeout: Duration::from_millis(40),
+            total_timeout: Duration::from_secs(1),
+            ..AgentLoopLimits::default()
+        });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunWatchdogTriggered { kind, .. } if kind == "idle"
+    )));
+}
+
+#[tokio::test]
+async fn agent_loop_total_watchdog_bounds_active_run() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "total-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let loop_runner =
+        AgentLoop::new(store.clone(), Arc::new(SlowModelClient)).with_limits(AgentLoopLimits {
+            idle_timeout: Duration::from_secs(1),
+            total_timeout: Duration::from_millis(40),
+            ..AgentLoopLimits::default()
+        });
+
+    loop_runner.run(&run.id).await.unwrap();
+
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunWatchdogTriggered { kind, .. } if kind == "total"
+    )));
+}
+
+#[tokio::test]
+async fn no_progress_fingerprint_survives_restart_and_stops_repeated_observation_turns() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "progress-project".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let first_executor = ToolExecutor::new(vec![Arc::new(ObserveTool)], PermissionRules::default());
+    AgentLoop::with_tool_executor(
+        store.clone(),
+        Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
+            ToolCall::new("observe-1", "test.observe", json!({ "query": "first" })),
+        ])])),
+        first_executor,
+    )
+    .with_limits(AgentLoopLimits {
+        max_turns: 1,
+        max_no_progress_turns: 2,
+        ..AgentLoopLimits::default()
+    })
+    .run(&run.id)
+    .await
+    .unwrap();
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunProgressFingerprint {
+            consecutive_no_progress: 1,
+            ..
+        }
+    )));
+    let (persisted_fingerprint, persisted_evidence) = store
+        .events(&run.id)
+        .await
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::RunProgressFingerprint {
+                fingerprint,
+                evidence,
+                ..
+            } => Some((fingerprint, evidence)),
+            _ => None,
+        })
+        .unwrap();
+    let resumed_run = store
+        .create_run(
+            "progress-project-restarted".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_event(AgentEvent::RunProgressFingerprint {
+            run_id: resumed_run.id.clone(),
+            turn: 1,
+            fingerprint: persisted_fingerprint,
+            consecutive_no_progress: 1,
+            evidence: persisted_evidence,
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let restarted_executor =
+        ToolExecutor::new(vec![Arc::new(ObserveTool)], PermissionRules::default());
+    AgentLoop::with_tool_executor(
+        store.clone(),
+        Arc::new(MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "observe-2",
+                "test.observe",
+                json!({ "query": "different-but-still-read-only" }),
+            ),
+        ])])),
+        restarted_executor,
+    )
+    .with_limits(AgentLoopLimits {
+        max_turns: 3,
+        max_no_progress_turns: 2,
+        ..AgentLoopLimits::default()
+    })
+    .run(&resumed_run.id)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store.get_run(&resumed_run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+    assert!(store
+        .events(&resumed_run.id)
+        .await
+        .iter()
+        .any(|event| matches!(
+            event,
+            AgentEvent::RunProgressFingerprint {
+                consecutive_no_progress: 2,
+                ..
+            }
+        )));
+}
+
+#[tokio::test]
+async fn source_mutation_resets_no_progress_counter_before_repeated_reads_stop_run() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "progress-mutation-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![Arc::new(ObserveTool), Arc::new(SuccessfulMutationTool)],
+        PermissionRules::default(),
+    );
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "observe-before",
+            "test.observe",
+            json!({ "query": "before" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "write-progress",
+            "fs.multi_patch",
+            json!({ "path": "project/page.txt", "edits": [{ "oldStr": "old", "newStr": "new" }] }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "observe-after-1",
+            "test.observe",
+            json!({ "query": "after one" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "observe-after-2",
+            "test.observe",
+            json!({ "query": "after two" }),
+        )]),
+    ]);
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 10,
+            max_no_progress_turns: 2,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let counters = store
+        .events(&run.id)
+        .await
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunProgressFingerprint {
+                consecutive_no_progress,
+                ..
+            } => Some(*consecutive_no_progress),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(counters, vec![1, 0, 1, 2]);
+    assert_eq!(
+        store.get_run(&run.id).await.unwrap().status,
+        AgentRunStatus::Partial
+    );
+}
+
+#[tokio::test]
+async fn chunk_commit_sha_resets_no_progress_when_repair_reuses_the_same_path() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "progress-chunk-commit-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![Arc::new(SequencedChunkCommitTool::default())],
+        PermissionRules::default(),
+    );
+    let repeated_commit = || {
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "commit-repair",
+            "fs.commit_chunks",
+            json!({ "path": "project/src/pages/index.astro" }),
+        )])
+    };
+    let model = MockModelClient::new(vec![
+        repeated_commit(),
+        repeated_commit(),
+        repeated_commit(),
+    ]);
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 3,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let counters = store
+        .events(&run.id)
+        .await
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunProgressFingerprint {
+                consecutive_no_progress,
+                ..
+            } => Some(*consecutive_no_progress),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(counters, vec![0, 0, 1]);
+}
+
+#[tokio::test]
+async fn distinct_staged_chunks_count_as_progress_without_marking_source_authored() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "progress-chunk-stage-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "stage-a",
+                "fs.write_chunk",
+                json!({ "path": "project/src/pages/index.astro", "content": "part-a" }),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "stage-b",
+                "fs.write_chunk",
+                json!({ "path": "project/src/pages/index.astro", "content": "part-b" }),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "stage-b-again",
+                "fs.write_chunk",
+                json!({ "path": "project/src/pages/index.astro", "content": "part-b" }),
+            )]),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![Arc::new(SuccessfulChunkStageTool)],
+        PermissionRules::default(),
+    );
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 3,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let counters = store
+        .events(&run.id)
+        .await
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunProgressFingerprint {
+                consecutive_no_progress,
+                ..
+            } => Some(*consecutive_no_progress),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(counters, vec![0, 0, 1]);
+    let requests = captured_requests.lock().await;
+    assert!(!requests[2].system_prompt.contains("source_authored"));
+}
+
+#[tokio::test]
+async fn first_unique_file_reads_count_as_bounded_progress_but_repeats_do_not() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "progress-read-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![Arc::new(ReadObservationTool)],
+        PermissionRules::default(),
+    );
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "read-a",
+            "fs.read",
+            json!({ "path": "project/a.txt" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "read-b",
+            "fs.read",
+            json!({ "path": "project/b.txt" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "read-b-again",
+            "fs.read",
+            json!({ "path": "project/b.txt" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "read-b-third",
+            "fs.read",
+            json!({ "path": "project/b.txt" }),
+        )]),
+    ]);
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 10,
+            max_no_progress_turns: 2,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let counters = store
+        .events(&run.id)
+        .await
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunProgressFingerprint {
+                consecutive_no_progress,
+                ..
+            } => Some(*consecutive_no_progress),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(counters, vec![0, 0, 1, 2]);
+}
+
+#[tokio::test]
+async fn observation_budgets_reject_excess_reads_and_searches_but_allow_mutation() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "observation-budget-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(ReadObservationTool),
+            Arc::new(SearchObservationTool),
+            Arc::new(SuccessfulMutationTool),
+        ],
+        PermissionRules::default(),
+    );
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new("read-a", "fs.read", json!({ "path": "project/a.txt" })),
+            ToolCall::new("search-a", "fs.search", json!({ "query": "alpha" })),
+        ]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new("read-b", "fs.read", json!({ "path": "project/b.txt" })),
+            ToolCall::new("search-b", "fs.search", json!({ "query": "beta" })),
+            ToolCall::new(
+                "write-b",
+                "fs.multi_patch",
+                json!({ "path": "project/b.txt", "edits": [] }),
+            ),
+        ]),
+    ]);
+    let results = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 2,
+            max_read_tool_calls: 1,
+            max_search_tool_calls: 1,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let rejected = results
+        .iter()
+        .filter(|result| {
+            result.is_error
+                && result
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("errorKind"))
+                    .and_then(Value::as_str)
+                    == Some("run.observation_budget_exhausted")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rejected.len(), 2);
+    assert!(results
+        .iter()
+        .any(|result| result.tool_use_id == "write-b" && !result.is_error));
+    let budget_events = store
+        .events(&run.id)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::RunObservationBudget {
+                read_used,
+                search_used,
+                ..
+            } => Some((read_used, search_used)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(budget_events, vec![(1, 1), (1, 1)]);
+}
+
+#[tokio::test]
+async fn candidate_repair_uses_a_smaller_observation_budget_without_blocking_writes() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "repair-observation-budget-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(PreviewRejectTool),
+            Arc::new(ReadObservationTool),
+            Arc::new(SuccessfulMutationTool),
+        ],
+        PermissionRules::default(),
+    );
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "publish-rejected",
+            "preview.publish",
+            json!({}),
+        )]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "repair-read-a",
+                "fs.read",
+                json!({ "path": "state/validation-report.json" }),
+            ),
+            ToolCall::new(
+                "repair-read-b",
+                "fs.read",
+                json!({ "path": "project/a.tsx" }),
+            ),
+            ToolCall::new(
+                "repair-read-c",
+                "fs.read",
+                json!({ "path": "project/b.tsx" }),
+            ),
+            ToolCall::new(
+                "repair-write",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [] }),
+            ),
+        ]),
+    ]);
+    let results = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 2,
+            max_read_tool_calls: 20,
+            max_repair_read_tool_calls: 2,
+            max_repair_search_tool_calls: 1,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let repair_rejection = results
+        .iter()
+        .find(|result| result.tool_use_id == "repair-read-c")
+        .expect("third repair read should have a paired result");
+    assert!(repair_rejection.is_error);
+    assert_eq!(
+        repair_rejection.metadata.as_ref().unwrap()["category"],
+        "repair_read"
+    );
+    assert!(results
+        .iter()
+        .any(|result| result.tool_use_id == "repair-write" && !result.is_error));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunObservationBudget {
+            repair_active: true,
+            repair_read_used: 2,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn build_failure_activates_repair_observation_budget() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "build-failure-repair-budget-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(PreviewBuildFailTool),
+            Arc::new(ReadObservationTool),
+        ],
+        PermissionRules::default(),
+    );
+    let model = MockModelClient::new(vec![
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "publish-build-failed",
+            "preview.publish",
+            json!({}),
+        )]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "repair-read-a",
+                "fs.read",
+                json!({ "path": "project/a.tsx" }),
+            ),
+            ToolCall::new(
+                "repair-read-b",
+                "fs.read",
+                json!({ "path": "project/b.tsx" }),
+            ),
+            ToolCall::new(
+                "repair-read-c",
+                "fs.read",
+                json!({ "path": "project/c.tsx" }),
+            ),
+        ]),
+    ]);
+    let results = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 2,
+            max_read_tool_calls: 20,
+            max_repair_read_tool_calls: 2,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let third_read = results
+        .iter()
+        .find(|result| result.tool_use_id == "repair-read-c")
+        .expect("third build-repair read should have a paired result");
+    assert!(third_read.is_error);
+    assert_eq!(
+        third_read.metadata.as_ref().unwrap()["category"],
+        "repair_read"
+    );
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunObservationBudget {
+            repair_active: true,
+            repair_read_used: 2,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn exhausted_repair_budget_directs_mutation_instead_of_more_observation() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "repair-budget-workflow-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "author-source",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [] }),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "publish-build-failed",
+                "preview.publish",
+                json!({}),
+            )]),
+            ModelResponse::ToolCalls(vec![
+                ToolCall::new("repair-read", "fs.read", json!({ "path": "project/a.tsx" })),
+                ToolCall::new("repair-search", "fs.search", json!({ "query": "broken" })),
+            ]),
+            ModelResponse::Error("stop after exhausted repair workflow capture".to_string()),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(SuccessfulMutationTool),
+            Arc::new(PreviewBuildFailTool),
+            Arc::new(ReadObservationTool),
+            Arc::new(SearchObservationTool),
+        ],
+        PermissionRules::default(),
+    );
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 4,
+            max_read_tool_calls: 20,
+            max_search_tool_calls: 20,
+            max_repair_read_tool_calls: 1,
+            max_repair_search_tool_calls: 1,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].system_prompt.contains("repairing_source"));
+    assert!(requests[3]
+        .system_prompt
+        .contains("The repair observation budget is exhausted"));
+    assert!(requests[3]
+        .system_prompt
+        .contains("Do not call fs.read, fs.list, or fs.search"));
+    assert!(requests[3]
+        .tools
+        .iter()
+        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list" | "fs.search")));
+    assert!(requests[3]
+        .deferred_tools
+        .iter()
+        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list" | "fs.search")));
+}
+
+#[tokio::test]
+async fn exhausted_repair_read_budget_hides_reads_while_search_remains_available() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "repair-read-budget-workflow-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "author-source",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [] }),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "publish-build-failed",
+                "preview.publish",
+                json!({}),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "repair-read",
+                "fs.read",
+                json!({ "path": "project/a.tsx" }),
+            )]),
+            ModelResponse::Error("stop after repair read capture".to_string()),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(SuccessfulMutationTool),
+            Arc::new(PreviewBuildFailTool),
+            Arc::new(ReadObservationTool),
+            Arc::new(SearchObservationTool),
+        ],
+        PermissionRules::default(),
+    );
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 4,
+            max_read_tool_calls: 20,
+            max_search_tool_calls: 20,
+            max_repair_read_tool_calls: 1,
+            max_repair_search_tool_calls: 2,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3]
+        .tools
+        .iter()
+        .chain(&requests[3].deferred_tools)
+        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list")));
+    assert!(requests[3]
+        .tools
+        .iter()
+        .chain(&requests[3].deferred_tools)
+        .any(|tool| tool.name == "fs.search"));
+}
+
+#[tokio::test]
+async fn repair_mutation_directs_immediate_publish_without_more_exploration() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "repair-mutation-workflow-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "author-source",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [] }),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "publish-rejected",
+                "preview.publish",
+                json!({}),
+            )]),
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "repair-source",
+                "fs.multi_patch",
+                json!({ "path": "project/a.tsx", "edits": [{ "oldStr": "bad", "newStr": "good" }] }),
+            )]),
+            ModelResponse::Error("stop after repair publish workflow capture".to_string()),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![
+            Arc::new(SuccessfulMutationTool),
+            Arc::new(PreviewRejectTool),
+        ],
+        PermissionRules::default(),
+    );
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 4,
+            max_no_progress_turns: 10,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].system_prompt.contains("publishing_repair"));
+    assert!(requests[3]
+        .system_prompt
+        .contains("Call preview.publish now; do not read, list, search"));
+}
+
+#[tokio::test]
+async fn build_prompt_publishes_authoritative_workflow_stage_and_budget_remaining() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "workflow-progress-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "list-inputs",
+                "fs.list",
+                json!({ "path": "inputs" }),
+            )]),
+            ModelResponse::Error("stop after workflow prompt capture".to_string()),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![Arc::new(ListObservationTool)],
+        PermissionRules::default(),
+    );
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_read_tool_calls: 2,
+            max_search_tool_calls: 1,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].system_prompt.contains("discovering_inputs"));
+    assert!(requests[1].system_prompt.contains("loading_requirements"));
+    assert!(requests[1].system_prompt.contains("inputs_inventoried"));
+    assert!(requests[1].system_prompt.contains("\"remaining\":1"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("shell.run defaults to the appRoot as its working directory"));
+    assert!(requests[0]
+        .system_prompt
+        .contains("never project/src/pages/index.astro"));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunWorkflowProgress { stage, .. } if stage == "loading_requirements"
+    )));
+}
+
+struct ObserveTool;
+
+#[async_trait]
+impl Tool for ObserveTool {
+    fn name(&self) -> &'static str {
+        "test.observe"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({ "observed": true })))
+    }
+}
+
+struct SuccessfulMutationTool;
+
+#[async_trait]
+impl Tool for SuccessfulMutationTool {
+    fn name(&self) -> &'static str {
+        "fs.multi_patch"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "path": input["path"],
+            "written": true
+        })))
+    }
+}
+
+#[derive(Default)]
+struct SequencedChunkCommitTool {
+    calls: AtomicUsize,
+}
+
+struct SuccessfulChunkStageTool;
+
+#[async_trait]
+impl Tool for SuccessfulChunkStageTool {
+    fn name(&self) -> &'static str {
+        "fs.write_chunk"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "path": input["path"],
+            "received": true
+        })))
+    }
+}
+
+#[async_trait]
+impl Tool for SequencedChunkCommitTool {
+    fn name(&self) -> &'static str {
+        "fs.commit_chunks"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let sha256 = if call == 0 {
+            "source-sha-a"
+        } else {
+            "source-sha-b"
+        };
+        Ok(ToolResult::ok(json!({
+            "path": input["path"],
+            "sha256": sha256,
+            "written": true
+        })))
+    }
+}
+
+struct PreviewRejectTool;
+
+#[async_trait]
+impl Tool for PreviewRejectTool {
+    fn name(&self) -> &'static str {
+        "preview.publish"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::typed_recoverable(
+            "candidate rejected",
+            "generation.validation_failed",
+            json!({ "candidateManifestHash": "candidate-rejected-digest" }),
+        ))
+    }
+}
+
+struct PreviewBuildFailTool;
+
+#[async_trait]
+impl Tool for PreviewBuildFailTool {
+    fn name(&self) -> &'static str {
+        "preview.publish"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::typed_recoverable(
+            "build failed",
+            "build.failed",
+            json!({ "command": "npm run build", "stderr": "fixture compiler error" }),
+        ))
+    }
+}
+
+struct ReadObservationTool;
+
+#[async_trait]
+impl Tool for ReadObservationTool {
+    fn name(&self) -> &'static str {
+        "fs.read"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "path": input["path"],
+            "text": "fixture"
+        })))
+    }
+}
+
+struct ListObservationTool;
+
+#[async_trait]
+impl Tool for ListObservationTool {
+    fn name(&self) -> &'static str {
+        "fs.list"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "path": input["path"],
+            "entries": ["brief.md", "content-sources.json"]
+        })))
+    }
+}
+
+struct SearchObservationTool;
+
+#[async_trait]
+impl Tool for SearchObservationTool {
+    fn name(&self) -> &'static str {
+        "fs.search"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::ok(json!({
+            "query": input["query"],
+            "matches": []
+        })))
+    }
+}
+
+struct SlowTool;
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &'static str {
+        "test.slow"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(ToolResult::ok(json!({ "unexpected": true })))
+    }
+}
+
+struct SlowBuildTool;
+
+#[async_trait]
+impl Tool for SlowBuildTool {
+    fn name(&self) -> &'static str {
+        "project.build"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        Ok(ToolResult::ok(json!({ "built": true })))
+    }
+}
+
+#[derive(Debug)]
+struct SlowModelClient;
+
+#[async_trait]
+impl ModelClient for SlowModelClient {
+    async fn next_response(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(ModelResponse::TextOnly("late".to_string()))
+    }
+}
+
 struct TerminalFailTool;
 
 #[async_trait]
@@ -2652,6 +4550,47 @@ impl Tool for InterruptCancelTool {
 struct RecordingModelClient {
     responses: Arc<Mutex<VecDeque<ModelResponse>>>,
     requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+#[derive(Debug, Clone)]
+struct UsageModelClient {
+    turns: Arc<Mutex<VecDeque<(ModelResponse, ModelTokenUsage)>>>,
+}
+
+impl UsageModelClient {
+    fn new(turns: Vec<(ModelResponse, ModelTokenUsage)>) -> Self {
+        Self {
+            turns: Arc::new(Mutex::new(VecDeque::from(turns))),
+        }
+    }
+
+    async fn next_turn(&self) -> anyhow::Result<(ModelResponse, ModelTokenUsage)> {
+        self.turns
+            .lock()
+            .await
+            .pop_front()
+            .ok_or_else(|| anyhow!("usage model response queue exhausted"))
+    }
+}
+
+#[async_trait]
+impl ModelClient for UsageModelClient {
+    async fn next_response(&self, _request: ModelRequest) -> anyhow::Result<ModelResponse> {
+        Ok(self.next_turn().await?.0)
+    }
+
+    async fn next_response_scoped_with_execution(
+        &self,
+        _request: ModelRequest,
+        _scope: ModelGatewayScope,
+    ) -> anyhow::Result<ModelClientTurn> {
+        let (response, usage) = self.next_turn().await?;
+        Ok(ModelClientTurn {
+            response,
+            execution: None,
+            usage: Some(usage),
+        })
+    }
 }
 
 impl RecordingModelClient {

@@ -134,10 +134,22 @@ pub struct ModelExecutionSnapshot {
     pub provider_attempt_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTokenUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelClientTurn {
     pub response: ModelResponse,
     pub execution: Option<ModelExecutionSnapshot>,
+    pub usage: Option<ModelTokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +208,7 @@ pub trait ModelClient: Send + Sync {
         Ok(ModelClientTurn {
             response: self.next_response_scoped(request, scope).await?,
             execution: None,
+            usage: None,
         })
     }
 }
@@ -314,6 +327,7 @@ impl ModelClient for ConfiguredModelClient {
             Self::OpenAiCompatible(client) => Ok(ModelClientTurn {
                 response: client.next_response(request).await?,
                 execution: None,
+                usage: None,
             }),
         }
     }
@@ -451,7 +465,20 @@ impl HttpModelGatewayClient {
             if let Some(token) = &self.runtime_bearer_token {
                 call = call.bearer_auth(token);
             }
-            let response = call.send().await?;
+            let response = match call.send().await {
+                Ok(response) => response,
+                Err(error)
+                    if provider_gateway_transport_error_retryable(&error)
+                        && attempt < PROVIDER_GATEWAY_TRANSPORT_ATTEMPTS =>
+                {
+                    tokio::time::sleep(Duration::from_millis(
+                        250u64.saturating_mul(u64::from(attempt)),
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let status = response.status();
             let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
             if !status.is_success() {
@@ -488,19 +515,26 @@ impl HttpModelGatewayClient {
             {
                 let response = serde_json::from_value::<VersionedGatewayTurnResponse>(body)?;
                 let execution = response.model_execution.clone();
+                let usage = response.usage;
                 return Ok(ModelClientTurn {
                     response: response.into(),
                     execution: Some(execution),
+                    usage: Some(usage),
                 });
             }
             // Fixture and legacy gateway compatibility during the staged migration.
             return Ok(ModelClientTurn {
                 response: serde_json::from_value::<ModelGatewayTurnResponse>(body)?.into(),
                 execution: None,
+                usage: None,
             });
         }
         unreachable!("Provider Gateway transport attempts are at least one")
     }
+}
+
+fn provider_gateway_transport_error_retryable(error: &reqwest::Error) -> bool {
+    !error.is_builder() && (error.is_connect() || error.is_timeout() || error.is_request())
 }
 
 fn explicit_model_resource_id(model: &str) -> Option<&str> {
@@ -734,6 +768,8 @@ struct VersionedGatewayTurnResponse {
     #[serde(default)]
     text: Option<String>,
     model_execution: ModelExecutionSnapshot,
+    #[serde(default)]
+    usage: ModelTokenUsage,
 }
 
 #[derive(Debug, Deserialize)]

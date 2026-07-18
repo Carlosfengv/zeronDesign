@@ -22,7 +22,13 @@ fn valid_brief() -> serde_json::Value {
         "visualDirection": "quiet technical confidence",
         "recommendedTemplate": "astro-website",
         "assumptions": [],
-        "missingInformation": []
+        "missingInformation": [],
+        "acceptanceCriteria": {
+            "locale": "en",
+            "requiredRoutes": ["/"],
+            "requiredText": ["Product"],
+            "forbiddenText": ["Lorem ipsum"]
+        }
     })
 }
 
@@ -132,7 +138,12 @@ async fn brief_write_draft_normalizes_common_model_field_aliases() {
                 "visual_direction": "polished product launch",
                 "template": "website",
                 "assumptions": [],
-                "missing_information": []
+                "missing_information": [],
+                "acceptanceCriteria": {
+                    "requiredRoutes": ["/"],
+                    "requiredText": [],
+                    "forbiddenText": []
+                }
             }),
         ),
         ToolCall::new("tool-2", "brief.request_confirmation", json!({})),

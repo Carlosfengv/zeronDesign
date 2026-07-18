@@ -666,27 +666,55 @@ pub(super) async fn collect_search_matches(
     ctx: &ToolContext,
     query: &str,
     matches: &mut Vec<Value>,
-) -> Result<(), ToolError> {
+) -> Result<SearchSummary, ToolError> {
+    const MAX_SEARCH_FILES: usize = 256;
+    const MAX_SEARCH_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_SEARCH_MATCHES: usize = 200;
+    const MAX_MATCH_TEXT_CHARS: usize = 1_000;
+
     let mut stack = vec![path.to_path_buf()];
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned = 0usize;
+    let mut skipped_paths = 0usize;
+    let mut truncated = false;
+
     while let Some(path) = stack.pop() {
+        if search_ignored_path(&path, ctx) {
+            skipped_paths += 1;
+            continue;
+        }
         match workspace
             .path_kind(ctx, &path)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?
         {
             WorkspacePathKind::File => {
+                if files_scanned >= MAX_SEARCH_FILES || bytes_scanned >= MAX_SEARCH_BYTES {
+                    truncated = true;
+                    break;
+                }
                 let text = workspace
                     .read_to_string(ctx, &path)
                     .await
                     .unwrap_or_default();
+                files_scanned += 1;
+                bytes_scanned = bytes_scanned.saturating_add(text.len());
                 for (index, line) in text.lines().enumerate() {
                     if line.contains(query) {
                         matches.push(json!({
                             "path": display_workspace_path(&path, ctx),
                             "line": index + 1,
-                            "text": line,
+                            "text": line.chars().take(MAX_MATCH_TEXT_CHARS).collect::<String>(),
                         }));
+                        if matches.len() >= MAX_SEARCH_MATCHES {
+                            truncated = true;
+                            break;
+                        }
                     }
+                }
+                if truncated || bytes_scanned >= MAX_SEARCH_BYTES {
+                    truncated = truncated || !stack.is_empty();
+                    break;
                 }
             }
             WorkspacePathKind::Dir => {
@@ -700,5 +728,38 @@ pub(super) async fn collect_search_matches(
             }
         }
     }
-    Ok(())
+    Ok(SearchSummary {
+        files_scanned,
+        bytes_scanned,
+        skipped_paths,
+        truncated,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SearchSummary {
+    pub files_scanned: usize,
+    pub bytes_scanned: usize,
+    pub skipped_paths: usize,
+    pub truncated: bool,
+}
+
+fn search_ignored_path(path: &Path, ctx: &ToolContext) -> bool {
+    let relative = path.strip_prefix(&ctx.workspace_root).unwrap_or(path);
+    relative.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(
+                ".git"
+                    | ".next"
+                    | ".cache"
+                    | ".turbo"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | "coverage"
+                    | "target"
+            )
+        )
+    })
 }

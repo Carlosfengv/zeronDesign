@@ -50,7 +50,6 @@ pub trait ArtifactPublisher: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct FileArtifactPublisher {
     runtime_storage_dir: PathBuf,
-    root: PathBuf,
 }
 
 const SOURCE_SNAPSHOT_MANIFEST: &str = ".anydesign-source-snapshot-manifest.json";
@@ -68,7 +67,6 @@ impl FileArtifactPublisher {
     pub fn new(runtime_storage_dir: impl Into<PathBuf>) -> Self {
         let runtime_storage_dir = runtime_storage_dir.into();
         Self {
-            root: runtime_storage_dir.join("artifacts"),
             runtime_storage_dir,
         }
     }
@@ -81,11 +79,20 @@ impl FileArtifactPublisher {
             .join(safe_segment(version_id))
     }
 
-    fn staged_root(&self, project_id: &str, version_id: &str) -> PathBuf {
-        self.root
+    pub fn staged_version_root(
+        runtime_storage_dir: &Path,
+        project_id: &str,
+        version_id: &str,
+    ) -> PathBuf {
+        runtime_storage_dir
+            .join("artifacts")
             .join(safe_segment(project_id))
             .join("staged")
             .join(safe_segment(version_id))
+    }
+
+    fn staged_root(&self, project_id: &str, version_id: &str) -> PathBuf {
+        Self::staged_version_root(&self.runtime_storage_dir, project_id, version_id)
     }
 
     pub fn source_snapshot_root(

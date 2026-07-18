@@ -60,6 +60,15 @@ struct UnusedEditWorkspaceRestorer;
 
 #[async_trait::async_trait]
 impl EditWorkspaceRestorer for UnusedEditWorkspaceRestorer {
+    async fn prepare_build(
+        &self,
+        _store: &RuntimeStore,
+        _config: &RuntimeConfig,
+        _run: &crate::types::AgentRun,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn restore(
         &self,
         _store: &RuntimeStore,
@@ -74,10 +83,20 @@ impl EditWorkspaceRestorer for UnusedEditWorkspaceRestorer {
 #[derive(Default)]
 struct FailingEditWorkspaceRestorer {
     calls: AtomicUsize,
+    brief_versions: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait::async_trait]
 impl EditWorkspaceRestorer for FailingEditWorkspaceRestorer {
+    async fn prepare_build(
+        &self,
+        _store: &RuntimeStore,
+        _config: &RuntimeConfig,
+        _run: &crate::types::AgentRun,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn restore(
         &self,
         _store: &RuntimeStore,
@@ -86,6 +105,10 @@ impl EditWorkspaceRestorer for FailingEditWorkspaceRestorer {
         _source_snapshot_uri: &str,
     ) -> anyhow::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.brief_versions
+            .lock()
+            .unwrap()
+            .push(_run.brief_version.clone());
         Err(anyhow::anyhow!("injected edit restore failure"))
     }
 }
@@ -215,13 +238,41 @@ async fn start_build_cancels_created_run_when_sandbox_provisioning_fails() {
 #[tokio::test]
 async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
     let store = RuntimeStore::new();
-    let build_run = store
+    let brief_run = store
         .create_run(
+            "project-restore-failure".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief_draft(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "operators".to_string(),
+                content_hierarchy: vec!["hero".to_string()],
+                page_structure: serde_json::json!([]),
+                visual_direction: "clear".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let build_run = store
+        .create_run_with_context(
             "project-restore-failure".to_string(),
             AgentPhase::Build,
             "build".to_string(),
             "internal-balanced".to_string(),
             vec![],
+            Some(brief_id.clone()),
+            None,
         )
         .await;
     let binding = store
@@ -282,6 +333,10 @@ async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
         .unwrap_err();
 
     assert_eq!(restorer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        restorer.brief_versions.lock().unwrap().as_slice(),
+        [Some(brief_id)]
+    );
     assert!(matches!(error, super::RunLifecycleError::Conflict(_)));
     assert!(store
         .active_mutable_run_for_project("project-restore-failure")

@@ -21,7 +21,7 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
         .unwrap();
     store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
     let (preview_url, _preview_server) = start_preview_server().await;
-    let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); fs.writeFileSync('out/docs.html', `<main>${mdx}</main>`); fs.writeFileSync('out/index.html', '<a href=\"/docs\">Docs</a>');";
+    let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime docs lifecycle</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style>'; fs.writeFileSync('out/docs.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body><main><h1 id=\"overview\">Overview</h1><p>${mdx}</p></main></body></html>`); fs.writeFileSync('out/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body><nav><a href=\"/docs\">Docs</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label><main><h1>Docs lifecycle</h1></main></body></html>`);";
     let model = MockModelClient::new(vec![
         ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-init",
@@ -70,7 +70,7 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
             ToolCall::new(
                 "docs-candidate",
-                "preview.report_candidate",
+                "preview.publish",
                 json!({
                     "url": preview_url,
                     "screenshotId": "shot-docs-build"
@@ -119,7 +119,7 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
             ToolCall::new(
                 "docs-edit-candidate",
-                "preview.report_candidate",
+                "preview.publish",
                 json!({
                     "url": preview_url,
                     "screenshotId": "shot-docs-edit"

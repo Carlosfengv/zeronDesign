@@ -2151,7 +2151,10 @@ async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ToolCall::new(
                 "build-page",
                 "fs.write",
-                json!({ "path": "project/src/pages/index.astro", "text": "<main><h1>Initial hero</h1></main>" }),
+                json!({
+                    "path": "project/src/pages/index.astro",
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime website lifecycle</title></head><body><main><h1>Initial hero</h1><p>Home hero features for startup founders.</p></main></body></html>"
+                }),
             ),
             ToolCall::new("build-run", "project.build", json!({ "cwd": "project" })),
             ToolCall::new(
@@ -2171,7 +2174,7 @@ async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
             ToolCall::new(
                 "build-candidate",
-                "preview.report_candidate",
+                "preview.publish",
                 json!({
                     "url": preview_url,
                     "screenshotId": "shot-build"
@@ -2216,7 +2219,7 @@ async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
             ToolCall::new(
                 "edit-candidate",
-                "preview.report_candidate",
+                "preview.publish",
                 json!({
                     "url": preview_url,
                     "screenshotId": "shot-edit"
@@ -2256,7 +2259,7 @@ async fn public_runtime_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
             ToolCall::new(
                 "theme-candidate",
-                "preview.report_candidate",
+                "preview.publish",
                 json!({
                     "url": preview_url,
                     "screenshotId": "shot-theme-edit"

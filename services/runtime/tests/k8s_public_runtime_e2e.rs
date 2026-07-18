@@ -621,7 +621,7 @@ fn docs_build_response() -> ModelResponse {
         ),
         ToolCall::new(
             "docs-promote",
-            "preview.report_candidate",
+            "preview.publish",
             json!({ "url": "http://127.0.0.1:4321", "screenshotId": "docs-k3d-shot" }),
         ),
         ToolCall::new(
@@ -659,7 +659,7 @@ fn deterministic_edit_response(prefix: &str) -> ModelResponse {
         ),
         ToolCall::new(
             format!("{prefix}-promote"),
-            "preview.report_candidate",
+            "preview.publish",
             json!({ "url": "http://127.0.0.1:4321", "screenshotId": screenshot_id }),
         ),
         ToolCall::new(

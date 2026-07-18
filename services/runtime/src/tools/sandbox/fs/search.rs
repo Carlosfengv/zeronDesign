@@ -136,7 +136,14 @@ impl Tool for FsSearchTool {
         let path = checked_existing_path(&input, &ctx)?;
         let query = required_str(&input, "query")?;
         let mut matches = Vec::new();
-        collect_search_matches(&*self.workspace, &path, &ctx, query, &mut matches).await?;
-        Ok(ToolResult::ok(json!({ "matches": matches })))
+        let summary =
+            collect_search_matches(&*self.workspace, &path, &ctx, query, &mut matches).await?;
+        Ok(ToolResult::ok(json!({
+            "matches": matches,
+            "filesScanned": summary.files_scanned,
+            "bytesScanned": summary.bytes_scanned,
+            "skippedPaths": summary.skipped_paths,
+            "truncated": summary.truncated,
+        })))
     }
 }

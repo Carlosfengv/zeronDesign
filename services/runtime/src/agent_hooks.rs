@@ -98,7 +98,7 @@ fn success_lifecycle_effect(observation: &ToolSuccessObservation) -> Option<Valu
         "preview.publish" => {
             let promotion = content.get("promotion").unwrap_or(&Value::Null);
             serde_json::json!({
-                "effect": "promotion_state_updated",
+                "effect": "candidate_state_updated",
                 "versionId": promotion.get("versionId").cloned().unwrap_or(Value::Null),
                 "previewUrl": promotion.get("previewUrl").cloned().unwrap_or(Value::Null),
             })
@@ -662,16 +662,19 @@ fn recoverable_error_guard_guidance(error_kind: &str) -> &'static str {
             "Repair the fumadocs-docs scaffold before building: source.config.ts, lib/source.js, app/docs routes, and content/docs must match the runtime contract."
         }
         "preview.screenshot_missing" | "preview.screenshot_invalid" | "preview.screenshot_blank" => {
-            "Run preview.publish, or run preview.start and browser.screenshot before reporting a candidate."
+            "Run preview.publish so Runtime captures bound screenshot evidence; use preview.start and browser.screenshot only for diagnosis."
         }
         "preview.build_missing" | "preview.build_failed" | "preview.dist_missing" => {
-            "Run project.build successfully before preview.start, preview.report_candidate, or preview.publish."
+            "Run project.build successfully before preview.start or preview.publish."
         }
         "preview.source_snapshot_missing" | "preview.source_snapshot_mismatch" => {
             "Use the sourceSnapshotUri from the latest successful project.build result."
         }
         "preview.already_promoted" => {
             "Do not manually report another candidate after promotion; complete the run if the artifact satisfies the request, or edit source and use preview.publish for the new source snapshot."
+        }
+        "preview.manual_candidate_retired" => {
+            "Use preview.publish, then call run.complete only after Runtime returns a validated candidate."
         }
         "shell.command_denied" => "Use the dedicated runtime tool for this operation instead of shell.run.",
         "shell.non_zero_exit" => {
@@ -965,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_success_hook_classifies_publish_promotion_updates() {
+    fn post_tool_success_hook_classifies_publish_candidate_updates() {
         let decision = PostToolUseSuccessHook.apply(ToolSuccessObservation {
             tool_name: "preview.publish".to_string(),
             content: json!({
@@ -982,7 +985,7 @@ mod tests {
             .expect("preview.publish should have success metadata");
         assert_eq!(
             metadata["postToolUseSuccess"]["effect"],
-            "promotion_state_updated"
+            "candidate_state_updated"
         );
         assert_eq!(metadata["postToolUseSuccess"]["versionId"], "version-1");
     }

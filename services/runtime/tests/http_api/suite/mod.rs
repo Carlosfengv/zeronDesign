@@ -295,7 +295,11 @@ async fn wait_for_terminal(store: &RuntimeStore, run_id: &str) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    panic!("run {run_id} did not reach terminal status");
+    panic!(
+        "run {run_id} did not reach terminal status: run={:#?} events={:#?}",
+        store.get_run(run_id).await,
+        store.events(run_id).await,
+    );
 }
 
 async fn wait_for_terminal_with_timeout(store: &RuntimeStore, run_id: &str, seconds: u64) -> bool {
@@ -327,9 +331,13 @@ async fn start_preview_server() -> (String, JoinHandle<()>) {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
+            let html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime lifecycle fixture</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style></head><body><nav><a href=\"#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label><main><h1 id=\"overview\">Home Overview Initial hero Edited hero</h1><p>Explain the product with hero and features. Explain the runtime lifecycle for developer operators.</p></main></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
         }
     });
     (format!("http://{addr}/candidate"), handle)

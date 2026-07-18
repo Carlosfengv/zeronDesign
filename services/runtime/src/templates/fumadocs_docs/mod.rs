@@ -52,6 +52,90 @@ pub static FILES: &[TemplateFile] = &[
     },
 ];
 
+pub static FILES_RUNTIME_P3: &[TemplateFile] = &[
+    TemplateFile {
+        path: "package.json",
+        content: include_str!("files/package.runtime-p3.json"),
+        trim_final_newline: false,
+        role: TemplateFileRole::PackageManifest,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+    TemplateFile {
+        path: "package-lock.json",
+        content: include_str!("files/package-lock.runtime-p3.json"),
+        trim_final_newline: false,
+        role: TemplateFileRole::Lockfile,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+    asset!("postcss.config.mjs", TemplateFileRole::FrameworkConfig),
+    asset!("next.config.mjs", TemplateFileRole::FrameworkConfig),
+    asset!("source.config.ts", TemplateFileRole::FrameworkConfig),
+    asset!("tsconfig.json", TemplateFileRole::FrameworkConfig),
+    asset!("next-env.d.ts", TemplateFileRole::FrameworkConfig),
+    asset!("lib/source.js", TemplateFileRole::Source),
+    asset!("lib/layout.shared.jsx", TemplateFileRole::Source),
+    TemplateFile {
+        path: "components/mdx.jsx",
+        content: include_str!("files/components/mdx.runtime-p4.jsx"),
+        trim_final_newline: false,
+        role: TemplateFileRole::Source,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+    asset!("components/ui/button.jsx", TemplateFileRole::Source),
+    asset!("mdx-components.jsx", TemplateFileRole::Source),
+    asset!("app/tokens.css", TemplateFileRole::Style),
+    asset!("app/global.css", TemplateFileRole::Style),
+    asset!("app/layout.jsx", TemplateFileRole::Source),
+    asset!("app/page.jsx", TemplateFileRole::Source),
+    asset!("app/docs/layout.jsx", TemplateFileRole::Source),
+    asset!("app/docs/[[...slug]]/page.jsx", TemplateFileRole::Source),
+    asset!("content/docs/index.mdx", TemplateFileRole::Content),
+    asset!("content/docs/runtime-flow.mdx", TemplateFileRole::Content),
+    TemplateFile {
+        path: "content/docs/meta.json",
+        content: include_str!("files/content/docs/meta.json"),
+        trim_final_newline: true,
+        role: TemplateFileRole::Content,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+];
+
+pub static FILES_RUNTIME_P4: &[TemplateFile] = &[
+    asset!("package.json", TemplateFileRole::PackageManifest),
+    asset!("package-lock.json", TemplateFileRole::Lockfile),
+    asset!("postcss.config.mjs", TemplateFileRole::FrameworkConfig),
+    asset!("next.config.mjs", TemplateFileRole::FrameworkConfig),
+    asset!("source.config.ts", TemplateFileRole::FrameworkConfig),
+    asset!("tsconfig.json", TemplateFileRole::FrameworkConfig),
+    asset!("next-env.d.ts", TemplateFileRole::FrameworkConfig),
+    asset!("lib/source.js", TemplateFileRole::Source),
+    asset!("lib/layout.shared.jsx", TemplateFileRole::Source),
+    TemplateFile {
+        path: "components/mdx.jsx",
+        content: include_str!("files/components/mdx.runtime-p4.jsx"),
+        trim_final_newline: false,
+        role: TemplateFileRole::Source,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+    asset!("components/ui/button.jsx", TemplateFileRole::Source),
+    asset!("mdx-components.jsx", TemplateFileRole::Source),
+    asset!("app/tokens.css", TemplateFileRole::Style),
+    asset!("app/global.css", TemplateFileRole::Style),
+    asset!("app/layout.jsx", TemplateFileRole::Source),
+    asset!("app/page.jsx", TemplateFileRole::Source),
+    asset!("app/docs/layout.jsx", TemplateFileRole::Source),
+    asset!("app/docs/[[...slug]]/page.jsx", TemplateFileRole::Source),
+    asset!("content/docs/index.mdx", TemplateFileRole::Content),
+    asset!("content/docs/runtime-flow.mdx", TemplateFileRole::Content),
+    TemplateFile {
+        path: "content/docs/meta.json",
+        content: include_str!("files/content/docs/meta.json"),
+        trim_final_newline: true,
+        role: TemplateFileRole::Content,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+];
+
 pub static STYLE_TOKENS: &[StyleTokenSpec] = &[
     StyleTokenSpec {
         name: "color.background",
@@ -162,6 +246,8 @@ const SOURCE_PATHS: &[&str] = &[
     "app/docs/layout.jsx",
     "app/docs/[[...slug]]/page.jsx",
     "app/page.jsx",
+    "src/mdx-components.jsx",
+    "src/mdx-components.tsx",
     "content/docs/index.mdx",
     "content/docs/meta.json",
 ];
@@ -230,6 +316,14 @@ impl TemplateOperations for FumadocsDocsOperations {
         if snapshot.has_root("pages") || snapshot.has_root("src/pages") {
             violations.push(
                 "project/pages and project/src/pages are forbidden for fumadocs-docs; keep routes under app/"
+                    .to_string(),
+            );
+        }
+        if snapshot.file("src/mdx-components.jsx").is_some()
+            || snapshot.file("src/mdx-components.tsx").is_some()
+        {
+            violations.push(
+                "project/src/mdx-components.* is forbidden for fumadocs-docs; use the seeded components/mdx.jsx mapping"
                     .to_string(),
             );
         }
@@ -304,19 +398,44 @@ impl TemplateOperations for FumadocsDocsOperations {
             },
             summary: "Docs source contract invalid",
             violations,
-            guidance: "Repair the fumadocs-docs app-router scaffold: keep routes under app/, docs content under content/docs, and do not create project/pages or project/src/pages.",
+            guidance: "Repair the fumadocs-docs app-router scaffold: keep routes under app/, docs content under content/docs, use the seeded components/mdx.jsx mapping, and do not create project/pages, project/src/pages, or project/src/mdx-components.*.",
         }
     }
 }
 
 pub fn spec() -> TemplateSpec {
+    spec_with_identity(
+        "fumadocs-docs@runtime-p5",
+        "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
+        FILES,
+    )
+}
+
+pub fn legacy_p3_spec() -> TemplateSpec {
+    spec_with_identity(
+        "fumadocs-docs@runtime-p3",
+        "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
+        FILES_RUNTIME_P3,
+    )
+}
+
+pub fn legacy_p4_spec() -> TemplateSpec {
+    spec_with_identity(
+        "fumadocs-docs@runtime-p4",
+        "3fb0f309bb3ce8cc7044d21981bc72bde1938f95f904e2589b75c443f7143cd3",
+        FILES_RUNTIME_P4,
+    )
+}
+
+fn spec_with_identity(
+    version: &str,
+    manifest_sha256: &str,
+    files: &'static [TemplateFile],
+) -> TemplateSpec {
     TemplateSpec {
         id: TemplateId::parse("fumadocs-docs").unwrap(),
-        version: TemplateVersion::parse("fumadocs-docs@runtime-p3").unwrap(),
-        manifest_sha256: ManifestHash::parse(
-            "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
-        )
-        .unwrap(),
+        version: TemplateVersion::parse(version).unwrap(),
+        manifest_sha256: ManifestHash::parse(manifest_sha256).unwrap(),
         framework: FrameworkId::parse("fumadocs").unwrap(),
         surface: "docs",
         default_title: "AnyDesign Runtime Docs",
@@ -324,7 +443,7 @@ pub fn spec() -> TemplateSpec {
             id: SandboxExecutionProfileId::parse("fumadocs-docs").unwrap(),
             version: SandboxExecutionProfileVersion::parse("0.1.0").unwrap(),
         },
-        files: FILES,
+        files,
         inspection_files: &[
             "package.json",
             "next.config.mjs",
@@ -356,9 +475,14 @@ pub fn spec() -> TemplateSpec {
             supported_craft_packs: &["accessibility-baseline", "responsive-layout"],
         },
         mutation_policy: MutationPolicySpec {
-            forbidden_write_roots: &["pages", "src/pages"],
+            forbidden_write_roots: &[
+                "pages",
+                "src/pages",
+                "src/mdx-components.jsx",
+                "src/mdx-components.tsx",
+            ],
             error_kind: "docs.routing_root_forbidden",
-            guidance: "Keep fumadocs-docs projects on the Next app router. Write docs routes under app/docs/[[...slug]] and MDX content under content/docs; do not create pages or src/pages.",
+            guidance: "Keep fumadocs-docs projects on the Next app router and seeded MDX mapping. Write docs routes under app/docs/[[...slug]] and MDX content under content/docs; do not create pages, src/pages, or src/mdx-components.*.",
         },
         style: StyleContractSpec {
             version: "runtime-style-contract@p3",

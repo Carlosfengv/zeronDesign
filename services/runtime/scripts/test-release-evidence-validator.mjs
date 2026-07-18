@@ -19,7 +19,7 @@ const fixture = {
   },
   transport: { mode: "mtls", mtlsVerified: true, rotationWindowVerified: true, runtimeSanHash: sha, sandboxSanHash: sha, runtimeCertSerialHash: sha, sandboxCertSerialHash: sha, runtimeCertExpiresAt: "2026-07-13T00:00:00Z", sandboxCertExpiresAt: "2026-07-13T00:00:00Z" },
   auth: { principalMode: "required", projectOwnershipVerified: true, channelJwtVerified: true },
-  provider: { mode: "approved-real", model: "approved-model", approvalReference: "R17-1", credentialPresent: true },
+  provider: { mode: "real", model: "deepseek-v4-pro", credentialPresent: true },
   preflight: {
     schemaVersion: "runtime-rc-preflight@1", passed: true, prefetchImages: true, lockHash: sha,
     entries: [{ name: "runtime", canonicalRef: "registry.example/runtime:v1", lockedDigest: `sha256:${sha}`, lockedDigestVerified: true, mutableTagMatchesLock: true, pulled: true }],

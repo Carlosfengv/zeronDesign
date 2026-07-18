@@ -16,6 +16,7 @@ use std::{
 use tokio::{net::TcpStream, process::Child, sync::Mutex, time::sleep};
 
 const CHANNEL_LEASE_TTL_SECONDS: i64 = 300;
+const CHANNEL_LEASE_HEARTBEAT_INTERVAL_SECONDS: i64 = 60;
 const PORT_FORWARD_READY_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +100,14 @@ impl ChannelManager {
                 && lease.status == ChannelLeaseStatus::Ready
                 && lease.expires_at > Utc::now()
         }) {
-            lease.heartbeat_at = Utc::now();
-            lease.expires_at = Utc::now() + Duration::seconds(CHANNEL_LEASE_TTL_SECONDS);
+            let now = Utc::now();
+            if now - lease.heartbeat_at
+                < Duration::seconds(CHANNEL_LEASE_HEARTBEAT_INTERVAL_SECONDS)
+            {
+                return endpoint_from_lease(&lease, scheme, path);
+            }
+            lease.heartbeat_at = now;
+            lease.expires_at = now + Duration::seconds(CHANNEL_LEASE_TTL_SECONDS);
             let lease = store.put_channel_lease(lease).await?;
             return endpoint_from_lease(&lease, scheme, path);
         }
@@ -502,5 +509,29 @@ mod tests {
         assert!(leases.iter().any(|lease| {
             lease.pod_uid == "pod-uid-2" && lease.status == ChannelLeaseStatus::Ready
         }));
+    }
+
+    #[tokio::test]
+    async fn repeated_endpoint_resolution_coalesces_durable_heartbeats() {
+        let storage = temp_dir();
+        let store = RuntimeStore::with_checkpoint_dir(&storage);
+        let binding = ready_binding(&store, "pod-uid-1").await;
+        let manager = manager("epoch-1");
+        for _ in 0..2 {
+            manager
+                .endpoint_with_mode(
+                    &store,
+                    &binding,
+                    "run-1",
+                    3001,
+                    "ws",
+                    "/workspace",
+                    TransportMode::ServiceDns,
+                )
+                .await
+                .unwrap();
+        }
+        let snapshots = std::fs::read_to_string(storage.join("channel-leases.jsonl")).unwrap();
+        assert_eq!(snapshots.lines().count(), 2);
     }
 }

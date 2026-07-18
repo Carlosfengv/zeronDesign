@@ -12,6 +12,24 @@ use std::{error::Error, fmt};
 pub enum PreviewAccessContext<'a> {
     Public(Option<&'a AuthenticatedPrincipal>),
     InternalCapture,
+    InternalCaptureHost,
+}
+
+pub fn internal_capture_origin(base_url: &str, lease_id: &str) -> Option<String> {
+    if lease_id.is_empty()
+        || !lease_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(base_url).ok()?;
+    url.set_host(Some(&format!("{lease_id}.preview.local")))
+        .ok()?;
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,4 +176,18 @@ fn validate_preview_path(preview_path: &str) -> Result<(), PreviewAccessError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_capture_origin;
+
+    #[test]
+    fn internal_capture_origin_uses_a_lease_scoped_host_and_preserves_the_port() {
+        assert_eq!(
+            internal_capture_origin("http://127.0.0.1:8081", "lease-123").as_deref(),
+            Some("http://lease-123.preview.local:8081/")
+        );
+        assert!(internal_capture_origin("http://127.0.0.1:8081", "../lease").is_none());
+    }
 }

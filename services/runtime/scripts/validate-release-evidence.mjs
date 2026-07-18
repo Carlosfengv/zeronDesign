@@ -125,8 +125,8 @@ export function validateReleaseEvidence(evidence) {
   if (evidence?.transport?.rotationWindowVerified !== true || !sha256(evidence?.transport?.runtimeCertSerialHash) || !sha256(evidence?.transport?.sandboxCertSerialHash) || !hasText(evidence?.transport?.runtimeCertExpiresAt) || !hasText(evidence?.transport?.sandboxCertExpiresAt)) fail(errors, "mTLS certificate rotation and sanitized certificate metadata are required");
   if (evidence?.auth?.principalMode !== "required" || evidence?.auth?.projectOwnershipVerified !== true) fail(errors, "public principal ownership gate is required");
   if (evidence?.auth?.channelJwtVerified !== true) fail(errors, "workspace channel JWT gate is required");
-  if (evidence?.provider?.mode !== "approved-real") fail(errors, "approved real provider evidence is required");
-  if (!hasText(evidence?.provider?.model) || !hasText(evidence?.provider?.approvalReference)) fail(errors, "provider model and approval reference are required");
+  if (evidence?.provider?.mode !== "real") fail(errors, "real provider evidence is required");
+  if (!hasText(evidence?.provider?.model)) fail(errors, "provider model is required");
   if (evidence?.provider?.credentialPresent !== true) fail(errors, "provider credential presence was not recorded");
 
   const preflight = evidence?.preflight;

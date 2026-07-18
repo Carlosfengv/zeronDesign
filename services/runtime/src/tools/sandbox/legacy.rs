@@ -55,6 +55,8 @@ mod diagnostics;
 mod fs_support;
 #[path = "support/package.rs"]
 mod package_support;
+#[path = "preview/acceptance.rs"]
+mod preview_acceptance;
 #[path = "preview/fidelity.rs"]
 mod preview_fidelity;
 #[path = "preview/lifecycle.rs"]
@@ -63,6 +65,8 @@ mod preview_lifecycle;
 mod preview_publish;
 #[path = "support/preview.rs"]
 mod preview_support;
+#[path = "preview/validation.rs"]
+mod preview_validation;
 #[path = "project/build.rs"]
 mod project_build;
 #[path = "project/initializer.rs"]

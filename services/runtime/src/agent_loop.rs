@@ -10,33 +10,185 @@ use crate::{
     design_profile::render_design_profile_markdown,
     model_gateway::{
         ModelClient, ModelGatewayRequestError, ModelGatewayScope, ModelRequest, ModelResponse,
-        ToolCall, ToolInputParseFailure, ToolInputTooLargeFailure,
+        ModelTokenUsage, ToolCall, ToolInputParseFailure, ToolInputTooLargeFailure,
     },
     tools::{
         self,
-        runtime::ToolExecutor,
+        runtime::{ToolExecutor, ToolResult},
         streaming::{tool_result_error_text, StreamingToolExecutor, StreamingToolResult},
     },
     types::{
-        sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, Brief,
-        CheckpointConversationRange, DesignProfile, DesignSourceIndex, DesignSourceIndexSection,
+        canonical_json_hash, sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun,
+        AgentRunStatus, Brief, CheckpointConversationRange, DesignProfile, DesignSourceIndex,
+        DesignSourceIndexSection,
     },
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     sync::Arc,
+    time::Duration,
 };
+use tokio::time::{self, Instant};
 
 const EMPTY_TURN_LIMIT: u32 = 3;
-const MAX_TURNS: u32 = 80;
+const TOOL_POLICY_RECOVERY_LIMIT: u32 = 5;
+const TOOL_POLICY_RECOVERY_MARKER: &str = "[runtime_tool_policy_recovery]";
 const BOOTSTRAP_DIRECT_WRITE_ARGUMENT_BYTES: usize = 96_000;
 const BOOTSTRAP_DIRECT_WRITE_TEXT_CHARS: usize = 48_000;
 const BOOTSTRAP_CHUNK_TEXT_CHARS: usize = 7_000;
 const COMPACT_MESSAGE_THRESHOLD: usize = 32;
 const COMPACT_KEEP_RECENT: usize = 16;
+const MAX_PROGRESS_OBSERVATIONS: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentLoopLimits {
+    pub max_turns: u32,
+    pub max_tool_calls: u32,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_consecutive_protocol_errors: u32,
+    pub total_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_no_progress_turns: u32,
+    pub max_read_tool_calls: u32,
+    pub max_search_tool_calls: u32,
+    pub max_repair_read_tool_calls: u32,
+    pub max_repair_search_tool_calls: u32,
+}
+
+impl Default for AgentLoopLimits {
+    fn default() -> Self {
+        Self {
+            max_turns: 20,
+            max_tool_calls: 60,
+            max_input_tokens: 200_000,
+            max_output_tokens: 40_000,
+            max_consecutive_protocol_errors: 3,
+            total_timeout: Duration::from_secs(30 * 60),
+            idle_timeout: Duration::from_secs(5 * 60),
+            max_no_progress_turns: 5,
+            max_read_tool_calls: 36,
+            max_search_tool_calls: 8,
+            max_repair_read_tool_calls: 6,
+            max_repair_search_tool_calls: 2,
+        }
+    }
+}
+
+impl AgentLoopLimits {
+    fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_turns: positive_u32_env("RUNTIME_AGENT_MAX_TURNS", defaults.max_turns),
+            max_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_TOOL_CALLS",
+                defaults.max_tool_calls,
+            ),
+            max_input_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_INPUT_TOKENS",
+                defaults.max_input_tokens,
+            ),
+            max_output_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_OUTPUT_TOKENS",
+                defaults.max_output_tokens,
+            ),
+            max_consecutive_protocol_errors: positive_u32_env(
+                "RUNTIME_AGENT_MAX_CONSECUTIVE_PROTOCOL_ERRORS",
+                defaults.max_consecutive_protocol_errors,
+            ),
+            total_timeout: Duration::from_secs(positive_u64_env(
+                "RUNTIME_AGENT_TOTAL_TIMEOUT_SECONDS",
+                defaults.total_timeout.as_secs(),
+            )),
+            idle_timeout: Duration::from_secs(positive_u64_env(
+                "RUNTIME_AGENT_IDLE_TIMEOUT_SECONDS",
+                defaults.idle_timeout.as_secs(),
+            )),
+            max_no_progress_turns: positive_u32_env(
+                "RUNTIME_AGENT_MAX_NO_PROGRESS_TURNS",
+                defaults.max_no_progress_turns,
+            ),
+            max_read_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_READ_TOOL_CALLS",
+                defaults.max_read_tool_calls,
+            ),
+            max_search_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_SEARCH_TOOL_CALLS",
+                defaults.max_search_tool_calls,
+            ),
+            max_repair_read_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_REPAIR_READ_TOOL_CALLS",
+                defaults.max_repair_read_tool_calls,
+            ),
+            max_repair_search_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_REPAIR_SEARCH_TOOL_CALLS",
+                defaults.max_repair_search_tool_calls,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ObservationBudgetUsage {
+    read_tool_calls: u32,
+    search_tool_calls: u32,
+    repair_active: bool,
+    repair_read_tool_calls: u32,
+    repair_search_tool_calls: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+struct RunProgressState {
+    source_mutations: BTreeMap<String, String>,
+    source_digest: Option<String>,
+    candidate_digest: Option<String>,
+    rejected_candidate_digests: BTreeSet<String>,
+    completed_steps: BTreeSet<String>,
+    observations: BTreeSet<String>,
+}
+
+impl RunProgressState {
+    fn fingerprint(&self) -> String {
+        sha256_hex(
+            &serde_json::to_vec(self).expect("run progress state must serialize deterministically"),
+        )
+    }
+}
+
+impl RunTokenUsage {
+    fn add(self, usage: ModelTokenUsage) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(usage.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(usage.output_tokens),
+        }
+    }
+
+    fn replace(self, previous: Option<ModelTokenUsage>, usage: ModelTokenUsage) -> Self {
+        let previous = previous.unwrap_or_default();
+        Self {
+            input_tokens: self
+                .input_tokens
+                .saturating_sub(previous.input_tokens)
+                .saturating_add(usage.input_tokens),
+            output_tokens: self
+                .output_tokens
+                .saturating_sub(previous.output_tokens)
+                .saturating_add(usage.output_tokens),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolResultMessage {
@@ -54,6 +206,7 @@ pub struct AgentLoop {
     tool_executor: ToolExecutor,
     post_tool_failure_hook: PostToolUseFailureHook,
     post_tool_success_hook: PostToolUseSuccessHook,
+    limits: AgentLoopLimits,
 }
 
 impl AgentLoop {
@@ -64,6 +217,7 @@ impl AgentLoop {
             tool_executor: tools::control_plane::control_plane_executor(),
             post_tool_failure_hook: PostToolUseFailureHook::default(),
             post_tool_success_hook: PostToolUseSuccessHook,
+            limits: AgentLoopLimits::from_env(),
         }
     }
 
@@ -78,10 +232,54 @@ impl AgentLoop {
             tool_executor,
             post_tool_failure_hook: PostToolUseFailureHook::default(),
             post_tool_success_hook: PostToolUseSuccessHook,
+            limits: AgentLoopLimits::from_env(),
         }
     }
 
+    pub fn with_limits(mut self, limits: AgentLoopLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     pub async fn run(&self, run_id: &str) -> Result<Vec<ToolResultMessage>> {
+        let started = Instant::now();
+        let mut last_activity = started;
+        let mut event_count = self.store.events(run_id).await.len();
+        let poll_interval = self
+            .limits
+            .idle_timeout
+            .min(self.limits.total_timeout)
+            .checked_div(4)
+            .unwrap_or(Duration::from_millis(10))
+            .clamp(Duration::from_millis(10), Duration::from_millis(250));
+        let mut execution = Box::pin(self.run_inner(run_id));
+        loop {
+            tokio::select! {
+                result = &mut execution => return result,
+                _ = time::sleep(poll_interval) => {
+                    let current_event_count = self.store.events(run_id).await.len();
+                    if current_event_count > event_count {
+                        event_count = current_event_count;
+                        last_activity = Instant::now();
+                    }
+                    let now = Instant::now();
+                    let timeout = if now.duration_since(started) >= self.limits.total_timeout {
+                        Some(("total", now.duration_since(started), self.limits.total_timeout))
+                    } else if now.duration_since(last_activity) >= self.limits.idle_timeout {
+                        Some(("idle", now.duration_since(last_activity), self.limits.idle_timeout))
+                    } else {
+                        None
+                    };
+                    if let Some((kind, elapsed, limit)) = timeout {
+                        drop(execution);
+                        return self.finalize_watchdog_timeout(run_id, kind, elapsed, limit).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_inner(&self, run_id: &str) -> Result<Vec<ToolResultMessage>> {
         let run = self
             .store
             .update_run_status(run_id, AgentRunStatus::Running)
@@ -152,6 +350,7 @@ impl AgentLoop {
         };
 
         let mut empty_turns = 0;
+        let mut tool_policy_recovery_turns: u32 = 0;
         let mut results = Vec::new();
         let mut message_window = self.recovered_message_window(run_id).await;
         if let Some(context) = repair_target_context.as_deref() {
@@ -169,8 +368,40 @@ impl AgentLoop {
             }
         }
         let mut recoverable_error_state: Option<RecoverableErrorState> = None;
+        let persisted_events = self.store.events(run_id).await;
+        let mut tool_calls_used = persisted_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolStarted { tool_use_id, .. }
+                        if !tool_use_id.starts_with("bootstrap:")
+                )
+            })
+            .count() as u32;
+        let mut token_usage_by_turn = recovered_model_usage_by_turn(&persisted_events);
+        let mut token_usage = token_usage_by_turn
+            .values()
+            .copied()
+            .fold(RunTokenUsage::default(), RunTokenUsage::add);
+        let mut consecutive_protocol_errors =
+            recovered_consecutive_protocol_errors(&persisted_events);
+        let mut observation_budget_usage = recovered_observation_budget_usage(&persisted_events);
+        let (mut progress_state, mut last_progress_fingerprint, mut consecutive_no_progress) =
+            recovered_progress_state(&persisted_events);
+        let first_turn = message_window
+            .iter()
+            .filter_map(|message| message.get("turn").and_then(Value::as_u64))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1) as u32;
 
-        for turn in 1..=MAX_TURNS {
+        for turn in first_turn..=self.limits.max_turns {
+            if let Some(reason) = token_budget_exhausted_reason(token_usage, self.limits, false) {
+                self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
+                    .await?;
+                return Ok(results);
+            }
             self.append_run_user_messages_to_window(&project_id, run_id, &mut message_window)
                 .await;
             self.save_checkpoint(
@@ -184,30 +415,65 @@ impl AgentLoop {
                 .get_run(run_id)
                 .await
                 .ok_or_else(|| anyhow!("run not found before model turn: {run_id}"))?;
-            let (tools, deferred_tools) = self
+            let (mut tools, mut deferred_tools) = self
                 .tool_executor
                 .model_tool_snapshot(self.store.clone(), run_id)
                 .await;
+            tools.retain(|tool| {
+                !observation_tool_budget_exhausted(
+                    &tool.name,
+                    observation_budget_usage,
+                    self.limits,
+                ) && !observation_tool_redundant_before_first_publish(
+                    &tool.name,
+                    current_run.phase,
+                    &progress_state,
+                    consecutive_no_progress,
+                )
+            });
+            deferred_tools.retain(|tool| {
+                !observation_tool_budget_exhausted(
+                    &tool.name,
+                    observation_budget_usage,
+                    self.limits,
+                ) && !observation_tool_redundant_before_first_publish(
+                    &tool.name,
+                    current_run.phase,
+                    &progress_state,
+                    consecutive_no_progress,
+                )
+            });
+            let mut system_prompt =
+                system_prompt_for_run(&current_run, repair_target_context.as_deref());
+            if matches!(
+                current_run.phase,
+                AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+            ) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&render_workflow_progress_context(
+                    &current_run,
+                    &progress_state,
+                    observation_budget_usage,
+                    self.limits,
+                ));
+            }
+            let model_request = ModelRequest {
+                run_id: run_id.to_string(),
+                turn,
+                model: current_run.model.clone(),
+                phase: current_run.phase,
+                agent_profile: current_run.agent_profile.clone(),
+                system_prompt,
+                messages: message_window.clone(),
+                tools,
+                deferred_tools,
+            };
+            let estimated_input_tokens = estimate_model_request_tokens(&model_request);
             let model_turn = self
                 .model
-                .next_response_scoped_with_execution(
-                    ModelRequest {
-                        run_id: run_id.to_string(),
-                        turn,
-                        model: current_run.model.clone(),
-                        phase: current_run.phase,
-                        agent_profile: current_run.agent_profile.clone(),
-                        system_prompt: system_prompt_for_run(
-                            &current_run,
-                            repair_target_context.as_deref(),
-                        ),
-                        messages: message_window.clone(),
-                        tools,
-                        deferred_tools,
-                    },
-                    model_gateway_scope.clone(),
-                )
+                .next_response_scoped_with_execution(model_request, model_gateway_scope.clone())
                 .await;
+            let mut protocol_fuse_summary = None;
             if let Ok(turn_response) = &model_turn {
                 if let Some(snapshot) = &turn_response.execution {
                     let _ = self
@@ -220,9 +486,150 @@ impl AgentLoop {
                         })
                         .await;
                 }
+                let (usage, estimated) = turn_response
+                    .usage
+                    .map(|usage| (usage, false))
+                    .unwrap_or_else(|| {
+                        (
+                            ModelTokenUsage {
+                                input_tokens: estimated_input_tokens,
+                                output_tokens: estimate_model_response_tokens(
+                                    &turn_response.response,
+                                ),
+                                cached_input_tokens: 0,
+                            },
+                            true,
+                        )
+                    });
+                let previous_usage = token_usage_by_turn.insert(turn, usage);
+                token_usage = token_usage.replace(previous_usage, usage);
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::ModelUsage {
+                        run_id: run_id.to_string(),
+                        turn,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cached_input_tokens: usage.cached_input_tokens,
+                        estimated,
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+                if let Some(kind) = model_protocol_error_kind(&turn_response.response) {
+                    consecutive_protocol_errors = consecutive_protocol_errors.saturating_add(1);
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::ModelProtocolError {
+                            run_id: run_id.to_string(),
+                            turn,
+                            kind: kind.to_string(),
+                            consecutive: consecutive_protocol_errors,
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                    if consecutive_protocol_errors >= self.limits.max_consecutive_protocol_errors {
+                        protocol_fuse_summary = Some(format!(
+                            "Model protocol error fuse opened after {} consecutive recoverable protocol errors; last_kind={kind}, limit={}",
+                            consecutive_protocol_errors,
+                            self.limits.max_consecutive_protocol_errors
+                        ));
+                    }
+                } else {
+                    consecutive_protocol_errors = 0;
+                }
+                let budget_calls = model_response_tool_calls(&turn_response.response);
+                let incoming_tool_calls = budget_calls.len() as u32;
+                if incoming_tool_calls > 0
+                    && tool_calls_used.saturating_add(incoming_tool_calls)
+                        > self.limits.max_tool_calls
+                {
+                    message_window.push(json!({
+                        "role": "assistant",
+                        "turn": turn,
+                        "toolCalls": budget_calls
+                            .iter()
+                            .map(|call| json!({
+                                "id": call.id,
+                                "name": call.name,
+                                "input": call.input,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
+                    self.record_tool_starts(run_id, &budget_calls).await;
+                    let reason = format!(
+                        "Run tool-call budget exhausted: used={}, requested={}, limit={}",
+                        tool_calls_used, incoming_tool_calls, self.limits.max_tool_calls
+                    );
+                    let budget_results = self
+                        .emit_missing_tool_results(run_id, &budget_calls, &reason)
+                        .await;
+                    for result in &budget_results {
+                        message_window.push(json!({
+                            "role": "tool",
+                            "turn": turn,
+                            "toolUseId": result.tool_use_id,
+                            "toolName": result.tool_name,
+                            "isError": result.is_error,
+                            "content": result.content,
+                            "metadata": result.metadata,
+                        }));
+                    }
+                    results.extend(budget_results);
+                    self.save_turn_checkpoint(run_id, turn, &message_window)
+                        .await?;
+                    self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
+                        .await?;
+                    return Ok(results);
+                }
+                if let Some(reason) = token_budget_exhausted_reason(token_usage, self.limits, true)
+                {
+                    if budget_calls.is_empty() {
+                        append_budget_stopped_model_response(
+                            &mut message_window,
+                            turn,
+                            &turn_response.response,
+                        );
+                    } else {
+                        message_window.push(json!({
+                            "role": "assistant",
+                            "turn": turn,
+                            "toolCalls": budget_calls
+                                .iter()
+                                .map(|call| json!({
+                                    "id": call.id,
+                                    "name": call.name,
+                                    "input": call.input,
+                                }))
+                                .collect::<Vec<_>>(),
+                        }));
+                        self.record_tool_starts(run_id, &budget_calls).await;
+                        let budget_results = self
+                            .emit_missing_tool_results(run_id, &budget_calls, &reason)
+                            .await;
+                        for result in &budget_results {
+                            message_window.push(json!({
+                                "role": "tool",
+                                "turn": turn,
+                                "toolUseId": result.tool_use_id,
+                                "toolName": result.tool_name,
+                                "isError": result.is_error,
+                                "content": result.content,
+                                "metadata": result.metadata,
+                            }));
+                        }
+                        results.extend(budget_results);
+                    }
+                    self.save_turn_checkpoint(run_id, turn, &message_window)
+                        .await?;
+                    self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
+                        .await?;
+                    return Ok(results);
+                }
+                tool_calls_used = tool_calls_used.saturating_add(incoming_tool_calls);
             }
             match model_turn.map(|turn_response| turn_response.response) {
                 Ok(ModelResponse::ToolCalls(calls)) => {
+                    tool_policy_recovery_turns = 0;
                     if calls.is_empty() {
                         message_window.push(json!({
                             "role": "assistant",
@@ -264,7 +671,15 @@ impl AgentLoop {
                             }))
                             .collect::<Vec<_>>(),
                     }));
-                    let tool_results = self.execute_tools(run_id, calls).await;
+                    let progress_calls = calls.clone();
+                    let tool_results = self
+                        .execute_tools_with_observation_budget(
+                            run_id,
+                            turn,
+                            calls,
+                            &mut observation_budget_usage,
+                        )
+                        .await;
                     for result in &tool_results {
                         message_window.push(json!({
                             "role": "tool",
@@ -302,24 +717,59 @@ impl AgentLoop {
                         .await?;
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
-                    results.extend(tool_results);
+                    if let Some(summary) = protocol_fuse_summary {
+                        results.extend(tool_results);
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     if let Some(summary) = guard_summary {
+                        results.extend(tool_results);
                         self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
                             .await?;
                         return Ok(results);
                     }
                     if let Some((status, summary)) = completion {
+                        results.extend(tool_results);
                         self.finalize(run_id, status, &summary, &message_window)
                             .await?;
                         return Ok(results);
                     }
-                    let should_stop = matches!(
-                        self.store.get_run(run_id).await.map(|run| run.status),
-                        Some(status) if status.is_terminal() || status == AgentRunStatus::NeedsUserInput
-                    );
-                    if should_stop {
+                    let current_status = self.store.get_run(run_id).await.map(|run| run.status);
+                    if current_status == Some(AgentRunStatus::NeedsUserInput) {
+                        results.extend(tool_results);
                         return Ok(results);
                     }
+                    if let Some(status) = current_status.filter(|status| status.is_terminal()) {
+                        let summary =
+                            terminal_tool_result_summary(&tool_results).unwrap_or_else(|| {
+                                format!("Run stopped with status {}", status_string(status))
+                            });
+                        results.extend(tool_results);
+                        self.finalize(run_id, status, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
+                    if let Some(summary) = self
+                        .record_progress_fingerprint(
+                            run_id,
+                            turn,
+                            &progress_calls,
+                            &tool_results,
+                            &mut progress_state,
+                            &mut last_progress_fingerprint,
+                            &mut consecutive_no_progress,
+                            current_run.phase,
+                            observation_budget_usage,
+                        )
+                        .await
+                    {
+                        results.extend(tool_results);
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
+                    results.extend(tool_results);
                     self.compact_if_needed(run_id, &mut message_window).await?;
                 }
                 Ok(ModelResponse::ToolInputParseFailed {
@@ -350,7 +800,13 @@ impl AgentLoop {
                     let mut tool_results = if parsed_calls.is_empty() {
                         Vec::new()
                     } else {
-                        self.execute_tools(run_id, parsed_calls).await
+                        self.execute_tools_with_observation_budget(
+                            run_id,
+                            turn,
+                            parsed_calls,
+                            &mut observation_budget_usage,
+                        )
+                        .await
                     };
                     self.record_tool_starts(run_id, &failure_calls).await;
                     tool_results
@@ -384,6 +840,11 @@ impl AgentLoop {
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
                     results.extend(tool_results);
+                    if let Some(summary) = protocol_fuse_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     if let Some(summary) = guard_summary {
                         self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
                             .await?;
@@ -419,7 +880,13 @@ impl AgentLoop {
                     let mut tool_results = if parsed_calls.is_empty() {
                         Vec::new()
                     } else {
-                        self.execute_tools(run_id, parsed_calls).await
+                        self.execute_tools_with_observation_budget(
+                            run_id,
+                            turn,
+                            parsed_calls,
+                            &mut observation_budget_usage,
+                        )
+                        .await
                     };
                     self.record_tool_starts(run_id, &failure_calls).await;
                     tool_results.extend(
@@ -455,6 +922,11 @@ impl AgentLoop {
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
                     results.extend(tool_results);
+                    if let Some(summary) = protocol_fuse_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     if let Some(summary) = guard_summary {
                         self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
                             .await?;
@@ -548,11 +1020,17 @@ impl AgentLoop {
                     }));
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
+                    if let Some(summary) = protocol_fuse_summary {
+                        self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     recoverable_error_state = None;
                     self.compact_if_needed(run_id, &mut message_window).await?;
                     continue;
                 }
                 Ok(ModelResponse::TextOnly(text)) => {
+                    let tool_policy_recovery = text.starts_with(TOOL_POLICY_RECOVERY_MARKER);
                     let _ = self
                         .store
                         .append_event(AgentEvent::AgentMessage {
@@ -576,10 +1054,32 @@ impl AgentLoop {
                         "turn": turn,
                         "text": text,
                     }));
-                    empty_turns += 1;
+                    if tool_policy_recovery {
+                        empty_turns = 0;
+                        tool_policy_recovery_turns = tool_policy_recovery_turns.saturating_add(1);
+                        message_window.push(json!({
+                            "role": "user",
+                            "turn": turn,
+                            "kind": "runtime_tool_policy_recovery",
+                            "text": "Runtime rejected the previous tool request because that tool is absent from the current tool list. Do not request it again. On the next turn, make exactly one call to a currently available source-mutation tool such as fs.patch, fs.multi_patch, fs.write, or fs.commit_chunks, then call preview.publish. Do not answer with prose."
+                        }));
+                    } else {
+                        tool_policy_recovery_turns = 0;
+                        empty_turns += 1;
+                    }
                     self.save_turn_checkpoint(run_id, turn, &message_window)
                         .await?;
                     recoverable_error_state = None;
+                    if tool_policy_recovery_turns >= TOOL_POLICY_RECOVERY_LIMIT {
+                        self.finalize(
+                            run_id,
+                            AgentRunStatus::Partial,
+                            "Provider repeatedly requested tools absent from the current Runtime policy for 5 consecutive turns",
+                            &message_window,
+                        )
+                        .await?;
+                        break;
+                    }
                     if empty_turns >= EMPTY_TURN_LIMIT {
                         self.finalize(
                             run_id,
@@ -641,7 +1141,7 @@ impl AgentLoop {
             self.finalize(
                 run_id,
                 AgentRunStatus::Partial,
-                "Reached max turns",
+                &format!("Reached model-turn budget: limit={}", self.limits.max_turns),
                 &message_window,
             )
             .await?;
@@ -1092,8 +1592,14 @@ impl AgentLoop {
             .map(str::to_string))
     }
 
-    async fn execute_tools(&self, run_id: &str, calls: Vec<ToolCall>) -> Vec<ToolResultMessage> {
-        self.record_tool_starts(run_id, &calls).await;
+    async fn execute_recorded_tools(
+        &self,
+        run_id: &str,
+        calls: Vec<ToolCall>,
+    ) -> Vec<ToolResultMessage> {
+        if calls.is_empty() {
+            return Vec::new();
+        }
 
         let streaming = StreamingToolExecutor::new(self.tool_executor.clone());
         let results = streaming
@@ -1105,6 +1611,133 @@ impl AgentLoop {
             messages.push(self.record_tool_result(run_id, result).await);
         }
         messages
+    }
+
+    async fn execute_tools_with_observation_budget(
+        &self,
+        run_id: &str,
+        turn: u32,
+        calls: Vec<ToolCall>,
+        usage: &mut ObservationBudgetUsage,
+    ) -> Vec<ToolResultMessage> {
+        self.record_tool_starts(run_id, &calls).await;
+        let ordered_ids = calls.iter().map(|call| call.id.clone()).collect::<Vec<_>>();
+        let mut allowed = Vec::new();
+        let mut rejected = Vec::new();
+
+        for call in calls {
+            match observation_tool_class(&call.name) {
+                Some("read") if usage.read_tool_calls >= self.limits.max_read_tool_calls => {
+                    rejected.push((
+                        call,
+                        "read",
+                        usage.read_tool_calls,
+                        self.limits.max_read_tool_calls,
+                    ));
+                }
+                Some("read")
+                    if usage.repair_active
+                        && usage.repair_read_tool_calls
+                            >= self.limits.max_repair_read_tool_calls =>
+                {
+                    rejected.push((
+                        call,
+                        "repair_read",
+                        usage.repair_read_tool_calls,
+                        self.limits.max_repair_read_tool_calls,
+                    ));
+                }
+                Some("search") if usage.search_tool_calls >= self.limits.max_search_tool_calls => {
+                    rejected.push((
+                        call,
+                        "search",
+                        usage.search_tool_calls,
+                        self.limits.max_search_tool_calls,
+                    ));
+                }
+                Some("search")
+                    if usage.repair_active
+                        && usage.repair_search_tool_calls
+                            >= self.limits.max_repair_search_tool_calls =>
+                {
+                    rejected.push((
+                        call,
+                        "repair_search",
+                        usage.repair_search_tool_calls,
+                        self.limits.max_repair_search_tool_calls,
+                    ));
+                }
+                Some("read") => {
+                    usage.read_tool_calls = usage.read_tool_calls.saturating_add(1);
+                    if usage.repair_active {
+                        usage.repair_read_tool_calls =
+                            usage.repair_read_tool_calls.saturating_add(1);
+                    }
+                    allowed.push(call);
+                }
+                Some("search") => {
+                    usage.search_tool_calls = usage.search_tool_calls.saturating_add(1);
+                    if usage.repair_active {
+                        usage.repair_search_tool_calls =
+                            usage.repair_search_tool_calls.saturating_add(1);
+                    }
+                    allowed.push(call);
+                }
+                _ => allowed.push(call),
+            }
+        }
+
+        let mut by_id = self
+            .execute_recorded_tools(run_id, allowed)
+            .await
+            .into_iter()
+            .map(|result| (result.tool_use_id.clone(), result))
+            .collect::<BTreeMap<_, _>>();
+        for (call, category, used, limit) in rejected {
+            let result = StreamingToolResult {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                result: ToolResult::typed_error(
+                    format!(
+                        "Run {category} observation budget exhausted: used={used}, limit={limit}"
+                    ),
+                    "run.observation_budget_exhausted",
+                    true,
+                    json!({
+                        "category": category,
+                        "used": used,
+                        "limit": limit,
+                        "suggestedAction": "Stop exploring. Use the evidence already collected to mutate source, publish a Candidate, or call run.complete if validation already passed."
+                    }),
+                ),
+                synthetic: true,
+            };
+            let recorded = self.record_tool_result(run_id, result).await;
+            by_id.insert(call.id, recorded);
+        }
+        update_repair_observation_budget_state(by_id.values(), usage);
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunObservationBudget {
+                run_id: run_id.to_string(),
+                turn,
+                read_used: usage.read_tool_calls,
+                read_limit: self.limits.max_read_tool_calls,
+                search_used: usage.search_tool_calls,
+                search_limit: self.limits.max_search_tool_calls,
+                repair_active: usage.repair_active,
+                repair_read_used: usage.repair_read_tool_calls,
+                repair_read_limit: self.limits.max_repair_read_tool_calls,
+                repair_search_used: usage.repair_search_tool_calls,
+                repair_search_limit: self.limits.max_repair_search_tool_calls,
+                timestamp: Utc::now(),
+            })
+            .await;
+
+        ordered_ids
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect()
     }
 
     async fn record_tool_starts(&self, run_id: &str, calls: &[ToolCall]) {
@@ -1721,6 +2354,109 @@ impl AgentLoop {
             .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn record_progress_fingerprint(
+        &self,
+        run_id: &str,
+        turn: u32,
+        calls: &[ToolCall],
+        results: &[ToolResultMessage],
+        state: &mut RunProgressState,
+        last_fingerprint: &mut String,
+        consecutive_no_progress: &mut u32,
+        phase: AgentPhase,
+        observation_budget_usage: ObservationBudgetUsage,
+    ) -> Option<String> {
+        update_progress_state(state, calls, results);
+        let fingerprint = state.fingerprint();
+        if fingerprint == *last_fingerprint {
+            *consecutive_no_progress = consecutive_no_progress.saturating_add(1);
+        } else {
+            *consecutive_no_progress = 0;
+        }
+        let tool_sequence = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "name": call.name,
+                    "inputDigest": canonical_json_hash(&call.input),
+                })
+            })
+            .collect::<Vec<_>>();
+        let evidence = json!({
+            "state": state,
+            "toolSequenceDigest": canonical_json_hash(&json!(tool_sequence)),
+            "toolNames": calls.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
+        });
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunProgressFingerprint {
+                run_id: run_id.to_string(),
+                turn,
+                fingerprint: fingerprint.clone(),
+                consecutive_no_progress: *consecutive_no_progress,
+                evidence,
+                timestamp: Utc::now(),
+            })
+            .await;
+        let workflow =
+            workflow_progress_snapshot(phase, state, observation_budget_usage, self.limits);
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunWorkflowProgress {
+                run_id: run_id.to_string(),
+                turn,
+                stage: workflow.stage,
+                completed_steps: workflow.completed_steps,
+                next_action: workflow.next_action,
+                budgets: workflow.budgets,
+                timestamp: Utc::now(),
+            })
+            .await;
+        *last_fingerprint = fingerprint.clone();
+        (*consecutive_no_progress >= self.limits.max_no_progress_turns).then(|| {
+            format!(
+                "Run stopped for no_progress: consecutive_turns={}, limit={}, fingerprint={fingerprint}",
+                *consecutive_no_progress, self.limits.max_no_progress_turns
+            )
+        })
+    }
+
+    async fn finalize_watchdog_timeout(
+        &self,
+        run_id: &str,
+        kind: &str,
+        elapsed: Duration,
+        limit: Duration,
+    ) -> Result<Vec<ToolResultMessage>> {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunWatchdogTriggered {
+                run_id: run_id.to_string(),
+                kind: kind.to_string(),
+                elapsed_ms,
+                limit_ms,
+                timestamp: Utc::now(),
+            })
+            .await;
+        let summary = format!(
+            "Run watchdog stopped execution: kind={kind}, elapsed_ms={elapsed_ms}, limit_ms={limit_ms}"
+        );
+        let message_window = self.recovered_message_window(run_id).await;
+        let current = self
+            .store
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found after watchdog timeout: {run_id}"))?;
+        if !current.status.is_terminal() && current.status != AgentRunStatus::NeedsUserInput {
+            self.finalize(run_id, AgentRunStatus::Partial, &summary, &message_window)
+                .await?;
+        }
+        Ok(Vec::new())
+    }
+
     async fn finalize(
         &self,
         run_id: &str,
@@ -1745,16 +2481,27 @@ impl AgentLoop {
                 run_id,
             );
         }
-        self.store.update_run_status(run_id, status).await?;
-        let _ = self
+        let run_before_finalize = self.store.get_run(run_id).await;
+        if run_before_finalize.as_ref().map(|run| run.status) != Some(status) {
+            self.store.update_run_status(run_id, status).await?;
+        }
+        let completion_already_recorded = self
             .store
-            .append_event(AgentEvent::RunCompleted {
-                run_id: run_id.to_string(),
-                status: status_string(status).to_string(),
-                summary: summary.to_string(),
-                timestamp: Utc::now(),
-            })
-            .await;
+            .events(run_id)
+            .await
+            .iter()
+            .any(AgentEvent::is_run_completed);
+        if !completion_already_recorded {
+            let _ = self
+                .store
+                .append_event(AgentEvent::RunCompleted {
+                    run_id: run_id.to_string(),
+                    status: status_string(status).to_string(),
+                    summary: summary.to_string(),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
         if let Some(run) = self.store.get_run(run_id).await {
             self.append_run_completed_conversation_item(
                 run_id,
@@ -1946,6 +2693,759 @@ impl AgentLoop {
         )
         .await?;
         Ok(())
+    }
+}
+
+fn positive_u32_env(name: &str, default: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn positive_u64_env(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn recovered_progress_state(events: &[AgentEvent]) -> (RunProgressState, String, u32) {
+    for event in events.iter().rev() {
+        if let AgentEvent::RunProgressFingerprint {
+            fingerprint,
+            consecutive_no_progress,
+            evidence,
+            ..
+        } = event
+        {
+            if let Ok(state) = serde_json::from_value::<RunProgressState>(
+                evidence.get("state").cloned().unwrap_or(Value::Null),
+            ) {
+                if state.fingerprint() == *fingerprint {
+                    return (state, fingerprint.clone(), *consecutive_no_progress);
+                }
+            }
+        }
+    }
+    let state = RunProgressState::default();
+    let fingerprint = state.fingerprint();
+    (state, fingerprint, 0)
+}
+
+fn observation_tool_class(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "fs.read" | "fs.list" => Some("read"),
+        "fs.search" => Some("search"),
+        _ => None,
+    }
+}
+
+fn observation_tool_budget_exhausted(
+    tool_name: &str,
+    usage: ObservationBudgetUsage,
+    limits: AgentLoopLimits,
+) -> bool {
+    match observation_tool_class(tool_name) {
+        Some("read") => {
+            usage.read_tool_calls >= limits.max_read_tool_calls
+                || (usage.repair_active
+                    && usage.repair_read_tool_calls >= limits.max_repair_read_tool_calls)
+        }
+        Some("search") => {
+            usage.search_tool_calls >= limits.max_search_tool_calls
+                || (usage.repair_active
+                    && usage.repair_search_tool_calls >= limits.max_repair_search_tool_calls)
+        }
+        _ => false,
+    }
+}
+
+fn observation_tool_redundant_before_first_publish(
+    tool_name: &str,
+    phase: AgentPhase,
+    state: &RunProgressState,
+    consecutive_no_progress: u32,
+) -> bool {
+    observation_tool_class(tool_name).is_some()
+        && matches!(phase, AgentPhase::Build | AgentPhase::Edit)
+        && state.completed_steps.contains("source_authored")
+        && state.candidate_digest.is_none()
+        && !state.completed_steps.contains("repair_required")
+        && state.rejected_candidate_digests.is_empty()
+        && consecutive_no_progress >= 1
+}
+
+fn recovered_observation_budget_usage(events: &[AgentEvent]) -> ObservationBudgetUsage {
+    let rejected = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFailed {
+                tool_use_id,
+                metadata: Some(metadata),
+                ..
+            } if metadata.get("errorKind").and_then(Value::as_str)
+                == Some("run.observation_budget_exhausted") =>
+            {
+                Some(tool_use_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut usage = ObservationBudgetUsage::default();
+    for event in events {
+        match event {
+            AgentEvent::ToolFailed {
+                tool,
+                metadata: Some(metadata),
+                ..
+            } if tool == "preview.publish"
+                && matches!(
+                    metadata.get("errorKind").and_then(Value::as_str),
+                    Some(
+                        "generation.validation_failed"
+                            | "acceptance.validation_failed"
+                            | "build.failed"
+                    )
+                ) =>
+            {
+                usage.repair_active = true;
+                usage.repair_read_tool_calls = 0;
+                usage.repair_search_tool_calls = 0;
+            }
+            AgentEvent::ToolCompleted { tool, .. } if tool == "preview.publish" => {
+                usage.repair_active = false;
+                usage.repair_read_tool_calls = 0;
+                usage.repair_search_tool_calls = 0;
+            }
+            AgentEvent::ToolStarted {
+                tool, tool_use_id, ..
+            } if !tool_use_id.starts_with("bootstrap:") && !rejected.contains(tool_use_id) => {
+                match observation_tool_class(tool) {
+                    Some("read") => {
+                        usage.read_tool_calls = usage.read_tool_calls.saturating_add(1);
+                        if usage.repair_active {
+                            usage.repair_read_tool_calls =
+                                usage.repair_read_tool_calls.saturating_add(1);
+                        }
+                    }
+                    Some("search") => {
+                        usage.search_tool_calls = usage.search_tool_calls.saturating_add(1);
+                        if usage.repair_active {
+                            usage.repair_search_tool_calls =
+                                usage.repair_search_tool_calls.saturating_add(1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    usage
+}
+
+fn update_repair_observation_budget_state<'a>(
+    results: impl Iterator<Item = &'a ToolResultMessage>,
+    usage: &mut ObservationBudgetUsage,
+) {
+    let mut repair_required = false;
+    let mut candidate_ready = false;
+    for result in results {
+        if result.tool_name != "preview.publish" {
+            continue;
+        }
+        if !result.is_error {
+            candidate_ready = true;
+            continue;
+        }
+        if matches!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("errorKind"))
+                .and_then(Value::as_str),
+            Some("generation.validation_failed" | "acceptance.validation_failed" | "build.failed")
+        ) {
+            repair_required = true;
+        }
+    }
+    if repair_required {
+        usage.repair_active = true;
+        usage.repair_read_tool_calls = 0;
+        usage.repair_search_tool_calls = 0;
+    } else if candidate_ready {
+        usage.repair_active = false;
+        usage.repair_read_tool_calls = 0;
+        usage.repair_search_tool_calls = 0;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowProgressSnapshot {
+    stage: String,
+    completed_steps: Vec<String>,
+    next_action: String,
+    budgets: Value,
+}
+
+fn workflow_progress_snapshot(
+    phase: AgentPhase,
+    state: &RunProgressState,
+    usage: ObservationBudgetUsage,
+    limits: AgentLoopLimits,
+) -> WorkflowProgressSnapshot {
+    let completed_steps = state.completed_steps.iter().cloned().collect::<Vec<_>>();
+    let read_remaining = limits
+        .max_read_tool_calls
+        .saturating_sub(usage.read_tool_calls);
+    let search_remaining = limits
+        .max_search_tool_calls
+        .saturating_sub(usage.search_tool_calls);
+    let repair_read_remaining = limits
+        .max_repair_read_tool_calls
+        .saturating_sub(usage.repair_read_tool_calls);
+    let repair_search_remaining = limits
+        .max_repair_search_tool_calls
+        .saturating_sub(usage.repair_search_tool_calls);
+    let budgets = json!({
+        "read": {
+            "used": usage.read_tool_calls,
+            "limit": limits.max_read_tool_calls,
+            "remaining": read_remaining,
+        },
+        "search": {
+            "used": usage.search_tool_calls,
+            "limit": limits.max_search_tool_calls,
+            "remaining": search_remaining,
+        },
+        "repair": {
+            "active": usage.repair_active,
+            "read": {
+                "used": usage.repair_read_tool_calls,
+                "limit": limits.max_repair_read_tool_calls,
+                "remaining": repair_read_remaining,
+            },
+            "search": {
+                "used": usage.repair_search_tool_calls,
+                "limit": limits.max_repair_search_tool_calls,
+                "remaining": repair_search_remaining,
+            }
+        }
+    });
+    let has = |step: &str| state.completed_steps.contains(step);
+    let project_initialized = has("project_initialized") || phase != AgentPhase::Build;
+    let (stage, next_action) = if phase == AgentPhase::Build && !has("inputs_inventoried") {
+        (
+            "discovering_inputs",
+            "Call fs.list once on inputs, then read only files present in that inventory.",
+        )
+    } else if phase == AgentPhase::Build && (!has("brief_loaded") || !has("content_sources_loaded"))
+    {
+        (
+            "loading_requirements",
+            "Read the missing required Brief or Content Sources file; do not probe optional paths.",
+        )
+    } else if state.candidate_digest.is_some() {
+        (
+            "ready_to_complete",
+            "The Candidate is ready. Call run.complete without additional exploration.",
+        )
+    } else if has("repair_required") || !state.rejected_candidate_digests.is_empty() {
+        let stage = if state.rejected_candidate_digests.is_empty() {
+            "repairing_source"
+        } else {
+            "repairing_candidate"
+        };
+        if has("repair_mutated") {
+            (
+                "publishing_repair",
+                "A source mutation is already recorded after the failed publish. Call preview.publish now; do not read, list, search, or rebuild separately.",
+            )
+        } else if usage.repair_active && repair_read_remaining == 0 && repair_search_remaining == 0
+        {
+            (
+                stage,
+                "The repair observation budget is exhausted. Do not call fs.read, fs.list, or fs.search. Use the failure metadata already returned and the known appRoot source, make a focused source mutation now, then call preview.publish.",
+            )
+        } else {
+            (
+                stage,
+                "Use only the returned validation, acceptance, or build failure metadata for a bounded source repair, then call preview.publish once.",
+            )
+        }
+    } else if !project_initialized {
+        (
+            "initializing_project",
+            "Call project.init using the frozen template and app root.",
+        )
+    } else if !has("project_inspected") && !has("project_source_read") {
+        (
+            "inspecting_source",
+            "Inspect the initialized project once, then choose the exact source files to change.",
+        )
+    } else if !has("source_authored") {
+        (
+            "authoring_content",
+            "Stop exploring and create or patch the required Website/Docs source now.",
+        )
+    } else {
+        (
+            "validating_candidate",
+            "Call preview.publish. If it fails, use only the returned report for a bounded repair.",
+        )
+    };
+    WorkflowProgressSnapshot {
+        stage: stage.to_string(),
+        completed_steps,
+        next_action: next_action.to_string(),
+        budgets,
+    }
+}
+
+fn render_workflow_progress_context(
+    run: &AgentRun,
+    state: &RunProgressState,
+    usage: ObservationBudgetUsage,
+    limits: AgentLoopLimits,
+) -> String {
+    let workflow = workflow_progress_snapshot(run.phase, state, usage, limits);
+    format!(
+        "Runtime Workflow Progress (authoritative; do not redo completed steps):\n{}",
+        serde_json::to_string(&json!({
+            "stage": workflow.stage,
+            "completedSteps": workflow.completed_steps,
+            "nextAction": workflow.next_action,
+            "observationBudgets": workflow.budgets,
+        }))
+        .expect("workflow progress must serialize")
+    )
+}
+
+fn update_progress_state(
+    state: &mut RunProgressState,
+    calls: &[ToolCall],
+    results: &[ToolResultMessage],
+) {
+    for call in calls {
+        let Some(result) = results.iter().find(|result| result.tool_use_id == call.id) else {
+            continue;
+        };
+        if result.is_error {
+            let error_kind = result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("errorKind"))
+                .and_then(Value::as_str);
+            if matches!(
+                error_kind,
+                Some("generation.validation_failed" | "acceptance.validation_failed")
+            ) {
+                if let Some(candidate_digest) = result
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("candidateManifestHash"))
+                    .and_then(Value::as_str)
+                {
+                    state
+                        .rejected_candidate_digests
+                        .insert(candidate_digest.to_string());
+                    state
+                        .completed_steps
+                        .insert("candidate_rejected".to_string());
+                }
+            }
+            if matches!(
+                error_kind,
+                Some(
+                    "generation.validation_failed"
+                        | "acceptance.validation_failed"
+                        | "build.failed"
+                )
+            ) {
+                state.completed_steps.insert("repair_required".to_string());
+                state.completed_steps.remove("repair_mutated");
+                if error_kind == Some("build.failed") {
+                    state.completed_steps.insert("build_failed".to_string());
+                }
+            }
+            continue;
+        }
+        let normalized_path = call
+            .input
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim_start_matches("/workspace/");
+        match call.name.as_str() {
+            "fs.list" if normalized_path.trim_end_matches('/') == "inputs" => {
+                state
+                    .completed_steps
+                    .insert("inputs_inventoried".to_string());
+            }
+            "fs.read" if normalized_path == "inputs/brief.md" => {
+                state.completed_steps.insert("brief_loaded".to_string());
+            }
+            "fs.read" if normalized_path == "inputs/content-sources.json" => {
+                state
+                    .completed_steps
+                    .insert("content_sources_loaded".to_string());
+            }
+            "fs.read" if normalized_path.starts_with("project/") => {
+                state
+                    .completed_steps
+                    .insert("project_source_read".to_string());
+            }
+            "project.inspect" => {
+                state
+                    .completed_steps
+                    .insert("project_inspected".to_string());
+            }
+            "project.init" => {
+                state
+                    .completed_steps
+                    .insert("project_initialized".to_string());
+            }
+            "project.ensure_dependencies" => {
+                state
+                    .completed_steps
+                    .insert("dependencies_ready".to_string());
+            }
+            "preview.publish" => {
+                state.completed_steps.insert("candidate_ready".to_string());
+                state.completed_steps.remove("repair_required");
+                state.completed_steps.remove("repair_mutated");
+                state.completed_steps.remove("build_failed");
+            }
+            "run.complete" => {
+                state.completed_steps.insert("run_completed".to_string());
+            }
+            _ => {}
+        }
+        if is_source_mutation_tool(&call.name) || is_staged_source_progress_tool(&call.name) {
+            let target = call
+                .input
+                .get("path")
+                .or_else(|| call.input.get("cwd"))
+                .and_then(Value::as_str)
+                .unwrap_or("project");
+            state.source_mutations.insert(
+                format!("{}:{target}", call.name),
+                canonical_json_hash(&call.input),
+            );
+            if is_source_mutation_tool(&call.name) {
+                if call.name != "project.init" && target.starts_with("project") {
+                    state.completed_steps.insert("source_authored".to_string());
+                }
+                if state.completed_steps.contains("repair_required") {
+                    state.completed_steps.insert("repair_mutated".to_string());
+                }
+            }
+        }
+        if state.observations.len() < MAX_PROGRESS_OBSERVATIONS {
+            if let Some(observation) = progress_observation_key(call) {
+                state.observations.insert(observation);
+            }
+        }
+        if let Some(digest) =
+            find_string_field(&result.content, "sourceFingerprint").or_else(|| {
+                (call.name == "fs.commit_chunks")
+                    .then(|| find_string_field(&result.content, "sha256"))
+                    .flatten()
+            })
+        {
+            state.source_digest = Some(digest);
+        }
+        if let Some(digest) = find_string_field(&result.content, "candidateManifestHash")
+            .or_else(|| find_string_field(&result.content, "artifactManifestHash"))
+        {
+            state.candidate_digest = Some(digest);
+        }
+        if matches!(
+            call.name.as_str(),
+            "brief.write_draft"
+                | "project.init"
+                | "project.build"
+                | "preview.publish"
+                | "run.complete"
+        ) {
+            state.completed_steps.insert(call.name.clone());
+        }
+    }
+}
+
+fn terminal_tool_result_summary(results: &[ToolResultMessage]) -> Option<String> {
+    results.iter().find_map(|result| {
+        let unrecoverable = result.is_error
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("recoverable"))
+                .and_then(Value::as_bool)
+                == Some(false);
+        unrecoverable.then(|| {
+            result
+                .content
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Run stopped after a terminal tool failure")
+                .to_string()
+        })
+    })
+}
+
+fn is_source_mutation_tool(name: &str) -> bool {
+    name == "fs.write"
+        || name == "fs.patch"
+        || name == "fs.multi_patch"
+        || name == "fs.commit_chunks"
+        || name == "fs.delete"
+        || name.starts_with("style.")
+        || name == "project.init"
+}
+
+fn is_staged_source_progress_tool(name: &str) -> bool {
+    name == "fs.write_chunk"
+}
+
+fn progress_observation_key(call: &ToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "fs.read" | "fs.list" => Some(format!(
+            "{}:{}",
+            call.name,
+            call.input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+        )),
+        "fs.search" => Some(format!(
+            "fs.search:{}:{}",
+            call.input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("."),
+            call.input
+                .get("query")
+                .or_else(|| call.input.get("pattern"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        )),
+        "project.inspect" => Some("project.inspect".to_string()),
+        _ => None,
+    }
+}
+
+fn find_string_field(value: &Value, field: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|value| find_string_field(value, field))
+            }),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_field(value, field)),
+        _ => None,
+    }
+}
+
+fn recovered_model_usage_by_turn(events: &[AgentEvent]) -> BTreeMap<u32, ModelTokenUsage> {
+    let mut usage_by_turn = BTreeMap::new();
+    for event in events {
+        if let AgentEvent::ModelUsage {
+            turn,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            ..
+        } = event
+        {
+            usage_by_turn.insert(
+                *turn,
+                ModelTokenUsage {
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cached_input_tokens: *cached_input_tokens,
+                },
+            );
+        }
+    }
+    usage_by_turn
+}
+
+fn recovered_consecutive_protocol_errors(events: &[AgentEvent]) -> u32 {
+    let Some(last_usage_turn) = events.iter().rev().find_map(|event| {
+        if let AgentEvent::ModelUsage { turn, .. } = event {
+            Some(*turn)
+        } else {
+            None
+        }
+    }) else {
+        return 0;
+    };
+    events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if let AgentEvent::ModelProtocolError {
+                turn, consecutive, ..
+            } = event
+            {
+                (*turn == last_usage_turn).then_some(*consecutive)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn token_budget_exhausted_reason(
+    usage: RunTokenUsage,
+    limits: AgentLoopLimits,
+    after_response: bool,
+) -> Option<String> {
+    let input_exhausted = if after_response {
+        usage.input_tokens > limits.max_input_tokens
+    } else {
+        usage.input_tokens >= limits.max_input_tokens
+    };
+    let output_exhausted = if after_response {
+        usage.output_tokens > limits.max_output_tokens
+    } else {
+        usage.output_tokens >= limits.max_output_tokens
+    };
+    (input_exhausted || output_exhausted).then(|| {
+        format!(
+            "Run token budget exhausted: input_used={}, input_limit={}, output_used={}, output_limit={}",
+            usage.input_tokens,
+            limits.max_input_tokens,
+            usage.output_tokens,
+            limits.max_output_tokens
+        )
+    })
+}
+
+fn estimate_model_request_tokens(request: &ModelRequest) -> u64 {
+    serde_json::to_vec(request)
+        .map(|serialized| estimated_tokens_for_len(serialized.len()))
+        .unwrap_or(1)
+}
+
+fn estimate_model_response_tokens(response: &ModelResponse) -> u64 {
+    let size = match response {
+        ModelResponse::ToolCalls(calls)
+        | ModelResponse::ToolCallsThenError { calls, .. }
+        | ModelResponse::ToolCallsThenFallback { calls, .. } => calls
+            .iter()
+            .map(|call| call.id.len() + call.name.len() + call.input.to_string().len())
+            .sum(),
+        ModelResponse::ToolInputParseFailed {
+            parsed_calls,
+            failures,
+        } => {
+            parsed_calls
+                .iter()
+                .map(|call| call.id.len() + call.name.len() + call.input.to_string().len())
+                .sum::<usize>()
+                + failures
+                    .iter()
+                    .map(|failure| failure.raw_len)
+                    .sum::<usize>()
+        }
+        ModelResponse::ToolInputTooLarge {
+            parsed_calls,
+            failures,
+        } => {
+            parsed_calls
+                .iter()
+                .map(|call| call.id.len() + call.name.len() + call.input.to_string().len())
+                .sum::<usize>()
+                + failures
+                    .iter()
+                    .map(|failure| failure.input_chars)
+                    .sum::<usize>()
+        }
+        ModelResponse::TextOnly(text) | ModelResponse::Error(text) => text.len(),
+    };
+    estimated_tokens_for_len(size)
+}
+
+fn estimated_tokens_for_len(length: usize) -> u64 {
+    u64::try_from(length.saturating_add(3) / 4)
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+fn model_protocol_error_kind(response: &ModelResponse) -> Option<&'static str> {
+    match response {
+        ModelResponse::ToolInputParseFailed { .. } => Some("tool_input_json_parse_failed"),
+        ModelResponse::ToolInputTooLarge { .. } => Some("tool_input_too_large"),
+        ModelResponse::ToolCallsThenFallback { .. } => Some("partial_tool_calls_fallback"),
+        _ => None,
+    }
+}
+
+fn append_budget_stopped_model_response(
+    message_window: &mut Vec<Value>,
+    turn: u32,
+    response: &ModelResponse,
+) {
+    match response {
+        ModelResponse::TextOnly(text) => message_window.push(json!({
+            "role": "assistant",
+            "turn": turn,
+            "text": text,
+        })),
+        ModelResponse::Error(error) | ModelResponse::ToolCallsThenError { error, .. } => {
+            message_window.push(json!({
+                "role": "model",
+                "turn": turn,
+                "error": error,
+            }));
+        }
+        ModelResponse::ToolCallsThenFallback { reason, .. } => message_window.push(json!({
+            "role": "system",
+            "turn": turn,
+            "text": format!("Model fallback response stopped by token budget: {reason}"),
+        })),
+        ModelResponse::ToolCalls(_)
+        | ModelResponse::ToolInputParseFailed { .. }
+        | ModelResponse::ToolInputTooLarge { .. } => message_window.push(json!({
+            "role": "assistant",
+            "turn": turn,
+            "toolCalls": [],
+        })),
+    }
+}
+
+fn model_response_tool_calls(response: &ModelResponse) -> Vec<ToolCall> {
+    match response {
+        ModelResponse::ToolCalls(calls)
+        | ModelResponse::ToolCallsThenError { calls, .. }
+        | ModelResponse::ToolCallsThenFallback { calls, .. } => calls.clone(),
+        ModelResponse::ToolInputParseFailed {
+            parsed_calls,
+            failures,
+        } => parsed_calls
+            .iter()
+            .cloned()
+            .chain(failures.iter().map(tool_input_parse_failure_call))
+            .collect(),
+        ModelResponse::ToolInputTooLarge {
+            parsed_calls,
+            failures,
+        } => parsed_calls
+            .iter()
+            .cloned()
+            .chain(failures.iter().map(tool_input_too_large_failure_call))
+            .collect(),
+        ModelResponse::TextOnly(_) | ModelResponse::Error(_) => Vec::new(),
     }
 }
 
@@ -2172,13 +3672,13 @@ fn system_prompt_for_run(run: &AgentRun, repair_target_context: Option<&str>) ->
 fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> {
     let phase_instruction = match run.phase {
         AgentPhase::Brief => {
-            "Create a structured Brief draft from the provided content sources only. Use content.list_sources and content.read_source to inspect user inputs. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to astro-website for website projects or fumadocs-docs for docs projects. Call brief.write_draft with the complete Brief, then call brief.request_confirmation and wait for user confirmation before completing."
+            "Create a structured Brief draft from the provided content sources only. Use content.list_sources and content.read_source to inspect user inputs. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to astro-website for website projects or fumadocs-docs for docs projects. Keep acceptanceCriteria conservative and limited to user-observable release gates. For requiredRoutes, copy literal URL paths only when the user explicitly provides them; otherwise include exactly one template entry route: / for astro-website or /docs/ for fumadocs-docs. Never turn a section heading, feature, topic, checklist item, or document chapter into a route. For requiredText, copy only wording the user explicitly marks as an exact title, headline, visible brand, or quoted phrase. Do not promote feature lists, requested topics, prose instructions, or section coverage into exact-text assertions. Include forbidden template placeholders or explicitly rejected content. Copy genuine exact text literally without translating or paraphrasing it. Call brief.write_draft with the complete Brief and acceptance criteria, then call brief.request_confirmation and wait for user confirmation before completing."
         }
         AgentPhase::Build => {
-            "Use the runtime project workflow. Read inputs/brief.md, inputs/content-sources.json, inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md when present. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. Edit app source with fs.* under the appRoot, then call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. Inspect the returned designProfileFidelity report before run.complete. If a required rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, browser.screenshot, and preview.report_candidate separately when debugging a failed publish. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
+            "Use the runtime project workflow. First call fs.list on inputs, then read inputs/brief.md and inputs/content-sources.json plus only the optional Design Context files actually present in that listing; do not probe missing optional paths. Before editing, turn the frozen acceptanceCriteria in inputs/brief.md into a checklist and implement every required route and exact required text in the first Candidate; do not substitute another route or paraphrase exact text. Verify that checklist against source before the first preview.publish. Design responsive layouts for a 375px viewport from the first Candidate. Grid or flex children that contain tables, charts, code, or other intrinsic-width content must use min-width: 0; internal horizontal scrollers must be constrained with max-width: 100% and overflow-x: auto. If responsive-layout reports document-level horizontal overflow, inspect grid/flex min-content sizing and fixed or viewport widths first; keep necessary overflow inside the intended component and do not hide document overflow as a substitute for fixing the source. Prefer server-rendered HTML, CSS, or SVG for non-interactive charts and dashboard visuals. Do not add a client-side chart library or browser script unless the user explicitly requests interaction; in Astro, never reference Astro.props or frontmatter variables directly from a client script. Every same-origin href must resolve to a generated route or anchor; render non-navigating states as buttons or plain content instead of broken links. For fumadocs-docs, use the seeded MDX component mapping: Steps/Step, Tabs/Tab, and Accordions/Accordion support both flat child syntax and compound syntax such as <Steps.Step>. Do not create src/mdx-components.tsx, replace components/mdx.jsx, or import fumadocs-ui/dist internals to use those components. Optional files are inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. Edit app source with fs.* under the appRoot, then call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. Inspect the returned validation report and designProfileFidelity report before run.complete. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Edit => {
-            "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the promoted artifact contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read inputs/design-profile.json, inputs/design.md, and new user content sources such as docs markdown when present, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. After source edits are complete, call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the promoted artifact and the returned designProfileFidelity report. If a required rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property using only exact token names from state/style-contract.json, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. If the artifact and fidelity report satisfy the request, call run.complete. Only use project.build, preview.start, browser.screenshot, and preview.report_candidate separately when debugging a failed publish. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
+            "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the validated candidate contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read inputs/design-profile.json, inputs/design.md, and new user content sources such as docs markdown when present, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. After source edits are complete, call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the validated candidate, the returned validation report, and the designProfileFidelity report. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property using only exact token names from state/style-contract.json, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. If the candidate and both validation reports satisfy the request, call run.complete; Runtime atomically promotes the candidate and completes the run. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Review => {
             "Review the candidate preview using read-only tools and report actionable findings. The exact candidate version is included as CandidateVersion in the runtime identity; pass it unchanged as review.report_finding.versionId. Read inputs/design-profile.json and inputs/design.md when present, then compare the preview, source, style tokens, content voice, accessibility, and visible UI against the DesignProfile. If the candidate drifts from the DesignProfile, call review.report_finding with category visual, content, or safety as appropriate. Do not mutate files during Review runs."
@@ -2209,6 +3709,14 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         == Some("source_fallback")
     {
         "\nFidelity mode is source_fallback. Before project.init or any mutation, read inputs/design-source.md when it is permitted. If the runtime requires indexed access, read inputs/design-source-index.json and call design_source.read_sections with exact section ids from that index until every missing required section is satisfied."
+    } else {
+        ""
+    };
+    let shell_path_instruction = if matches!(
+        run.phase,
+        AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+    ) {
+        "shell.run defaults to the appRoot as its working directory. When cwd is omitted, use appRoot-relative shell paths such as src/pages/index.astro, never project/src/pages/index.astro. Prefer fs.read, fs.list, and fs.search for observations; use shell.run only for commands that are not available through a dedicated Runtime tool."
     } else {
         ""
     };
@@ -2245,6 +3753,10 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         PromptContextSection {
             id: "source_fallback",
             content: design_source_read_instruction.trim().to_string(),
+        },
+        PromptContextSection {
+            id: "shell_paths",
+            content: shell_path_instruction.to_string(),
         },
         PromptContextSection {
             id: "runtime_policy",
@@ -2508,6 +4020,68 @@ fn render_markdown_list(items: &[String]) -> String {
 mod design_capsule_tests {
     use super::*;
 
+    #[test]
+    fn observation_tools_are_hidden_when_their_global_or_repair_budget_is_exhausted() {
+        let limits = AgentLoopLimits::default();
+        let usage = ObservationBudgetUsage {
+            read_tool_calls: limits.max_read_tool_calls,
+            search_tool_calls: 1,
+            repair_active: true,
+            repair_read_tool_calls: 3,
+            repair_search_tool_calls: limits.max_repair_search_tool_calls,
+        };
+
+        assert!(observation_tool_budget_exhausted("fs.read", usage, limits));
+        assert!(observation_tool_budget_exhausted("fs.list", usage, limits));
+        assert!(observation_tool_budget_exhausted(
+            "fs.search",
+            usage,
+            limits
+        ));
+        assert!(!observation_tool_budget_exhausted(
+            "fs.patch", usage, limits
+        ));
+    }
+
+    #[test]
+    fn redundant_observation_tools_are_hidden_after_a_stalled_pre_publish_check() {
+        let mut state = RunProgressState::default();
+        state.completed_steps.insert("source_authored".to_string());
+
+        assert!(!observation_tool_redundant_before_first_publish(
+            "fs.read",
+            AgentPhase::Build,
+            &state,
+            0,
+        ));
+        assert!(observation_tool_redundant_before_first_publish(
+            "fs.read",
+            AgentPhase::Build,
+            &state,
+            1,
+        ));
+        assert!(observation_tool_redundant_before_first_publish(
+            "fs.search",
+            AgentPhase::Edit,
+            &state,
+            1,
+        ));
+        assert!(!observation_tool_redundant_before_first_publish(
+            "fs.patch",
+            AgentPhase::Build,
+            &state,
+            1,
+        ));
+
+        state.completed_steps.insert("repair_required".to_string());
+        assert!(!observation_tool_redundant_before_first_publish(
+            "fs.read",
+            AgentPhase::Build,
+            &state,
+            1,
+        ));
+    }
+
     fn profile() -> DesignProfile {
         let now = Utc::now();
         DesignProfile {
@@ -2632,6 +4206,117 @@ mod design_capsule_tests {
             .contains(&"component-behavior".to_string()));
     }
 
+    #[test]
+    fn rejected_candidate_digest_counts_as_progress_once() {
+        let call = ToolCall::new("publish-1", "preview.publish", json!({}));
+        let result = ToolResultMessage {
+            tool_use_id: "publish-1".to_string(),
+            tool_name: "preview.publish".to_string(),
+            is_error: true,
+            content: json!({ "error": "acceptance failed" }),
+            metadata: Some(json!({
+                "errorKind": "acceptance.validation_failed",
+                "candidateManifestHash": "candidate-digest-1"
+            })),
+        };
+        let mut state = RunProgressState::default();
+
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&call),
+            std::slice::from_ref(&result),
+        );
+        let first = state.fingerprint();
+        assert!(state
+            .rejected_candidate_digests
+            .contains("candidate-digest-1"));
+
+        update_progress_state(&mut state, &[call], &[result]);
+        assert_eq!(state.fingerprint(), first);
+    }
+
+    #[test]
+    fn observation_budget_recovery_counts_attempted_tools_but_not_budget_rejections() {
+        let now = Utc::now();
+        let events = vec![
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.read".to_string(),
+                summary: "read".to_string(),
+                tool_use_id: "read-allowed".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.read".to_string(),
+                summary: "read".to_string(),
+                tool_use_id: "read-rejected".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::ToolFailed {
+                run_id: "run-1".to_string(),
+                tool: "fs.read".to_string(),
+                error: "budget exhausted".to_string(),
+                tool_use_id: "read-rejected".to_string(),
+                recoverable: true,
+                metadata: Some(json!({
+                    "errorKind": "run.observation_budget_exhausted"
+                })),
+                timestamp: now,
+            },
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.search".to_string(),
+                summary: "search".to_string(),
+                tool_use_id: "search-allowed".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.read".to_string(),
+                summary: "bootstrap".to_string(),
+                tool_use_id: "bootstrap:read".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::ToolFailed {
+                run_id: "run-1".to_string(),
+                tool: "preview.publish".to_string(),
+                error: "candidate rejected".to_string(),
+                tool_use_id: "publish-rejected".to_string(),
+                recoverable: true,
+                metadata: Some(json!({
+                    "errorKind": "generation.validation_failed"
+                })),
+                timestamp: now,
+            },
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.read".to_string(),
+                summary: "repair read".to_string(),
+                tool_use_id: "repair-read".to_string(),
+                timestamp: now,
+            },
+            AgentEvent::ToolStarted {
+                run_id: "run-1".to_string(),
+                tool: "fs.search".to_string(),
+                summary: "repair search".to_string(),
+                tool_use_id: "repair-search".to_string(),
+                timestamp: now,
+            },
+        ];
+
+        assert_eq!(
+            recovered_observation_budget_usage(&events),
+            ObservationBudgetUsage {
+                read_tool_calls: 2,
+                search_tool_calls: 2,
+                repair_active: true,
+                repair_read_tool_calls: 1,
+                repair_search_tool_calls: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn prompt_assembler_keeps_dcp_read_policy_and_source_fallback_separate() {
         let store = RuntimeStore::new();
@@ -2653,6 +4338,7 @@ mod design_capsule_tests {
                 "runtime_identity",
                 "phase_workflow",
                 "source_fallback",
+                "shell_paths",
                 "runtime_policy"
             ]
         );
@@ -2661,5 +4347,52 @@ mod design_capsule_tests {
         assert!(prompt.contains("state/style-contract.json after init"));
         assert!(prompt.contains("Fidelity mode is source_fallback"));
         assert!(prompt.contains("untrusted design references"));
+    }
+
+    #[tokio::test]
+    async fn brief_prompt_keeps_routes_and_exact_text_acceptance_conservative() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "project-brief".to_string(),
+                AgentPhase::Brief,
+                "brief".to_string(),
+                "test-model".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        let prompt = PromptContextAssembler::for_run(&run).render();
+        assert!(prompt.contains("include exactly one template entry route"));
+        assert!(prompt.contains("Never turn a section heading, feature, topic"));
+        assert!(prompt.contains("Do not promote feature lists, requested topics"));
+        assert!(prompt.contains("/docs/ for fumadocs-docs"));
+        assert!(!prompt.contains("every explicitly required route and exact user-visible"));
+    }
+
+    #[tokio::test]
+    async fn build_prompt_requires_first_candidate_acceptance_checklist() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "project-build".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "test-model".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        let prompt = PromptContextAssembler::for_run(&run).render();
+        assert!(prompt.contains("turn the frozen acceptanceCriteria"));
+        assert!(prompt.contains("implement every required route and exact required text"));
+        assert!(prompt.contains("Verify that checklist against source before the first"));
+        assert!(prompt.contains("Grid or flex children that contain tables"));
+        assert!(prompt.contains("must use min-width: 0"));
+        assert!(prompt.contains("do not hide document overflow as a substitute"));
+        assert!(prompt.contains("Prefer server-rendered HTML, CSS, or SVG"));
+        assert!(prompt.contains("Do not add a client-side chart library"));
+        assert!(prompt.contains("Every same-origin href must resolve"));
+        assert!(prompt.contains("Do not create src/mdx-components.tsx"));
     }
 }

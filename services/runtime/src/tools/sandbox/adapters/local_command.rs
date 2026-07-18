@@ -85,7 +85,8 @@ async fn run_local_command(
         .args(&argv[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command.spawn()?;
     let stdout = Arc::new(Mutex::new(Vec::new()));
     let stderr = Arc::new(Mutex::new(Vec::new()));

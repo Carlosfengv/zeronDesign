@@ -121,6 +121,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing-subscriber",
+ "unicode-normalization",
  "x509-parser",
 ]
 

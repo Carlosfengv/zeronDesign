@@ -361,6 +361,7 @@ pub enum ArtifactPublishStatus {
     Staging,
     Staged,
     Validating,
+    Ready,
     Promoting,
     Promoted,
     Failed,
@@ -1634,6 +1635,66 @@ pub enum AgentEvent {
         snapshot: Value,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "model.usage", rename_all = "camelCase")]
+    ModelUsage {
+        run_id: String,
+        turn: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        estimated: bool,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "model.protocol_error", rename_all = "camelCase")]
+    ModelProtocolError {
+        run_id: String,
+        turn: u32,
+        kind: String,
+        consecutive: u32,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "run.watchdog_triggered", rename_all = "camelCase")]
+    RunWatchdogTriggered {
+        run_id: String,
+        kind: String,
+        elapsed_ms: u64,
+        limit_ms: u64,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "run.progress_fingerprint", rename_all = "camelCase")]
+    RunProgressFingerprint {
+        run_id: String,
+        turn: u32,
+        fingerprint: String,
+        consecutive_no_progress: u32,
+        evidence: Value,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "run.observation_budget", rename_all = "camelCase")]
+    RunObservationBudget {
+        run_id: String,
+        turn: u32,
+        read_used: u32,
+        read_limit: u32,
+        search_used: u32,
+        search_limit: u32,
+        repair_active: bool,
+        repair_read_used: u32,
+        repair_read_limit: u32,
+        repair_search_used: u32,
+        repair_search_limit: u32,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "run.workflow_progress", rename_all = "camelCase")]
+    RunWorkflowProgress {
+        run_id: String,
+        turn: u32,
+        stage: String,
+        completed_steps: Vec<String>,
+        next_action: String,
+        budgets: Value,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "permission.requested", rename_all = "camelCase")]
     PermissionRequested {
         run_id: String,
@@ -1708,6 +1769,12 @@ impl AgentEvent {
             | Self::ChunkCommitted { run_id, .. }
             | Self::MetricRecorded { run_id, .. }
             | Self::ModelExecution { run_id, .. }
+            | Self::ModelUsage { run_id, .. }
+            | Self::ModelProtocolError { run_id, .. }
+            | Self::RunWatchdogTriggered { run_id, .. }
+            | Self::RunProgressFingerprint { run_id, .. }
+            | Self::RunObservationBudget { run_id, .. }
+            | Self::RunWorkflowProgress { run_id, .. }
             | Self::PermissionRequested { run_id, .. }
             | Self::PermissionDenied { run_id, .. }
             | Self::StateChanged { run_id, .. }

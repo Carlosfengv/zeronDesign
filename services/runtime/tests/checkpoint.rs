@@ -1,5 +1,6 @@
 use anydesign_runtime::config::{SandboxBackendMode, WorkspaceChannelTlsMode};
 use anydesign_runtime::{
+    acceptance_contract::AcceptanceContractDraft,
     agent_loop::AgentLoop,
     conversation::RuntimeStore,
     http_api::{self, AppState},
@@ -16,8 +17,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 use serde_json::Value;
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, io::Write, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 async fn create_run(store: &RuntimeStore) -> String {
     store
@@ -322,7 +324,16 @@ async fn briefs_are_persisted_with_confirmation_status_after_restart() {
     let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
     let run_id = create_run(&store).await;
     let brief_id = store
-        .write_brief_draft(&run_id, website_brief())
+        .write_brief_draft_with_acceptance(
+            &run_id,
+            website_brief(),
+            Some(AcceptanceContractDraft {
+                locale: Some("zh-CN".to_string()),
+                required_routes: vec!["/".to_string()],
+                required_text: vec!["产品发布".to_string()],
+                forbidden_text: vec!["Lorem ipsum".to_string()],
+            }),
+        )
         .await
         .unwrap();
 
@@ -342,11 +353,23 @@ async fn briefs_are_persisted_with_confirmation_status_after_restart() {
     assert!(snapshots.contains("\"status\":\"draft\""));
     assert!(snapshots.contains("\"status\":\"confirmed\""));
     assert!(snapshots.contains("\"recommendedTemplate\":\"astro-website\""));
+    assert!(snapshots.contains("\"acceptanceContract\""));
+    assert!(snapshots.contains("\"schemaVersion\":\"acceptance-contract@1\""));
 
     let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
     let reloaded_brief = reloaded_store.get_brief(&brief_id).await.unwrap();
     assert_eq!(reloaded_brief.project_type, "website");
     assert_eq!(reloaded_brief.recommended_template, "astro-website");
+    let acceptance_contract = reloaded_store
+        .get_acceptance_contract(&brief_id)
+        .await
+        .expect("acceptance contract must survive restart");
+    acceptance_contract.validate().unwrap();
+    assert!(!acceptance_contract.legacy);
+    assert_eq!(acceptance_contract.locale.as_deref(), Some("zh-CN"));
+    assert_eq!(acceptance_contract.required_routes, vec!["/"]);
+    assert_eq!(acceptance_contract.required_text, vec!["产品发布"]);
+    assert_eq!(acceptance_contract.forbidden_text, vec!["lorem ipsum"]);
     assert_eq!(
         reloaded_store.brief_status(&brief_id).await,
         Some(BriefStatus::Confirmed)
@@ -360,6 +383,13 @@ async fn briefs_are_persisted_with_confirmation_status_after_restart() {
             .as_deref(),
         Some(brief_id.as_str())
     );
+    let reloaded_sources = timeout(
+        Duration::from_secs(1),
+        reloaded_store.content_sources_for_brief(&brief_id),
+    )
+    .await
+    .expect("recovered Brief content sources must not deadlock");
+    assert!(reloaded_sources.is_empty());
 }
 
 #[tokio::test]
@@ -551,6 +581,107 @@ async fn agent_runs_are_persisted_and_recovered_after_store_restart() {
         recovered.checkpoint_id.as_deref(),
         Some("checkpoint-recover-from-run-log-1")
     );
+}
+
+#[tokio::test]
+async fn persisted_runs_are_hydrated_once_per_store_instance() {
+    let checkpoint_dir = unique_temp_dir("checkpoints-run-state-single-hydration");
+    let run_log_dir = checkpoint_dir.join("logs");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    let run_id = create_run(&store).await;
+    store
+        .update_run_status(&run_id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+
+    let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert_eq!(
+        reloaded_store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Running
+    );
+
+    // Simulate a concurrent external writer leaving a partial tail after this
+    // process has loaded the WAL. Hot-path status and list operations must use
+    // the in-memory index instead of replaying the entire file under the store
+    // write lock on every call.
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(reloaded_store.run_state_log_path())
+        .unwrap();
+    writeln!(log, "{{partial-jsonl-tail").unwrap();
+
+    assert_eq!(
+        reloaded_store
+            .project_runs("project-1")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        reloaded_store
+            .update_run_status(&run_id, AgentRunStatus::Validating)
+            .await
+            .unwrap()
+            .status,
+        AgentRunStatus::Validating
+    );
+}
+
+#[tokio::test]
+async fn truncated_run_wal_tail_is_repaired_before_restart_continues_writing() {
+    let checkpoint_dir = unique_temp_dir("checkpoints-run-state-truncated-tail");
+    let run_log_dir = checkpoint_dir.join("logs");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    let run_id = create_run(&store).await;
+    store
+        .update_run_status(&run_id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+
+    let run_state_log_path = store.run_state_log_path();
+    let valid_len = fs::metadata(&run_state_log_path).unwrap().len();
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(&run_state_log_path)
+        .unwrap();
+    log.write_all(br#"{"id":"incomplete"#).unwrap();
+    drop(log);
+    assert!(fs::metadata(&run_state_log_path).unwrap().len() > valid_len);
+
+    let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert_eq!(
+        reloaded_store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Running
+    );
+    assert_eq!(fs::metadata(&run_state_log_path).unwrap().len(), valid_len);
+    reloaded_store
+        .update_run_status(&run_id, AgentRunStatus::Validating)
+        .await
+        .unwrap();
+
+    let second_restart = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert_eq!(
+        second_restart.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Validating
+    );
+}
+
+#[tokio::test]
+async fn complete_malformed_run_wal_record_fails_closed() {
+    let checkpoint_dir = unique_temp_dir("checkpoints-run-state-malformed-record");
+    let run_log_dir = checkpoint_dir.join("logs");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    create_run(&store).await;
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(store.run_state_log_path())
+        .unwrap();
+    writeln!(log, "{{malformed-complete-record").unwrap();
+    drop(log);
+
+    let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert!(reloaded_store.project_runs("project-1").await.is_err());
 }
 
 #[tokio::test]

@@ -37,6 +37,31 @@ pub async fn resolve_built_in_template_for_init(
     built_in_template_availability().resolve_for_init(&id).await
 }
 
+pub fn resolve_built_in_template_for_state(
+    state: &ProjectRuntimeState,
+) -> Result<Arc<TemplateSpec>, String> {
+    let registry = BuiltInTemplateRegistry::built_in();
+    let id = TemplateId::parse(&state.template_key).map_err(|error| error.to_string())?;
+    let version =
+        TemplateVersion::parse(&state.template_version).map_err(|error| error.to_string())?;
+    if let Some(manifest) = state.template_manifest_sha256.as_deref() {
+        let manifest = ManifestHash::parse(manifest).map_err(|error| error.to_string())?;
+        return registry
+            .resolve_version(&id, &version, &manifest)
+            .map_err(|error| error.to_string());
+    }
+    if registry.versions(&id).len() == 1 {
+        let current = registry.current(&id).map_err(|error| error.to_string())?;
+        if current.version == version {
+            return Ok(current);
+        }
+    }
+    Err(format!(
+        "project template identity is ambiguous or unavailable: {} {}",
+        id, version
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateCompatibilityIssue {
     pub project_id: String,

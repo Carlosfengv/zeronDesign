@@ -3,6 +3,7 @@ use super::{
     TemplateVersion,
 };
 use crate::artifact_manifest::ArtifactDeliverySpec;
+use crate::generation_contract::GenerationContract;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,3 +206,31 @@ impl PartialEq for TemplateSpec {
 }
 
 impl Eq for TemplateSpec {}
+
+impl TemplateSpec {
+    pub fn generation_contract(&self) -> Result<GenerationContract, String> {
+        let output_directory = self
+            .preview
+            .output_directories
+            .first()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "template {} has no preview output directory for its generation contract",
+                    self.id
+                )
+            })?;
+        let contract = match self.surface {
+            "website" => GenerationContract::website(self.id.as_str(), output_directory),
+            "docs" => GenerationContract::docs(self.id.as_str(), output_directory),
+            surface => {
+                return Err(format!(
+                    "template {} has unsupported generation surface: {surface}",
+                    self.id
+                ));
+            }
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+}

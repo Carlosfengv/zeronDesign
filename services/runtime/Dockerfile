@@ -5,6 +5,9 @@ ARG NODE_IMAGE=docker.io/library/node:22-bookworm@sha256:5647be709086c696ff32eda
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
 COPY services/runtime/Cargo.toml services/runtime/Cargo.lock ./
+# Cargo resolves the path-based provider-gateway dev dependency while reading
+# Cargo.lock, even though release builds do not compile the dev dependency.
+COPY services/provider-gateway/Cargo.toml /provider-gateway/Cargo.toml
 COPY services/runtime/target/docker-vendor /vendor
 COPY services/runtime/src ./src
 COPY services/runtime/scripts ./scripts
@@ -22,7 +25,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     sed -i "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_APT_MIRROR}|g; s|http://deb.debian.org/debian|${DEBIAN_APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=5 update \
-    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates chromium kubernetes-client \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+        ca-certificates \
+        chromium \
+        fontconfig \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        fonts-noto-core \
+        kubernetes-client \
+    && fc-cache -f \
     && useradd --system --uid 10001 --create-home --home-dir /var/lib/anydesign-runtime runtime
 ARG REPOSITORY_COMMIT=unknown
 ARG REPOSITORY_DIRTY=false
@@ -36,10 +47,14 @@ LABEL org.opencontainers.image.source="https://github.com/carlosfengv/zeronDesig
       io.zerondesign.image-lock-hash="${IMAGE_LOCK_HASH}"
 COPY --from=builder /build/target/release/anydesign-runtime /usr/local/bin/anydesign-runtime
 COPY --from=browser-collector-runtime /usr/local/bin/node /usr/local/bin/node
-RUN /usr/local/bin/node --version
+COPY --from=builder /build/scripts/check-browser-fonts.mjs /usr/local/lib/anydesign/check-browser-fonts.mjs
+RUN /usr/local/bin/node --version \
+    && /usr/local/bin/node /usr/local/lib/anydesign/check-browser-fonts.mjs
 ENV RUNTIME_REPOSITORY_COMMIT=${REPOSITORY_COMMIT} \
     RUNTIME_REPOSITORY_DIRTY=${REPOSITORY_DIRTY} \
     RUNTIME_IMAGE_REF=${RUNTIME_IMAGE_REF} \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
     RUNTIME_BROWSER_EXECUTABLE=/usr/bin/chromium \
     RUNTIME_BROWSER_COLLECTOR_EXECUTABLE=/usr/local/bin/node \
     RUNTIME_HOST=0.0.0.0 \

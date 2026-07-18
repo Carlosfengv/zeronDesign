@@ -42,6 +42,15 @@ struct RecoveryWorkspaceRestorer;
 
 #[async_trait::async_trait]
 impl EditWorkspaceRestorer for RecoveryWorkspaceRestorer {
+    async fn prepare_build(
+        &self,
+        _store: &RuntimeStore,
+        _config: &anydesign_runtime::RuntimeConfig,
+        _run: &anydesign_runtime::types::AgentRun,
+    ) -> anyhow::Result<()> {
+        unreachable!("profile sync recovery must reuse the persisted child Run")
+    }
+
     async fn restore(
         &self,
         _store: &RuntimeStore,

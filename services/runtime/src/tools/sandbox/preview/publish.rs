@@ -1,7 +1,12 @@
+use super::preview_acceptance::collect_and_persist_acceptance;
 use super::preview_fidelity::{
     evaluate_design_profile_fidelity, reject_unchanged_fidelity_republish,
 };
+use super::preview_validation::collect_and_persist_generation_validation;
 use super::*;
+use crate::runtime_storage::FileAcceptanceReportStore;
+
+const DEFAULT_MAX_ACCEPTANCE_REPAIR_CYCLES: u32 = 3;
 
 pub(super) fn preview_rebuilding_tool() -> Arc<dyn Tool> {
     Arc::new(PreviewRebuildingTool)
@@ -55,6 +60,7 @@ impl Tool for PreviewRebuildingTool {
                 timestamp: Utc::now(),
             })
             .await;
+        reopen_run_after_candidate_rejection(&ctx).await?;
         Ok(ToolResult::ok(json!({ "rebuilding": true })))
     }
 }
@@ -67,6 +73,10 @@ struct PreviewReportCandidateTool {
 impl Tool for PreviewReportCandidateTool {
     fn name(&self) -> &'static str {
         "preview.report_candidate"
+    }
+
+    fn is_enabled(&self, ctx: &ToolContext) -> bool {
+        ctx.policy_profile == RuntimePolicyProfile::LocalE2e
     }
 
     fn input_schema(&self) -> Value {
@@ -89,7 +99,16 @@ impl Tool for PreviewReportCandidateTool {
         Ok(input)
     }
 
-    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+    async fn check_permission(&self, input: &Value, ctx: &ToolContext) -> PermissionResult {
+        if ctx.policy_profile != RuntimePolicyProfile::LocalE2e {
+            return PermissionResult::Deny {
+                message: "preview.report_candidate is retired outside local E2E; use preview.publish so generation, acceptance, and atomic completion gates cannot be bypassed".to_string(),
+                reason: PermissionReason::Rule {
+                    source: RuleSource::Runtime,
+                    rule_content: "manual candidate reporting is local-e2e-only".to_string(),
+                },
+            };
+        }
         let url = input.get("url").and_then(Value::as_str).unwrap_or_default();
         if !is_internal_preview_url(url) {
             return PermissionResult::Deny {
@@ -229,6 +248,17 @@ impl Tool for PreviewPublishTool {
         ctx: ToolContext,
         progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
+        let source_root = input
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(|cwd| {
+                check_context_workspace_path(&resolve_path(cwd, &ctx.workspace_root), &ctx)
+                    .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))
+            })
+            .transpose()?
+            .unwrap_or_else(|| default_project_dir(&ctx));
+        reject_unchanged_candidate_validation_republish(&*self.workspace, &ctx, &source_root)
+            .await?;
         let build_tool = project_build::ProjectBuildTool {
             workspace: self.workspace.clone(),
             command: self.command.clone(),
@@ -303,8 +333,9 @@ impl Tool for PreviewPublishTool {
 
         // Create the immutable candidate identity before fidelity evaluation so
         // every failure (including an unavailable enforced verifier) has a
-        // durable candidate/evidence target.  Promotion and artifact staging
-        // happen only after the DCP gate has accepted this exact candidate.
+        // durable candidate/evidence target. Artifact staging happens only
+        // after the DCP gate accepts this exact candidate; current-version
+        // promotion is deferred to the atomic run.complete boundary.
         let source_snapshot_uri = build
             .get("sourceSnapshotUri")
             .and_then(Value::as_str)
@@ -352,7 +383,7 @@ impl Tool for PreviewPublishTool {
         {
             Ok(fidelity) => fidelity,
             Err(error) => {
-                reopen_run_after_fidelity_rejection(&ctx).await?;
+                reopen_run_after_candidate_rejection(&ctx).await?;
                 return Err(error);
             }
         };
@@ -362,7 +393,7 @@ impl Tool for PreviewPublishTool {
                 .as_deref(),
             &fidelity,
         ) {
-            reopen_run_after_fidelity_rejection(&ctx).await?;
+            reopen_run_after_candidate_rejection(&ctx).await?;
             return Err(error);
         }
         let published = report_preview_candidate(
@@ -385,14 +416,71 @@ impl Tool for PreviewPublishTool {
     }
 }
 
-async fn reopen_run_after_fidelity_rejection(ctx: &ToolContext) -> Result<(), ToolError> {
+async fn reject_unchanged_candidate_validation_republish(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    source_root: &Path,
+) -> Result<(), ToolError> {
+    let latest_validation = ctx
+        .store
+        .conversation_items(&ctx.project_id)
+        .await
+        .into_iter()
+        .rev()
+        .find(|item| {
+            item.run_id.as_deref() == Some(&ctx.run.id)
+                && matches!(
+                    item.kind.as_str(),
+                    "generation_validation_checked" | "acceptance_validation_checked"
+                )
+        });
+    let Some(latest_validation) = latest_validation else {
+        return Ok(());
+    };
+    let Some(metadata) = latest_validation.metadata else {
+        return Ok(());
+    };
+    if metadata.get("status").and_then(Value::as_str) != Some("failed") {
+        return Ok(());
+    }
+    let previous_fingerprint = metadata
+        .get("sourceFingerprint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let Some(previous_fingerprint) = previous_fingerprint else {
+        return Ok(());
+    };
+    let current_fingerprint = project_source_fingerprint(workspace, ctx, source_root).await?;
+    if current_fingerprint != previous_fingerprint {
+        return Ok(());
+    }
+    let validation_kind = match latest_validation.kind.as_str() {
+        "acceptance_validation_checked" => "acceptance",
+        _ => "generation",
+    };
+    Err(ToolError::typed_recoverable(
+        format!(
+            "preview.publish blocked because project source is unchanged since the failed {validation_kind} validation"
+        ),
+        format!("{validation_kind}.no_source_change_after_validation_failure"),
+        json!({
+            "sourceFingerprint": current_fingerprint,
+            "failedCheckIds": metadata.get("failedCheckIds").cloned().unwrap_or_else(|| json!([])),
+            "candidateVersionId": metadata.get("candidateVersionId").cloned(),
+            "validationKind": validation_kind,
+            "suggestedAction": "Read the persisted validation report, edit project source to address the failed checks, then call preview.publish again. Rebuilding unchanged source does not count as a repair."
+        }),
+    ))
+}
+
+async fn reopen_run_after_candidate_rejection(ctx: &ToolContext) -> Result<(), ToolError> {
     ctx.store
         .update_run_status(&ctx.run.id, AgentRunStatus::Running)
         .await
         .map(|_| ())
         .map_err(|error| {
             ToolError::Terminal(format!(
-                "failed to reopen run after Design Context verification rejection: {error}"
+                "failed to reopen run after candidate rejection: {error}"
             ))
         })
 }
@@ -567,11 +655,14 @@ async fn report_preview_candidate(
                 json!({ "latestBuild": latest_build.clone() }),
             )
         })?;
-    let expected_current_version_id = ctx
-        .run
-        .output_version_id
-        .as_deref()
-        .or(ctx.run.base_version_id.as_deref());
+    let expected_current_version_id = match ctx.run.base_version_id.clone() {
+        Some(base_version_id) => Some(base_version_id),
+        None => ctx
+            .store
+            .current_project_version(&ctx.project_id)
+            .await
+            .map(|version| version.id),
+    };
     let publish = ctx
         .store
         .begin_artifact_publish(
@@ -581,7 +672,7 @@ async fn report_preview_candidate(
             &candidate.id,
             candidate_manifest_hash,
             source_snapshot_uri,
-            expected_current_version_id,
+            expected_current_version_id.as_deref(),
         )
         .await
         .map_err(|error| ToolError::Terminal(format!("artifact stage state failed: {error}")))?;
@@ -755,8 +846,210 @@ async fn report_preview_candidate(
             .await
             .ok();
         return Err(ToolError::Recoverable(format!(
-            "preview promotion rejected: {error}"
+            "preview candidate validation rejected: {error}"
         )));
+    }
+    if candidate_was_announced {
+        let (validation_report, validation_report_uri) =
+            match collect_and_persist_generation_validation(
+                workspace,
+                ctx,
+                &template,
+                &candidate.id,
+                &candidate_manifest,
+                &latest_build,
+                &staged_artifact,
+                &candidate.preview_url,
+            )
+            .await
+            {
+                Ok(validation) => validation,
+                Err(error) => {
+                    publisher.abort(&staged_artifact).await.ok();
+                    ctx.store
+                        .transition_artifact_publish(
+                            &publish.id,
+                            ArtifactPublishStatus::GarbageCollectable,
+                            None,
+                            None,
+                            None,
+                            Some(&format!("{error:?}")),
+                        )
+                        .await
+                        .ok();
+                    return Err(error);
+                }
+            };
+        let generation_contract = template.generation_contract().map_err(|error| {
+            ToolError::Terminal(format!("generation contract is invalid: {error}"))
+        })?;
+        let validation_blockers = validation_report.promotion_blockers(&generation_contract);
+        if !validation_blockers.is_empty() {
+            publisher.abort(&staged_artifact).await.ok();
+            ctx.store
+                .transition_artifact_publish(
+                    &publish.id,
+                    ArtifactPublishStatus::GarbageCollectable,
+                    None,
+                    None,
+                    None,
+                    Some("generation validation failed"),
+                )
+                .await
+                .ok();
+            reopen_run_after_candidate_rejection(ctx).await?;
+            return Err(ToolError::typed_recoverable(
+                "preview.publish blocked by the generation validation contract",
+                "generation.validation_failed",
+                json!({
+                    "validationReportUri": validation_report_uri,
+                    "validationReportPath": "state/validation-report.json",
+                    "candidateManifestHash": candidate_manifest_hash,
+                    "blockers": validation_blockers.iter().map(|blocker| json!({
+                        "checkId": blocker.check_id,
+                        "status": blocker.status,
+                        "message": blocker.message,
+                    })).collect::<Vec<_>>(),
+                    "suggestedAction": "Read state/validation-report.json, repair the reported source or content issue, then publish a new candidate."
+                }),
+            ));
+        }
+        let (acceptance_report, acceptance_report_uri) = match collect_and_persist_acceptance(
+            workspace,
+            ctx,
+            &candidate.id,
+            candidate_manifest_hash,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                publisher.abort(&staged_artifact).await.ok();
+                ctx.store
+                    .transition_artifact_publish(
+                        &publish.id,
+                        ArtifactPublishStatus::GarbageCollectable,
+                        None,
+                        None,
+                        None,
+                        Some(&format!("{error:?}")),
+                    )
+                    .await
+                    .ok();
+                return Err(error);
+            }
+        };
+        if !acceptance_report.passed() {
+            let repair_attempt = FileAcceptanceReportStore::new(&ctx.runtime_storage_dir)
+                .failed_report_count(&ctx.project_id, &ctx.run.id)
+                .map_err(|error| {
+                    ToolError::Terminal(format!(
+                        "acceptance repair budget could not be evaluated: {error}"
+                    ))
+                })?;
+            let max_repair_cycles = std::env::var("RUNTIME_MAX_ACCEPTANCE_REPAIR_CYCLES")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_MAX_ACCEPTANCE_REPAIR_CYCLES);
+            let repair_exhausted = repair_attempt >= max_repair_cycles;
+            publisher.abort(&staged_artifact).await.ok();
+            ctx.store
+                .transition_artifact_publish(
+                    &publish.id,
+                    ArtifactPublishStatus::GarbageCollectable,
+                    None,
+                    None,
+                    None,
+                    Some("acceptance contract failed"),
+                )
+                .await
+                .ok();
+            let state = if repair_exhausted {
+                "acceptance_repair_exhausted"
+            } else {
+                "acceptance_repairing"
+            };
+            let _ = ctx
+                .store
+                .append_event(AgentEvent::StateChanged {
+                    run_id: ctx.run.id.clone(),
+                    state: format!("{state}:attempt={repair_attempt}:limit={max_repair_cycles}"),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            let metadata = json!({
+                "acceptanceReportUri": acceptance_report_uri,
+                "acceptanceReportPath": "state/acceptance-report.json",
+                "contractDigest": acceptance_report.contract_digest,
+                "candidateManifestHash": candidate_manifest_hash,
+                "failedChecks": acceptance_report.checks.iter().filter(|check| {
+                    check.status == crate::acceptance_contract::AcceptanceCheckStatus::Failed
+                }).collect::<Vec<_>>(),
+                "repairAttempt": repair_attempt,
+                "maxRepairCycles": max_repair_cycles,
+                "repairExhausted": repair_exhausted,
+                "suggestedAction": if repair_exhausted {
+                    "Repair budget is exhausted. Preserve the rejected Candidate evidence and request a revised user Brief or explicit retry."
+                } else {
+                    "Read state/acceptance-report.json, repair the existing Candidate source without changing the Brief, then publish a new Candidate."
+                }
+            });
+            if !repair_exhausted {
+                reopen_run_after_candidate_rejection(ctx).await?;
+            }
+            return if repair_exhausted {
+                Err(ToolError::TerminalWithMetadata {
+                    message: "preview.publish exhausted the frozen Brief acceptance repair budget"
+                        .to_string(),
+                    error_kind: "acceptance.repair_exhausted".to_string(),
+                    metadata,
+                })
+            } else {
+                Err(ToolError::typed_recoverable(
+                    "preview.publish blocked by the frozen Brief acceptance contract",
+                    "acceptance.validation_failed",
+                    metadata,
+                ))
+            };
+        }
+        let ready = ctx
+            .store
+            .transition_artifact_publish(
+                &publish.id,
+                ArtifactPublishStatus::Ready,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::Terminal(format!("artifact candidate-ready state failed: {error}"))
+            })?;
+        ctx.store
+            .set_run_output_version(&ctx.run.id, candidate.id.clone())
+            .await
+            .map_err(|error| {
+                ToolError::Terminal(format!("candidate output version state failed: {error}"))
+            })?;
+        return Ok(json!({
+            "versionId": candidate.id,
+            "reviewRunId": review_run.id,
+            "status": "candidate_ready",
+            "url": candidate.preview_url.clone(),
+            "previewUrl": candidate.preview_url,
+            "artifactManifestHash": staged_artifact.artifact_manifest_hash,
+            "artifactPublishId": ready.id,
+            "artifactExportBytes": export_receipt.total_bytes,
+            "artifactExportFileCount": export_receipt.file_count,
+            "artifactExportManifestHash": export_receipt.manifest_hash,
+            "candidateManifestHash": candidate_manifest_hash,
+            "validationReportUri": validation_report_uri,
+            "validationChecks": validation_report.checks,
+            "acceptanceReportUri": acceptance_report_uri,
+            "acceptanceChecks": acceptance_report.checks,
+        }));
     }
     ctx.store
         .transition_artifact_publish(
@@ -807,7 +1100,7 @@ async fn report_preview_candidate(
         &ctx.run.id,
         &candidate.id,
         gate_report,
-        expected_current_version_id,
+        expected_current_version_id.as_deref(),
     )
     .await
     {

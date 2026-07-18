@@ -11,6 +11,8 @@ const DOCS_TEMPLATE_YAML: &str =
     include_str!("../../../infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml");
 const RUNTIME_DEPLOYMENT_YAML: &str =
     include_str!("../../../infra/agent-sandbox/runtime/deployment.yaml");
+const PROVIDER_GATEWAY_DEPLOYMENT_YAML: &str =
+    include_str!("../../../infra/provider-gateway/k3d-persistent-sqlite-deployment.yaml");
 const ASTRO_SANDBOX_DOCKERFILE: &str =
     include_str!("../../../infra/agent-sandbox/astro-website/Dockerfile");
 const WORKSPACE_INIT_SH: &str = include_str!("../../../infra/agent-sandbox/base/workspace-init.sh");
@@ -22,6 +24,15 @@ const RUNTIME_RC_GATE_SH: &str =
     include_str!("../../../infra/agent-sandbox/run-runtime-rc-gate.sh");
 const RUNTIME_RC_PREFLIGHT_SH: &str =
     include_str!("../../../infra/agent-sandbox/preflight-runtime-rc.sh");
+
+#[test]
+fn deployment_manifests_parse_without_cluster() {
+    let runtime_docs = yaml_documents(RUNTIME_DEPLOYMENT_YAML);
+    named_doc(&runtime_docs, "Deployment", "anydesign-runtime");
+
+    let provider_docs = yaml_documents(PROVIDER_GATEWAY_DEPLOYMENT_YAML);
+    named_doc(&provider_docs, "Deployment", "provider-gateway");
+}
 
 #[test]
 fn runtime_rc_refreshes_short_lived_principal_after_provider_waits() {

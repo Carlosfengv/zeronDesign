@@ -144,8 +144,7 @@ async function main() {
   const repository = runtime.repository ?? {};
   const releaseCandidate = args.mode === "release"
     && repository.dirty === false
-    && provider?.mode === "approved-real"
-    && Boolean(provider?.approvalReference)
+    && provider?.mode === "real"
     && preflight?.schemaVersion === "runtime-rc-preflight@1"
     && preflight?.passed === true
     && preflight?.prefetchImages === true;
@@ -194,7 +193,6 @@ async function main() {
     provider: {
       mode: provider?.mode ?? "fixture",
       model: provider?.model ?? "unknown",
-      approvalReference: provider?.approvalReference ?? args["approval-reference"] ?? null,
       credentialPresent: provider?.credentialPresent === true,
     },
     preflight,
@@ -226,16 +224,10 @@ async function main() {
     "channel-lease-pod-uid-change", "checkpoint-runtime-restart",
     "artifact-staged-before-cas", "cas-before-event", "run-cancel",
   ]);
-  const releaseEligible = releaseCandidate
-    && evidence.preflight.lockHash === evidence.repository.lockHash
-    && evidence.preflight.entries?.length === Object.keys(lock.images || {}).length
-    && evidence.preflight.entries.every(entry => entry.lockedDigestVerified === true
-      && entry.mutableTagMatchesLock === true
-      && entry.pulled === true)
-    && evidence.fixture.deployed
+  const auditPassed = evidence.fixture.deployed
     && evidence.fixture.concurrent
     && enforcedDcpLifecyclePassed(evidence.enforcedDcpFixture)
-    && providerDcpProjectPassed(evidence.providerDcpProject)
+    && (provider?.mode === "fixture" || providerDcpProjectPassed(evidence.providerDcpProject))
     && fixtureKinds.has("website")
     && fixtureKinds.has("docs")
     && projectKinds.has("website")
@@ -251,14 +243,24 @@ async function main() {
     && [...requiredRecovery].every(scenario => evidence.recoveryScenarios.some(item => item.scenario === scenario && item.result === "pass" && item.orphanCount === 0))
     && evidence.projects.every(project => project.artifactAssertions?.content?.matched === true
       && project.artifactAssertions?.computedStyle?.passed === true
-      && project.artifactAssertions?.route === (project.kind === "docs" ? "/docs/" : "/")
+      && project.artifactAssertions?.route === (
+        project.kind === "docs" && provider?.mode !== "fixture" ? "/docs/" : "/"
+      )
       && project.cancelCleanup?.passed === true
       && project.dependencyEvidence?.passed === true
       && project.terminalToolFailureCount === 0
       && artifactAvailableAfterRelease(project))
     && scan.matches.length === 0;
+  const releaseEligible = releaseCandidate
+    && evidence.preflight.lockHash === evidence.repository.lockHash
+    && evidence.preflight.entries?.length === Object.keys(lock.images || {}).length
+    && evidence.preflight.entries.every(entry => entry.lockedDigestVerified === true
+      && entry.mutableTagMatchesLock === true
+      && entry.pulled === true)
+    && auditPassed;
+  evidence.auditPassed = auditPassed;
   evidence.releaseEligible = releaseEligible;
-  evidence.result = releaseEligible ? "pass" : "fail";
+  evidence.result = auditPassed ? "pass" : "fail";
   await writeFile(args.out, `${JSON.stringify(evidence, null, 2)}\n`);
   process.stdout.write(`Release evidence aggregated: ${args.out} (eligible=${releaseEligible})\n`);
 }

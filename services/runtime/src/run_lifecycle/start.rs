@@ -46,12 +46,13 @@ pub struct StartRunContext {
 impl RunLifecycleService {
     pub async fn start(
         &self,
-        request: StartRunCommand,
+        mut request: StartRunCommand,
     ) -> Result<RunLifecycleOutcome, RunLifecycleError> {
         super::start_validation::validate(&request)?;
         validate_project_access_before_initial_run(self, &request).await?;
         validate_sandbox_context(&self.store, &request).await?;
         validate_project_lifecycle_context(&self.store, &request).await?;
+        inherit_edit_brief_from_base_version(&self.store, &mut request).await?;
         let prepared = self
             .design_profiles
             .prepare_run_context(crate::design_profile_service::RunProfileContextQuery {
@@ -402,6 +403,21 @@ impl RunLifecycleService {
                     .await);
             }
         }
+        if run.phase == AgentPhase::Build && run.sandbox_id.is_some() {
+            if let Err(error) = self
+                .edit_workspace_restorer
+                .prepare_build(&self.store, &self.config, &run)
+                .await
+            {
+                return Err(self
+                    .compensate_created_run_error(
+                        &run,
+                        "build_workspace_prepare",
+                        conflict_error(error),
+                    )
+                    .await);
+            }
+        }
         if run.phase == AgentPhase::Edit {
             if let Err(error) = restore_edit_workspace_from_base_version(self, &run).await {
                 return Err(self
@@ -422,6 +438,52 @@ impl RunLifecycleService {
             status: "queued".to_string(),
         })
     }
+}
+
+async fn inherit_edit_brief_from_base_version(
+    store: &RuntimeStore,
+    request: &mut StartRunCommand,
+) -> Result<(), RunLifecycleError> {
+    if request.phase != AgentPhase::Edit {
+        return Ok(());
+    }
+    let base_version_id = request
+        .input_context
+        .base_version_id
+        .as_deref()
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("Edit run requires baseVersionId")))?;
+    let base_version = store
+        .get_project_version(base_version_id)
+        .await
+        .ok_or_else(|| not_found(format!("base version not found: {base_version_id}")))?;
+    let source_run = store
+        .get_run(&base_version.created_by_run_id)
+        .await
+        .ok_or_else(|| {
+            conflict_error(anyhow::anyhow!("Edit base version source run is missing"))
+        })?;
+    let inherited_brief_id = source_run.brief_version.ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "Edit base version is missing frozen Brief provenance"
+        ))
+    })?;
+    if request
+        .input_context
+        .brief_id
+        .as_deref()
+        .is_some_and(|brief_id| brief_id != inherited_brief_id)
+    {
+        return Err(conflict_error(anyhow::anyhow!(
+            "Edit briefId does not match the base version frozen Brief"
+        )));
+    }
+    if !store.is_brief_confirmed(&inherited_brief_id).await {
+        return Err(conflict_error(anyhow::anyhow!(
+            "Edit base version frozen Brief is not confirmed"
+        )));
+    }
+    request.input_context.brief_id = Some(inherited_brief_id);
+    Ok(())
 }
 
 async fn compile_and_attach_design_context(

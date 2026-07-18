@@ -20,6 +20,7 @@ pub(in crate::http_api) async fn proxy_candidate_preview(
             &access.lease_id,
         )?,
         PreviewAccessContext::InternalCapture => format!("/preview-captures/{lease_id}"),
+        PreviewAccessContext::InternalCaptureHost => String::new(),
     };
     let mut upstream = reqwest::Url::parse(&access.upstream_endpoint)
         .map_err(|error| internal_error(anyhow::anyhow!(error)))?;

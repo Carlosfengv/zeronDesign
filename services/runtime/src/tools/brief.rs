@@ -1,4 +1,5 @@
 use crate::{
+    acceptance_contract::AcceptanceContractDraft,
     conversation::RuntimeStore,
     types::{AgentEvent, Brief},
 };
@@ -7,13 +8,28 @@ use chrono::Utc;
 use serde_json::{json, Map, Value};
 
 pub async fn write_draft(store: &RuntimeStore, run_id: &str, input: Value) -> Result<Value> {
-    let input = normalize_draft_input(input);
+    let mut input = normalize_draft_input(input);
+    let acceptance_draft: AcceptanceContractDraft = serde_json::from_value(
+        input
+            .get("acceptanceCriteria")
+            .cloned()
+            .ok_or_else(|| anyhow!("brief.write_draft requires acceptanceCriteria"))?,
+    )
+    .map_err(|err| anyhow!("brief.write_draft received invalid acceptanceCriteria: {err}"))?;
+    acceptance_draft
+        .validate()
+        .map_err(|err| anyhow!("brief.write_draft acceptance validation failed: {err}"))?;
+    if let Value::Object(object) = &mut input {
+        object.remove("acceptanceCriteria");
+    }
     let brief: Brief = serde_json::from_value(input)
         .map_err(|err| anyhow!("brief.write_draft received invalid brief JSON: {err}"))?;
     brief
         .validate_for_runtime()
         .map_err(|err| anyhow!("brief.write_draft validation failed: {err}"))?;
-    let brief_id = store.write_brief_draft(run_id, brief).await?;
+    let brief_id = store
+        .write_brief_draft_with_acceptance(run_id, brief, Some(acceptance_draft))
+        .await?;
     Ok(json!({ "briefId": brief_id }))
 }
 

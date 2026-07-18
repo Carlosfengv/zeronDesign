@@ -1,4 +1,5 @@
 use anydesign_runtime::{
+    acceptance_contract::AcceptanceContractDraft,
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     design_context::{
@@ -74,6 +75,38 @@ async fn create_run(store: &RuntimeStore) -> String {
         )
         .await
         .id
+}
+
+async fn attach_acceptance_brief(
+    store: &RuntimeStore,
+    run_id: &str,
+    required_text: &str,
+) -> String {
+    let brief = Brief {
+        project_type: "website".to_string(),
+        audience: "product teams".to_string(),
+        content_hierarchy: vec!["hero".to_string()],
+        page_structure: json!(["hero"]),
+        visual_direction: "clear and accessible".to_string(),
+        recommended_template: "astro-website".to_string(),
+        assumptions: Vec::new(),
+        missing_information: Vec::new(),
+    };
+    let brief_id = store
+        .write_brief_draft_with_acceptance(
+            run_id,
+            brief,
+            Some(AcceptanceContractDraft {
+                locale: Some("en".to_string()),
+                required_routes: vec!["/".to_string()],
+                required_text: vec![required_text.to_string()],
+                forbidden_text: vec!["Lorem ipsum".to_string()],
+            }),
+        )
+        .await
+        .unwrap();
+    store.confirm_brief(run_id, &brief_id).await.unwrap();
+    brief_id
 }
 
 fn imported_design_profile(source_artifact_id: &str, source_hash: &str) -> DesignProfile {
@@ -459,6 +492,59 @@ async fn fs_read_write_list_and_search_are_workspace_bounded() {
         .any(|entry| entry["name"] == "new.md"));
     assert_eq!(results[3].result.content["matches"][0]["line"], 1);
     assert_eq!(store.audit_records().await.len(), 4);
+}
+
+#[tokio::test]
+async fn fs_search_skips_generated_dependency_trees_and_reports_bounds() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/node_modules/dependency")).unwrap();
+    fs::create_dir_all(workspace.join("project/.next/server")).unwrap();
+    fs::write(
+        workspace.join("project/node_modules/dependency/index.js"),
+        "needle should not be searched",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("project/.next/server/page.js"),
+        "needle should not be searched",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("project/source.md"),
+        "needle should be returned",
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor_local_e2e(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "tool-search-bounded",
+                "fs.search",
+                json!({ "path": "project", "query": "needle" }),
+            )],
+        )
+        .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].result.is_error);
+    assert_eq!(
+        results[0].result.content["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        results[0].result.content["matches"][0]["path"],
+        "/workspace/project/source.md"
+    );
+    assert!(results[0].result.content["skippedPaths"].as_u64().unwrap() >= 2);
+    assert_eq!(results[0].result.content["truncated"], false);
 }
 
 #[tokio::test]
@@ -2065,7 +2151,7 @@ async fn fumadocs_docs_real_next_build_smoke() {
     let docs_dir = workspace.join("project/content/docs");
     fs::write(
         docs_dir.join("runtime-flow.mdx"),
-        "---\ntitle: Runtime Flow\ndescription: Build and edit lifecycle\n---\n\n# Runtime Flow\n\nThe runtime creates, builds, previews, and promotes docs.\n",
+        "---\ntitle: Runtime Flow\ndescription: Build and edit lifecycle\n---\n\n# Runtime Flow\n\n<Steps>\n  <Steps.Step>Initialize the project.</Steps.Step>\n  <Step>Build and publish the candidate.</Step>\n</Steps>\n\n<Tabs items={[\"CLI\", \"API\"]}>\n  <Tabs.Tab value=\"CLI\">Run the CLI.</Tabs.Tab>\n  <Tab value=\"API\">Call the API.</Tab>\n</Tabs>\n\n<Accordions type=\"single\" collapsible>\n  <Accordions.Accordion title=\"What is validated?\">Build, render, links, and accessibility.</Accordions.Accordion>\n</Accordions>\n",
     )
     .unwrap();
     fs::write(
@@ -2251,18 +2337,29 @@ async fn fumadocs_docs_rejects_pages_router_writes_with_structured_metadata() {
                         "text": "export default function Page() { return null; }"
                     }),
                 ),
+                ToolCall::new(
+                    "tool-write-shadow-mdx-components",
+                    "fs.write",
+                    json!({
+                        "path": "project/src/mdx-components.tsx",
+                        "text": "export function useMDXComponents() { return {}; }"
+                    }),
+                ),
             ],
         )
         .await;
 
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 4);
     assert!(!results[0].result.is_error);
     assert!(results[1].result.is_error);
     assert_error_kind(&results[1].result, "docs.routing_root_forbidden");
     assert!(results[2].result.is_error);
     assert_error_kind(&results[2].result, "docs.routing_root_forbidden");
+    assert!(results[3].result.is_error);
+    assert_error_kind(&results[3].result, "docs.routing_root_forbidden");
     assert!(!workspace.join("project/pages/index.jsx").exists());
     assert!(!workspace.join("project/src/pages/index.jsx").exists());
+    assert!(!workspace.join("project/src/mdx-components.tsx").exists());
 }
 
 #[tokio::test]
@@ -3110,6 +3207,39 @@ async fn successful_project_build_freezes_candidate_and_rejects_source_mutation(
     assert!(mutation[0].result.is_error);
     assert_error_kind(&mutation[0].result, "project.candidate_frozen");
     assert!(!workspace.join("project/after-build.txt").exists());
+
+    let rebuilding = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-preview-rebuilding",
+                "preview.rebuilding",
+                json!({}),
+            )],
+        )
+        .await;
+    assert!(!rebuilding[0].result.is_error);
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Running
+    );
+    let repaired_mutation = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "tool-write-after-rebuilding",
+                "fs.write",
+                json!({ "path": "project/after-build.txt", "text": "allowed" }),
+            )],
+        )
+        .await;
+    assert!(!repaired_mutation[0].result.is_error);
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/after-build.txt")).unwrap(),
+        "allowed"
+    );
 
     let runtime_state_write = executor
         .execute_calls(
@@ -5487,13 +5617,14 @@ async fn preview_start_spawns_static_server_from_fumadocs_out() {
 }
 
 #[tokio::test]
-async fn preview_publish_builds_screenshots_and_promotes_candidate() {
+async fn preview_publish_prepares_candidate_and_run_complete_atomically_promotes_it() {
     let workspace = setup_workspace();
     let (preview_url, _preview_server) = start_preview_server().await;
     let transport = RecordingChannelTransport::default();
     let command_backend = JsonWorkspaceChannelCommandBackend::new(transport.clone(), &workspace);
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "publish candidate").await;
     let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
         sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
         Default::default(),
@@ -5545,7 +5676,10 @@ async fn preview_publish_builds_screenshots_and_promotes_candidate() {
         results[0].result.content["screenshot"]["screenshotId"],
         "publish-shot"
     );
-    assert_eq!(results[0].result.content["promotion"]["status"], "promoted");
+    assert_eq!(
+        results[0].result.content["promotion"]["status"],
+        "candidate_ready"
+    );
     let publish_id = results[0].result.content["promotion"]["artifactPublishId"]
         .as_str()
         .expect("promotion must expose artifactPublishId");
@@ -5555,13 +5689,52 @@ async fn preview_publish_builds_screenshots_and_promotes_candidate() {
             .map(str::len),
         Some(64)
     );
+    assert!(
+        results[0].result.content["promotion"]["acceptanceReportUri"]
+            .as_str()
+            .is_some_and(|uri| uri.starts_with("runtime://acceptance-reports/"))
+    );
+    assert!(results[0].result.content["promotion"]["acceptanceChecks"]
+        .as_array()
+        .is_some_and(|checks| !checks.is_empty()));
+    assert!(workspace.join("state/acceptance-report.json").exists());
     let publish = store.get_artifact_publish(publish_id).await.unwrap();
-    assert_eq!(publish.status, ArtifactPublishStatus::Promoted);
-    assert!(publish.immutable_artifact_uri.is_some());
+    assert_eq!(publish.status, ArtifactPublishStatus::Ready);
+    assert!(publish.immutable_artifact_uri.is_none());
     assert!(publish.source_snapshot_uri.starts_with("runtime://"));
+    assert!(store.current_project_version("project-1").await.is_none());
+    let candidate_version_id = results[0].result.content["promotion"]["versionId"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        store
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .output_version_id
+            .as_deref(),
+        Some(candidate_version_id)
+    );
     assert!(workspace
         .join("outputs/screenshots/publish-shot.json")
         .exists());
+    let validation_items = store.conversation_items("project-1").await;
+    for kind in [
+        "generation_validation_checked",
+        "acceptance_validation_checked",
+    ] {
+        let metadata = validation_items
+            .iter()
+            .find(|item| item.run_id.as_deref() == Some(&run_id) && item.kind == kind)
+            .and_then(|item| item.metadata.as_ref())
+            .unwrap_or_else(|| panic!("missing persisted {kind} metadata"));
+        assert_eq!(metadata["status"], "passed");
+        assert_eq!(
+            metadata["sourceFingerprint"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_eq!(metadata["failedCheckIds"], json!([]));
+    }
 
     let requests = transport.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| {
@@ -5583,7 +5756,424 @@ async fn preview_publish_builds_screenshots_and_promotes_candidate() {
         })
         .collect::<Vec<_>>();
     assert!(event_types.contains(&"preview.candidate".to_string()));
-    assert!(event_types.contains(&"preview.updated".to_string()));
+    assert!(!event_types.contains(&"preview.updated".to_string()));
+    assert!(!event_types.contains(&"run.completed".to_string()));
+
+    let persisted_acceptance_report = workspace
+        .join(".runtime-storage/acceptance-reports/project-1")
+        .join(&run_id)
+        .join(format!("{candidate_version_id}.json"));
+    let acceptance_report_bytes = fs::read(&persisted_acceptance_report).unwrap();
+    fs::remove_file(&persisted_acceptance_report).unwrap();
+    let rejected_completion = StreamingToolExecutor::new(
+        control_plane_executor()
+            .with_workspace_root(&workspace)
+            .with_runtime_storage_dir(workspace.join(".runtime-storage")),
+    )
+    .execute_calls(
+        store.clone(),
+        &run_id,
+        vec![ToolCall::new(
+            "tool-complete-without-acceptance",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Must remain a candidate." }),
+        )],
+    )
+    .await;
+    assert!(rejected_completion[0].result.is_error);
+    assert!(tool_result_error_text(&rejected_completion[0].result)
+        .contains("candidate acceptance report is missing or invalid"));
+    assert!(store.current_project_version("project-1").await.is_none());
+    assert_ne!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Completed
+    );
+    fs::write(&persisted_acceptance_report, acceptance_report_bytes).unwrap();
+
+    let completed = StreamingToolExecutor::new(
+        control_plane_executor()
+            .with_workspace_root(&workspace)
+            .with_runtime_storage_dir(workspace.join(".runtime-storage")),
+    )
+    .execute_calls(
+        store.clone(),
+        &run_id,
+        vec![ToolCall::new(
+            "tool-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Candidate accepted." }),
+        )],
+    )
+    .await;
+    assert!(
+        !completed[0].result.is_error,
+        "{}",
+        tool_result_error_text(&completed[0].result)
+    );
+    assert_eq!(
+        store.current_project_version("project-1").await.unwrap().id,
+        candidate_version_id
+    );
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(
+        store.get_artifact_publish(publish_id).await.unwrap().status,
+        ArtifactPublishStatus::Promoted
+    );
+    let completed_events = store.events(&run_id).await;
+    let preview_updated_index = completed_events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::PreviewUpdated { .. }))
+        .unwrap();
+    let run_completed_index = completed_events
+        .iter()
+        .position(AgentEvent::is_run_completed)
+        .unwrap();
+    assert!(preview_updated_index < run_completed_index);
+}
+
+#[tokio::test]
+async fn preview_publish_rejects_candidate_that_fails_frozen_brief_acceptance() {
+    let workspace = setup_workspace();
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let command_backend =
+        JsonWorkspaceChannelCommandBackend::new(RecordingChannelTransport::default(), &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "Required launch title").await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "acceptance-failure-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "<main><h1>Different title</h1><script>Required launch title</script></main>",
+    )
+    .unwrap();
+
+    let published = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "acceptance-failure-publish",
+                "preview.publish",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "acceptance-failure-shot"
+                }),
+            )],
+        )
+        .await;
+
+    assert!(published[0].result.is_error);
+    assert_error_kind(&published[0].result, "acceptance.validation_failed");
+    assert_eq!(
+        published[0].result.metadata.as_ref().unwrap()["repairAttempt"],
+        1
+    );
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Running
+    );
+    let build_logs_before_unchanged = fs::read_dir(workspace.join("outputs/build"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("build-"))
+        .count();
+    let unchanged = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "acceptance-failure-unchanged-publish",
+                "preview.publish",
+                json!({
+                    "url": preview_url,
+                    "screenshotId": "acceptance-failure-unchanged-shot"
+                }),
+            )],
+        )
+        .await;
+    assert!(unchanged[0].result.is_error);
+    assert_error_kind(
+        &unchanged[0].result,
+        "acceptance.no_source_change_after_validation_failure",
+    );
+    assert_eq!(
+        unchanged[0].result.metadata.as_ref().unwrap()["failedCheckIds"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let build_logs_after_unchanged = fs::read_dir(workspace.join("outputs/build"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("build-"))
+        .count();
+    assert_eq!(build_logs_after_unchanged, build_logs_before_unchanged);
+    let repair_write = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "acceptance-failure-repair-write",
+                "fs.write",
+                json!({ "path": "project/repair-marker.txt", "text": "repair allowed" }),
+            )],
+        )
+        .await;
+    assert!(
+        !repair_write[0].result.is_error,
+        "{}",
+        tool_result_error_text(&repair_write[0].result)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("project/repair-marker.txt")).unwrap(),
+        "repair allowed"
+    );
+    assert!(store.current_project_version("project-1").await.is_none());
+    assert!(store
+        .get_run(&run_id)
+        .await
+        .unwrap()
+        .output_version_id
+        .is_none());
+    let report: Value =
+        serde_json::from_slice(&fs::read(workspace.join("state/acceptance-report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["schemaVersion"], "acceptance-report@1");
+    assert_eq!(report["status"], "failed");
+    assert!(report["checks"]
+        .as_array()
+        .is_some_and(|checks| checks.iter().any(|check| check["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("required-text:"))
+            && check["status"] == "failed"
+            && check["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("required launch title")))));
+
+    for attempt in 2..=3 {
+        if attempt == 3 {
+            fs::write(
+                workspace.join("project/repair-marker.txt"),
+                "second real repair mutation",
+            )
+            .unwrap();
+        }
+        let retried = executor
+            .execute_calls(
+                store.clone(),
+                &run_id,
+                vec![ToolCall::new(
+                    format!("acceptance-failure-publish-{attempt}"),
+                    "preview.publish",
+                    json!({
+                        "url": preview_url,
+                        "screenshotId": format!("acceptance-failure-shot-{attempt}")
+                    }),
+                )],
+            )
+            .await;
+        assert!(retried[0].result.is_error);
+        assert_eq!(
+            retried[0].result.metadata.as_ref().unwrap()["repairAttempt"],
+            attempt
+        );
+        if attempt < 3 {
+            assert_error_kind(&retried[0].result, "acceptance.validation_failed");
+            assert_eq!(
+                retried[0].result.metadata.as_ref().unwrap()["recoverable"],
+                true
+            );
+        } else {
+            assert_eq!(
+                retried[0].result.metadata.as_ref().unwrap()["errorKind"],
+                "acceptance.repair_exhausted"
+            );
+            assert_eq!(
+                retried[0].result.metadata.as_ref().unwrap()["recoverable"],
+                false
+            );
+            assert_eq!(
+                retried[0].result.metadata.as_ref().unwrap()["repairExhausted"],
+                true
+            );
+        }
+    }
+    assert_eq!(
+        store.get_run(&run_id).await.unwrap().status,
+        AgentRunStatus::Failed
+    );
+    assert!(store.current_project_version("project-1").await.is_none());
+}
+
+#[tokio::test]
+async fn preview_publish_rejects_unchanged_source_after_failed_generation_validation() {
+    let workspace = setup_workspace();
+    let runtime_storage = unique_temp_dir("generation-noop-runtime-store");
+    let (preview_url, _preview_server) = start_preview_server().await;
+    let command_backend =
+        JsonWorkspaceChannelCommandBackend::new(RecordingChannelTransport::default(), &workspace);
+    let store = RuntimeStore::with_storage_dirs(
+        runtime_storage.join("checkpoints"),
+        runtime_storage.join("run-logs"),
+    );
+    let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "Runtime preview fixture").await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let initialized = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "generation-noop-init",
+                "project.init",
+                json!({ "template": "astro-website" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+    fs::create_dir_all(workspace.join("project/dist")).unwrap();
+    fs::write(
+        workspace.join("project/dist/index.html"),
+        "<!doctype html><html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width\"><title>Runtime preview fixture</title></head><body><main><h1>Runtime preview fixture</h1></main></body></html>",
+    )
+    .unwrap();
+    let built = executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "generation-noop-build",
+                "project.build",
+                json!({ "cwd": "project" }),
+            )],
+        )
+        .await;
+    assert!(
+        !built[0].result.is_error,
+        "{}",
+        tool_result_error_text(&built[0].result)
+    );
+    let source_fingerprint = built[0].result.content["sourceFingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    store
+        .append_conversation_item(
+            "project-1",
+            Some(&run_id),
+            "generation_validation_checked",
+            Some("assistant"),
+            "Generation validation checked: 1 required failure(s).",
+            Some(json!({
+                "status": "failed",
+                "sourceFingerprint": source_fingerprint,
+                "candidateVersionId": "version-rejected",
+                "failedCheckIds": ["mobile-render"],
+            })),
+        )
+        .await;
+    store
+        .update_run_status(&run_id, AgentRunStatus::Running)
+        .await
+        .unwrap();
+
+    let reloaded_store = RuntimeStore::with_storage_dirs(
+        runtime_storage.join("checkpoints"),
+        runtime_storage.join("run-logs"),
+    );
+    let reloaded_executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(
+            Arc::new(LocalWorkspaceBackend),
+            Arc::new(JsonWorkspaceChannelCommandBackend::new(
+                RecordingChannelTransport::default(),
+                &workspace,
+            )),
+        ),
+        Default::default(),
+        &workspace,
+    ));
+    let build_logs_before_unchanged = fs::read_dir(workspace.join("outputs/build"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("build-"))
+        .count();
+    let unchanged = reloaded_executor
+        .execute_calls(
+            reloaded_store,
+            &run_id,
+            vec![ToolCall::new(
+                "generation-noop-unchanged-publish",
+                "preview.publish",
+                json!({ "url": preview_url, "screenshotId": "generation-noop-unchanged" }),
+            )],
+        )
+        .await;
+    assert!(unchanged[0].result.is_error);
+    assert_error_kind(
+        &unchanged[0].result,
+        "generation.no_source_change_after_validation_failure",
+    );
+    assert_eq!(
+        unchanged[0].result.metadata.as_ref().unwrap()["failedCheckIds"],
+        json!(["mobile-render"])
+    );
+    let build_logs_after_unchanged = fs::read_dir(workspace.join("outputs/build"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("build-"))
+        .count();
+    assert_eq!(build_logs_after_unchanged, build_logs_before_unchanged);
+
+    fs::write(
+        workspace.join("project/repair-marker.txt"),
+        "real generation repair mutation",
+    )
+    .unwrap();
+    let changed = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "generation-noop-changed-publish",
+                "preview.publish",
+                json!({ "url": preview_url, "screenshotId": "generation-noop-changed" }),
+            )],
+        )
+        .await;
+    assert!(
+        !changed[0].result.is_error,
+        "{}",
+        tool_result_error_text(&changed[0].result)
+    );
+
+    fs::remove_dir_all(workspace).unwrap();
+    fs::remove_dir_all(runtime_storage).unwrap();
 }
 
 #[tokio::test]
@@ -5593,6 +6183,7 @@ async fn local_e2e_preview_publish_ignores_model_selected_endpoint() {
         JsonWorkspaceChannelCommandBackend::new(RecordingChannelTransport::default(), &workspace);
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "Managed publish").await;
     let executor = StreamingToolExecutor::new(
         ToolExecutor::new_with_workspace_root(
             sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
@@ -5619,7 +6210,17 @@ async fn local_e2e_preview_publish_ignores_model_selected_endpoint() {
     fs::create_dir_all(workspace.join("project/dist")).unwrap();
     fs::write(
         workspace.join("project/dist/index.html"),
-        "<!doctype html><title>Managed publish</title>",
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Managed publish</title>
+  </head>
+  <body>
+    <nav aria-label="Primary"><a href="/">Home</a></nav>
+    <main><h1>Managed publish</h1></main>
+  </body>
+</html>"#,
     )
     .unwrap();
 
@@ -5690,6 +6291,7 @@ async fn preview_publish_records_passing_token_fidelity_before_run_complete() {
     });
     let profile = store.create_design_profile(profile).await.unwrap();
     let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "fidelity candidate").await;
     store
         .attach_run_effective_design_profile(
             &run_id,
@@ -6173,6 +6775,7 @@ async fn preview_publish_rejects_unchanged_source_after_failed_fidelity_check() 
     });
     let profile = store.create_design_profile(profile).await.unwrap();
     let run_id = create_run(&store).await;
+    attach_acceptance_brief(&store, &run_id, "fidelity failing candidate").await;
     store
         .attach_run_effective_design_profile(
             &run_id,
@@ -6654,13 +7257,27 @@ async fn start_preview_server() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
+        const BODY: &[u8] = br#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Runtime preview fixture</title>
+  </head>
+  <body>
+    <nav aria-label="Primary"><a href="/">Home</a></nav>
+    <button type="button" aria-label="Search">Search</button>
+    <main><h1>Runtime preview fixture</h1><p>Validated preview content.</p></main>
+  </body>
+</html>"#;
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                BODY.len()
+            );
+            let _ = stream.write_all(&[header.as_bytes(), BODY].concat()).await;
         }
     });
     (format!("http://{}", addr), handle)

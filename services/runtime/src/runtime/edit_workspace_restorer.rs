@@ -12,12 +12,46 @@ use crate::{
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 pub struct RuntimeEditWorkspaceRestorer;
 
 #[async_trait]
 impl EditWorkspaceRestorer for RuntimeEditWorkspaceRestorer {
+    async fn prepare_build(
+        &self,
+        store: &RuntimeStore,
+        config: &RuntimeConfig,
+        run: &AgentRun,
+    ) -> anyhow::Result<()> {
+        let workspace_root = effective_workspace_root(config, &run.project_id);
+        let mut ctx = ToolContext::new(store.clone(), run.clone(), workspace_root.clone());
+        ctx.remote_workspace = config.sandbox_backend_mode == SandboxBackendMode::Kubernetes;
+        ctx.runtime_storage_dir = config.runtime_storage_dir.clone();
+        let backend: Box<dyn WorkspaceBackend> = match config.sandbox_backend_mode {
+            SandboxBackendMode::Kubernetes => Box::new(
+                SandboxChannelWorkspaceBackend::from_runtime_config(config)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ),
+            SandboxBackendMode::PhaseAContract => Box::new(LocalWorkspaceBackend),
+        };
+        clear_workspace_root(backend.as_ref(), &ctx, &workspace_root).await?;
+        store
+            .append_audit_record(
+                &run.project_id,
+                &run.id,
+                "workspace.prepare_build",
+                "scope=entire_workspace",
+                "allow",
+                "fresh Build workspace prepared after exclusive Sandbox acquisition",
+            )
+            .await;
+        Ok(())
+    }
+
     async fn restore(
         &self,
         store: &RuntimeStore,
@@ -77,6 +111,35 @@ impl EditWorkspaceRestorer for RuntimeEditWorkspaceRestorer {
             .await
             .map_err(|error| anyhow::anyhow!(error))
     }
+}
+
+async fn clear_workspace_root(
+    backend: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
+    let entries = match backend.list_dir(ctx, workspace_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
+    for entry in entries {
+        match entry.kind {
+            crate::tools::sandbox::WorkspaceEntryKind::Dir => {
+                backend
+                    .remove_dir_all(ctx, &entry.path)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            crate::tools::sandbox::WorkspaceEntryKind::File => {
+                backend
+                    .remove_file(ctx, &entry.path)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn restore_runtime_snapshot(
@@ -152,5 +215,53 @@ fn effective_workspace_root(config: &RuntimeConfig, project_id: &str) -> PathBuf
             config.workspace_root.join(safe)
         }
         SandboxBackendMode::Kubernetes => config.workspace_root.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::AgentPhase;
+
+    #[tokio::test]
+    async fn prepare_build_removes_all_previous_project_workspace_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "runtime-build-workspace-prepare-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = RuntimeConfig::from_env();
+        config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
+        config.workspace_root = root.clone();
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "new-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                vec![],
+            )
+            .await;
+        let workspace_root = effective_workspace_root(&config, &run.project_id);
+        std::fs::create_dir_all(workspace_root.join("project/out")).unwrap();
+        std::fs::create_dir_all(workspace_root.join("state")).unwrap();
+        std::fs::write(workspace_root.join("project/out/previous.html"), "secret").unwrap();
+        std::fs::write(workspace_root.join("state/project.json"), "{}").unwrap();
+        std::fs::write(workspace_root.join("previous-project.txt"), "secret").unwrap();
+
+        RuntimeEditWorkspaceRestorer
+            .prepare_build(&store, &config, &run)
+            .await
+            .unwrap();
+
+        assert!(workspace_root.exists());
+        assert_eq!(std::fs::read_dir(&workspace_root).unwrap().count(), 0);
+        assert!(store
+            .audit_records()
+            .await
+            .iter()
+            .any(|record| { record.run_id == run.id && record.tool == "workspace.prepare_build" }));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

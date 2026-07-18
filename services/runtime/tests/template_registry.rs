@@ -373,6 +373,84 @@ async fn built_in_manifest_hashes_match_current_project_init_output() {
     }
 }
 
+#[test]
+fn fumadocs_template_pins_a_resolvable_yuku_analyzer_graph() {
+    let registry = BuiltInTemplateRegistry::built_in();
+    let template_id = TemplateId::parse("fumadocs-docs").unwrap();
+    let spec = registry.current(&template_id).unwrap();
+    assert_eq!(spec.version.as_str(), "fumadocs-docs@runtime-p5");
+    let package_json = spec
+        .files
+        .iter()
+        .find(|file| file.path == "package.json")
+        .expect("fumadocs package.json");
+    let package_lock = spec
+        .files
+        .iter()
+        .find(|file| file.path == "package-lock.json")
+        .expect("fumadocs package-lock.json");
+    let manifest: serde_json::Value = serde_json::from_str(package_json.content).unwrap();
+    let lock: serde_json::Value = serde_json::from_str(package_lock.content).unwrap();
+
+    assert_eq!(
+        manifest["overrides"]["yuku-analyzer"],
+        serde_json::Value::String("0.6.5".to_string())
+    );
+    assert_eq!(
+        lock["packages"]["node_modules/yuku-analyzer"]["version"],
+        serde_json::Value::String("0.6.5".to_string())
+    );
+    assert!(lock["packages"].get("node_modules/yuku-ast").is_none());
+
+    let mdx_components = spec
+        .files
+        .iter()
+        .find(|file| file.path == "components/mdx.jsx")
+        .expect("fumadocs MDX components");
+    for compatibility_export in [
+        "Steps.Step = Step",
+        "Tabs.Tab = Tab",
+        "CompatibleAccordions.Accordion = Accordion",
+    ] {
+        assert!(
+            mdx_components.content.contains(compatibility_export),
+            "missing compound MDX compatibility: {compatibility_export}"
+        );
+    }
+
+    let legacy = registry
+        .resolve_version(
+            &template_id,
+            &TemplateVersion::parse("fumadocs-docs@runtime-p3").unwrap(),
+            &ManifestHash::parse(
+                "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
+            )
+            .unwrap(),
+        )
+        .expect("runtime-p3 projects must remain resolvable");
+    let legacy_manifest: serde_json::Value = serde_json::from_str(
+        legacy
+            .files
+            .iter()
+            .find(|file| file.path == "package.json")
+            .expect("legacy fumadocs package.json")
+            .content,
+    )
+    .unwrap();
+    assert!(legacy_manifest.get("overrides").is_none());
+
+    registry
+        .resolve_version(
+            &template_id,
+            &TemplateVersion::parse("fumadocs-docs@runtime-p4").unwrap(),
+            &ManifestHash::parse(
+                "3fb0f309bb3ce8cc7044d21981bc72bde1938f95f904e2589b75c443f7143cd3",
+            )
+            .unwrap(),
+        )
+        .expect("runtime-p4 projects must remain resolvable");
+}
+
 async fn initialize_and_hash(template: &str) -> ManifestHash {
     let workspace = unique_temp_dir(template);
     for directory in ["project", "inputs", "state", "outputs"] {

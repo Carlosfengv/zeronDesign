@@ -1,5 +1,12 @@
 use super::*;
 
+// Chromium is not reliably re-entrant in the constrained Runtime container:
+// concurrent headless processes can leave crashpad descendants holding stdio
+// open after the browser exits. Share one process slot across screenshots and
+// computed-style collectors so Website/Docs runs cannot wedge each other.
+pub(super) static RUNTIME_BROWSER_PROCESS_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub(super) fn browser_open_tool(workspace: Arc<dyn WorkspaceBackend>) -> Arc<dyn Tool> {
     Arc::new(BrowserOpenTool { workspace })
 }
@@ -259,7 +266,9 @@ pub(super) async fn capture_runtime_screenshot(
     // remote-fs-boundary: allow-end runtime-browser-screenshot-artifact
     let document_bytes = wait_for_runtime_proxy_document(url, Duration::from_secs(15)).await?;
     let document_sha256 = sha256_hex(&document_bytes);
-    let output = TokioCommand::new(executable)
+    let _browser_process_guard = RUNTIME_BROWSER_PROCESS_LOCK.lock().await;
+    let mut command = TokioCommand::new(executable);
+    command
         .arg("--headless=new")
         .arg("--disable-gpu")
         .arg("--no-sandbox")
@@ -269,15 +278,24 @@ pub(super) async fn capture_runtime_screenshot(
         .arg(url)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| {
-            typed_recoverable(
+        .kill_on_drop(true);
+    let output = match time::timeout(Duration::from_secs(30), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(typed_recoverable(
                 format!("Runtime browser worker failed to start: {error}"),
                 "browser.worker_failed",
                 json!({}),
-            )
-        })?;
+            ));
+        }
+        Err(_) => {
+            return Err(typed_recoverable(
+                "Runtime browser worker timed out after 30 seconds".to_string(),
+                "browser.capture_timeout",
+                json!({ "url": url, "deadlineMs": 30_000 }),
+            ));
+        }
+    };
     if !output.status.success() {
         return Err(typed_recoverable(
             format!(

@@ -675,7 +675,7 @@ fn ensure_browser_evidence_available(
     ))
 }
 
-async fn collect_browser_evidence(
+pub(super) async fn collect_browser_evidence(
     ctx: Option<&ToolContext>,
     preview_url: &str,
     rules: &[Value],
@@ -693,7 +693,7 @@ async fn collect_browser_evidence(
             let verification = rule.get("verification")?;
             matches!(
                 verification.get("kind").and_then(Value::as_str),
-                Some("computed-style" | "a11y" | "viewport")
+                Some("computed-style" | "a11y" | "viewport" | "page")
             )
             .then(|| {
                     json!({
@@ -714,8 +714,9 @@ async fn collect_browser_evidence(
         return json!({ "ok": true, "results": {} });
     }
 
+    let browser_url = internal_browser_evidence_url(ctx, preview_url);
     let mut input = json!({
-        "url": preview_url,
+        "url": browser_url,
         "assertions": assertions,
     });
     if let Some(ctx) = ctx {
@@ -754,6 +755,7 @@ async fn collect_browser_evidence(
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or_else(|| "node".to_string());
+    let _browser_process_guard = browser::RUNTIME_BROWSER_PROCESS_LOCK.lock().await;
     let mut command = TokioCommand::new(&collector_executable);
     command
         .arg("--input-type=module")
@@ -822,6 +824,26 @@ async fn collect_browser_evidence(
             "results": {}
         }),
     }
+}
+
+fn internal_browser_evidence_url(ctx: Option<&ToolContext>, preview_url: &str) -> String {
+    let Some(ctx) = ctx.filter(|ctx| ctx.remote_workspace) else {
+        return preview_url.to_string();
+    };
+    let Some(lease_id) = candidate_preview_lease_id(preview_url) else {
+        return preview_url.to_string();
+    };
+    crate::preview_access::internal_capture_origin(&ctx.runtime_browser_proxy_base_url, &lease_id)
+        .unwrap_or_else(|| preview_url.to_string())
+}
+
+fn candidate_preview_lease_id(preview_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(preview_url).ok()?;
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    (segments.len() == 2 && segments[0] == "previews").then(|| segments[1].to_string())
 }
 
 fn fidelity_rule_applies(rule: &Value, surface: &str) -> bool {
@@ -1059,8 +1081,8 @@ fn parse_css_number(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod fidelity_comparator_tests {
     use super::{
-        compare_fidelity_ratio, compare_fidelity_value, component_recipe_fidelity_rules,
-        ensure_browser_evidence_available,
+        candidate_preview_lease_id, compare_fidelity_ratio, compare_fidelity_value,
+        component_recipe_fidelity_rules, ensure_browser_evidence_available,
     };
     use serde_json::json;
 
@@ -1129,6 +1151,19 @@ mod fidelity_comparator_tests {
         }
         assert!(ensure_browser_evidence_available(false, &evidence, None, None).is_ok());
     }
+
+    #[test]
+    fn candidate_preview_lease_is_extracted_only_from_the_canonical_route() {
+        assert_eq!(
+            candidate_preview_lease_id("http://runtime/previews/lease-123/"),
+            Some("lease-123".to_string())
+        );
+        assert_eq!(
+            candidate_preview_lease_id("http://runtime/projects/p/previews/lease-123/"),
+            None
+        );
+        assert_eq!(candidate_preview_lease_id("http://runtime/"), None);
+    }
 }
 
 // remote-fs-boundary: allow-begin browser-evidence-test-fixtures
@@ -1163,8 +1198,13 @@ mod browser_evidence_tests {
                 };
                 tokio::spawn(async move {
                     let mut request = [0_u8; 4096];
-                    let _ = stream.read(&mut request).await;
-                    let html = "<!doctype html><style>body{margin:0;width:900px}</style><img src='/missing.png'><button></button><a href='/next'></a>";
+                    let bytes_read = stream.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..bytes_read]);
+                    let html = if request.starts_with("GET /previews/candidate-1/") {
+                        "<!doctype html><style>body{margin:0;width:900px}</style><img src='/missing.png'><button></button><a href='/next'></a>"
+                    } else {
+                        "<!doctype html><style>body{margin:0}</style><img alt='ok'><button>OK</button><a href='/next'>Next</a>"
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         html.len(), html
@@ -1201,8 +1241,12 @@ mod browser_evidence_tests {
             .await;
         let mut ctx = ToolContext::new(store, run.clone(), storage.join("workspace"));
         ctx.runtime_storage_dir = storage.clone();
-        let evidence =
-            collect_browser_evidence(Some(&ctx), &format!("http://{address}/"), &rules).await;
+        let evidence = collect_browser_evidence(
+            Some(&ctx),
+            &format!("http://{address}/previews/candidate-1/"),
+            &rules,
+        )
+        .await;
         server.abort();
         assert_eq!(evidence["ok"], json!(true));
         assert!(!evidence["results"]["a11y-image"]["violations"]

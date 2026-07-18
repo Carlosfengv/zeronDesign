@@ -75,6 +75,11 @@ pub enum ToolError {
         metadata: Value,
     },
     Terminal(String),
+    TerminalWithMetadata {
+        message: String,
+        error_kind: String,
+        metadata: Value,
+    },
     PermissionDenied(String),
     Aborted,
 }
@@ -85,6 +90,7 @@ impl ToolError {
             Self::Recoverable(message)
             | Self::RecoverableWithMetadata { message, .. }
             | Self::Terminal(message)
+            | Self::TerminalWithMetadata { message, .. }
             | Self::PermissionDenied(message) => message.clone(),
             Self::Aborted => "tool aborted".to_string(),
         }
@@ -870,6 +876,19 @@ impl ToolExecutor {
                             },
                         }
                     }
+                    Err(ToolError::TerminalWithMetadata {
+                        message,
+                        error_kind,
+                        metadata,
+                    }) => {
+                        ctx.store
+                            .update_run_status(&ctx.run.id, AgentRunStatus::Failed)
+                            .await
+                            .ok();
+                        ToolExecution {
+                            result: ToolResult::typed_error(message, error_kind, false, metadata),
+                        }
+                    }
                     Err(ToolError::Aborted) => ToolExecution {
                         result: ToolResult::error("tool aborted"),
                     },
@@ -1092,6 +1111,16 @@ fn typed_permission_denial_metadata(
     message: &str,
     input: &Value,
 ) -> Option<(String, Value)> {
+    if tool_name == "preview.report_candidate" && message.contains("retired outside local E2E") {
+        return Some((
+            "preview.manual_candidate_retired".to_string(),
+            json!({
+                "tool": tool_name,
+                "suggestedAction": "Call preview.publish without URL, port, command, or mode arguments. After it returns candidate_ready, call run.complete so promotion and completion commit atomically.",
+            }),
+        ));
+    }
+
     if tool_name == "shell.run" {
         return Some((
             "shell.command_denied".to_string(),

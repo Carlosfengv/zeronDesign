@@ -28,6 +28,7 @@ try {
     "--no-sandbox",
     "--no-first-run",
     "--no-default-browser-check",
+    "--host-resolver-rules=MAP *.preview.local 127.0.0.1",
     "--remote-debugging-port=0",
     `--user-data-dir=${profileDir}`,
     "about:blank",
@@ -52,6 +53,26 @@ try {
   try {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(() => {
+        const errors = [];
+        Object.defineProperty(window, "__anydesignConsoleErrors", { value: errors, configurable: false });
+        const originalConsoleError = console.error.bind(console);
+        console.error = (...args) => {
+          errors.push(args.map((value) => {
+            try { return typeof value === "string" ? value : JSON.stringify(value); }
+            catch { return String(value); }
+          }).join(" ").slice(0, 1000));
+          return originalConsoleError(...args);
+        };
+        window.addEventListener("error", (event) => {
+          errors.push(String(event.message || event.error || "window error").slice(0, 1000));
+        });
+        window.addEventListener("unhandledrejection", (event) => {
+          errors.push(String(event.reason || "unhandled rejection").slice(0, 1000));
+        });
+      })();`,
+    });
     if (input.headers) {
       await cdp.send("Network.enable");
       await cdp.send("Network.setExtraHTTPHeaders", { headers: input.headers });
@@ -59,12 +80,27 @@ try {
     const byRoute = Map.groupBy(input.assertions, (assertion) => assertion.route || "/");
     const results = {};
     for (const [route, assertions] of byRoute) {
-      const url = new URL(route, input.url).toString();
+      const url = resolvePreviewRouteUrl(input.url, route);
       const loaded = cdp.waitFor("Page.loadEventFired", TIMEOUT_MS);
       const navigation = await cdp.send("Page.navigate", { url });
       if (navigation.errorText) throw new Error(`navigation failed: ${navigation.errorText}`);
       await loaded;
       for (const assertion of assertions) {
+        if (assertion.kind === "page") {
+          const evaluation = await cdp.send("Runtime.evaluate", {
+            expression: pageHealthExpression(),
+            returnByValue: true,
+            awaitPromise: true,
+          });
+          if (evaluation.exceptionDetails) throw new Error(`page evaluation failed for ${assertion.ruleId}`);
+          results[assertion.ruleId] = {
+            route,
+            kind: assertion.kind,
+            check: assertion.check,
+            ...(evaluation.result?.value || {}),
+          };
+          continue;
+        }
         if (assertion.kind === "viewport") {
           await cdp.send("Emulation.setDeviceMetricsOverride", {
             width: assertion.viewport,
@@ -155,6 +191,15 @@ try {
   if (profileDir) await rm(profileDir, { recursive: true, force: true }).catch(() => {});
 }
 
+function resolvePreviewRouteUrl(previewUrl, route) {
+  const base = new URL(previewUrl);
+  base.search = "";
+  base.hash = "";
+  if (!base.pathname.endsWith("/")) base.pathname += "/";
+  const relativeRoute = String(route || "/").replace(/^\/+/, "");
+  return new URL(relativeRoute, base).toString();
+}
+
 function validateInput(input) {
   if (!input || typeof input !== "object") throw new Error("input must be an object");
   new URL(input.url);
@@ -167,7 +212,7 @@ function validateInput(input) {
         throw new Error(`${field} must be a non-empty string`);
       }
     }
-    if (!["computed-style", "a11y", "viewport"].includes(assertion.kind || "computed-style")) {
+    if (!["computed-style", "a11y", "viewport", "page"].includes(assertion.kind || "computed-style")) {
       throw new Error(`unsupported assertion kind for ${assertion.ruleId}`);
     }
     if ((assertion.kind || "computed-style") === "computed-style") {
@@ -179,6 +224,9 @@ function validateInput(input) {
     }
     if (assertion.kind === "a11y" && !["image-alt", "button-name", "link-name"].includes(assertion.check)) {
       throw new Error(`unsupported a11y check for ${assertion.ruleId}`);
+    }
+    if (assertion.kind === "page" && assertion.check !== "health") {
+      throw new Error(`unsupported page check for ${assertion.ruleId}`);
     }
     if (assertion.kind === "viewport" && (!Number.isInteger(assertion.viewport) || assertion.viewport < 320 || assertion.viewport > 3840)) {
       throw new Error(`viewport must be an integer in range for ${assertion.ruleId}`);
@@ -240,6 +288,61 @@ function a11yExpression(check) {
     return `(() => Array.from(document.querySelectorAll("button, [role=button]")).filter((element) => !(${text})(element)).map((element) => element.outerHTML.slice(0, 240)))()`;
   }
   return `(() => Array.from(document.querySelectorAll("a[href]")).filter((element) => !(${text})(element)).map((element) => element.outerHTML.slice(0, 240)))()`;
+}
+
+function pageHealthExpression() {
+  return `(async () => {
+    if (document.fonts?.ready) await document.fonts.ready;
+    const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const sameOriginLinks = Array.from(document.querySelectorAll("a[href]"))
+      .map((link) => {
+        try { return new URL(link.getAttribute("href"), location.href); }
+        catch { return null; }
+      })
+      .filter((url) => url && ["http:", "https:"].includes(url.protocol) && url.origin === location.origin);
+    const uniqueFetchUrls = [...new Set(sameOriginLinks.map((url) => {
+      url.hash = "";
+      return url.toString();
+    }))].slice(0, 50);
+    const brokenLinks = [];
+    for (const url of uniqueFetchUrls) {
+      try {
+        const response = await fetch(url, { method: "GET", credentials: "same-origin", redirect: "follow" });
+        if (!response.ok) brokenLinks.push({ url, status: response.status });
+      } catch (error) {
+        brokenLinks.push({ url, error: String(error?.message || error) });
+      }
+    }
+    const missingAnchors = sameOriginLinks
+      .filter((url) => url.pathname === location.pathname && url.search === location.search && url.hash)
+      .filter((url) => !document.getElementById(decodeURIComponent(url.hash.slice(1))))
+      .map((url) => url.hash);
+    const duplicateIds = [...document.querySelectorAll("[id]")]
+      .map((element) => element.id)
+      .filter((id, index, ids) => id && ids.indexOf(id) !== index);
+    const emptyCodeBlocks = [...document.querySelectorAll("pre, code")]
+      .filter((element) => !normalize(element.textContent))
+      .map((element) => element.outerHTML.slice(0, 240));
+    const bodyStyle = document.body ? getComputedStyle(document.body) : null;
+    return {
+      finalUrl: location.href,
+      title: normalize(document.title),
+      lang: normalize(document.documentElement.lang),
+      hasViewportMeta: Boolean(document.querySelector('meta[name="viewport"]')),
+      textLength: normalize(document.body?.innerText).length,
+      fontsStatus: document.fonts?.status || "unsupported",
+      fontsReady: !document.fonts || document.fonts.status === "loaded",
+      bodyFontFamily: normalize(bodyStyle?.fontFamily),
+      internalLinkCount: sameOriginLinks.length,
+      navLinkCount: document.querySelectorAll('nav a[href], [role="navigation"] a[href]').length,
+      brokenLinks,
+      missingAnchors: [...new Set(missingAnchors)],
+      duplicateIds: [...new Set(duplicateIds)],
+      emptyCodeBlocks,
+      searchControlPresent: Boolean(document.querySelector('[role="search"], input[type="search"], button[aria-label*="search" i], button[title*="search" i]')),
+      consoleErrors: Array.isArray(window.__anydesignConsoleErrors) ? window.__anydesignConsoleErrors.slice(0, 50) : [],
+    };
+  })()`;
 }
 
 function safeSegment(value) {

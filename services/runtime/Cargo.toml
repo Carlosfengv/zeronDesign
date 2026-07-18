@@ -28,6 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 x509-parser = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 kube = { version = "4", features = ["client", "rustls-tls", "ws"] }

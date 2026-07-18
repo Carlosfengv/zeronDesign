@@ -34,6 +34,13 @@ pub trait BuildSandboxProvisioner: Send + Sync {
 
 #[async_trait]
 pub trait EditWorkspaceRestorer: Send + Sync {
+    async fn prepare_build(
+        &self,
+        store: &RuntimeStore,
+        config: &RuntimeConfig,
+        run: &crate::types::AgentRun,
+    ) -> anyhow::Result<()>;
+
     async fn restore(
         &self,
         store: &RuntimeStore,

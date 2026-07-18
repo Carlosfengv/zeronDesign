@@ -1,3 +1,4 @@
+pub mod acceptance_contract;
 pub mod agent_hooks;
 pub mod agent_loop;
 pub mod artifact_access;
@@ -10,6 +11,7 @@ pub mod conversation;
 pub mod design_context;
 pub mod design_profile;
 pub mod design_profile_service;
+pub mod generation_contract;
 pub mod http_api;
 pub mod model_gateway;
 pub mod permission;
