@@ -429,6 +429,10 @@ impl RunLifecycleService {
                     .await);
             }
         }
+        self.store
+            .ensure_initial_checkpoint(&run.id)
+            .await
+            .map_err(internal_error)?;
         if run.phase != AgentPhase::Edit {
             self.register_start_session(&run).await?;
         }

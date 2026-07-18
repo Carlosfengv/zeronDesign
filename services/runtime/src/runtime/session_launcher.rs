@@ -6,7 +6,9 @@ use crate::{
     run_lifecycle::RunSessionLauncher,
     runtime::RuntimeSupervisor,
     tools::control_plane::control_plane_executor_for_config,
+    types::{AgentEvent, AgentRunStatus},
 };
+use chrono::Utc;
 use std::sync::Arc;
 
 pub struct RuntimeSessionLauncher {
@@ -51,8 +53,41 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
             } else {
                 control_plane_executor_for_config(&config)
             };
+            let session_store = store.clone();
             let session = QuerySession::with_tool_executor(store, model, tool_executor);
-            let _ = session.submit_run(&run_id).await;
+            if let Err(error) = session.submit_run(&run_id).await {
+                if let Some(run) = session_store.get_run(&run_id).await {
+                    if !run.status.is_terminal() && run.status != AgentRunStatus::NeedsUserInput {
+                        session_store
+                            .update_run_status(&run_id, AgentRunStatus::Failed)
+                            .await
+                            .ok();
+                        let summary = format!("Agent session failed: {error}");
+                        let _ = session_store
+                            .append_event(AgentEvent::RunCompleted {
+                                run_id: run_id.clone(),
+                                status: "failed".to_string(),
+                                summary: summary.clone(),
+                                timestamp: Utc::now(),
+                            })
+                            .await;
+                        session_store
+                            .append_conversation_item(
+                                &run.project_id,
+                                Some(&run_id),
+                                "run_completed",
+                                Some("system"),
+                                summary,
+                                Some(serde_json::json!({
+                                    "status": "failed",
+                                    "reason": "session_execution_error",
+                                })),
+                            )
+                            .await;
+                    }
+                }
+                return Err(error);
+            }
             Ok(())
         })?;
         Ok(())

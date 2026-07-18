@@ -373,6 +373,10 @@ async fn start_keeps_queued_run_recoverable_when_session_registration_fails() {
         store.get_run(&run_id).await.unwrap().status,
         AgentRunStatus::Queued
     );
+    assert!(
+        store.latest_checkpoint_for_run(&run_id).await.is_some(),
+        "queued run must have a recovery checkpoint before session registration"
+    );
     assert!(store.events(&run_id).await.iter().any(|event| matches!(
         event,
         crate::types::AgentEvent::StateChanged { state, .. }
