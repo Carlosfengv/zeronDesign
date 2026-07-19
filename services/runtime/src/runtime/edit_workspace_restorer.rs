@@ -2,6 +2,7 @@ use crate::{
     artifact_publisher::{safe_segment, FileArtifactPublisher},
     config::{RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
+    project::resolve_built_in_template_for_state,
     run_lifecycle::EditWorkspaceRestorer,
     tools::{
         runtime::ToolContext,
@@ -96,6 +97,7 @@ impl EditWorkspaceRestorer for RuntimeEditWorkspaceRestorer {
                 .await
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
+        restore_runtime_owned_project_state(backend.as_ref(), &ctx, &workspace_root, run).await?;
         let dependency_state = serde_json::to_string_pretty(&json!({
             "needsRestore": true,
             "reason": "source_snapshot_restored_without_node_modules",
@@ -111,6 +113,42 @@ impl EditWorkspaceRestorer for RuntimeEditWorkspaceRestorer {
             .await
             .map_err(|error| anyhow::anyhow!(error))
     }
+}
+
+async fn restore_runtime_owned_project_state(
+    backend: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    workspace_root: &Path,
+    run: &AgentRun,
+) -> anyhow::Result<()> {
+    let project_state = run
+        .project_state_snapshot
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("edit run is missing its project state snapshot"))?;
+    let template = resolve_built_in_template_for_state(project_state)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let project_state_json = serde_json::to_string_pretty(project_state)?;
+    backend
+        .write_string(
+            ctx,
+            &workspace_root.join("state/project.json"),
+            &project_state_json,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let style_contract = template
+        .style
+        .render(&template.id, Path::new(&project_state.app_root));
+    let style_contract_json = serde_json::to_string_pretty(&style_contract)?;
+    backend
+        .write_string(
+            ctx,
+            &workspace_root.join("state/style-contract.json"),
+            &style_contract_json,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(())
 }
 
 async fn clear_workspace_root(

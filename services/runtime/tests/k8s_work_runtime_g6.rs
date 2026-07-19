@@ -56,10 +56,10 @@ async fn dual_work_isolation_restart_and_uid_drift_on_k3d() {
     assert_eq!(state_b.observed_generation, state_b.desired_generation);
 
     let client = Client::try_default().await.unwrap();
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "anydesign-works");
-    let services: Api<Service> = Api::namespaced(client.clone(), "anydesign-works");
-    let policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), "anydesign-works");
-    let ingresses: Api<Ingress> = Api::namespaced(client.clone(), "anydesign-works");
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let services: Api<Service> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let ingresses: Api<Ingress> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     assert!(ingresses
         .list(&Default::default())
         .await
@@ -125,7 +125,7 @@ async fn dual_work_isolation_restart_and_uid_drift_on_k3d() {
     let replacement: Deployment = serde_json::from_value(json!({
         "apiVersion": "apps/v1", "kind": "Deployment",
         "metadata": {
-            "name": deployment_name, "namespace": "anydesign-works",
+            "name": deployment_name, "namespace": "ws-public-runtime-e2e",
             "labels": {"app.kubernetes.io/managed-by": "anydesign-work-runtime-controller"},
             "annotations": {
                 "anydesign.dev/signature-digest": format!("sha256:{}", "d".repeat(64)),
@@ -240,6 +240,7 @@ fn publish(
     store
         .commit_intent(&anydesign_runtime::publication::PublicationIntent {
             project_id: project_id.into(),
+            workspace_namespace: "ws-public-runtime-e2e".into(),
             kind: anydesign_runtime::publication::PublishOperationKind::Publish,
             release_id: Some(release_id.into()),
             expected_current_release_id: None,
@@ -261,7 +262,7 @@ async fn wait_deleted(api: &Api<Deployment>, name: &str) {
 }
 
 async fn assert_cross_work_blocked(client: Client, source_work: &str, target_service: &str) {
-    let pods: Api<Pod> = Api::namespaced(client, "anydesign-works");
+    let pods: Api<Pod> = Api::namespaced(client, "ws-public-runtime-e2e");
     let pod = pods
         .list(&ListParams::default().labels(&format!("anydesign.dev/work={source_work}")))
         .await

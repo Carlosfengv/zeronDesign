@@ -39,7 +39,7 @@ async fn publish_unpublish_and_republish_keep_stable_https_host_on_k3d() {
     let stable_host_slug = initial.host_slug.clone();
 
     let client = Client::try_default().await.unwrap();
-    let ingresses: Api<Ingress> = Api::namespaced(client.clone(), "anydesign-works");
+    let ingresses: Api<Ingress> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     assert!(ingresses
         .list(&Default::default())
         .await
@@ -50,7 +50,7 @@ async fn publish_unpublish_and_republish_keep_stable_https_host_on_k3d() {
     let conflicting: Ingress = serde_json::from_value(json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
-        "metadata": {"name": "foreign-host-owner", "namespace": "anydesign-works"},
+        "metadata": {"name": "foreign-host-owner", "namespace": "ws-public-runtime-e2e"},
         "spec": {
             "ingressClassName": "traefik",
             "rules": [{"host": reserved_host, "http": {"paths": [{
@@ -129,6 +129,7 @@ async fn publish_unpublish_and_republish_keep_stable_https_host_on_k3d() {
     let (unpublish_operation, _) = publication
         .commit_intent(&PublicationIntent {
             project_id: "g7-project".into(),
+            workspace_namespace: "ws-public-runtime-e2e".into(),
             kind: PublishOperationKind::Unpublish,
             release_id: None,
             expected_current_release_id: Some(release.id.clone()),
@@ -336,7 +337,7 @@ async fn update_rollback_restart_and_failed_switch_restore_blue_on_k3d() {
     );
     assert_endpoint_release(&client, &recovered_b.service_name, &release_b.id).await;
 
-    let pods: Api<Pod> = Api::namespaced(client.clone(), "anydesign-works");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     let blue_pod = pods
         .list(&kube::api::ListParams::default().labels(&format!(
             "anydesign.dev/work={},anydesign.dev/release-id={}",
@@ -373,7 +374,7 @@ async fn update_rollback_restart_and_failed_switch_restore_blue_on_k3d() {
         release_b.id
     );
     assert_external_release(&host, &release_b.id).await;
-    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "anydesign-works");
+    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     slices
         .delete("g8-blocking-old-endpoint", &Default::default())
         .await
@@ -412,6 +413,7 @@ async fn update_rollback_restart_and_failed_switch_restore_blue_on_k3d() {
 fn publish_intent(release_id: &str, generation: u64, key: &str) -> PublicationIntent {
     PublicationIntent {
         project_id: "g7-project".into(),
+        workspace_namespace: "ws-public-runtime-e2e".into(),
         kind: PublishOperationKind::Publish,
         release_id: Some(release_id.into()),
         expected_current_release_id: None,
@@ -526,6 +528,7 @@ fn g8_intent(
 ) -> PublicationIntent {
     PublicationIntent {
         project_id: "g8-project".into(),
+        workspace_namespace: "ws-public-runtime-e2e".into(),
         kind,
         release_id: Some(release_id.into()),
         expected_current_release_id: expected_current_release_id.map(str::to_string),
@@ -544,6 +547,9 @@ fn g8_controller(
         base_domain: required_env("WORKS_BASE_DOMAIN"),
         ingress_class: required_env("WORKS_INGRESS_CLASS"),
         tls_secret_name: required_env("WORKS_TLS_SECRET_NAME"),
+        certificate_issuer_name: std::env::var("WORKS_CERTIFICATE_ISSUER_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         probe_scheme: required_env("WORKS_PROBE_SCHEME"),
         probe_resolve: Some(required_env("WORKS_PROBE_RESOLVE").parse().unwrap()),
         probe_ca_file: Some(PathBuf::from(required_env("WORKS_PROBE_CA_FILE"))),
@@ -564,7 +570,7 @@ fn g8_controller(
 }
 
 async fn service_release(client: &Client, service_name: &str) -> String {
-    let services: Api<Service> = Api::namespaced(client.clone(), "anydesign-works");
+    let services: Api<Service> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     services
         .get(service_name)
         .await
@@ -578,7 +584,7 @@ async fn service_release(client: &Client, service_name: &str) -> String {
 }
 
 async fn force_service_release(client: &Client, service_name: &str, release_id: &str) {
-    let services: Api<Service> = Api::namespaced(client.clone(), "anydesign-works");
+    let services: Api<Service> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     services
         .patch(
             service_name,
@@ -590,8 +596,8 @@ async fn force_service_release(client: &Client, service_name: &str, release_id: 
 }
 
 async fn assert_endpoint_release(client: &Client, service_name: &str, release_id: &str) {
-    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "anydesign-works");
-    let pods: Api<Pod> = Api::namespaced(client.clone(), "anydesign-works");
+    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     let mut endpoints = 0usize;
     for slice in slices
         .list(
@@ -619,7 +625,7 @@ async fn assert_endpoint_release(client: &Client, service_name: &str, release_id
 }
 
 async fn assert_two_release_deployments(client: &Client, work_name: &str) {
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "anydesign-works");
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     assert_eq!(
         deployments
             .list(
@@ -635,13 +641,13 @@ async fn assert_two_release_deployments(client: &Client, work_name: &str) {
 }
 
 async fn create_blocking_endpoint_slice(client: &Client, service_name: &str, pod_name: &str) {
-    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "anydesign-works");
+    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
     let slice: EndpointSlice = serde_json::from_value(json!({
         "apiVersion": "discovery.k8s.io/v1",
         "kind": "EndpointSlice",
         "metadata": {
             "name": "g8-blocking-old-endpoint",
-            "namespace": "anydesign-works",
+            "namespace": "ws-public-runtime-e2e",
             "labels": {"kubernetes.io/service-name": service_name}
         },
         "addressType": "IPv4",
@@ -649,7 +655,7 @@ async fn create_blocking_endpoint_slice(client: &Client, service_name: &str, pod
         "endpoints": [{
             "addresses": ["10.255.255.1"],
             "conditions": {"ready": true},
-            "targetRef": {"kind": "Pod", "namespace": "anydesign-works", "name": pod_name}
+            "targetRef": {"kind": "Pod", "namespace": "ws-public-runtime-e2e", "name": pod_name}
         }]
     }))
     .unwrap();
@@ -664,9 +670,9 @@ async fn create_blocking_endpoint_slice(client: &Client, service_name: &str, pod
 }
 
 async fn assert_resources_absent(client: Client, work_name: &str) {
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "anydesign-works");
-    let services: Api<Service> = Api::namespaced(client.clone(), "anydesign-works");
-    let ingresses: Api<Ingress> = Api::namespaced(client, "anydesign-works");
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let services: Api<Service> = Api::namespaced(client.clone(), "ws-public-runtime-e2e");
+    let ingresses: Api<Ingress> = Api::namespaced(client, "ws-public-runtime-e2e");
     assert!(services.get_opt(work_name).await.unwrap().is_none());
     assert!(ingresses.get_opt(work_name).await.unwrap().is_none());
     assert!(deployments

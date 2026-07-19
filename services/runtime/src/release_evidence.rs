@@ -190,6 +190,7 @@ impl ReleaseEvidenceService {
             "editRunId": edit_run_id,
             "bindingId": binding.id,
             "podUid": binding.pod_uid,
+            "workspaceNamespace": binding.namespace,
             "buildId": publish.build_id,
             "candidateManifestHash": publish.candidate_manifest_hash,
             "sourceSnapshotUri": publish.source_snapshot_uri,

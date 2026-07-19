@@ -108,8 +108,7 @@ async fn candidate_preview_proxy_enforces_lease_identity_and_manifest_hash() {
         .upsert_project_access(
             "preview-project",
             "principal-preview-owner".to_string(),
-            Some("workspace-preview".to_string()),
-            None,
+            "ws-preview".to_string(),
         )
         .await
         .unwrap();

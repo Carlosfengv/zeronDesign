@@ -148,7 +148,8 @@ pub fn sandbox_backend_for_config(config: &RuntimeConfig) -> Arc<dyn SandboxBack
         SandboxBackendMode::Kubernetes => Arc::new(KubernetesSandboxBackend::new(
             KubectlSandboxClient::new(),
             SandboxAdapterConfig {
-                namespace: config.k8s_namespace.clone(),
+                // The trusted ProjectAccess record replaces this value before every claim.
+                namespace: "ws-unassigned".to_string(),
                 ..Default::default()
             },
         )),
@@ -163,6 +164,7 @@ pub trait SandboxBackend: Send + Sync {
         &self,
         store: &RuntimeStore,
         project_id: &str,
+        workspace_namespace: &str,
         template_key: &str,
     ) -> Result<SandboxBinding>;
     async fn wait_ready(
@@ -176,14 +178,12 @@ pub trait SandboxBackend: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct PhaseAContractSandboxBackend {
-    namespace: String,
     channel_protocol: SandboxChannelProtocol,
 }
 
 impl Default for PhaseAContractSandboxBackend {
     fn default() -> Self {
         Self {
-            namespace: "anydesign-sandboxes".to_string(),
             channel_protocol: SandboxChannelProtocol::Websocket,
         }
     }
@@ -199,6 +199,7 @@ impl SandboxBackend for PhaseAContractSandboxBackend {
         &self,
         store: &RuntimeStore,
         project_id: &str,
+        workspace_namespace: &str,
         template_key: &str,
     ) -> Result<SandboxBinding> {
         let short_id = store.next_id("sandbox");
@@ -210,7 +211,7 @@ impl SandboxBackend for PhaseAContractSandboxBackend {
                 claim_name.clone(),
                 workspace_pvc_name(&claim_name),
                 resolve_warm_pool_name(template_key)?,
-                self.namespace.clone(),
+                workspace_namespace.to_string(),
                 self.channel_protocol,
             )
             .await
@@ -304,11 +305,12 @@ impl SandboxBackend for KubernetesSandboxBackend {
         &self,
         store: &RuntimeStore,
         project_id: &str,
+        workspace_namespace: &str,
         template_key: &str,
     ) -> Result<SandboxBinding> {
-        self.adapter(store.clone(), None)
-            .claim(template_key, project_id)
-            .await
+        let mut adapter = self.adapter(store.clone(), None);
+        adapter.set_namespace(workspace_namespace);
+        adapter.claim(template_key, project_id).await
     }
 
     async fn wait_ready(
@@ -717,9 +719,23 @@ impl Tool for SandboxClaimTool {
             .ok_or_else(|| {
                 ToolError::Recoverable("sandbox.claim requires templateKey".to_string())
             })?;
+        let workspace_namespace = match ctx.store.get_project_access(&ctx.project_id).await {
+            Some(access) => access.workspace_namespace,
+            None if self.backend.mode() == "phase_a_contract" => "ws-phase-a-local".to_string(),
+            None => {
+                return Err(ToolError::Recoverable(
+                    "project workspace is not registered".to_string(),
+                ))
+            }
+        };
         let binding = self
             .backend
-            .claim(&ctx.store, &ctx.project_id, template_key)
+            .claim(
+                &ctx.store,
+                &ctx.project_id,
+                &workspace_namespace,
+                template_key,
+            )
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         ctx.store

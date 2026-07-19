@@ -629,7 +629,7 @@ pub struct SandboxAdapterConfig {
 impl Default for SandboxAdapterConfig {
     fn default() -> Self {
         Self {
-            namespace: "anydesign-sandboxes".to_string(),
+            namespace: "ws-unassigned".to_string(),
             channel_protocol: SandboxChannelProtocol::Websocket,
             wait_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_secs(2),
@@ -666,6 +666,10 @@ where
             client,
             config,
         }
+    }
+
+    pub fn set_namespace(&mut self, namespace: &str) {
+        self.config.namespace = namespace.to_string();
     }
 
     pub async fn claim(&self, template_key: &str, project_id: &str) -> Result<SandboxBinding> {
@@ -799,23 +803,43 @@ pub fn resolve_warm_pool_name(template_key: &str) -> Result<String> {
 }
 
 pub fn sandbox_claim_name(project_id: &str, short_id: &str) -> String {
-    format!(
-        "project-{}-{}",
-        sanitize_k8s_name(project_id),
-        sanitize_k8s_name(short_id)
-    )
-    .trim_end_matches('-')
-    .chars()
-    .take(63)
-    .collect()
+    let project = sanitize_k8s_name(project_id);
+    let unique_suffix = sanitize_k8s_name(short_id);
+    let project_budget = 63usize.saturating_sub("project--".len() + unique_suffix.len());
+    let project = project
+        .chars()
+        .take(project_budget)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    format!("project-{project}-{unique_suffix}")
 }
 
 pub fn workspace_pvc_name(sandbox_claim_name: &str) -> String {
-    format!("workspace-{}", sanitize_k8s_name(sandbox_claim_name))
-        .trim_end_matches('-')
+    let claim = sanitize_k8s_name(sandbox_claim_name);
+    let claim_budget = 63 - "workspace-".len();
+    if claim.len() <= claim_budget {
+        return format!("workspace-{claim}");
+    }
+    let suffix_budget = 20.min(claim_budget.saturating_sub(2));
+    let prefix_budget = claim_budget - suffix_budget - 1;
+    let prefix = claim
         .chars()
-        .take(63)
-        .collect()
+        .take(prefix_budget)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    let suffix = claim
+        .chars()
+        .rev()
+        .take(suffix_budget)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .trim_start_matches('-')
+        .to_string();
+    format!("workspace-{prefix}-{suffix}")
 }
 
 pub fn sandbox_channel_endpoint(

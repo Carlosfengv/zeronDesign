@@ -186,6 +186,20 @@ fn sandbox_names_are_k8s_safe_and_template_specific() {
     );
     assert!(sandbox_claim_name("Project_ABC", "sandbox-123").starts_with("project-project-abc"));
     assert!(sandbox_claim_name("x", "y").len() <= 63);
+
+    let long_project = "real-20260718142059-zenova-agent-cloud-with-a-long-project-name";
+    let first = sandbox_claim_name(long_project, "sandbox-1848");
+    let second = sandbox_claim_name(long_project, "sandbox-1849");
+    assert_ne!(first, second);
+    assert!(first.ends_with("sandbox-1848"));
+    assert!(second.ends_with("sandbox-1849"));
+    assert!(first.len() <= 63);
+    let first_pvc = workspace_pvc_name(&first);
+    let second_pvc = workspace_pvc_name(&second);
+    assert_ne!(first_pvc, second_pvc);
+    assert!(first_pvc.ends_with("sandbox-1848"));
+    assert!(second_pvc.ends_with("sandbox-1849"));
+    assert!(first_pvc.len() <= 63);
 }
 
 #[test]

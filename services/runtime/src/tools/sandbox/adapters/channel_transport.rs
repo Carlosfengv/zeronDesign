@@ -693,6 +693,8 @@ async fn connect_workspace_channel(
             .to_string();
         let port = handshake.uri().port_u16().unwrap_or(443);
         let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        let expected_server_san =
+            expected_workspace_channel_server_san(tls.expected_server_san.as_str(), &host)?;
         let server_name = ServerName::try_from(host)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid channel host"))?;
         let tls_stream = tokio_rustls::TlsConnector::from(tls.client_config.clone())
@@ -700,7 +702,7 @@ async fn connect_workspace_channel(
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))?;
         let stream = MaybeTlsStream::Rustls(tls_stream);
-        verify_workspace_channel_server_san(&stream, &tls.expected_server_san)?;
+        verify_workspace_channel_server_san(&stream, &expected_server_san)?;
         client_async(handshake, stream)
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))
@@ -709,6 +711,21 @@ async fn connect_workspace_channel(
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::ConnectionRefused, error))
     }
+}
+
+fn expected_workspace_channel_server_san(template: &str, host: &str) -> io::Result<String> {
+    if !template.contains("{namespace}") {
+        return Ok(template.to_string());
+    }
+    let namespace = host.split('.').nth(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace channel host does not include a namespace",
+        )
+    })?;
+    crate::types::validate_workspace_namespace(namespace)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Ok(template.replace("{namespace}", namespace))
 }
 
 fn verify_workspace_channel_server_san(
@@ -747,4 +764,31 @@ fn verify_workspace_channel_server_san(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_identity_tests {
+    use super::expected_workspace_channel_server_san;
+
+    #[test]
+    fn resolves_workspace_namespace_from_service_dns_name() {
+        let san = expected_workspace_channel_server_san(
+            "spiffe://anydesign.local/ns/{namespace}/sa/anydesign-sandbox",
+            "claim-123.ws-project-a.svc.cluster.local",
+        )
+        .unwrap();
+        assert_eq!(
+            san,
+            "spiffe://anydesign.local/ns/ws-project-a/sa/anydesign-sandbox"
+        );
+    }
+
+    #[test]
+    fn rejects_service_dns_name_without_workspace_namespace() {
+        assert!(expected_workspace_channel_server_san(
+            "spiffe://anydesign.local/ns/{namespace}/sa/anydesign-sandbox",
+            "localhost",
+        )
+        .is_err());
+    }
 }

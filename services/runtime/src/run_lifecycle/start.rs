@@ -37,8 +37,6 @@ pub struct StartRunContext {
     pub parent_run_id: Option<String>,
     pub design_profile_id: Option<String>,
     pub design_fidelity_mode: Option<String>,
-    pub workspace_id: Option<String>,
-    pub organization_id: Option<String>,
     pub model_resource_id: Option<String>,
     pub finding_ids: Vec<String>,
 }
@@ -57,8 +55,6 @@ impl RunLifecycleService {
             .design_profiles
             .prepare_run_context(crate::design_profile_service::RunProfileContextQuery {
                 project_id: &request.project_id,
-                workspace_id: request.input_context.workspace_id.as_deref(),
-                organization_id: request.input_context.organization_id.as_deref(),
                 explicit_profile_id: request.input_context.design_profile_id.as_deref(),
                 phase: request.phase,
                 brief_id: request.input_context.brief_id.as_deref(),
@@ -386,7 +382,7 @@ impl RunLifecycleService {
             } else {
                 run
             };
-        let run = maybe_provision_build_sandbox(self, run).await?;
+        let run = maybe_provision_mutation_sandbox(self, run).await?;
         if sandbox_phase_requires_binding(run.phase) && run.sandbox_id.is_some() {
             let allowed_parent_run_id = request.input_context.parent_run_id.as_deref();
             if let Err(error) = self
@@ -843,23 +839,8 @@ async fn validate_project_access_before_initial_run(
                 "project access ownership must be registered before the initial run"
             ))
         })?;
-    if request
-        .input_context
-        .workspace_id
-        .as_deref()
-        .is_some_and(|workspace_id| access.workspace_id.as_deref() != Some(workspace_id))
-        || request
-            .input_context
-            .organization_id
-            .as_deref()
-            .is_some_and(|organization_id| {
-                access.organization_id.as_deref() != Some(organization_id)
-            })
-    {
-        return Err(conflict_error(anyhow::anyhow!(
-            "project access scope identity drift detected"
-        )));
-    }
+    crate::types::validate_workspace_namespace(&access.workspace_namespace)
+        .map_err(|error| conflict_error(anyhow::anyhow!(error)))?;
     Ok(())
 }
 
@@ -966,7 +947,7 @@ async fn validate_sandbox_context(
     }
 
     if sandbox_phase_requires_binding(request.phase) && requested_binding.is_none() {
-        if request.phase == AgentPhase::Build {
+        if matches!(request.phase, AgentPhase::Build | AgentPhase::Edit) {
             return Ok(());
         }
         return Err(conflict_error(anyhow::anyhow!(
@@ -1074,11 +1055,11 @@ fn is_mutable_phase(phase: AgentPhase) -> bool {
     )
 }
 
-async fn maybe_provision_build_sandbox(
+async fn maybe_provision_mutation_sandbox(
     service: &RunLifecycleService,
     run: AgentRun,
 ) -> Result<AgentRun, RunLifecycleError> {
-    if run.phase != AgentPhase::Build || run.sandbox_id.is_some() {
+    if !matches!(run.phase, AgentPhase::Build | AgentPhase::Edit) || run.sandbox_id.is_some() {
         return Ok(run);
     }
     let Some(brief_id) = run.brief_version.as_deref() else {

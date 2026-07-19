@@ -4437,6 +4437,57 @@ async fn build_failure_activates_repair_observation_budget() {
 }
 
 #[tokio::test]
+async fn missing_dependency_publish_failure_enters_repair_before_no_progress_stop() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "missing-dependency-repair-project".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "test".to_string(),
+            vec![],
+        )
+        .await;
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![
+            ModelResponse::ToolCalls(vec![ToolCall::new(
+                "publish-missing-dependency",
+                "preview.publish",
+                json!({}),
+            )]),
+            ModelResponse::Error("stop after repair prompt capture".to_string()),
+        ],
+        captured_requests.clone(),
+    );
+    let executor = ToolExecutor::new(
+        vec![Arc::new(PreviewMissingDependencyTool)],
+        PermissionRules::default(),
+    );
+
+    AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor)
+        .with_limits(AgentLoopLimits {
+            max_turns: 2,
+            max_no_progress_turns: 1,
+            ..AgentLoopLimits::default()
+        })
+        .run(&run.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].system_prompt.contains("repairing_source"));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunObservationBudget {
+            repair_active: true,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn exhausted_repair_budget_directs_mutation_instead_of_more_observation() {
     let store = RuntimeStore::new();
     let run = store
@@ -5064,6 +5115,41 @@ impl Tool for PreviewBuildFailTool {
             "build failed",
             "build.failed",
             json!({ "command": "npm run build", "stderr": "fixture compiler error" }),
+        ))
+    }
+}
+
+struct PreviewMissingDependencyTool;
+
+#[async_trait]
+impl Tool for PreviewMissingDependencyTool {
+    fn name(&self) -> &'static str {
+        "preview.publish"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+
+    async fn check_permission(&self, input: &Value, _ctx: &ToolContext) -> PermissionResult {
+        PermissionResult::Allow {
+            updated_input: input.clone(),
+            reason: PermissionReason::Other {
+                reason: "test allow".to_string(),
+            },
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        _ctx: ToolContext,
+        _progress: ProgressSink,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::typed_recoverable(
+            "missing dependency",
+            "build.missing_dependency",
+            json!({ "stderr": "module not found" }),
         ))
     }
 }

@@ -216,6 +216,19 @@ async fn start_edit_waits_for_continue_before_spawning_agent() {
     )
     .unwrap();
     let store = RuntimeStore::new();
+    store
+        .upsert_project_runtime_state(
+            "project-1",
+            "project".to_string(),
+            "astro-website".to_string(),
+            "astro-website@runtime-p3".to_string(),
+            "astro".to_string(),
+            "npm".to_string(),
+            "package-lock.json".to_string(),
+            "https://registry.npmjs.org/".to_string(),
+        )
+        .await
+        .unwrap();
     let run = store
         .create_run(
             "project-1".to_string(),
@@ -225,6 +238,7 @@ async fn start_edit_waits_for_continue_before_spawning_agent() {
             vec![],
         )
         .await;
+    store.write_brief(&run.id, website_brief()).await.unwrap();
     let binding = store
         .create_sandbox_binding(
             "project-1",
@@ -358,6 +372,19 @@ async fn start_edit_inherits_frozen_dcp_restores_and_rematerializes_the_promoted
         .unwrap();
 
     let store = RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone());
+    store
+        .upsert_project_runtime_state(
+            "project-1",
+            "project".to_string(),
+            "astro-website".to_string(),
+            "astro-website@runtime-p3".to_string(),
+            "astro".to_string(),
+            "npm".to_string(),
+            "package-lock.json".to_string(),
+            "https://registry.npmjs.org/".to_string(),
+        )
+        .await
+        .unwrap();
     let source = store
         .create_run(
             "project-1".to_string(),

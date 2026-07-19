@@ -236,6 +236,94 @@ async fn start_build_cancels_created_run_when_sandbox_provisioning_fails() {
 }
 
 #[tokio::test]
+async fn start_edit_rehydrates_a_released_project_before_restoring_workspace() {
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-edit-rehydrate".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief_draft(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "operators".to_string(),
+                content_hierarchy: vec!["hero".to_string()],
+                page_structure: serde_json::json!([]),
+                visual_direction: "clear".to_string(),
+                recommended_template: "astro-website".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let build_run = store
+        .create_run_with_context(
+            "project-edit-rehydrate".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+            Some(brief_id),
+            None,
+        )
+        .await;
+    let version = store
+        .create_project_version_candidate(
+            "project-edit-rehydrate",
+            &build_run.id,
+            "http://preview.invalid".to_string(),
+            None,
+            Some("runtime://source-snapshots/project-edit-rehydrate/base".to_string()),
+        )
+        .await;
+    store
+        .promote_project_version("project-edit-rehydrate", &build_run.id, &version.id)
+        .await
+        .unwrap();
+    store
+        .update_run_status(&build_run.id, AgentRunStatus::Completed)
+        .await
+        .unwrap();
+    let provisioner = Arc::new(FailingSandboxProvisioner::default());
+    let service = RunLifecycleService::new(
+        RuntimeConfig::from_env(),
+        store.clone(),
+        Arc::new(RecordingSessionLauncher::default()),
+        provisioner.clone(),
+        Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
+    );
+
+    let error = service
+        .start(super::StartRunCommand {
+            project_id: "project-edit-rehydrate".to_string(),
+            phase: AgentPhase::Edit,
+            agent_profile: "edit".to_string(),
+            input_context: super::StartRunContext {
+                base_version_id: Some(version.id),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(error, super::RunLifecycleError::Conflict(_)));
+    assert!(store
+        .active_mutable_run_for_project("project-edit-rehydrate")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
     let store = RuntimeStore::new();
     let brief_run = store

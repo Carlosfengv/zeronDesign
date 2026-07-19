@@ -287,14 +287,10 @@ impl AgentLoop {
         let project_id = run.project_id.clone();
         let project_access = self.store.get_project_access(&project_id).await;
         let model_gateway_scope = ModelGatewayScope {
-            organization_id: project_access
-                .as_ref()
-                .and_then(|access| access.organization_id.clone())
-                .unwrap_or_else(|| "runtime-local".to_string()),
             workspace_id: project_access
                 .as_ref()
-                .and_then(|access| access.workspace_id.clone())
-                .unwrap_or_else(|| "runtime-local".to_string()),
+                .map(|access| access.workspace_namespace.clone())
+                .unwrap_or_else(|| "ws-runtime-local".to_string()),
             project_id: project_id.clone(),
         };
         let _ = self
@@ -2951,13 +2947,8 @@ fn recovered_observation_budget_usage(events: &[AgentEvent]) -> ObservationBudge
                 metadata: Some(metadata),
                 ..
             } if tool == "preview.publish"
-                && matches!(
+                && preview_failure_requires_repair(
                     metadata.get("errorKind").and_then(Value::as_str),
-                    Some(
-                        "generation.validation_failed"
-                            | "acceptance.validation_failed"
-                            | "build.failed"
-                    )
                 ) =>
             {
                 usage.repair_active = true;
@@ -3010,13 +3001,12 @@ fn update_repair_observation_budget_state<'a>(
             candidate_ready = true;
             continue;
         }
-        if matches!(
+        if preview_failure_requires_repair(
             result
                 .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("errorKind"))
                 .and_then(Value::as_str),
-            Some("generation.validation_failed" | "acceptance.validation_failed" | "build.failed")
         ) {
             repair_required = true;
         }
@@ -3206,17 +3196,10 @@ fn update_progress_state(
                         .insert("candidate_rejected".to_string());
                 }
             }
-            if matches!(
-                error_kind,
-                Some(
-                    "generation.validation_failed"
-                        | "acceptance.validation_failed"
-                        | "build.failed"
-                )
-            ) {
+            if preview_failure_requires_repair(error_kind) {
                 state.completed_steps.insert("repair_required".to_string());
                 state.completed_steps.remove("repair_mutated");
-                if error_kind == Some("build.failed") {
+                if error_kind.is_some_and(|kind| kind.starts_with("build.")) {
                     state.completed_steps.insert("build_failed".to_string());
                 }
             }
@@ -3323,6 +3306,13 @@ fn update_progress_state(
             state.completed_steps.insert(call.name.clone());
         }
     }
+}
+
+fn preview_failure_requires_repair(error_kind: Option<&str>) -> bool {
+    matches!(
+        error_kind,
+        Some("generation.validation_failed" | "acceptance.validation_failed")
+    ) || error_kind.is_some_and(|kind| kind.starts_with("build."))
 }
 
 fn terminal_tool_result_summary(results: &[ToolResultMessage]) -> Option<String> {

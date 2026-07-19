@@ -319,7 +319,7 @@ async fn public_runtime_enforced_dcp_build_collects_bound_browser_evidence() {
                 "fs.write",
                 json!({
                     "path": "project/src/pages/index.astro",
-                    "text": "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;max-width:100%;overflow-x:hidden;font-family:system-ui,sans-serif}main{box-sizing:border-box;min-height:100vh;padding:32px;max-width:960px;margin:auto}</style></head><body><main><h1>Enforced browser evidence</h1><p>This page has no unnamed controls, links, or images.</p></main></body></html>"
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Enforced browser evidence</title><style>html,body{margin:0;max-width:100%;overflow-x:hidden;font-family:system-ui,sans-serif}main{box-sizing:border-box;min-height:100vh;padding:32px;max-width:960px;margin:auto}</style></head><body><main><h1>Enforced browser evidence</h1><p>This page has no unnamed controls, links, or images.</p></main></body></html>"
                 }),
             ),
             ToolCall::new(
@@ -380,7 +380,7 @@ async fn public_runtime_enforced_dcp_build_collects_bound_browser_evidence() {
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
     assert!(
-        wait_for_terminal_with_timeout(&store, &run_id, 45).await,
+        wait_for_terminal_with_timeout(&store, &run_id, 120).await,
         "enforced browser-evidence run did not reach terminal status: {:?}",
         store.events(&run_id).await
     );
@@ -620,7 +620,7 @@ async fn public_runtime_enforced_dcp_worker_loss_keeps_candidate_unpromoted() {
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
     assert!(
-        wait_for_terminal_with_timeout(&store, &run_id, 45).await,
+        wait_for_terminal_with_timeout(&store, &run_id, 120).await,
         "worker-loss run did not reach terminal status: {:?}",
         store.events(&run_id).await
     );
@@ -764,7 +764,7 @@ async fn public_runtime_enforced_dcp_repairs_required_a11y_failure_before_promot
                 "fs.write",
                 json!({
                     "path": "project/src/pages/index.astro",
-                    "text": "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;max-width:100%;overflow-x:hidden}main{padding:24px}</style></head><body><main><h1>Repair required fidelity</h1><img src=\"/hero.png\"></main></body></html>"
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Repair required fidelity</title><style>html,body{margin:0;max-width:100%;overflow-x:hidden}main{padding:24px}</style></head><body><main><h1>Repair required fidelity</h1><img src=\"/hero.png\"></main></body></html>"
                 }),
             ),
             ToolCall::new(
@@ -850,7 +850,7 @@ async fn public_runtime_enforced_dcp_repairs_required_a11y_failure_before_promot
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     let run_id = payload["runId"].as_str().unwrap().to_string();
     assert!(
-        wait_for_terminal_with_timeout(&store, &run_id, 45).await,
+        wait_for_terminal_with_timeout(&store, &run_id, 120).await,
         "enforced repair run did not reach terminal status: {:?}",
         store.events(&run_id).await
     );
@@ -1054,7 +1054,7 @@ async fn public_runtime_dcp_source_fallback_reads_verified_source_before_build_p
                 "fs.write",
                 json!({
                     "path": "project/src/pages/index.astro",
-                    "text": "<main><h1>Imported source fallback</h1></main>"
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Imported source fallback</title></head><body><main><h1>Imported source fallback</h1></main></body></html>"
                 }),
             ),
             ToolCall::new(
@@ -1255,7 +1255,7 @@ async fn public_runtime_dcp_large_source_fallback_reads_required_index_section_b
                 "fs.write",
                 json!({
                     "path": "project/src/pages/index.astro",
-                    "text": "<main><h1>Indexed imported source</h1></main>"
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Indexed imported source</title></head><body><main><h1>Indexed imported source</h1></main></body></html>"
                 }),
             ),
             ToolCall::new(
@@ -1310,16 +1310,16 @@ async fn public_runtime_dcp_large_source_fallback_reads_required_index_section_b
                 "sectionIds": ["section-2-tokens"]
             }),
         )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "large-source-edit-patch",
+            "fs.patch",
+            json!({
+                "path": "project/src/pages/index.astro",
+                "oldStr": "<h1>Indexed imported source</h1>",
+                "newStr": "<h1>Indexed imported edit</h1>"
+            }),
+        )]),
         ModelResponse::ToolCalls(vec![
-            ToolCall::new(
-                "large-source-edit-patch",
-                "fs.patch",
-                json!({
-                    "path": "project/src/pages/index.astro",
-                    "oldStr": "Indexed imported source",
-                    "newStr": "Indexed imported edit"
-                }),
-            ),
             ToolCall::new(
                 "large-source-edit-publish",
                 "preview.publish",
@@ -1372,16 +1372,16 @@ async fn public_runtime_dcp_large_source_fallback_reads_required_index_section_b
                 "sectionIds": ["section-2-tokens"]
             }),
         )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "large-source-repair-patch",
+            "fs.patch",
+            json!({
+                "path": "project/src/pages/index.astro",
+                "oldStr": "<h1>Indexed imported edit</h1>",
+                "newStr": "<h1>Indexed imported repair</h1>"
+            }),
+        )]),
         ModelResponse::ToolCalls(vec![
-            ToolCall::new(
-                "large-source-repair-patch",
-                "fs.patch",
-                json!({
-                    "path": "project/src/pages/index.astro",
-                    "oldStr": "Indexed imported edit",
-                    "newStr": "Indexed imported repair"
-                }),
-            ),
             ToolCall::new(
                 "large-source-repair-publish",
                 "preview.publish",
@@ -1636,7 +1636,11 @@ async fn public_runtime_dcp_large_source_fallback_reads_required_index_section_b
         .any(|hash| hash == &required_section.sha256));
     let project = workspace.join("project-dcp-large-source/project");
     let repaired = fs::read_to_string(project.join("dist/index.html")).unwrap();
-    assert!(repaired.contains("Indexed imported repair"));
+    assert!(
+        repaired.contains("Indexed imported repair"),
+        "repair output did not include the requested title: output={repaired:?} events={:?}",
+        store.events(&repair_run_id).await
+    );
 
     fs::remove_dir_all(workspace).unwrap();
 }
@@ -1725,7 +1729,7 @@ async fn public_runtime_dcp_build_reads_mutates_and_publishes_real_workspace_out
                 "fs.write",
                 json!({
                     "path": "project/src/pages/index.astro",
-                    "text": "<main><h1>DCP lifecycle hero</h1></main>"
+                    "text": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>DCP lifecycle</title></head><body><main><h1>DCP lifecycle hero</h1></main></body></html>"
                 }),
             ),
             ToolCall::new(

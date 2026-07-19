@@ -102,7 +102,8 @@ impl KubernetesSandboxExecutionProfileReadiness<TokioCommandRunner> {
         Self::with_runner(
             TokioCommandRunner,
             std::env::var("KUBECTL").unwrap_or_else(|_| "kubectl".to_string()),
-            std::env::var("K8S_NAMESPACE").unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
+            std::env::var("RUNTIME_TEMPLATE_PROBE_NAMESPACE")
+                .unwrap_or_else(|_| "ws-template-probe".to_string()),
             Duration::from_secs(
                 std::env::var("RUNTIME_EXECUTION_PROFILE_READINESS_TTL_SECONDS")
                     .ok()
@@ -173,7 +174,9 @@ where
             .pointer("/status/readyReplicas")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        Ok(desired > 0 && ready > 0)
+        // A zero-replica pool is the v1beta1 template indirection object. Claims
+        // cold-create a Sandbox when no resident pooled Sandbox is available.
+        Ok(ready >= desired)
     }
 
     async fn get_resource(&self, resource: &str, name: &str) -> Result<serde_json::Value, String> {
@@ -290,7 +293,10 @@ fn use_kubernetes_readiness() -> bool {
     {
         Some("kubernetes" | "k8s") => true,
         Some("static" | "disabled" | "off") => false,
-        _ => std::env::var_os("KUBERNETES_SERVICE_HOST").is_some(),
+        // Workspace-specific readiness is enforced by the claim in the
+        // ProjectAccess namespace. A central Runtime has no tenant namespace
+        // it can safely probe as a global default.
+        _ => false,
     }
 }
 

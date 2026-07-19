@@ -21,7 +21,7 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
         .unwrap();
     store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
     let (preview_url, _preview_server) = start_preview_server().await;
-    let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime docs lifecycle</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style>'; fs.writeFileSync('out/docs.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body><main><h1 id=\"overview\">Overview</h1><p>${mdx}</p></main></body></html>`); fs.writeFileSync('out/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body><nav><a href=\"/docs\">Docs</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label><main><h1>Docs lifecycle</h1></main></body></html>`);";
+    let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime docs lifecycle</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style>'; const navigation='<nav><a href=\"/\">Home</a><a href=\"/docs/\">Docs</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>'; fs.writeFileSync('out/docs/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body>${navigation}<main><h1 id=\"overview\">Overview</h1><p>${mdx}</p></main></body></html>`); fs.writeFileSync('out/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body>${navigation}<main><h1>Docs lifecycle</h1></main></body></html>`);";
     let model = MockModelClient::new(vec![
         ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-init",
@@ -52,7 +52,13 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
                     "text": "---\ntitle: Overview\n---\n\n# Initial docs title\n\nInitial lifecycle section"
                 }),
             ),
-            ToolCall::new("docs-build", "project.build", json!({ "cwd": "project" })),
+        ]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-build",
+            "project.build",
+            json!({ "cwd": "project" }),
+        )]),
+        ModelResponse::ToolCalls(vec![
             ToolCall::new(
                 "docs-preview",
                 "preview.start",
@@ -68,40 +74,40 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
                 "browser.screenshot",
                 json!({ "screenshotId": "shot-docs-build", "blank": false }),
             ),
-            ToolCall::new(
-                "docs-candidate",
-                "preview.publish",
-                json!({
-                    "url": preview_url,
-                    "screenshotId": "shot-docs-build"
-                }),
-            ),
-            ToolCall::new(
-                "docs-complete",
-                "run.complete",
-                json!({ "status": "completed", "summary": "Docs preview promoted" }),
-            ),
         ]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-candidate",
+            "preview.publish",
+            json!({
+                "url": preview_url,
+                "screenshotId": "shot-docs-build"
+            }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Docs preview promoted" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-read",
+            "fs.read",
+            json!({ "path": "project/content/docs/index.mdx" }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-patch",
+            "fs.patch",
+            json!({
+                "path": "project/content/docs/index.mdx",
+                "oldStr": "Initial docs title",
+                "newStr": "Edited docs title"
+            }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-build",
+            "project.build",
+            json!({ "cwd": "project" }),
+        )]),
         ModelResponse::ToolCalls(vec![
-            ToolCall::new(
-                "docs-edit-read",
-                "fs.read",
-                json!({ "path": "project/content/docs/index.mdx" }),
-            ),
-            ToolCall::new(
-                "docs-edit-patch",
-                "fs.patch",
-                json!({
-                    "path": "project/content/docs/index.mdx",
-                    "oldStr": "Initial docs title",
-                    "newStr": "Edited docs title"
-                }),
-            ),
-            ToolCall::new(
-                "docs-edit-build",
-                "project.build",
-                json!({ "cwd": "project" }),
-            ),
             ToolCall::new(
                 "docs-edit-preview",
                 "preview.start",
@@ -117,20 +123,20 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
                 "browser.screenshot",
                 json!({ "screenshotId": "shot-docs-edit", "blank": false }),
             ),
-            ToolCall::new(
-                "docs-edit-candidate",
-                "preview.publish",
-                json!({
-                    "url": preview_url,
-                    "screenshotId": "shot-docs-edit"
-                }),
-            ),
-            ToolCall::new(
-                "docs-edit-complete",
-                "run.complete",
-                json!({ "status": "completed", "summary": "Edited docs preview promoted" }),
-            ),
         ]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-candidate",
+            "preview.publish",
+            json!({
+                "url": preview_url,
+                "screenshotId": "shot-docs-edit"
+            }),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Edited docs preview promoted" }),
+        )]),
     ]);
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
@@ -173,7 +179,12 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
     let build_run_id = build_payload["runId"].as_str().unwrap().to_string();
     wait_for_terminal(&store, &build_run_id).await;
     let build_run = store.get_run(&build_run_id).await.unwrap();
-    assert_eq!(build_run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        build_run.status,
+        AgentRunStatus::Completed,
+        "docs build failed: {build_run:?} events={:?}",
+        store.events(&build_run_id).await
+    );
     let initial_version_id = build_run.output_version_id.clone().unwrap();
 
     let runtime_state = app
@@ -245,7 +256,12 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
     assert_eq!(continue_response.status(), StatusCode::OK);
     wait_for_terminal(&store, &edit_run_id).await;
     let edit_run = store.get_run(&edit_run_id).await.unwrap();
-    assert_eq!(edit_run.status, AgentRunStatus::Completed);
+    assert_eq!(
+        edit_run.status,
+        AgentRunStatus::Completed,
+        "docs edit failed: {edit_run:?} events={:?}",
+        store.events(&edit_run_id).await
+    );
     let edited_version_id = edit_run.output_version_id.clone().unwrap();
     assert_ne!(edited_version_id, initial_version_id);
     assert_eq!(
@@ -260,7 +276,8 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
         fs::read_to_string(workspace.join("docs-project/project/content/docs/index.mdx")).unwrap();
     assert!(mdx.contains("Edited docs title"));
     assert!(!mdx.contains("Initial docs title"));
-    let html = fs::read_to_string(workspace.join("docs-project/project/out/docs.html")).unwrap();
+    let html =
+        fs::read_to_string(workspace.join("docs-project/project/out/docs/index.html")).unwrap();
     assert!(html.contains("Edited docs title"));
 }
 

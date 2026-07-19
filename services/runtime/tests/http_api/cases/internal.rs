@@ -22,8 +22,7 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
     });
     let body = json!({
         "ownerPrincipalId": "principal-owner-1",
-        "workspaceId": "workspace-1",
-        "organizationId": "organization-1"
+        "workspaceNamespace": "ws-one"
     })
     .to_string();
 
@@ -57,6 +56,27 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
         .unwrap();
     assert_eq!(allowed.status(), StatusCode::OK);
 
+    let namespace_change = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/internal/projects/project-access-1/access")
+                .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "admin-project-access-token")
+                .body(Body::from(
+                    json!({
+                        "ownerPrincipalId": "principal-owner-1",
+                        "workspaceNamespace": "ws-two"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(namespace_change.status(), StatusCode::CONFLICT);
+
     drop(store);
     let restarted = RuntimeStore::with_checkpoint_dir(storage);
     let record = restarted
@@ -64,8 +84,7 @@ async fn project_access_internal_route_requires_admin_and_persists_across_store_
         .await
         .unwrap();
     assert_eq!(record.owner_principal_id, "principal-owner-1");
-    assert_eq!(record.workspace_id.as_deref(), Some("workspace-1"));
-    assert_eq!(record.organization_id.as_deref(), Some("organization-1"));
+    assert_eq!(record.workspace_namespace, "ws-one");
 }
 
 #[tokio::test]
@@ -516,6 +535,11 @@ async fn production_initial_run_requires_registered_project_access() {
     );
     let mut config = phase_a_contract_config();
     config.policy_profile = RuntimePolicyProfile::Production;
+    config.database_url = "postgres://runtime@postgres/runtime".to_string();
+    config.object_storage_url = "s3://runtime-artifacts/test".to_string();
+    config.object_storage_endpoint = "https://object-store.example".to_string();
+    config.object_storage_access_key = Some("test-access-key".to_string());
+    config.object_storage_secret_key = Some("test-secret-key".to_string());
     config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
     config.public_principal_public_key_files = vec![public_key_path];
     config.validate_startup().unwrap();
@@ -568,8 +592,7 @@ async fn production_initial_run_requires_registered_project_access() {
         .upsert_project_access(
             "owned-project",
             "principal-owned".to_string(),
-            Some("workspace-owned".to_string()),
-            None,
+            "ws-owned".to_string(),
         )
         .await
         .unwrap();
@@ -586,21 +609,7 @@ async fn production_initial_run_requires_registered_project_access() {
         )
         .await
         .unwrap();
-    assert_eq!(drifted.status(), StatusCode::CONFLICT);
-
-    let allowed = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/runs")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(request_body("workspace-owned")))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(drifted.status(), StatusCode::OK);
 }
 
 fn scoped_project_token(

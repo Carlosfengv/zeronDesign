@@ -455,6 +455,14 @@ async fn sandbox_claim_wait_ready_open_channel_sequence_uses_binding_contract() 
 #[tokio::test]
 async fn sandbox_tools_can_use_injected_kubernetes_backend() {
     let store = RuntimeStore::new();
+    store
+        .upsert_project_access(
+            "Project_ABC",
+            "owner-1".to_string(),
+            "ws-kube-sandboxes".to_string(),
+        )
+        .await
+        .unwrap();
     let run = store
         .create_run(
             "Project_ABC".to_string(),
@@ -491,7 +499,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
 
     assert!(!claimed.result.is_error);
     assert_eq!(claimed.result.content["mode"], "kubernetes");
-    assert_eq!(claimed.result.content["namespace"], "kube-sandboxes");
+    assert_eq!(claimed.result.content["namespace"], "ws-kube-sandboxes");
     assert_eq!(claimed.result.content["status"], "claiming");
     let binding_id = claimed.result.content["bindingId"].as_str().unwrap();
     let workspace_pvc_name = claimed.result.content["workspacePvcName"]
@@ -500,7 +508,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
         .to_string();
     let created = client.created.lock().unwrap().clone();
     assert_eq!(created.len(), 1);
-    assert_eq!(created[0].namespace, "kube-sandboxes");
+    assert_eq!(created[0].namespace, "ws-kube-sandboxes");
     assert_eq!(created[0].warm_pool_name, "anydesign-astro-website-pool");
     assert_eq!(created[0].workspace_pvc_name, workspace_pvc_name);
 
@@ -542,7 +550,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
     );
     assert_eq!(
         opened.result.content["endpoint"],
-        "ws://workspace-channel-7f9b.kube-sandboxes.svc.cluster.local:3001/workspace"
+        "ws://workspace-channel-7f9b.ws-kube-sandboxes.svc.cluster.local:3001/workspace"
     );
 
     let deleted = executor
@@ -563,7 +571,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
     );
     assert_eq!(
         client.deleted.lock().unwrap().as_slice(),
-        [("kube-sandboxes".to_string(), created[0].name.clone())]
+        [("ws-kube-sandboxes".to_string(), created[0].name.clone())]
     );
 }
 
