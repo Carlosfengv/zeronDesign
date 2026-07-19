@@ -52,7 +52,7 @@ async fn imported_design_profile_requires_review_before_activation_and_survives_
         )
         .await
         .unwrap();
-    assert_eq!(unauthorized_import.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized_import.status(), StatusCode::OK);
 
     let imported = app
         .clone()

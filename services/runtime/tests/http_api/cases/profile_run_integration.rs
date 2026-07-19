@@ -222,26 +222,30 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
 }
 
 #[tokio::test]
-async fn start_run_resolves_design_profile_by_workspace_then_project_precedence() {
+async fn start_run_uses_explicit_platform_then_project_profile_binding() {
     let store = RuntimeStore::new();
+    let mut config = public_auth_disabled_config();
+    config.internal_admin_token = Some("profile-admin-token".into());
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: public_auth_disabled_config(),
+        config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
 
-    let workspace_created = app
+    let platform_created = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-admin-token")
                 .body(Body::from(
                     design_profile_request_for_scope(
                         None,
-                        json!({ "workspaceId": "workspace-1" }),
+                        json!({ "platform": true }),
                         vec!["astro-website"],
                     )
                     .to_string(),
@@ -250,11 +254,9 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
         )
         .await
         .unwrap();
-    let workspace_body = to_bytes(workspace_created.into_body(), 16384)
-        .await
-        .unwrap();
-    let workspace_payload: Value = serde_json::from_slice(&workspace_body).unwrap();
-    let workspace_profile_id = workspace_payload["designProfile"]["id"].as_str().unwrap();
+    let platform_body = to_bytes(platform_created.into_body(), 16384).await.unwrap();
+    let platform_payload: Value = serde_json::from_slice(&platform_body).unwrap();
+    let platform_profile_id = platform_payload["designProfile"]["id"].as_str().unwrap();
 
     let project_created = app
         .clone()
@@ -274,7 +276,23 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
     let project_payload: Value = serde_json::from_slice(&project_body).unwrap();
     let project_profile_id = project_payload["designProfile"]["id"].as_str().unwrap();
 
-    let workspace_run = app
+    let platform_bound = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/project-1/design-profile")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "designProfileId": platform_profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(platform_bound.status(), StatusCode::OK);
+
+    let platform_run = app
         .clone()
         .oneshot(
             Request::builder()
@@ -287,7 +305,6 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
                         "phase": "brief",
                         "agentProfile": "brief",
                         "inputContext": {
-                            "workspaceId": "workspace-1",
                             "contentSources": [
                                 ContentSource::readable("source-1", "prompt", "Make a website")
                             ]
@@ -299,21 +316,21 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
         )
         .await
         .unwrap();
-    assert_eq!(workspace_run.status(), StatusCode::OK);
-    let workspace_run_body = to_bytes(workspace_run.into_body(), 4096).await.unwrap();
-    let workspace_run_payload: Value = serde_json::from_slice(&workspace_run_body).unwrap();
-    let workspace_run_id = workspace_run_payload["runId"].as_str().unwrap();
+    assert_eq!(platform_run.status(), StatusCode::OK);
+    let platform_run_body = to_bytes(platform_run.into_body(), 4096).await.unwrap();
+    let platform_run_payload: Value = serde_json::from_slice(&platform_run_body).unwrap();
+    let platform_run_id = platform_run_payload["runId"].as_str().unwrap();
     assert_eq!(
         store
-            .get_run(workspace_run_id)
+            .get_run(platform_run_id)
             .await
             .unwrap()
             .design_profile_id
             .as_deref(),
-        Some(workspace_profile_id)
+        Some(platform_profile_id)
     );
     store
-        .update_run_status(workspace_run_id, AgentRunStatus::Completed)
+        .update_run_status(platform_run_id, AgentRunStatus::Completed)
         .await
         .unwrap();
 
@@ -345,7 +362,6 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
                         "phase": "brief",
                         "agentProfile": "brief",
                         "inputContext": {
-                            "workspaceId": "workspace-1",
                             "contentSources": [
                                 ContentSource::readable("source-2", "prompt", "Make another website")
                             ]
@@ -373,11 +389,13 @@ async fn start_run_resolves_design_profile_by_workspace_then_project_precedence(
 }
 
 #[tokio::test]
-async fn start_run_resolves_design_profile_by_organization_fallback() {
+async fn start_run_does_not_implicitly_apply_a_platform_profile() {
     let store = RuntimeStore::new();
+    let mut config = public_auth_disabled_config();
+    config.internal_admin_token = Some("profile-admin-token".into());
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: public_auth_disabled_config(),
+        config,
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -389,10 +407,12 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
                 .method("POST")
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-admin-token")
                 .body(Body::from(
                     design_profile_request_for_scope(
                         None,
-                        json!({ "organizationId": "org-1" }),
+                        json!({ "platform": true }),
                         vec!["astro-website"],
                     )
                     .to_string(),
@@ -401,9 +421,7 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
         )
         .await
         .unwrap();
-    let created_body = to_bytes(created.into_body(), 16384).await.unwrap();
-    let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
-    let profile_id = created_payload["designProfile"]["id"].as_str().unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
 
     let started = app
         .oneshot(
@@ -417,7 +435,6 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
                         "phase": "brief",
                         "agentProfile": "brief",
                         "inputContext": {
-                            "organizationId": "org-1",
                             "contentSources": [
                                 ContentSource::readable("source-1", "prompt", "Make a website")
                             ]
@@ -440,7 +457,7 @@ async fn start_run_resolves_design_profile_by_organization_fallback() {
             .unwrap()
             .design_profile_id
             .as_deref(),
-        Some(profile_id)
+        None
     );
 }
 

@@ -20,8 +20,6 @@ async fn run_context_resolution_fails_closed_for_missing_explicit_profile() {
     let error = service
         .prepare_run_context(RunProfileContextQuery {
             project_id: "project-1",
-            workspace_id: None,
-            organization_id: None,
             explicit_profile_id: Some("profile-missing"),
             phase: AgentPhase::Edit,
             brief_id: None,

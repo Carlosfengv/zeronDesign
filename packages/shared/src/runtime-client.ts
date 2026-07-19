@@ -211,8 +211,6 @@ export type RuntimeClient = {
   ): Promise<z.output<typeof DesignProfileDiffResponseSchema>>;
   listDesignProfiles(query?: {
     projectId?: string;
-    workspaceId?: string;
-    organizationId?: string;
     includeArchived?: boolean;
   }): Promise<z.output<typeof ListDesignProfilesResponseSchema>>;
   updateDesignProfile(
@@ -227,6 +225,9 @@ export type RuntimeClient = {
     request: BindProjectDesignProfileRequest,
   ): Promise<z.output<typeof ProjectDesignProfileResponseSchema>>;
   getProjectDesignProfile(
+    projectId: string,
+  ): Promise<z.output<typeof ProjectDesignProfileResponseSchema>>;
+  unbindProjectDesignProfile(
     projectId: string,
   ): Promise<z.output<typeof ProjectDesignProfileResponseSchema>>;
   resolvePermission(
@@ -271,7 +272,9 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
     path: string,
     schema: TSchema,
   ): Promise<z.infer<TSchema>> {
-    return requestJson(fetchImpl, baseUrl, path, schema, { headers: publicHeaders });
+    return requestJson(fetchImpl, baseUrl, path, schema, {
+      headers: { ...publicHeaders, ...internalHeaders },
+    });
   }
 
   async function post<TSchema extends z.ZodTypeAny>(
@@ -281,7 +284,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
   ): Promise<z.infer<TSchema>> {
     return requestJson(fetchImpl, baseUrl, path, schema, {
       method: "POST",
-      headers: { "content-type": "application/json", ...publicHeaders },
+      headers: { "content-type": "application/json", ...publicHeaders, ...internalHeaders },
       body: JSON.stringify(body),
     });
   }
@@ -381,7 +384,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         DesignSourceArtifactResponseSchema,
         {
           method: "POST",
-          headers: { "content-type": "application/json", ...internalHeaders },
+          headers: { "content-type": "application/json", ...publicHeaders, ...internalHeaders },
           body: JSON.stringify(request),
         },
       ),
@@ -391,14 +394,14 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         baseUrl,
         `/design-source-artifacts/${encodePathSegment(artifactId)}`,
         DesignSourceArtifactResponseSchema,
-        { headers: internalHeaders },
+        { headers: { ...publicHeaders, ...internalHeaders } },
       ),
     getDesignSourceArtifactContent: (artifactId) =>
       requestBytes(
         fetchImpl,
         baseUrl,
         `/design-source-artifacts/${encodePathSegment(artifactId)}/content`,
-        { headers: internalHeaders },
+        { headers: { ...publicHeaders, ...internalHeaders } },
       ),
     importDesignProfile: (request) =>
       requestJson(
@@ -408,7 +411,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         ImportDesignProfileResponseSchema,
         {
           method: "POST",
-          headers: { "content-type": "application/json", ...internalHeaders },
+          headers: { "content-type": "application/json", ...publicHeaders, ...internalHeaders },
           body: JSON.stringify(request),
         },
       ),
@@ -420,7 +423,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         ActivateDesignProfileResponseSchema,
         {
           method: "POST",
-          headers: { "content-type": "application/json", ...internalHeaders },
+          headers: { "content-type": "application/json", ...publicHeaders, ...internalHeaders },
           body: JSON.stringify(request),
         },
       ),
@@ -432,7 +435,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
           ? `/design-profiles/${encodePathSegment(designProfileId)}/conversion-report`
           : `/design-profiles/${encodePathSegment(designProfileId)}/versions/${version}/conversion-report`,
         DesignProfileConversionReportSchema,
-        { headers: internalHeaders },
+        { headers: { ...publicHeaders, ...internalHeaders } },
       ),
     getDesignProfileFidelityReport: (designProfileId, version, query) =>
       get(
@@ -463,7 +466,7 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         DesignProfileResponseSchema,
         {
           method: "PUT",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...publicHeaders, ...internalHeaders },
           body: JSON.stringify(request),
         },
       ),
@@ -483,6 +486,14 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       get(
         `/projects/${encodePathSegment(projectId)}/design-profile`,
         ProjectDesignProfileResponseSchema,
+      ),
+    unbindProjectDesignProfile: (projectId) =>
+      requestJson(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/design-profile`,
+        ProjectDesignProfileResponseSchema,
+        { method: "DELETE", headers: publicHeaders },
       ),
     resolvePermission: (permissionId, request) =>
       post(
@@ -699,19 +710,11 @@ function encodePathSegment(value: string): string {
 
 function designProfilesPath(query?: {
   projectId?: string;
-  workspaceId?: string;
-  organizationId?: string;
   includeArchived?: boolean;
 }): string {
   const params = new URLSearchParams();
   if (query?.projectId) {
     params.set("projectId", query.projectId);
-  }
-  if (query?.workspaceId) {
-    params.set("workspaceId", query.workspaceId);
-  }
-  if (query?.organizationId) {
-    params.set("organizationId", query.organizationId);
   }
   if (query?.includeArchived) {
     params.set("includeArchived", "true");

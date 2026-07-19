@@ -141,7 +141,7 @@ async fn required_public_auth_protects_project_reads_and_permission_mutations() 
     let state = http_api::app_state(config);
     state
         .store
-        .upsert_project_access("project-1", "owner-1".into(), None, None)
+        .upsert_project_access("project-1", "owner-1".into(), "ws-test".into())
         .await
         .unwrap();
     let run = state
@@ -268,6 +268,138 @@ async fn required_public_auth_protects_project_reads_and_permission_mutations() 
 }
 
 #[tokio::test]
+async fn design_profiles_are_project_private_and_platform_profiles_are_read_only_to_users() {
+    let key_path = unique_temp_dir("design-profile-principal-key").join("current.der");
+    std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+    let signing_key = SigningKey::from_bytes(&[47_u8; 32]);
+    std::fs::write(
+        &key_path,
+        signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut config = phase_a_contract_config();
+    config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+    config.public_principal_public_key_files = vec![key_path.clone()];
+    config.public_principal_issuer = "anydesign-bff".into();
+    config.public_principal_audience = "anydesign-runtime-public".into();
+    let state = http_api::app_state(config);
+    state
+        .store
+        .upsert_project_access(
+            "project-private",
+            "owner-private".into(),
+            "ws-private".into(),
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .upsert_project_access("project-other", "owner-other".into(), "ws-other".into())
+        .await
+        .unwrap();
+    let private_profile = authorization_dcp_profile("profile-private", "project-private");
+    state
+        .store
+        .create_design_profile(private_profile.clone())
+        .await
+        .unwrap();
+    let mut platform_profile = authorization_dcp_profile("profile-platform", "unused");
+    platform_profile.scope = json!({ "platform": true });
+    state
+        .store
+        .create_design_profile(platform_profile.clone())
+        .await
+        .unwrap();
+
+    let issuer = PublicPrincipalJwtIssuer::from_signing_key(
+        signing_key,
+        "anydesign-bff",
+        "anydesign-runtime-public",
+        60,
+    );
+    let private_read = scoped_token(
+        &issuer,
+        "owner-private",
+        "project-private",
+        PROJECT_READ_OPERATION,
+    );
+    let other_read = scoped_token(
+        &issuer,
+        "owner-other",
+        "project-other",
+        PROJECT_READ_OPERATION,
+    );
+    let other_write = scoped_token(
+        &issuer,
+        "owner-other",
+        "project-other",
+        PROJECT_WRITE_OPERATION,
+    );
+    let app = http_api::router_with_state(state);
+
+    let private_visible = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles/profile-private")
+                .header("authorization", format!("Bearer {private_read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(private_visible.status(), StatusCode::OK);
+
+    let cross_project = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles/profile-private")
+                .header("authorization", format!("Bearer {other_read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_project.status(), StatusCode::FORBIDDEN);
+
+    let platform_visible = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles/profile-platform")
+                .header("authorization", format!("Bearer {other_read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(platform_visible.status(), StatusCode::OK);
+
+    let platform_write = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/design-profiles/profile-platform")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {other_write}"))
+                .body(Body::from(
+                    json!({ "name": "changed", "profile": {} }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(platform_write.status(), StatusCode::FORBIDDEN);
+
+    std::fs::remove_dir_all(key_path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
 async fn promoted_preview_metadata_requires_preview_scope() {
     let key_path = unique_temp_dir("promoted-preview-key").join("current.der");
     std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
@@ -289,7 +421,7 @@ async fn promoted_preview_metadata_requires_preview_scope() {
     let state = http_api::app_state(config);
     state
         .store
-        .upsert_project_access("project-preview", "owner-1".into(), None, None)
+        .upsert_project_access("project-preview", "owner-1".into(), "ws-test".into())
         .await
         .unwrap();
     let run = state
@@ -379,7 +511,7 @@ async fn structured_brief_read_and_confirmation_enforce_project_scopes() {
     let state = http_api::app_state(config);
     state
         .store
-        .upsert_project_access("brief-project", "owner-1".into(), None, None)
+        .upsert_project_access("brief-project", "owner-1".into(), "ws-test".into())
         .await
         .unwrap();
     let run = state
@@ -497,12 +629,12 @@ async fn design_context_diagnostics_require_run_project_read_and_expose_only_fro
     let state = http_api::app_state(config);
     state
         .store
-        .upsert_project_access("dcp-auth-project", "owner-1".into(), None, None)
+        .upsert_project_access("dcp-auth-project", "owner-1".into(), "ws-test".into())
         .await
         .unwrap();
     state
         .store
-        .upsert_project_access("another-project", "owner-1".into(), None, None)
+        .upsert_project_access("another-project", "owner-1".into(), "ws-other".into())
         .await
         .unwrap();
 

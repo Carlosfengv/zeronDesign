@@ -8,6 +8,7 @@ fn design_profile_route_family_is_frozen() {
             ("GET", "/design-profiles/{design_profile_id}"),
             ("PUT", "/design-profiles/{design_profile_id}"),
             ("POST", "/projects/{project_id}/design-profile"),
+            ("DELETE", "/projects/{project_id}/design-profile"),
         ],
     );
 }

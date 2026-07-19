@@ -223,6 +223,7 @@ fn route_manifest_metadata_is_complete_and_fail_closed() {
         "artifact_referer",
         "artifact_referer_and_preview_principal_when_required",
         "capture_listener_only",
+        "design_profile_scope",
         "internal_service",
         "project_access_in_production",
         "project_principal_read_when_required",

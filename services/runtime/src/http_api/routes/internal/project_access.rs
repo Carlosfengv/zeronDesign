@@ -34,16 +34,23 @@ async fn internal_upsert_project_access(
             "projectId and ownerPrincipalId are required".to_string(),
         ));
     }
+    crate::types::validate_workspace_namespace(&request.workspace_namespace)
+        .map_err(bad_request)?;
     let record = state
         .store
         .upsert_project_access(
             &project_id,
             request.owner_principal_id,
-            request.workspace_id,
-            request.organization_id,
+            request.workspace_namespace,
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| {
+            if error.to_string().contains(" is immutable;") {
+                conflict_error(error)
+            } else {
+                internal_error(error)
+            }
+        })?;
     state
         .store
         .append_audit_record(

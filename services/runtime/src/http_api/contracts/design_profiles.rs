@@ -59,8 +59,6 @@ pub struct ProjectDesignProfileResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ListDesignProfilesQuery {
     pub project_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub organization_id: Option<String>,
     #[serde(default)]
     pub include_archived: bool,
 }

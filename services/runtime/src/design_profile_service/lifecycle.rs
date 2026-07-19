@@ -34,8 +34,6 @@ pub struct UpdateProfileCommand {
 
 pub struct ListProfilesQuery {
     pub project_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub organization_id: Option<String>,
     pub include_archived: bool,
 }
 
@@ -51,6 +49,19 @@ impl DesignProfileService {
         required("name", &command.name)?;
         let now = Utc::now();
         let payload = command.payload;
+        let scope = scope_with_project_id(
+            payload_value(&payload, "scope").unwrap_or(Value::Null),
+            command.project_id.as_deref(),
+        );
+        crate::types::validate_design_profile_scope(&scope)
+            .map_err(DesignProfileServiceError::InvalidRequest)?;
+        if let Some(project_id) = command.project_id.as_deref() {
+            if scope.get("projectId").and_then(Value::as_str) != Some(project_id) {
+                return Err(DesignProfileServiceError::InvalidRequest(
+                    "projectId must match profile.scope.projectId".to_string(),
+                ));
+            }
+        }
         let mut profile = DesignProfile {
             id: self.store.next_id("design-profile"),
             schema_version: payload
@@ -61,10 +72,7 @@ impl DesignProfileService {
             name: command.name,
             status: payload_string(&payload, "status")?,
             version: 1,
-            scope: scope_with_project_id(
-                payload_value(&payload, "scope").unwrap_or(Value::Null),
-                command.project_id.as_deref(),
-            ),
+            scope,
             source: payload_value(&payload, "source")
                 .unwrap_or_else(|| json!({ "kind": "manual" })),
             product: required_value(&payload, "product")?,
@@ -102,20 +110,11 @@ impl DesignProfileService {
     pub async fn list(&self, query: ListProfilesQuery) -> Vec<Value> {
         let active = self
             .store
-            .list_design_profiles(
-                query.project_id.as_deref(),
-                query.workspace_id.as_deref(),
-                query.organization_id.as_deref(),
-                query.include_archived,
-            )
+            .list_design_profiles(query.project_id.as_deref(), query.include_archived)
             .await;
         let drafts = self
             .store
-            .list_design_profile_drafts(
-                query.project_id.as_deref(),
-                query.workspace_id.as_deref(),
-                query.organization_id.as_deref(),
-            )
+            .list_design_profile_drafts(query.project_id.as_deref())
             .await;
         let active_ids = active
             .iter()
@@ -343,6 +342,12 @@ impl DesignProfileService {
         let payload = command.profile.as_object().cloned().ok_or_else(|| {
             DesignProfileServiceError::InvalidRequest("profile must be an object".to_string())
         })?;
+        let requested_scope = required_value(&payload, "scope")?;
+        if requested_scope != existing.scope {
+            return Err(DesignProfileServiceError::InvalidRequest(
+                "design profile scope is immutable".to_string(),
+            ));
+        }
         let mut profile = DesignProfile {
             id: existing.id,
             schema_version: payload
@@ -353,7 +358,7 @@ impl DesignProfileService {
             name: command.name,
             status: payload_string(&payload, "status")?,
             version: existing.version + 1,
-            scope: required_value(&payload, "scope")?,
+            scope: requested_scope,
             source: payload_value(&payload, "source").unwrap_or(existing.source),
             product: required_value(&payload, "product")?,
             brand: required_value(&payload, "brand")?,
@@ -422,6 +427,14 @@ impl DesignProfileService {
     ) -> Result<Option<DesignProfile>, DesignProfileServiceError> {
         required("projectId", project_id)?;
         Ok(self.store.project_design_profile(project_id).await)
+    }
+
+    pub async fn unbind_project(&self, project_id: &str) -> Result<(), DesignProfileServiceError> {
+        required("projectId", project_id)?;
+        self.store
+            .unbind_project_design_profile(project_id)
+            .await
+            .map_err(store_error)
     }
 
     pub async fn conversion_report(

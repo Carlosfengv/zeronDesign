@@ -285,15 +285,8 @@ fn design_profile_request_for_scope(
 }
 
 async fn wait_for_terminal(store: &RuntimeStore, run_id: &str) {
-    for _ in 0..100 {
-        if store
-            .get_run(run_id)
-            .await
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    if wait_for_terminal_with_timeout(store, run_id, 45).await {
+        return;
     }
     panic!(
         "run {run_id} did not reach terminal status: run={:#?} events={:#?}",

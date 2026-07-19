@@ -44,7 +44,7 @@ async fn start_run_input_context_binds_existing_sandbox() {
         .unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
-        config: public_auth_disabled_config(),
+        config: phase_a_contract_config(),
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
@@ -72,8 +72,9 @@ async fn start_run_input_context_binds_existing_sandbox() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let payload: Value = serde_json::from_slice(&body).unwrap();
     let run_id = payload["runId"].as_str().unwrap();
     assert_eq!(

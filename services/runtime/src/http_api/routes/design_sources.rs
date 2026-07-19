@@ -18,12 +18,55 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
         .route("/design-profiles/import", post(import_design_profile))
 }
 
+async fn authorize_design_source_scope(
+    state: &AppState,
+    authorization: &ApplicationAuthorizationPolicy,
+    headers: &HeaderMap,
+    scope: &Value,
+    write: bool,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    crate::types::validate_design_source_scope(scope).map_err(bad_request)?;
+    if scope.get("platform").and_then(Value::as_bool) == Some(true) {
+        if internal_admin_authorized(&state.config, headers) {
+            return Ok(());
+        }
+        if write {
+            return Err(forbidden(
+                "platform design sources require platform administrator authorization".to_string(),
+            ));
+        }
+        authorize_current_project_operation(state, authorization, headers, PROJECT_READ_OPERATION)
+            .await?;
+        return Ok(());
+    }
+    let project_id = scope
+        .get("projectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            bad_request("design source scope must be project or platform".to_string())
+        })?;
+    authorize_project_operation(
+        state,
+        authorization,
+        headers,
+        project_id,
+        if write {
+            PROJECT_WRITE_OPERATION
+        } else {
+            PROJECT_READ_OPERATION
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn create_design_source_artifact(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     headers: HeaderMap,
     Json(request): Json<CreateDesignSourceArtifactRequest>,
 ) -> Result<Json<DesignSourceArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_design_source_authorization(&state.config, &headers)?;
+    authorize_design_source_scope(&state, &authorization, &headers, &request.scope, true).await?;
     if request.content_base64.len() > MAX_DESIGN_SOURCE_BASE64_BYTES {
         return Err(bad_request(format!(
             "contentBase64 exceeds the {MAX_DESIGN_SOURCE_BYTES}-byte decoded source limit"
@@ -66,31 +109,33 @@ async fn create_design_source_artifact(
 
 async fn get_design_source_artifact(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(artifact_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DesignSourceArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_design_source_authorization(&state.config, &headers)?;
     validate_required_string("artifactId", &artifact_id)?;
     let artifact = state
         .store
         .get_design_source_artifact(&artifact_id)
         .await
         .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
+    authorize_design_source_scope(&state, &authorization, &headers, &artifact.scope, false).await?;
     Ok(Json(DesignSourceArtifactResponse { artifact }))
 }
 
 async fn get_design_source_artifact_content(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     Path(artifact_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<(HeaderMap, Vec<u8>), (StatusCode, Json<ErrorResponse>)> {
-    require_design_source_authorization(&state.config, &headers)?;
     validate_required_string("artifactId", &artifact_id)?;
     let artifact = state
         .store
         .get_design_source_artifact(&artifact_id)
         .await
         .ok_or_else(|| not_found(format!("design source artifact not found: {artifact_id}")))?;
+    authorize_design_source_scope(&state, &authorization, &headers, &artifact.scope, false).await?;
     let content = state
         .store
         .read_design_source_artifact_content(&artifact_id)
@@ -117,10 +162,11 @@ async fn get_design_source_artifact_content(
 
 async fn import_design_profile(
     State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
     headers: HeaderMap,
     Json(request): Json<ImportDesignProfileRequest>,
 ) -> Result<Json<ImportDesignProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_design_source_authorization(&state.config, &headers)?;
+    authorize_design_source_scope(&state, &authorization, &headers, &request.scope, true).await?;
     validate_required_string("name", &request.name)?;
     crate::types::validate_design_source_scope(&request.scope).map_err(bad_request)?;
     let artifact = state

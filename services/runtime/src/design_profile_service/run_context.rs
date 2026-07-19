@@ -7,8 +7,6 @@ use serde_json::Value;
 
 pub struct RunProfileContextQuery<'a> {
     pub project_id: &'a str,
-    pub workspace_id: Option<&'a str>,
-    pub organization_id: Option<&'a str>,
     pub explicit_profile_id: Option<&'a str>,
     pub phase: AgentPhase,
     pub brief_id: Option<&'a str>,
@@ -28,12 +26,7 @@ impl DesignProfileService {
     ) -> Result<PreparedRunProfile, DesignProfileServiceError> {
         let profile = self
             .store
-            .resolve_design_profile(
-                query.project_id,
-                query.workspace_id,
-                query.organization_id,
-                query.explicit_profile_id,
-            )
+            .resolve_design_profile(query.project_id, query.explicit_profile_id)
             .await
             .map_err(super::store_error)?;
         if query.phase != AgentPhase::Build {

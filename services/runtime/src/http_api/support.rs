@@ -102,19 +102,3 @@ pub(in crate::http_api) fn run_lifecycle_service(
         design_profiles,
     )
 }
-
-pub(in crate::http_api) fn require_design_source_authorization(
-    config: &RuntimeConfig,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if internal_admin_authorized(config, headers) {
-        return Ok(());
-    }
-    Err((
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse {
-            error: "design source artifacts require service authorization".to_string(),
-            error_code: None,
-        }),
-    ))
-}

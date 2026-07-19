@@ -29,7 +29,7 @@ async fn design_source_artifact_api_is_authorized_immutable_and_restart_safe() {
         )
         .await
         .unwrap();
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::OK);
 
     let hash_mismatch = app
         .clone()

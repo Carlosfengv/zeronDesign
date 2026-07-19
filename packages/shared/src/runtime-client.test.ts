@@ -307,8 +307,7 @@ describe("runtime client", () => {
             projectAccess: {
               projectId: "project-1",
               ownerPrincipalId: "principal-1",
-              workspaceId: "workspace-1",
-              organizationId: null,
+              workspaceNamespace: "ws-one",
               createdAt: timestamp,
               updatedAt: timestamp,
             },
@@ -324,7 +323,7 @@ describe("runtime client", () => {
 
     await client.upsertProjectAccess("project-1", {
       ownerPrincipalId: "principal-1",
-      workspaceId: "workspace-1",
+      workspaceNamespace: "ws-one",
     });
 
     expect(calls[0]).toEqual({
@@ -338,7 +337,7 @@ describe("runtime client", () => {
         },
         body: JSON.stringify({
           ownerPrincipalId: "principal-1",
-          workspaceId: "workspace-1",
+          workspaceNamespace: "ws-one",
         }),
       },
     });
@@ -554,7 +553,6 @@ describe("runtime client", () => {
       (
         await client.listDesignProfiles({
           projectId: "project-1",
-          workspaceId: "workspace-1",
           includeArchived: true,
         })
       ).designProfiles,
@@ -586,7 +584,7 @@ describe("runtime client", () => {
       "http://runtime.local/design-profiles/design-profile-1",
       "http://runtime.local/design-profiles/design-profile-1/versions",
       "http://runtime.local/design-profiles/design-profile-1/diff?fromVersion=1&toVersion=2",
-      "http://runtime.local/design-profiles?projectId=project-1&workspaceId=workspace-1&includeArchived=true",
+      "http://runtime.local/design-profiles?projectId=project-1&includeArchived=true",
       "http://runtime.local/design-profiles/design-profile-1",
       "http://runtime.local/design-profiles/design-profile-1/archive",
       "http://runtime.local/projects/project-1/design-profile",
