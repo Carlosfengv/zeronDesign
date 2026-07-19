@@ -40,6 +40,7 @@ impl KubernetesWorkRuntimeBackend {
     }
 
     pub async fn from_runtime_config(config: &RuntimeConfig) -> Result<Self> {
+        crate::ensure_rustls_crypto_provider()?;
         let prober_image = config
             .work_runtime_prober_image
             .clone()
@@ -107,10 +108,10 @@ impl KubernetesWorkRuntimeBackend {
         let namespace = namespaces
             .get(&desired.namespace)
             .await
-            .context("get Published Runtime namespace")?;
+            .context("get Workspace namespace for Published Runtime")?;
         let labels = namespace.metadata.labels.unwrap_or_default();
-        if labels.get("anydesign.dev/purpose").map(String::as_str) != Some("published-works") {
-            bail!("Published Runtime namespace is missing its managed purpose label");
+        if !is_managed_publication_namespace(&labels) {
+            bail!("Published Runtime namespace is not a managed Workspace");
         }
         Ok(())
     }
@@ -612,6 +613,15 @@ fn is_digest_pinned_image(image: &str) -> bool {
         })
 }
 
+fn is_managed_publication_namespace(labels: &std::collections::BTreeMap<String, String>) -> bool {
+    labels
+        .get("zerondesign.dev/workspace")
+        .is_some_and(|value| value == "true")
+        || labels
+            .get("anydesign.dev/purpose")
+            .is_some_and(|value| value == "published-works")
+}
+
 async fn wait_absent<K>(api: &Api<K>, name: &str, timeout: Duration) -> Result<()>
 where
     K: Clone + DeserializeOwned + std::fmt::Debug + Resource<DynamicType = ()>,
@@ -641,7 +651,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::is_digest_pinned_image;
+    use super::{is_digest_pinned_image, is_managed_publication_namespace};
+    use std::collections::BTreeMap;
 
     #[test]
     fn release_prober_image_is_fail_closed_and_digest_pinned() {
@@ -652,5 +663,16 @@ mod tests {
         assert!(!is_digest_pinned_image(
             "registry.example/anydesign/release-prober:latest"
         ));
+    }
+
+    #[test]
+    fn workspace_namespace_is_a_valid_publication_boundary() {
+        let labels = BTreeMap::from([("zerondesign.dev/workspace".into(), "true".into())]);
+        assert!(is_managed_publication_namespace(&labels));
+
+        let legacy = BTreeMap::from([("anydesign.dev/purpose".into(), "published-works".into())]);
+        assert!(is_managed_publication_namespace(&legacy));
+
+        assert!(!is_managed_publication_namespace(&BTreeMap::new()));
     }
 }

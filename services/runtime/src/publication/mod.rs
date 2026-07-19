@@ -8,7 +8,7 @@ mod store;
 pub use backend::{
     ControlPlaneOnlyBackend, DesiredUnpublishRuntime, DesiredWorkRuntime,
     KubernetesResourceIdentity, ObservedWorkRuntime, PublicationReconcileDisposition,
-    ReleaseTrustEvidence, WorkRuntimeBackend, FIELD_MANAGER, WORKS_NAMESPACE,
+    ReleaseTrustEvidence, WorkRuntimeBackend, FIELD_MANAGER,
 };
 pub use controller::WorkRuntimeController;
 pub use kubernetes::{KubernetesIngressExposure, KubernetesWorkRuntimeBackend};

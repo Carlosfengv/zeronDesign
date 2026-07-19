@@ -32,7 +32,7 @@ release references retain the caller-visible Registry host.
 
 ## G6 Kubernetes runtime
 
-`infra/public-runtime/base.yaml` establishes the shared `anydesign-works`
+`infra/public-runtime/base.yaml` establishes the shared `ws-public-runtime-e2e`
 namespace, controller RBAC, Pod Security enforcement, quota, default-deny
 networking, isolated Release Prober policy, and the native admission baseline.
 It intentionally contains no Ingress.

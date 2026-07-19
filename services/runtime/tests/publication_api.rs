@@ -124,6 +124,15 @@ async fn publication_routes_are_idempotent_persistent_and_queryable() {
     let mut config = config(&root);
     config.works_base_domain = Some("works.example.test".into());
     let state = http_api::app_state(config.clone());
+    state
+        .store
+        .upsert_project_access(
+            "publication-project",
+            "owner-1".into(),
+            "ws-publication-test".into(),
+        )
+        .await
+        .unwrap();
     let release = seed_validated_release(&state).await;
     let app = http_api::router_with_state(state.clone());
     let body = json!({
@@ -230,6 +239,15 @@ async fn publication_routes_are_idempotent_persistent_and_queryable() {
 async fn publication_mutation_requires_idempotency_and_validated_release() {
     let root = root("validation");
     let state = http_api::app_state(config(&root));
+    state
+        .store
+        .upsert_project_access(
+            "publication-project",
+            "owner-1".into(),
+            "ws-publication-test".into(),
+        )
+        .await
+        .unwrap();
     let release = seed_validated_release(&state).await;
     let app = http_api::router_with_state(state);
     let missing_precondition = app
@@ -331,7 +349,7 @@ async fn publication_write_requires_scoped_owner_principal_when_auth_is_enabled(
     let state = http_api::app_state(config);
     state
         .store
-        .upsert_project_access("publication-project", "owner-1".into(), None, None)
+        .upsert_project_access("publication-project", "owner-1".into(), "ws-test".into())
         .await
         .unwrap();
     let release = seed_validated_release(&state).await;

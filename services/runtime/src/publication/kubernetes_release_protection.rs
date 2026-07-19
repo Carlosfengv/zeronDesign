@@ -1,4 +1,4 @@
-use super::{PublicationStore, WORKS_NAMESPACE};
+use super::PublicationStore;
 use crate::release::{ReleaseProtectionSet, ReleaseProtectionSource, ReleaseStore};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -36,35 +36,46 @@ impl ReleaseProtectionSource for KubernetesReleaseProtectionSource {
                 .into_iter()
                 .map(|packaging| packaging.release_id),
         );
-        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), WORKS_NAMESPACE);
-        let live = deployments
-            .list(&ListParams::default())
-            .await
-            .context("scan live Published Deployments before Registry GC")?;
         let mut image_digests = BTreeSet::new();
-        for deployment in live {
-            if let Some(release_id) = deployment
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get("anydesign.dev/release-id"))
-            {
-                release_ids.insert(release_id.clone());
-            }
-            for container in deployment
-                .spec
-                .into_iter()
-                .flat_map(|spec| spec.template.spec)
-                .flat_map(|spec| spec.containers)
-            {
-                if let Some(digest) = container
-                    .image
-                    .as_deref()
-                    .and_then(|image| image.rsplit_once('@'))
-                    .map(|(_, digest)| digest)
-                    .filter(|digest| is_sha256_digest(digest))
+        let namespaces = self
+            .publication_store
+            .runtimes()
+            .into_iter()
+            .map(|runtime| runtime.workspace_namespace)
+            .collect::<BTreeSet<_>>();
+        for namespace in namespaces {
+            let deployments: Api<Deployment> =
+                Api::namespaced(self.client.clone(), namespace.as_str());
+            let live = deployments
+                .list(&ListParams::default())
+                .await
+                .with_context(|| {
+                    format!("scan live Published Deployments in {namespace} before Registry GC")
+                })?;
+            for deployment in live {
+                if let Some(release_id) = deployment
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("anydesign.dev/release-id"))
                 {
-                    image_digests.insert(digest.to_string());
+                    release_ids.insert(release_id.clone());
+                }
+                for container in deployment
+                    .spec
+                    .into_iter()
+                    .flat_map(|spec| spec.template.spec)
+                    .flat_map(|spec| spec.containers)
+                {
+                    if let Some(digest) = container
+                        .image
+                        .as_deref()
+                        .and_then(|image| image.rsplit_once('@'))
+                        .map(|(_, digest)| digest)
+                        .filter(|digest| is_sha256_digest(digest))
+                    {
+                        image_digests.insert(digest.to_string());
+                    }
                 }
             }
         }

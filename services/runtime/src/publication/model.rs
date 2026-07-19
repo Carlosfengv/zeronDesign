@@ -83,6 +83,7 @@ pub enum PublicationOutboxStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicationIntent {
     pub project_id: String,
+    pub workspace_namespace: String,
     pub kind: PublishOperationKind,
     pub release_id: Option<String>,
     pub expected_current_release_id: Option<String>,
@@ -93,8 +94,10 @@ pub struct PublicationIntent {
 
 impl PublicationIntent {
     pub fn validate(&self) -> Result<(), String> {
+        crate::types::validate_workspace_namespace(&self.workspace_namespace)?;
         for (field, value) in [
             ("projectId", self.project_id.as_str()),
+            ("workspaceNamespace", self.workspace_namespace.as_str()),
             ("runtimeProfileId", self.runtime_profile_id.as_str()),
             ("idempotencyKey", self.idempotency_key.as_str()),
         ] {
@@ -103,6 +106,7 @@ impl PublicationIntent {
             }
         }
         if self.project_id.len() > 128
+            || self.workspace_namespace.len() > 63
             || self.runtime_profile_id.len() > 128
             || self.idempotency_key.len() > 256
         {
@@ -154,6 +158,7 @@ impl PublicationIntent {
         };
         framed_hash(&[
             self.project_id.as_str(),
+            self.workspace_namespace.as_str(),
             kind,
             self.release_id.as_deref().unwrap_or(""),
             self.expected_current_release_id.as_deref().unwrap_or(""),
@@ -190,6 +195,7 @@ pub struct PublishOperation {
 pub struct WorkRuntimeState {
     pub schema_version: String,
     pub project_id: String,
+    pub workspace_namespace: String,
     pub desired_publication: PublicationDesiredState,
     pub desired_release_id: Option<String>,
     pub current_release_id: Option<String>,
@@ -249,6 +255,7 @@ mod tests {
     fn request_hash_is_framed_and_excludes_raw_idempotency_key() {
         let intent = PublicationIntent {
             project_id: "project-1".into(),
+            workspace_namespace: "ws-project-one".into(),
             kind: PublishOperationKind::Publish,
             release_id: Some("release-1".into()),
             expected_current_release_id: None,

@@ -181,10 +181,12 @@ async fn publish_work(
         PublishOperationKind::Publish
     };
     validate_publication_precondition(&headers, request.expected_current_release_id.as_deref())?;
+    let workspace_namespace = project_workspace_namespace(&state, &project_id).await?;
     commit_publication_intent(
         &state,
         PublicationIntent {
             project_id,
+            workspace_namespace,
             kind,
             release_id: Some(request.release_id),
             expected_current_release_id: request.expected_current_release_id,
@@ -222,10 +224,12 @@ async fn rollback_work(
         &headers,
         request.expected_current_release_id.as_deref(),
     )?;
+    let workspace_namespace = project_workspace_namespace(&state, &project_id).await?;
     commit_publication_intent(
         &state,
         PublicationIntent {
             project_id,
+            workspace_namespace,
             kind: PublishOperationKind::Rollback,
             release_id: Some(request.release_id),
             expected_current_release_id: request.expected_current_release_id,
@@ -256,10 +260,12 @@ async fn unpublish_work(
         &headers,
         request.expected_current_release_id.as_deref(),
     )?;
+    let workspace_namespace = project_workspace_namespace(&state, &project_id).await?;
     commit_publication_intent(
         &state,
         PublicationIntent {
             project_id,
+            workspace_namespace,
             kind: PublishOperationKind::Unpublish,
             release_id: None,
             expected_current_release_id: request.expected_current_release_id,
@@ -269,6 +275,18 @@ async fn unpublish_work(
         },
     )
     .await
+}
+
+async fn project_workspace_namespace(
+    state: &AppState,
+    project_id: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .store
+        .get_project_access(project_id)
+        .await
+        .map(|access| access.workspace_namespace)
+        .ok_or_else(|| conflict_error(anyhow::anyhow!("project workspace is not provisioned")))
 }
 
 async fn commit_publication_intent(

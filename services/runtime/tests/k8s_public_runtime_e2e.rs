@@ -90,7 +90,6 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     let capture_address = capture_listener.local_addr().unwrap();
     let mut config = RuntimeConfig::from_env();
     config.sandbox_backend_mode = SandboxBackendMode::Kubernetes;
-    config.k8s_namespace = "anydesign-sandboxes".to_string();
     config.workspace_channel_signing_key_file = Some(signing_key);
     config.runtime_storage_dir = storage.clone();
     config.workspace_root = PathBuf::from("/workspace");
@@ -122,7 +121,7 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     let store = RuntimeStore::with_checkpoint_dir(&storage);
     for project_id in ["website-k3d", "docs-k3d"] {
         store
-            .upsert_project_access(project_id, "k3d-e2e-owner".to_string(), None, None)
+            .upsert_project_access(project_id, "k3d-e2e-owner".to_string(), "ws-k3d".into())
             .await
             .unwrap();
     }

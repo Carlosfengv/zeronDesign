@@ -87,8 +87,8 @@ digest_b="$(build_release b "$release_b")"
 prober_digest="$(build_prober)"
 
 "$KUBECTL" apply -f "$ROOT/infra/public-runtime/base.yaml" >/dev/null
-"$KUBECTL" wait --for=jsonpath='{.status.phase}'=Active namespace/anydesign-works --timeout=60s >/dev/null
-"$KUBECTL" delete deployment,service,networkpolicy -n anydesign-works \
+"$KUBECTL" wait --for=jsonpath='{.status.phase}'=Active namespace/ws-public-runtime-e2e --timeout=60s >/dev/null
+"$KUBECTL" delete deployment,service,networkpolicy -n ws-public-runtime-e2e \
   -l app.kubernetes.io/managed-by=anydesign-work-runtime-controller \
   --ignore-not-found=true --wait=true >/dev/null
 
@@ -100,7 +100,7 @@ WORK_RUNTIME_PROBER_IMAGE="${REGISTRY_INTERNAL}/anydesign/release-prober@${probe
 cargo test --manifest-path "$ROOT/services/runtime/Cargo.toml" \
   --test k8s_work_runtime_g6 -- --nocapture
 
-if "$KUBECTL" get ingress -n anydesign-works -o name | grep -q .; then
+if "$KUBECTL" get ingress -n ws-public-runtime-e2e -o name | grep -q .; then
   printf 'G6 must not create Ingress resources\n' >&2
   exit 4
 fi

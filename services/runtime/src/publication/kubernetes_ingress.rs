@@ -22,6 +22,7 @@ pub struct KubernetesIngressExposure {
     pub base_domain: String,
     pub ingress_class: String,
     pub tls_secret_name: String,
+    pub certificate_issuer_name: Option<String>,
     pub probe_scheme: String,
     pub probe_resolve: Option<SocketAddr>,
     pub probe_ca_file: Option<PathBuf>,
@@ -38,10 +39,8 @@ impl KubernetesIngressExposure {
                 .works_ingress_class
                 .clone()
                 .context("WORKS_INGRESS_CLASS is required")?,
-            tls_secret_name: config
-                .works_tls_secret_name
-                .clone()
-                .context("WORKS_TLS_SECRET_NAME is required")?,
+            tls_secret_name: config.works_tls_secret_name.clone().unwrap_or_default(),
+            certificate_issuer_name: config.works_certificate_issuer_name.clone(),
             probe_scheme: config.works_probe_scheme.clone(),
             probe_resolve: config.works_probe_resolve,
             probe_ca_file: config.works_probe_ca_file.clone(),
@@ -58,8 +57,18 @@ impl KubernetesIngressExposure {
         {
             bail!("WORKS_BASE_DOMAIN is invalid");
         }
-        if self.ingress_class.trim().is_empty() || self.tls_secret_name.trim().is_empty() {
-            bail!("Ingress class and TLS secret name are required");
+        if self.ingress_class.trim().is_empty() {
+            bail!("Ingress class is required");
+        }
+        if self.certificate_issuer_name.is_none() && self.tls_secret_name.trim().is_empty() {
+            bail!("TLS secret name is required without a certificate issuer");
+        }
+        if self
+            .certificate_issuer_name
+            .as_ref()
+            .is_some_and(|issuer| !valid_dns_label(issuer))
+        {
+            bail!("WORKS_CERTIFICATE_ISSUER_NAME is invalid");
         }
         if self.probe_scheme != "https" {
             bail!("Published external probe must use HTTPS");
@@ -76,6 +85,14 @@ impl KubernetesIngressExposure {
 
     fn host(&self, host_slug: &str) -> String {
         format!("{host_slug}.{}", self.base_domain)
+    }
+
+    fn tls_secret_name(&self, work_name: &str) -> String {
+        if self.certificate_issuer_name.is_some() {
+            format!("{work_name}-tls")
+        } else {
+            self.tls_secret_name.clone()
+        }
     }
 
     fn client_for(&self, host: &str) -> Result<reqwest::Client> {
@@ -124,6 +141,20 @@ impl KubernetesWorkRuntimeBackend {
                 bail!("Published host is already owned by another Ingress");
             }
         }
+        let mut annotations = json!({
+            "anydesign.dev/release-id": desired.release_id,
+            "nginx.ingress.kubernetes.io/ssl-redirect": "true"
+        });
+        if let Some(issuer) = &exposure.certificate_issuer_name {
+            annotations["cert-manager.io/cluster-issuer"] = json!(issuer);
+            annotations["cert-manager.io/duration"] = json!("2160h");
+            annotations["cert-manager.io/renew-before"] = json!("720h");
+            annotations["cert-manager.io/private-key-algorithm"] = json!("ECDSA");
+            annotations["cert-manager.io/private-key-size"] = json!("256");
+            annotations["cert-manager.io/private-key-rotation-policy"] = json!("Always");
+            annotations["cert-manager.io/revision-history-limit"] = json!("3");
+        }
+        let tls_secret_name = exposure.tls_secret_name(&desired.work_name);
         let ingress = object::<Ingress>(json!({
             "apiVersion": "networking.k8s.io/v1",
             "kind": "Ingress",
@@ -131,14 +162,11 @@ impl KubernetesWorkRuntimeBackend {
                 "name": desired.work_name,
                 "namespace": desired.namespace,
                 "labels": desired.labels,
-                "annotations": {
-                    "anydesign.dev/release-id": desired.release_id,
-                    "nginx.ingress.kubernetes.io/ssl-redirect": "true"
-                }
+                "annotations": annotations
             },
             "spec": {
                 "ingressClassName": exposure.ingress_class,
-                "tls": [{"hosts": [host], "secretName": exposure.tls_secret_name}],
+                "tls": [{"hosts": [host], "secretName": tls_secret_name}],
                 "rules": [{"host": host, "http": {"paths": [{
                     "path": "/", "pathType": "Prefix",
                     "backend": {"service": {"name": desired.stable_service_name, "port": {"name": "http"}}}
@@ -314,4 +342,55 @@ fn valid_dns_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && label.as_bytes()[0].is_ascii_alphanumeric()
         && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KubernetesIngressExposure;
+
+    fn exposure(
+        tls_secret_name: &str,
+        certificate_issuer_name: Option<&str>,
+    ) -> KubernetesIngressExposure {
+        KubernetesIngressExposure {
+            base_domain: "works.example.test".into(),
+            ingress_class: "traefik".into(),
+            tls_secret_name: tls_secret_name.into(),
+            certificate_issuer_name: certificate_issuer_name.map(str::to_string),
+            probe_scheme: "https".into(),
+            probe_resolve: None,
+            probe_ca_file: None,
+        }
+    }
+
+    #[test]
+    fn managed_certificate_mode_derives_a_per_work_secret() {
+        let exposure = exposure("", Some("works-cluster-issuer"));
+
+        exposure.validate().unwrap();
+
+        assert_eq!(exposure.tls_secret_name("work-abc123"), "work-abc123-tls");
+    }
+
+    #[test]
+    fn legacy_certificate_mode_keeps_the_shared_secret() {
+        let exposure = exposure("works-wildcard-tls", None);
+
+        exposure.validate().unwrap();
+
+        assert_eq!(
+            exposure.tls_secret_name("work-abc123"),
+            "works-wildcard-tls"
+        );
+    }
+
+    #[test]
+    fn managed_certificate_mode_rejects_an_invalid_cluster_issuer_name() {
+        let exposure = exposure("", Some("Invalid/Issuer"));
+
+        assert_eq!(
+            exposure.validate().unwrap_err().to_string(),
+            "WORKS_CERTIFICATE_ISSUER_NAME is invalid"
+        );
+    }
 }

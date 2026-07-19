@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const WORKS_NAMESPACE: &str = "anydesign-works";
 pub const FIELD_MANAGER: &str = "anydesign-work-runtime-controller";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,7 +97,7 @@ impl DesiredUnpublishRuntime {
             bail!("work runtime is not desired Unpublished");
         }
         Ok(Self {
-            namespace: WORKS_NAMESPACE.into(),
+            namespace: runtime.workspace_namespace.clone(),
             project_id: runtime.project_id.clone(),
             work_name: runtime.service_name.clone(),
             service_name: runtime.service_name.clone(),
@@ -199,7 +198,7 @@ impl DesiredWorkRuntime {
         );
         labels.insert("app.kubernetes.io/managed-by".into(), FIELD_MANAGER.into());
         Ok(Self {
-            namespace: WORKS_NAMESPACE.into(),
+            namespace: runtime.workspace_namespace.clone(),
             project_id: runtime.project_id.clone(),
             work_name: work_name.clone(),
             deployment_name: deployment_name.clone(),
@@ -306,6 +305,7 @@ mod tests {
         let runtime = WorkRuntimeState {
             schema_version: "work-runtime-state@1".into(),
             project_id: "project-a".into(),
+            workspace_namespace: "ws-project-a".into(),
             desired_publication: PublicationDesiredState::Published,
             desired_release_id: Some("release-a".into()),
             current_release_id: None,

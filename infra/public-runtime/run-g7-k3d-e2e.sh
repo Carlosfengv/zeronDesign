@@ -99,7 +99,7 @@ prober_digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$prober_hos
 [[ "$prober_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
 
 "$KUBECTL" apply -f "$ROOT/infra/public-runtime/base.yaml" >/dev/null
-"$KUBECTL" delete deployment,service,ingress,networkpolicy -n anydesign-works \
+"$KUBECTL" delete deployment,service,ingress,networkpolicy -n ws-public-runtime-e2e \
   -l app.kubernetes.io/managed-by=anydesign-work-runtime-controller \
   --ignore-not-found=true --wait=true >/dev/null
 
@@ -115,7 +115,7 @@ openssl req -newkey rsa:2048 -nodes -subj "/CN=*.${BASE_DOMAIN}" \
 printf 'subjectAltName=DNS:*.%s\nextendedKeyUsage=serverAuth\n' "$BASE_DOMAIN" >"$tmp/tls.ext"
 openssl x509 -req -sha256 -days 2 -in "$tls_csr" -CA "$ca_cert" -CAkey "$ca_key" \
   -CAcreateserial -extfile "$tmp/tls.ext" -out "$tls_cert" >/dev/null 2>&1
-"$KUBECTL" create secret tls anydesign-works-wildcard-tls -n anydesign-works \
+"$KUBECTL" create secret tls ws-public-runtime-e2e-wildcard-tls -n ws-public-runtime-e2e \
   --cert="$tls_cert" --key="$tls_key" --dry-run=client -o yaml | "$KUBECTL" apply -f - >/dev/null
 
 RUN_WORK_RUNTIME_G7_K8S_E2E=1 \
@@ -125,14 +125,14 @@ WORK_RUNTIME_PROBER_IMAGE="${REGISTRY_INTERNAL}/anydesign/release-prober@${probe
 WORK_RUNTIME_EXPOSURE=ingress \
 WORKS_BASE_DOMAIN="$BASE_DOMAIN" \
 WORKS_INGRESS_CLASS=traefik \
-WORKS_TLS_SECRET_NAME=anydesign-works-wildcard-tls \
+WORKS_TLS_SECRET_NAME=ws-public-runtime-e2e-wildcard-tls \
 WORKS_PROBE_SCHEME=https \
 WORKS_PROBE_RESOLVE="127.0.0.1:${HTTPS_PORT}" \
 WORKS_PROBE_CA_FILE="$ca_cert" \
 cargo test --manifest-path "$ROOT/services/runtime/Cargo.toml" \
   --test k8s_work_runtime_g7 -- --nocapture
 
-host="$($KUBECTL get ingress -n anydesign-works -l app.kubernetes.io/managed-by=anydesign-work-runtime-controller -o jsonpath='{.items[0].spec.rules[0].host}')"
+host="$($KUBECTL get ingress -n ws-public-runtime-e2e -l app.kubernetes.io/managed-by=anydesign-work-runtime-controller -o jsonpath='{.items[0].spec.rules[0].host}')"
 [[ -n "$host" ]]
 curl --fail --silent --show-error --cacert "$ca_cert" \
   --resolve "${host}:${HTTPS_PORT}:127.0.0.1" \
