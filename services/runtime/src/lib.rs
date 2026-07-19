@@ -7,6 +7,7 @@ pub mod artifact_publisher;
 pub mod authorization;
 pub mod channel_manager;
 pub mod config;
+pub mod control_plane_persistence;
 pub mod conversation;
 pub mod design_context;
 pub mod design_profile;
@@ -14,6 +15,7 @@ pub mod design_profile_service;
 pub mod generation_contract;
 pub mod http_api;
 pub mod model_gateway;
+pub mod object_storage;
 pub mod permission;
 pub mod preview;
 pub mod preview_access;
@@ -40,3 +42,14 @@ pub mod workspace_auth;
 
 pub use config::RuntimeConfig;
 pub use conversation::RuntimeStore;
+
+pub(crate) fn ensure_rustls_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => Ok(()),
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+        Err(_) => anyhow::bail!("install Runtime rustls crypto provider"),
+    }
+}

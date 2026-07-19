@@ -370,7 +370,7 @@ pub(super) async fn capture_runtime_screenshot(
     let metadata_path = screenshot_path.with_extension("json");
     // remote-fs-boundary: allow-begin runtime-browser-screenshot-artifact
     fs::write(
-        metadata_path,
+        &metadata_path,
         serde_json::to_vec_pretty(&json!({
             "uri": capture.uri,
             "pngSha256": capture.png_sha256,
@@ -382,6 +382,11 @@ pub(super) async fn capture_runtime_screenshot(
         .map_err(|error| ToolError::Terminal(error.to_string()))?,
     )
     .map_err(|error| ToolError::Terminal(format!("write screenshot metadata: {error}")))?;
+    crate::object_storage::sync_object_file(&ctx.runtime_storage_dir, &screenshot_path)
+        .and_then(|_| {
+            crate::object_storage::sync_object_file(&ctx.runtime_storage_dir, &metadata_path)
+        })
+        .map_err(|error| ToolError::Terminal(format!("persist screenshot object: {error}")))?;
     // remote-fs-boundary: allow-end runtime-browser-screenshot-artifact
     Ok(Some(capture))
 }

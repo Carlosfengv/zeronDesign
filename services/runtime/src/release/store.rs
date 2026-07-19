@@ -3,6 +3,7 @@ use super::{
     ReleasePackagingInput, ReleasePackagingRecord, ReleasePackagingStatus, WorkRelease,
     WorkReleaseStatus,
 };
+use crate::control_plane_persistence::PostgresControlPlaneMirror;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     fmt, fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 const JOURNAL_FILE: &str = "release-events.jsonl";
@@ -77,10 +78,18 @@ struct ReleaseEvent {
 pub struct ReleaseStore {
     root: PathBuf,
     state: Mutex<ReleaseState>,
+    mirror: Option<Arc<PostgresControlPlaneMirror>>,
 }
 
 impl ReleaseStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ReleaseStoreError> {
+        Self::open_with_mirror(root, None)
+    }
+
+    pub(crate) fn open_with_mirror(
+        root: impl Into<PathBuf>,
+        mirror: Option<Arc<PostgresControlPlaneMirror>>,
+    ) -> Result<Self, ReleaseStoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let mut state = read_checkpoint(&root).unwrap_or_default();
@@ -93,6 +102,7 @@ impl ReleaseStore {
         Ok(Self {
             root,
             state: Mutex::new(state),
+            mirror,
         })
     }
 
@@ -514,8 +524,19 @@ impl ReleaseStore {
             packaging,
         };
         append_event(&self.root, &event)?;
+        self.sync_mirror(&self.root.join(JOURNAL_FILE))?;
         apply_event(state, event)?;
         write_checkpoint(&self.root, state)?;
+        self.sync_mirror(&self.root.join(CHECKPOINT_FILE))?;
+        Ok(())
+    }
+
+    fn sync_mirror(&self, path: &Path) -> Result<(), ReleaseStoreError> {
+        if let Some(mirror) = self.mirror.as_deref() {
+            mirror
+                .sync_file(path)
+                .map_err(|error| ReleaseStoreError::Storage(error.to_string()))?;
+        }
         Ok(())
     }
 }

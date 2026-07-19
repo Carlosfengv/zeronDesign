@@ -10,6 +10,7 @@ COPY services/runtime/Cargo.toml services/runtime/Cargo.lock ./
 COPY services/provider-gateway/Cargo.toml /provider-gateway/Cargo.toml
 COPY services/runtime/target/docker-vendor /vendor
 COPY services/runtime/src ./src
+COPY services/runtime/migrations ./migrations
 COPY services/runtime/scripts ./scripts
 RUN mkdir -p .cargo \
     && printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "/vendor"\n' > .cargo/config.toml \

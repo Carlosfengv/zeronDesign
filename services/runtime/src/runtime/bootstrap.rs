@@ -4,6 +4,7 @@ use crate::{
     channel_manager::ChannelManager,
     config::{SandboxBackendMode, WorkRuntimeBackendMode},
     http_api::{self, AppState},
+    object_storage::{S3ObjectStorage, S3ObjectStorageConfig},
     project::{
         audit_project_template_compatibility, ProjectInitWorkspaceTransaction,
         WorkspaceTransactionError,
@@ -269,12 +270,32 @@ impl RuntimeBootstrap {
     }
 
     pub async fn recover(self) -> anyhow::Result<RecoveredRuntime> {
+        crate::ensure_rustls_crypto_provider()?;
         self.config.validate_startup().map_err(anyhow::Error::msg)?;
+        S3ObjectStorage::open(
+            S3ObjectStorageConfig {
+                url: &self.config.object_storage_url,
+                endpoint: &self.config.object_storage_endpoint,
+                access_key: self
+                    .config
+                    .object_storage_access_key
+                    .as_deref()
+                    .unwrap_or_default(),
+                secret_key: self
+                    .config
+                    .object_storage_secret_key
+                    .as_deref()
+                    .unwrap_or_default(),
+                region: &self.config.object_storage_region,
+                allow_http: self.config.object_storage_allow_http,
+            },
+            &self.config.runtime_storage_dir,
+        )?;
         let supervisor = RuntimeSupervisor::new();
-        let state = http_api::recover_startup_runs(http_api::app_state_with_supervisor(
+        let state = http_api::recover_startup_runs(http_api::try_app_state_with_supervisor(
             self.config,
             supervisor.clone(),
-        ))
+        )?)
         .await?;
         supervisor.mark_recovered();
         Ok(RecoveredRuntime { state, supervisor })

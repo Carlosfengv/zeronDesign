@@ -146,6 +146,11 @@ pub struct RuntimeConfig {
     pub kimi_cn_base_url: String,
     pub database_url: String,
     pub object_storage_url: String,
+    pub object_storage_endpoint: String,
+    pub object_storage_access_key: Option<String>,
+    pub object_storage_secret_key: Option<String>,
+    pub object_storage_region: String,
+    pub object_storage_allow_http: bool,
     pub runtime_storage_dir: PathBuf,
     pub workspace_root: PathBuf,
     pub runtime_public_base_url: String,
@@ -162,13 +167,13 @@ pub struct RuntimeConfig {
     pub public_principal_audience: String,
     pub public_principal_public_key_files: Vec<PathBuf>,
     pub public_principal_max_ttl_seconds: u64,
-    pub k8s_namespace: String,
     pub work_runtime_backend_mode: WorkRuntimeBackendMode,
     pub work_runtime_exposure_mode: WorkRuntimeExposureMode,
     pub work_runtime_prober_image: Option<String>,
     pub works_base_domain: Option<String>,
     pub works_ingress_class: Option<String>,
     pub works_tls_secret_name: Option<String>,
+    pub works_certificate_issuer_name: Option<String>,
     pub works_probe_scheme: String,
     pub works_probe_resolve: Option<SocketAddr>,
     pub works_probe_ca_file: Option<PathBuf>,
@@ -240,6 +245,14 @@ impl RuntimeConfig {
                 .unwrap_or_else(|_| "sqlite://runtime.db".to_string()),
             object_storage_url: env::var("OBJECT_STORAGE_URL")
                 .unwrap_or_else(|_| "file:///tmp/anydesign-runtime".to_string()),
+            object_storage_endpoint: env::var("OBJECT_STORAGE_ENDPOINT").unwrap_or_default(),
+            object_storage_access_key: secret_env("OBJECT_STORAGE_ACCESS_KEY")
+                .or_else(|| secret_file_env("OBJECT_STORAGE_ACCESS_KEY_FILE")),
+            object_storage_secret_key: secret_env("OBJECT_STORAGE_SECRET_KEY")
+                .or_else(|| secret_file_env("OBJECT_STORAGE_SECRET_KEY_FILE")),
+            object_storage_region: env::var("OBJECT_STORAGE_REGION")
+                .unwrap_or_else(|_| "us-east-1".to_string()),
+            object_storage_allow_http: truthy_env("OBJECT_STORAGE_ALLOW_HTTP"),
             runtime_storage_dir: env::var("RUNTIME_STORAGE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("anydesign-runtime")),
@@ -274,10 +287,7 @@ impl RuntimeConfig {
                 "WORKSPACE_CHANNEL_CLIENT_KEY_FILE",
             ),
             workspace_channel_server_san: env::var("WORKSPACE_CHANNEL_SERVER_SAN").unwrap_or_else(
-                |_| {
-                    "spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox"
-                        .to_string()
-                },
+                |_| "spiffe://anydesign.local/ns/{namespace}/sa/anydesign-sandbox".to_string(),
             ),
             public_principal_auth_mode: env::var("PUBLIC_PRINCIPAL_AUTH_MODE")
                 .ok()
@@ -302,8 +312,6 @@ impl RuntimeConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(120),
-            k8s_namespace: env::var("K8S_NAMESPACE")
-                .unwrap_or_else(|_| "anydesign-sandboxes".to_string()),
             work_runtime_backend_mode: env::var("WORK_RUNTIME_BACKEND")
                 .ok()
                 .map(|value| WorkRuntimeBackendMode::from_env_value(&value))
@@ -316,6 +324,7 @@ impl RuntimeConfig {
             works_base_domain: optional_string_env("WORKS_BASE_DOMAIN"),
             works_ingress_class: optional_string_env("WORKS_INGRESS_CLASS"),
             works_tls_secret_name: optional_string_env("WORKS_TLS_SECRET_NAME"),
+            works_certificate_issuer_name: optional_string_env("WORKS_CERTIFICATE_ISSUER_NAME"),
             works_probe_scheme: env::var("WORKS_PROBE_SCHEME")
                 .unwrap_or_else(|_| "https".to_string()),
             works_probe_resolve: env::var("WORKS_PROBE_RESOLVE")
@@ -412,11 +421,18 @@ impl RuntimeConfig {
                 for (name, value) in [
                     ("WORKS_BASE_DOMAIN", &self.works_base_domain),
                     ("WORKS_INGRESS_CLASS", &self.works_ingress_class),
-                    ("WORKS_TLS_SECRET_NAME", &self.works_tls_secret_name),
                 ] {
                     if value.as_deref().is_none_or(str::is_empty) {
                         return Err(format!("{name} is required for Ingress exposure"));
                     }
+                }
+                if self.works_certificate_issuer_name.is_none()
+                    && self.works_tls_secret_name.is_none()
+                {
+                    return Err(
+                        "WORKS_TLS_SECRET_NAME is required when WORKS_CERTIFICATE_ISSUER_NAME is not configured"
+                            .to_string(),
+                    );
                 }
                 if self.works_probe_scheme != "https" {
                     return Err("WORKS_PROBE_SCHEME must be https".to_string());
@@ -482,6 +498,9 @@ impl RuntimeConfig {
                 if !self.workspace_channel_server_san.starts_with("spiffe://") {
                     return Err("WORKSPACE_CHANNEL_SERVER_SAN must be a SPIFFE URI".to_string());
                 }
+                if !self.workspace_channel_server_san.contains("{namespace}") {
+                    return Err("WORKSPACE_CHANNEL_SERVER_SAN must contain {namespace}".to_string());
+                }
             }
         }
         if self.policy_profile == RuntimePolicyProfile::Production
@@ -507,6 +526,38 @@ impl RuntimeConfig {
             if !(1..=300).contains(&self.public_principal_max_ttl_seconds) {
                 return Err(
                     "PUBLIC_PRINCIPAL_MAX_TTL_SECONDS must be between 1 and 300".to_string()
+                );
+            }
+        }
+        if self.policy_profile == RuntimePolicyProfile::Production
+            && !(self.database_url.starts_with("postgres://")
+                || self.database_url.starts_with("postgresql://"))
+        {
+            return Err("DATABASE_URL must use PostgreSQL in production".to_string());
+        }
+        if self.policy_profile == RuntimePolicyProfile::Production {
+            if !self.object_storage_url.starts_with("s3://") {
+                return Err("OBJECT_STORAGE_URL must use s3:// in production".to_string());
+            }
+            if self.object_storage_endpoint.trim().is_empty()
+                || self
+                    .object_storage_access_key
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || self
+                    .object_storage_secret_key
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err(
+                    "production object storage requires endpoint and credentials".to_string(),
+                );
+            }
+            if self.object_storage_endpoint.starts_with("http://")
+                && !self.object_storage_allow_http
+            {
+                return Err(
+                    "HTTP object storage requires OBJECT_STORAGE_ALLOW_HTTP=true".to_string(),
                 );
             }
         }
@@ -653,6 +704,11 @@ mod tests {
         let mut config = RuntimeConfig::from_env();
         config.sandbox_backend_mode = SandboxBackendMode::PhaseAContract;
         config.public_principal_public_key_files.clear();
+        config.database_url = "postgres://runtime@postgres/runtime".to_string();
+        config.object_storage_url = "s3://runtime-artifacts/test".to_string();
+        config.object_storage_endpoint = "https://object-store.example".to_string();
+        config.object_storage_access_key = Some("test-access-key".to_string());
+        config.object_storage_secret_key = Some("test-secret-key".to_string());
         config
     }
 
@@ -684,6 +740,65 @@ mod tests {
         config.policy_profile = RuntimePolicyProfile::LocalE2e;
         config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
         config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn production_requires_postgres_control_plane() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::Production;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "PUBLIC_PRINCIPAL_AUTH_MODE must be required in production"
+        );
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+        let key = std::env::temp_dir().join(format!(
+            "runtime-config-public-key-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&key, b"fixture").unwrap();
+        config.public_principal_public_key_files = vec![key.clone()];
+        config.npm_registry = "http://npm-proxy.local".to_string();
+        config.database_url = "sqlite://runtime.db".to_string();
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "DATABASE_URL must use PostgreSQL in production"
+        );
+        std::fs::remove_file(key).unwrap();
+    }
+
+    #[test]
+    fn production_requires_s3_object_storage() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::Production;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Required;
+        let key = std::env::temp_dir().join(format!(
+            "runtime-config-object-storage-public-key-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&key, b"fixture").unwrap();
+        config.public_principal_public_key_files = vec![key.clone()];
+        config.npm_registry = "http://npm-proxy.local".to_string();
+        config.object_storage_url = "file:///tmp/runtime".to_string();
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "OBJECT_STORAGE_URL must use s3:// in production"
+        );
+        config.object_storage_url = "s3://runtime-artifacts/test".to_string();
+        config.object_storage_endpoint.clear();
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "production object storage requires endpoint and credentials"
+        );
+        config.object_storage_endpoint = "http://object-store.local".to_string();
+        config.object_storage_allow_http = false;
+        assert_eq!(
+            config.validate_startup().unwrap_err(),
+            "HTTP object storage requires OBJECT_STORAGE_ALLOW_HTTP=true"
+        );
+        std::fs::remove_file(key).unwrap();
     }
 
     #[test]
@@ -793,6 +908,9 @@ mod tests {
         config.works_base_domain = Some("works.example.test".into());
         config.works_ingress_class = Some("nginx".into());
         config.works_tls_secret_name = Some("works-wildcard-tls".into());
+        config.validate_startup().unwrap();
+        config.works_tls_secret_name = None;
+        config.works_certificate_issuer_name = Some("works-cluster-issuer".into());
         config.validate_startup().unwrap();
     }
 }

@@ -6,6 +6,7 @@ use super::{
     PublishCheckpoint, PublishOperation, PublishOperationKind, PublishOperationStatus,
     WorkRuntimeState, WorkRuntimeStatus,
 };
+use crate::control_plane_persistence::PostgresControlPlaneMirror;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,7 +15,7 @@ use std::{
     fmt, fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 const JOURNAL_FILE: &str = "publication-commits.jsonl";
@@ -82,10 +83,18 @@ struct PublicationCommit {
 pub struct PublicationStore {
     root: PathBuf,
     state: Mutex<PublicationSnapshot>,
+    mirror: Option<Arc<PostgresControlPlaneMirror>>,
 }
 
 impl PublicationStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, PublicationStoreError> {
+        Self::open_with_mirror(root, None)
+    }
+
+    pub(crate) fn open_with_mirror(
+        root: impl Into<PathBuf>,
+        mirror: Option<Arc<PostgresControlPlaneMirror>>,
+    ) -> Result<Self, PublicationStoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let mut state = read_checkpoint(&root).unwrap_or_default();
@@ -98,6 +107,7 @@ impl PublicationStore {
         Ok(Self {
             root,
             state: Mutex::new(state),
+            mirror,
         })
     }
 
@@ -188,6 +198,7 @@ impl PublicationStore {
         };
         persist_commit(
             &self.root,
+            self.mirror.as_deref(),
             &mut snapshot,
             operation.clone(),
             runtime.clone(),
@@ -203,6 +214,16 @@ impl PublicationStore {
 
     pub fn runtime(&self, project_id: &str) -> Option<WorkRuntimeState> {
         self.state.lock().unwrap().runtimes.get(project_id).cloned()
+    }
+
+    pub fn runtimes(&self) -> Vec<WorkRuntimeState> {
+        self.state
+            .lock()
+            .unwrap()
+            .runtimes
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn operations_for_project(&self, project_id: &str) -> Vec<PublishOperation> {
@@ -381,6 +402,7 @@ impl PublicationStore {
         ]);
         persist_commit(
             &self.root,
+            self.mirror.as_deref(),
             &mut snapshot,
             operation.clone(),
             runtime.clone(),
@@ -395,6 +417,11 @@ fn validate_compare_and_set(
     current: Option<&WorkRuntimeState>,
     intent: &PublicationIntent,
 ) -> Result<(), PublicationStoreError> {
+    if current.is_some_and(|runtime| runtime.workspace_namespace != intent.workspace_namespace) {
+        return Err(PublicationStoreError::Conflict(
+            "workspace namespace is immutable for an existing publication".to_string(),
+        ));
+    }
     if let Some(expected) = intent.expected_generation {
         if current.map_or(0, |runtime| runtime.desired_generation) != expected {
             return Err(PublicationStoreError::Conflict(
@@ -457,6 +484,7 @@ fn initial_runtime(
     WorkRuntimeState {
         schema_version: WORK_RUNTIME_STATE_SCHEMA.to_string(),
         project_id: intent.project_id.clone(),
+        workspace_namespace: intent.workspace_namespace.clone(),
         desired_publication: PublicationDesiredState::Unpublished,
         desired_release_id: None,
         current_release_id: None,
@@ -485,6 +513,7 @@ fn initial_runtime(
 
 fn persist_commit(
     root: &Path,
+    mirror: Option<&PostgresControlPlaneMirror>,
     snapshot: &mut PublicationSnapshot,
     operation: PublishOperation,
     runtime: WorkRuntimeState,
@@ -498,8 +527,22 @@ fn persist_commit(
         outbox,
     };
     append_commit(root, &commit)?;
+    sync_mirror(mirror, &root.join(JOURNAL_FILE))?;
     apply_commit_with_key(snapshot, commit, scoped_key)?;
     write_checkpoint(root, snapshot)?;
+    sync_mirror(mirror, &root.join(CHECKPOINT_FILE))?;
+    Ok(())
+}
+
+fn sync_mirror(
+    mirror: Option<&PostgresControlPlaneMirror>,
+    path: &Path,
+) -> Result<(), PublicationStoreError> {
+    if let Some(mirror) = mirror {
+        mirror
+            .sync_file(path)
+            .map_err(|error| PublicationStoreError::Storage(error.to_string()))?;
+    }
     Ok(())
 }
 

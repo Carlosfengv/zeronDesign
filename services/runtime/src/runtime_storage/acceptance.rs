@@ -1,4 +1,7 @@
-use crate::{acceptance_contract::AcceptanceReport, artifact_publisher::safe_segment};
+use crate::{
+    acceptance_contract::AcceptanceReport, artifact_publisher::safe_segment,
+    object_storage::sync_object_file,
+};
 use anyhow::{anyhow, Context, Result};
 use std::{fs, path::PathBuf};
 
@@ -38,6 +41,7 @@ impl FileAcceptanceReportStore {
             serde_json::to_vec_pretty(report).context("failed to serialize acceptance report")?,
         )?;
         fs::rename(&temporary, &target)?;
+        sync_object_file(&self.runtime_storage_dir, &target)?;
         Ok(Self::uri(
             project_id,
             &report.run_id,

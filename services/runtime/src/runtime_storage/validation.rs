@@ -1,4 +1,7 @@
-use crate::{artifact_publisher::safe_segment, generation_contract::ValidationReport};
+use crate::{
+    artifact_publisher::safe_segment, generation_contract::ValidationReport,
+    object_storage::sync_object_file,
+};
 use anyhow::{anyhow, Context, Result};
 use std::{fs, path::PathBuf};
 
@@ -38,6 +41,7 @@ impl FileValidationReportStore {
             serde_json::to_vec_pretty(report).context("failed to serialize validation report")?,
         )?;
         fs::rename(&temporary, &target)?;
+        sync_object_file(&self.runtime_storage_dir, &target)?;
         Ok(Self::uri(
             project_id,
             &report.run_id,

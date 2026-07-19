@@ -272,6 +272,7 @@ mod tests {
         store
             .commit_intent(&PublicationIntent {
                 project_id: "project-observed".into(),
+                workspace_namespace: "ws-project-observed".into(),
                 kind: PublishOperationKind::Publish,
                 release_id: Some("release-observed".into()),
                 expected_current_release_id: None,
@@ -365,6 +366,7 @@ mod tests {
         let (operation, _) = store
             .commit_intent(&PublicationIntent {
                 project_id: "project-observed".into(),
+                workspace_namespace: "ws-project-observed".into(),
                 kind: PublishOperationKind::Unpublish,
                 release_id: None,
                 expected_current_release_id: Some("release-observed".into()),
@@ -400,6 +402,7 @@ mod tests {
         let (update, _) = store
             .commit_intent(&PublicationIntent {
                 project_id: "project-observed".into(),
+                workspace_namespace: "ws-project-observed".into(),
                 kind: PublishOperationKind::Update,
                 release_id: Some("release-green".into()),
                 expected_current_release_id: Some("release-observed".into()),

@@ -719,6 +719,7 @@ pub(super) async fn collect_browser_evidence(
         "url": browser_url,
         "assertions": assertions,
     });
+    let mut screenshot_directory = None;
     if let Some(ctx) = ctx {
         let screenshot_dir = ctx
             .runtime_storage_dir
@@ -726,7 +727,8 @@ pub(super) async fn collect_browser_evidence(
             .join(safe_segment(&ctx.run.project_id))
             .join(safe_segment(&ctx.run.id))
             .join("verification");
-        input["viewportScreenshotDir"] = json!(screenshot_dir);
+        input["viewportScreenshotDir"] = json!(&screenshot_dir);
+        screenshot_directory = Some((ctx.runtime_storage_dir.clone(), screenshot_dir));
         input["viewportScreenshotUriPrefix"] = json!(format!(
             "runtime://screenshots/{}/{}/verification",
             safe_segment(&ctx.run.project_id),
@@ -804,7 +806,7 @@ pub(super) async fn collect_browser_evidence(
         }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match serde_json::from_str::<Value>(stdout.trim()) {
+    let evidence = match serde_json::from_str::<Value>(stdout.trim()) {
         Ok(value) if output.status.success() => value,
         Ok(value) => json!({
             "ok": false,
@@ -823,7 +825,19 @@ pub(super) async fn collect_browser_evidence(
             "error": format!("invalid browser evidence output: {error}"),
             "results": {}
         }),
+    };
+    if let Some((runtime_storage_dir, screenshot_dir)) = screenshot_directory {
+        if let Err(error) =
+            crate::object_storage::sync_object_tree(&runtime_storage_dir, &screenshot_dir)
+        {
+            return json!({
+                "ok": false,
+                "error": format!("persist browser verification screenshots: {error}"),
+                "results": evidence.get("results").cloned().unwrap_or_else(|| json!({}))
+            });
+        }
     }
+    evidence
 }
 
 fn internal_browser_evidence_url(ctx: Option<&ToolContext>, preview_url: &str) -> String {

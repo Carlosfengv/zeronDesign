@@ -202,10 +202,13 @@ impl WorkspaceChannelClientTls {
         let private_key = rustls_pemfile::private_key(&mut key_reader)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "client key is missing"))?;
         // remote-fs-boundary: allow-end runtime-owned-workspace-channel-tls-secret
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(cert_chain, private_key)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .with_root_certificates(roots)
+                .with_client_auth_cert(cert_chain, private_key)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         Ok(Some(Self {
             client_config: Arc::new(client_config),
             expected_server_san: Arc::new(config.workspace_channel_server_san.clone()),
@@ -681,6 +684,7 @@ async fn connect_workspace_channel(
     WebSocketStream<MaybeTlsStream<TcpStream>>,
     WebSocketResponse,
 )> {
+    crate::ensure_rustls_crypto_provider().map_err(io::Error::other)?;
     if let Some(tls) = tls {
         let host = handshake
             .uri()

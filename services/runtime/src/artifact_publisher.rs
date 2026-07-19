@@ -3,6 +3,7 @@ use crate::{
         manifest_file, ArtifactDeliverySpec, ArtifactManifest, ArtifactManifestFile,
         ARTIFACT_MANIFEST_FILE,
     },
+    object_storage::{delete_object_tree, sync_object_tree},
     templates::TemplateSpec,
     types::{sha256_hex, ArtifactPublishRecord, ArtifactPublishStatus},
 };
@@ -162,6 +163,7 @@ impl FileArtifactPublisher {
                 ));
             }
             fs::remove_dir_all(&temporary)?;
+            sync_object_tree(&self.runtime_storage_dir, &target)?;
             return Ok(format!(
                 "runtime://source-snapshots/{}/{}",
                 safe_segment(project_id),
@@ -171,7 +173,8 @@ impl FileArtifactPublisher {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(temporary, target)?;
+        fs::rename(temporary, &target)?;
+        sync_object_tree(&self.runtime_storage_dir, &target)?;
         Ok(format!(
             "runtime://source-snapshots/{}/{}",
             safe_segment(project_id),
@@ -292,7 +295,7 @@ impl FileArtifactPublisher {
             let bytes = fs::metadata(&source)?.len();
             manifest_files.push(manifest_file(&relative, bytes, sha256_file(&source)?)?);
         }
-        write_staged_manifest(
+        let staged = write_staged_manifest(
             &temporary_root,
             &staged_root,
             StagedManifestContext {
@@ -304,7 +307,9 @@ impl FileArtifactPublisher {
                 delivery: template.artifact_delivery,
             },
             manifest_files,
-        )
+        )?;
+        sync_object_tree(&self.runtime_storage_dir, &staged_root)?;
+        Ok(staged)
     }
 
     pub fn garbage_collect(&self, publish: &ArtifactPublishRecord) -> Result<()> {
@@ -312,16 +317,18 @@ impl FileArtifactPublisher {
             return Err(anyhow!("artifact publish is not garbage collectable"));
         }
         let staged = self.staged_root(&publish.project_id, &publish.version_id);
+        delete_object_tree(&self.runtime_storage_dir, &staged)?;
         if staged.exists() {
-            fs::remove_dir_all(staged)?;
+            fs::remove_dir_all(&staged)?;
         }
         let immutable = Self::version_root(
             &self.runtime_storage_dir,
             &publish.project_id,
             &publish.version_id,
         );
+        delete_object_tree(&self.runtime_storage_dir, &immutable)?;
         if immutable.exists() {
-            fs::remove_dir_all(immutable)?;
+            fs::remove_dir_all(&immutable)?;
         }
         Ok(())
     }
@@ -357,7 +364,7 @@ impl ArtifactPublisher for FileArtifactPublisher {
                 sha256_hex(&file.bytes),
             )?);
         }
-        write_staged_manifest(
+        let staged = write_staged_manifest(
             &temporary_root,
             &staged_root,
             StagedManifestContext {
@@ -369,7 +376,9 @@ impl ArtifactPublisher for FileArtifactPublisher {
                 delivery: ArtifactDeliverySpec::HOST_ROOT,
             },
             manifest_files,
-        )
+        )?;
+        sync_object_tree(&self.runtime_storage_dir, &staged_root)?;
+        Ok(staged)
     }
 
     async fn promote(&self, staged: &StagedArtifact) -> Result<String> {
@@ -386,6 +395,11 @@ impl ArtifactPublisher for FileArtifactPublisher {
                     "immutable artifact version already exists with different content"
                 ));
             }
+            sync_object_tree(&self.runtime_storage_dir, &target)?;
+            delete_object_tree(&self.runtime_storage_dir, &source)?;
+            if source.exists() {
+                fs::remove_dir_all(&source)?;
+            }
             return Ok(format!(
                 "runtime://artifacts/{}/versions/{}",
                 safe_segment(&staged.project_id),
@@ -395,7 +409,9 @@ impl ArtifactPublisher for FileArtifactPublisher {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(source, &target)?;
+        fs::rename(&source, &target)?;
+        sync_object_tree(&self.runtime_storage_dir, &target)?;
+        delete_object_tree(&self.runtime_storage_dir, &source)?;
         Ok(format!(
             "runtime://artifacts/{}/versions/{}",
             safe_segment(&staged.project_id),
@@ -405,8 +421,9 @@ impl ArtifactPublisher for FileArtifactPublisher {
 
     async fn abort(&self, staged: &StagedArtifact) -> Result<()> {
         let source = self.staged_root(&staged.project_id, &staged.version_id);
+        delete_object_tree(&self.runtime_storage_dir, &source)?;
         if source.exists() {
-            fs::remove_dir_all(source)?;
+            fs::remove_dir_all(&source)?;
         }
         Ok(())
     }

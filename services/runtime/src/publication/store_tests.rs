@@ -16,6 +16,7 @@ fn root(name: &str) -> PathBuf {
 fn publish(key: &str) -> PublicationIntent {
     PublicationIntent {
         project_id: "project-1".into(),
+        workspace_namespace: "ws-project-one".into(),
         kind: PublishOperationKind::Publish,
         release_id: Some("release-1".into()),
         expected_current_release_id: None,
@@ -86,6 +87,7 @@ fn desired_generation_compare_and_set_serializes_concurrent_requests() {
     store.commit_intent(&publish("publish-key")).unwrap();
     let intent = PublicationIntent {
         project_id: "project-1".into(),
+        workspace_namespace: "ws-project-one".into(),
         kind: PublishOperationKind::Unpublish,
         release_id: None,
         expected_current_release_id: None,

@@ -1,5 +1,6 @@
 use crate::{
     acceptance_contract::{AcceptanceContract, AcceptanceContractDraft},
+    control_plane_persistence::PostgresControlPlaneMirror,
     design_context::{
         frozen_run_design_context_manifest, validate_run_design_context_identity,
         CompiledDesignContext, ProfileCompatibilityMode, ProfileEnforcementMode,
@@ -86,6 +87,7 @@ pub struct RuntimeStore {
     tool_execution_log_path: Arc<PathBuf>,
     publication_store: Arc<PublicationStore>,
     release_store: Arc<ReleaseStore>,
+    control_plane_mirror: Option<Arc<PostgresControlPlaneMirror>>,
 }
 
 #[derive(Debug, Default)]
@@ -185,7 +187,7 @@ struct ArtifactPromotionCommit {
 #[serde(rename_all = "camelCase")]
 struct ProjectDesignProfileSnapshot {
     project_id: String,
-    design_profile_id: String,
+    design_profile_id: Option<String>,
     updated_at: chrono::DateTime<Utc>,
 }
 
@@ -235,27 +237,6 @@ fn repair_finding_status_for_run_status(status: AgentRunStatus) -> Option<Review
         | AgentRunStatus::Validating
         | AgentRunStatus::Cancelled => None,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScopeLevel {
-    Workspace,
-    Organization,
-}
-
-fn active_profiles_for_scope<'a>(
-    profiles: impl Iterator<Item = &'a DesignProfile>,
-    level: ScopeLevel,
-    id: &str,
-) -> Vec<DesignProfile> {
-    profiles
-        .filter(|profile| profile.status == "active")
-        .filter(|profile| match level {
-            ScopeLevel::Workspace => profile.workspace_id() == Some(id),
-            ScopeLevel::Organization => profile.organization_id() == Some(id),
-        })
-        .cloned()
-        .collect()
 }
 
 fn conversion_report_key(design_profile_id: &str, version: u32) -> String {
@@ -337,28 +318,9 @@ fn ensure_unique_project_active_profile(
     Ok(())
 }
 
-fn profile_visible_to_context(
-    profile: &DesignProfile,
-    project_id: &str,
-    workspace_id: Option<&str>,
-    organization_id: Option<&str>,
-) -> bool {
-    if let Some(scope_project_id) = profile.project_id() {
-        if scope_project_id != project_id {
-            return false;
-        }
-    }
-    if let Some(scope_workspace_id) = profile.workspace_id() {
-        if Some(scope_workspace_id) != workspace_id {
-            return false;
-        }
-    }
-    if let Some(scope_organization_id) = profile.organization_id() {
-        if Some(scope_organization_id) != organization_id {
-            return false;
-        }
-    }
-    true
+fn profile_visible_to_context(profile: &DesignProfile, project_id: &str) -> bool {
+    profile.project_id() == Some(project_id)
+        || (profile.is_platform_scope() && profile.status == "active")
 }
 
 impl Default for RuntimeStore {
@@ -417,6 +379,7 @@ impl Default for RuntimeStore {
             tool_execution_log_path: Arc::new(storage_root.join("tool-executions.jsonl")),
             publication_store,
             release_store,
+            control_plane_mirror: None,
         }
     }
 }
@@ -481,7 +444,27 @@ impl RuntimeStore {
             checkpoint_dir: Arc::new(checkpoint_dir),
             publication_store,
             release_store,
+            control_plane_mirror: None,
         }
+    }
+
+    pub fn try_with_database_url(
+        checkpoint_dir: impl Into<PathBuf>,
+        database_url: &str,
+    ) -> Result<Self> {
+        let checkpoint_dir = checkpoint_dir.into();
+        let mirror = PostgresControlPlaneMirror::open(database_url, &checkpoint_dir)?.map(Arc::new);
+        let mut store = Self::with_checkpoint_dir(&checkpoint_dir);
+        store.publication_store = Arc::new(
+            PublicationStore::open_with_mirror(checkpoint_dir.join("publication"), mirror.clone())
+                .map_err(|error| anyhow!(error.to_string()))?,
+        );
+        store.release_store = Arc::new(
+            ReleaseStore::open_with_mirror(checkpoint_dir.join("work-releases"), mirror.clone())
+                .map_err(|error| anyhow!(error.to_string()))?,
+        );
+        store.control_plane_mirror = mirror;
+        Ok(store)
     }
 
     pub fn with_storage_dirs(
@@ -543,6 +526,7 @@ impl RuntimeStore {
             run_log_dir: Arc::new(run_log_dir),
             publication_store,
             release_store,
+            control_plane_mirror: None,
         }
     }
 
@@ -552,6 +536,32 @@ impl RuntimeStore {
 
     pub fn release_store(&self) -> Arc<ReleaseStore> {
         Arc::clone(&self.release_store)
+    }
+
+    fn append_control_plane_jsonl<T: Serialize>(
+        &self,
+        path: &Path,
+        value: &T,
+        synced: bool,
+    ) -> Result<()> {
+        if synced {
+            append_jsonl_synced(path, value)?;
+        } else {
+            append_jsonl(path, value)?;
+        }
+        self.sync_control_plane_file(path)
+    }
+
+    fn append_control_plane_jsonl_data<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        append_jsonl_data_synced(path, value)?;
+        self.sync_control_plane_file(path)
+    }
+
+    fn sync_control_plane_file(&self, path: &Path) -> Result<()> {
+        if let Some(mirror) = self.control_plane_mirror.as_deref() {
+            mirror.sync_file(path)?;
+        }
+        Ok(())
     }
 
     pub fn next_id(&self, prefix: &str) -> String {
@@ -1100,26 +1110,15 @@ impl RuntimeStore {
     pub async fn list_design_profile_drafts(
         &self,
         project_id: Option<&str>,
-        workspace_id: Option<&str>,
-        organization_id: Option<&str>,
     ) -> Vec<DesignProfileDraft> {
         let mut inner = self.inner.write().await;
         self.hydrate_design_profile_drafts(&mut inner).ok();
-        let scope_filter_present =
-            project_id.is_some() || workspace_id.is_some() || organization_id.is_some();
         let mut drafts = inner
             .design_profile_drafts
             .values()
             .filter(|draft| {
-                if !scope_filter_present {
-                    return true;
-                }
-                project_id.is_some_and(|id| {
+                project_id.is_none_or(|id| {
                     draft.scope.get("projectId").and_then(Value::as_str) == Some(id)
-                }) || workspace_id.is_some_and(|id| {
-                    draft.scope.get("workspaceId").and_then(Value::as_str) == Some(id)
-                }) || organization_id.is_some_and(|id| {
-                    draft.scope.get("organizationId").and_then(Value::as_str) == Some(id)
                 })
             })
             .cloned()
@@ -1277,25 +1276,19 @@ impl RuntimeStore {
     pub async fn list_design_profiles(
         &self,
         project_id: Option<&str>,
-        workspace_id: Option<&str>,
-        organization_id: Option<&str>,
         include_archived: bool,
     ) -> Vec<DesignProfile> {
         let mut inner = self.inner.write().await;
         self.hydrate_design_profiles(&mut inner).ok();
-        let scope_filter_present =
-            project_id.is_some() || workspace_id.is_some() || organization_id.is_some();
         let mut profiles = inner
             .design_profiles
             .values()
             .filter(|profile| include_archived || profile.status != "archived")
             .filter(|profile| {
-                if !scope_filter_present {
-                    return true;
-                }
-                project_id.is_some_and(|id| profile.project_id() == Some(id))
-                    || workspace_id.is_some_and(|id| profile.workspace_id() == Some(id))
-                    || organization_id.is_some_and(|id| profile.organization_id() == Some(id))
+                project_id.is_none_or(|id| {
+                    profile.project_id() == Some(id)
+                        || (profile.is_platform_scope() && profile.status == "active")
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1358,10 +1351,22 @@ impl RuntimeStore {
         drop(inner);
         self.append_project_design_profile_snapshot(&ProjectDesignProfileSnapshot {
             project_id: project_id.to_string(),
-            design_profile_id: design_profile_id.to_string(),
+            design_profile_id: Some(design_profile_id.to_string()),
             updated_at: Utc::now(),
         })?;
         Ok(profile)
+    }
+
+    pub async fn unbind_project_design_profile(&self, project_id: &str) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_project_design_profiles(&mut inner)?;
+        inner.project_design_profiles.remove(project_id);
+        drop(inner);
+        self.append_project_design_profile_snapshot(&ProjectDesignProfileSnapshot {
+            project_id: project_id.to_string(),
+            design_profile_id: None,
+            updated_at: Utc::now(),
+        })
     }
 
     pub async fn project_design_profile(&self, project_id: &str) -> Option<DesignProfile> {
@@ -1713,8 +1718,6 @@ impl RuntimeStore {
     pub async fn resolve_design_profile(
         &self,
         project_id: &str,
-        workspace_id: Option<&str>,
-        organization_id: Option<&str>,
         explicit_design_profile_id: Option<&str>,
     ) -> Result<Option<DesignProfile>> {
         let mut inner = self.inner.write().await;
@@ -1726,7 +1729,7 @@ impl RuntimeStore {
                 .get(design_profile_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("design profile not found: {design_profile_id}"))?;
-            if !profile_visible_to_context(&profile, project_id, workspace_id, organization_id) {
+            if !profile_visible_to_context(&profile, project_id) {
                 return Err(anyhow!(
                     "design profile {design_profile_id} is not visible to project {project_id}"
                 ));
@@ -1734,36 +1737,6 @@ impl RuntimeStore {
             return Ok(Some(profile));
         }
         let Some(profile_id) = inner.project_design_profiles.get(project_id).cloned() else {
-            if let Some(workspace_id) = workspace_id {
-                let workspace_matches = active_profiles_for_scope(
-                    inner.design_profiles.values(),
-                    ScopeLevel::Workspace,
-                    workspace_id,
-                );
-                if workspace_matches.len() > 1 {
-                    return Err(anyhow!(
-                        "multiple workspace default design profiles match workspace {workspace_id}; pass designProfileId explicitly"
-                    ));
-                }
-                if let Some(profile) = workspace_matches.into_iter().next() {
-                    return Ok(Some(profile));
-                }
-            }
-            if let Some(organization_id) = organization_id {
-                let organization_matches = active_profiles_for_scope(
-                    inner.design_profiles.values(),
-                    ScopeLevel::Organization,
-                    organization_id,
-                );
-                if organization_matches.len() > 1 {
-                    return Err(anyhow!(
-                        "multiple organization default design profiles match organization {organization_id}; pass designProfileId explicitly"
-                    ));
-                }
-                if let Some(profile) = organization_matches.into_iter().next() {
-                    return Ok(Some(profile));
-                }
-            }
             return Ok(None);
         };
         let profile = inner
@@ -3056,7 +3029,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, event)
+        self.append_control_plane_jsonl(&path, event, false)
     }
 
     pub async fn events(&self, run_id: &str) -> Vec<AgentEvent> {
@@ -3215,7 +3188,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, item)
+        self.append_control_plane_jsonl(&path, item, false)
     }
 
     fn read_conversation_log_items(&self, project_id: &str) -> Result<Vec<ConversationItem>> {
@@ -3244,7 +3217,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, snapshot)
+        self.append_control_plane_jsonl(&path, snapshot, false)
     }
 
     fn read_brief_snapshot(&self, brief_id: &str) -> Result<Option<BriefSnapshot>> {
@@ -3276,7 +3249,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, snapshot)
+        self.append_control_plane_jsonl(&path, snapshot, false)
     }
 
     fn read_content_source_snapshot(
@@ -3336,7 +3309,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&path, artifact)
+        self.append_control_plane_jsonl(&path, artifact, true)
     }
 
     fn read_design_source_artifact(
@@ -3376,7 +3349,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, profile)
+        self.append_control_plane_jsonl(&path, profile, false)
     }
 
     fn profile_token_sync_operation_log_path(&self) -> PathBuf {
@@ -3394,7 +3367,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&path, operation)
+        self.append_control_plane_jsonl(&path, operation, true)
     }
 
     fn read_profile_token_sync_operations(&self) -> Result<Vec<ProfileTokenSyncOperation>> {
@@ -3430,7 +3403,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&path, draft)
+        self.append_control_plane_jsonl(&path, draft, true)
     }
 
     fn append_design_profile_conversion_report_snapshot(
@@ -3441,7 +3414,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&path, report)
+        self.append_control_plane_jsonl(&path, report, true)
     }
 
     fn read_design_profile_draft(
@@ -3594,7 +3567,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, snapshot)
+        self.append_control_plane_jsonl(&path, snapshot, false)
     }
 
     fn read_project_design_profile_snapshots(&self) -> Result<Vec<ProjectDesignProfileSnapshot>> {
@@ -3617,10 +3590,16 @@ impl RuntimeStore {
 
     fn hydrate_project_design_profiles(&self, inner: &mut RuntimeStoreInner) -> Result<()> {
         for snapshot in self.read_project_design_profile_snapshots()? {
-            inner
-                .project_design_profiles
-                .entry(snapshot.project_id)
-                .or_insert(snapshot.design_profile_id);
+            match snapshot.design_profile_id {
+                Some(design_profile_id) => {
+                    inner
+                        .project_design_profiles
+                        .insert(snapshot.project_id, design_profile_id);
+                }
+                None => {
+                    inner.project_design_profiles.remove(&snapshot.project_id);
+                }
+            }
         }
         Ok(())
     }
@@ -3630,7 +3609,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, binding)
+        self.append_control_plane_jsonl(&path, binding, false)
     }
 
     fn read_sandbox_binding(&self, binding_id: &str) -> Result<Option<SandboxBinding>> {
@@ -3638,16 +3617,6 @@ impl RuntimeStore {
             .read_sandbox_bindings()?
             .into_iter()
             .find(|binding| binding.id == binding_id))
-    }
-
-    fn read_sandbox_binding_with_workspace_pvc(
-        &self,
-        workspace_pvc_name: &str,
-    ) -> Result<Option<SandboxBinding>> {
-        Ok(self
-            .read_sandbox_bindings()?
-            .into_iter()
-            .find(|binding| binding.workspace_pvc_name == workspace_pvc_name))
     }
 
     fn read_sandbox_bindings(&self) -> Result<Vec<SandboxBinding>> {
@@ -3707,7 +3676,7 @@ impl RuntimeStore {
         if let Some(parent) = self.audit_log_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&self.audit_log_path, record)
+        self.append_control_plane_jsonl(&self.audit_log_path, record, false)
     }
 
     fn read_audit_log_records(&self) -> Result<Vec<AuditRecord>> {
@@ -3736,7 +3705,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, permission)
+        self.append_control_plane_jsonl(&path, permission, false)
     }
 
     fn read_pending_permission(&self, permission_id: &str) -> Result<Option<PendingPermission>> {
@@ -3782,7 +3751,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_data_synced(&path, execution)
+        self.append_control_plane_jsonl_data(&path, execution)
     }
 
     fn read_tool_executions(&self) -> Result<Vec<ToolExecutionRecord>> {
@@ -3915,7 +3884,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, finding)
+        self.append_control_plane_jsonl(&path, finding, false)
     }
 
     fn read_review_finding(&self, finding_id: &str) -> Result<Option<ReviewFinding>> {
@@ -3971,7 +3940,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, attempt)
+        self.append_control_plane_jsonl(&path, attempt, false)
     }
 
     fn read_repair_attempts(&self) -> Result<Vec<RepairAttempt>> {
@@ -4442,7 +4411,8 @@ impl RuntimeStore {
         fs::create_dir_all(&*self.checkpoint_dir)?;
         let path = self.checkpoint_path(&checkpoint.id);
         let json = serde_json::to_string_pretty(&checkpoint)?;
-        fs::write(path, json)?;
+        fs::write(&path, json)?;
+        self.sync_control_plane_file(&path)?;
 
         {
             let mut inner = self.inner.write().await;
@@ -4565,7 +4535,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&path, run)
+        self.append_control_plane_jsonl(&path, run, true)
     }
 
     fn read_run(&self, run_id: &str) -> Result<Option<AgentRun>> {
@@ -4646,7 +4616,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, version)
+        self.append_control_plane_jsonl(&path, version, false)
     }
 
     fn project_runtime_state_log_path(&self) -> PathBuf {
@@ -4658,7 +4628,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, state)
+        self.append_control_plane_jsonl(&path, state, false)
     }
 
     fn read_project_runtime_states(&self) -> Result<Vec<ProjectRuntimeState>> {
@@ -4731,7 +4701,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, record)
+        self.append_control_plane_jsonl(&path, record, false)
     }
 
     fn read_project_access_records(&self) -> Result<Vec<ProjectAccessRecord>> {
@@ -4769,25 +4739,34 @@ impl RuntimeStore {
         &self,
         project_id: &str,
         owner_principal_id: String,
-        workspace_id: Option<String>,
-        organization_id: Option<String>,
+        workspace_namespace: String,
     ) -> Result<ProjectAccessRecord> {
         if project_id.trim().is_empty() || owner_principal_id.trim().is_empty() {
             return Err(anyhow!(
                 "project access requires project and owner principal ids"
             ));
         }
+        crate::types::validate_workspace_namespace(&workspace_namespace)
+            .map_err(|error| anyhow!(error))?;
         let now = Utc::now();
-        let created_at = self
-            .get_project_access(project_id)
-            .await
-            .map(|record| record.created_at)
-            .unwrap_or(now);
+        let existing = self.get_project_access(project_id).await;
+        if let Some(existing) = existing.as_ref() {
+            if existing.workspace_namespace != workspace_namespace {
+                return Err(anyhow!(
+                    "project workspace namespace is immutable; use an explicit migration"
+                ));
+            }
+            if existing.owner_principal_id != owner_principal_id {
+                return Err(anyhow!(
+                    "project owner is immutable; use an explicit ownership transfer"
+                ));
+            }
+        }
+        let created_at = existing.map(|record| record.created_at).unwrap_or(now);
         let record = ProjectAccessRecord {
             project_id: project_id.to_string(),
             owner_principal_id,
-            workspace_id,
-            organization_id,
+            workspace_namespace,
             created_at,
             updated_at: now,
         };
@@ -4820,7 +4799,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, policy)
+        self.append_control_plane_jsonl(&path, policy, false)
     }
 
     fn read_design_context_enforcement_policies(
@@ -5057,7 +5036,7 @@ impl RuntimeStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl(&path, lease)
+        self.append_control_plane_jsonl(&path, lease, false)
     }
 
     fn read_preview_leases(&self) -> Result<Vec<PreviewLeaseRecord>> {
@@ -5210,7 +5189,7 @@ impl RuntimeStore {
         if let Some(parent) = self.channel_lease_log_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&self.channel_lease_log_path, lease)
+        self.append_control_plane_jsonl(&self.channel_lease_log_path, lease, true)
     }
 
     fn read_channel_leases(&self) -> Result<Vec<ChannelLeaseRecord>> {
@@ -5279,7 +5258,7 @@ impl RuntimeStore {
         if let Some(parent) = self.artifact_publish_log_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&self.artifact_publish_log_path, publish)
+        self.append_control_plane_jsonl(&self.artifact_publish_log_path, publish, true)
     }
 
     fn read_artifact_publishes(&self) -> Result<Vec<ArtifactPublishRecord>> {
@@ -5795,7 +5774,7 @@ impl RuntimeStore {
         if let Some(parent) = self.promotion_commit_log_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&self.promotion_commit_log_path, &commit)?;
+        self.append_control_plane_jsonl(&self.promotion_commit_log_path, &commit, true)?;
         inner
             .project_current_versions
             .insert(project_id.to_string(), version_id.to_string());
@@ -5875,7 +5854,7 @@ impl RuntimeStore {
         if let Some(parent) = self.outbox_log_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        append_jsonl_synced(&self.outbox_log_path, outbox)
+        self.append_control_plane_jsonl(&self.outbox_log_path, outbox, true)
     }
 
     pub async fn reconcile_artifact_promotions(&self) -> Result<usize> {
@@ -6172,8 +6151,17 @@ impl RuntimeStore {
         if let Some(version) = self.current_project_version(project_id).await {
             if let Some(run) = self.get_run(&version.created_by_run_id).await {
                 if let Some(binding_id) = run.sandbox_id.as_deref() {
-                    if let Some(binding) = self.get_sandbox_binding(binding_id).await {
-                        return Some(binding);
+                    let binding = match self.read_sandbox_binding(binding_id).ok().flatten() {
+                        Some(binding) => Some(binding),
+                        None => self.get_sandbox_binding(binding_id).await,
+                    };
+                    if let Some(binding) = binding {
+                        if !matches!(
+                            binding.status,
+                            SandboxBindingStatus::Failed | SandboxBindingStatus::Deleted
+                        ) {
+                            return Some(binding);
+                        }
                     }
                 }
             }
@@ -6221,7 +6209,27 @@ impl RuntimeStore {
         namespace: String,
         channel_protocol: SandboxChannelProtocol,
     ) -> Result<SandboxBinding> {
-        if let Some(existing) = self.read_sandbox_binding_with_workspace_pvc(&workspace_pvc_name)? {
+        let persisted_bindings = self.read_sandbox_bindings()?;
+        let reusable_persisted_binding_ids = persisted_bindings
+            .iter()
+            .filter(|binding| {
+                binding.workspace_pvc_name == workspace_pvc_name
+                    && binding.project_id == project_id
+                    && matches!(
+                        binding.status,
+                        SandboxBindingStatus::Failed | SandboxBindingStatus::Deleted
+                    )
+            })
+            .map(|binding| binding.id.clone())
+            .collect::<Vec<_>>();
+        if let Some(existing) = persisted_bindings.iter().find(|binding| {
+            binding.workspace_pvc_name == workspace_pvc_name
+                && (binding.project_id != project_id
+                    || !matches!(
+                        binding.status,
+                        SandboxBindingStatus::Failed | SandboxBindingStatus::Deleted
+                    ))
+        }) {
             return Err(anyhow!(
                 "workspace PVC {} is already bound to project {} via sandbox binding {}",
                 workspace_pvc_name,
@@ -6230,11 +6238,14 @@ impl RuntimeStore {
             ));
         }
         let mut inner = self.inner.write().await;
-        if let Some(existing) = inner
-            .sandbox_bindings
-            .values()
-            .find(|binding| binding.workspace_pvc_name == workspace_pvc_name)
-        {
+        if let Some(existing) = inner.sandbox_bindings.values().find(|binding| {
+            binding.workspace_pvc_name == workspace_pvc_name
+                && (binding.project_id != project_id
+                    || (!matches!(
+                        binding.status,
+                        SandboxBindingStatus::Failed | SandboxBindingStatus::Deleted
+                    ) && !reusable_persisted_binding_ids.contains(&binding.id)))
+        }) {
             return Err(anyhow!(
                 "workspace PVC {} is already bound to project {} via sandbox binding {}",
                 workspace_pvc_name,

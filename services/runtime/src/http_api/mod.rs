@@ -94,15 +94,25 @@ pub fn app_state(config: RuntimeConfig) -> AppState {
 }
 
 pub fn app_state_with_supervisor(config: RuntimeConfig, supervisor: RuntimeSupervisor) -> AppState {
-    AppState {
-        model: Arc::new(
-            model_client_from_config(&config)
-                .expect("runtime model provider configuration should be valid"),
-        ),
-        store: RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone()),
+    try_app_state_with_supervisor(config, supervisor)
+        .expect("runtime state configuration should be valid")
+}
+
+pub fn try_app_state_with_supervisor(
+    config: RuntimeConfig,
+    supervisor: RuntimeSupervisor,
+) -> anyhow::Result<AppState> {
+    let model = Arc::new(model_client_from_config(&config)?);
+    let store = RuntimeStore::try_with_database_url(
+        config.runtime_storage_dir.clone(),
+        &config.database_url,
+    )?;
+    Ok(AppState {
+        model,
+        store,
         config,
         supervisor,
-    }
+    })
 }
 
 pub async fn recovered_router(config: RuntimeConfig) -> anyhow::Result<Router> {
