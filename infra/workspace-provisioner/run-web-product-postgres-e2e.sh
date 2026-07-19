@@ -20,6 +20,8 @@ for command in docker k3d kubectl jq curl node openssl sha256sum; do
 done
 [[ "$(kubectl config current-context)" == "k3d-${cluster_name}" ]]
 [[ -s "${tls_evidence}" && -s "${tls_ca}" ]]
+kubectl -n "${runtime_namespace}" get secret \
+  zerondesign-web-runtime-principal >/dev/null
 
 mkdir -p "${evidence_dir}"
 work_dir="$(mktemp -d)"

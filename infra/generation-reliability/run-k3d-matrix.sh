@@ -7,6 +7,7 @@ K3D="${K3D:-k3d}"
 KUBECTL="${KUBECTL:-kubectl}"
 
 cluster_name="${GENERATION_MATRIX_CLUSTER:-zerondesign-e2e}"
+workspace_namespace="${GENERATION_MATRIX_WORKSPACE_NAMESPACE:-ws-runtime-rc}"
 matrix_mode="${GENERATION_MATRIX_MODE:-fixture}"
 bootstrap_mode="${GENERATION_MATRIX_BOOTSTRAP:-auto}"
 rc_mode="${GENERATION_MATRIX_RC_MODE:-audit}"
@@ -25,6 +26,11 @@ case "${matrix_mode}" in
     exit 2
     ;;
 esac
+if [[ ! "${workspace_namespace}" =~ ^ws-[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+  || (( ${#workspace_namespace} > 63 )); then
+  printf 'GENERATION_MATRIX_WORKSPACE_NAMESPACE must be a valid ws-* namespace\n' >&2
+  exit 2
+fi
 case "${bootstrap_mode}" in
   auto | always | reuse) ;;
   *)
@@ -127,7 +133,7 @@ collect_failure_evidence() {
   "${KUBECTL}" get deployments,statefulsets,pvc -A >"${failure_dir}/workloads.txt" 2>&1 || true
   "${KUBECTL}" get events -A --sort-by=.metadata.creationTimestamp \
     >"${failure_dir}/events.txt" 2>&1 || true
-  for namespace in anydesign-runtime provider-system anydesign-sandboxes; do
+  for namespace in anydesign-runtime provider-system "${workspace_namespace}"; do
     while IFS= read -r pod; do
       [[ -n "${pod}" ]] || continue
       "${KUBECTL}" logs -n "${namespace}" "${pod}" --all-containers --tail=250 \
@@ -155,12 +161,13 @@ if [[ "${dry_run}" == "1" ]]; then
     printf 'generation_matrix.missing_command: node\n' >&2
     exit 2
   }
-  node - "${cluster_name}" "${matrix_mode}" "${bootstrap_mode}" "${rc_mode}" \
+  node - "${cluster_name}" "${workspace_namespace}" "${matrix_mode}" "${bootstrap_mode}" "${rc_mode}" \
     "${evidence_dir}" "${runtime_image}" "${runtime_port:-auto}" <<'NODE'
-const [cluster, mode, bootstrap, rcMode, evidenceDir, runtimeImage, runtimePort] = process.argv.slice(2);
+const [cluster, workspaceNamespace, mode, bootstrap, rcMode, evidenceDir, runtimeImage, runtimePort] = process.argv.slice(2);
 process.stdout.write(`${JSON.stringify({
   schemaVersion: "generation-matrix-plan@1",
   cluster,
+  workspaceNamespace,
   mode,
   bootstrap,
   rcMode,
@@ -206,20 +213,32 @@ if "${K3D}" cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq
   cluster_exists=true
 fi
 channel_evidence="${evidence_dir}/k3d-channel.json"
+channel_workspace_namespace=""
+if [[ -s "${channel_evidence}" ]]; then
+  channel_workspace_namespace="$(node -e '
+const fs=require("node:fs");
+try {
+  const evidence=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+  process.stdout.write(evidence.cluster?.workspaceNamespace || "");
+} catch {}
+' "${channel_evidence}")"
+fi
 run_bootstrap=false
 case "${bootstrap_mode}" in
   always)
     run_bootstrap=true
     ;;
   auto)
-    if [[ "${cluster_exists}" != "true" || ! -s "${channel_evidence}" ]]; then
+    if [[ "${cluster_exists}" != "true" || ! -s "${channel_evidence}" \
+      || "${channel_workspace_namespace}" != "${workspace_namespace}" ]]; then
       run_bootstrap=true
     fi
     ;;
   reuse)
-    if [[ "${cluster_exists}" != "true" || ! -s "${channel_evidence}" ]]; then
-      printf 'reuse requires cluster %s and channel evidence %s\n' \
-        "${cluster_name}" "${channel_evidence}" >&2
+    if [[ "${cluster_exists}" != "true" || ! -s "${channel_evidence}" \
+      || "${channel_workspace_namespace}" != "${workspace_namespace}" ]]; then
+      printf 'reuse requires cluster %s and channel evidence %s for Workspace %s\n' \
+        "${cluster_name}" "${channel_evidence}" "${workspace_namespace}" >&2
       exit 2
     fi
     ;;
@@ -227,6 +246,7 @@ esac
 
 if [[ "${run_bootstrap}" == "true" ]]; then
   ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+    ANYDESIGN_E2E_NAMESPACE="${workspace_namespace}" \
     E2E_EVIDENCE_DIR="${evidence_dir}" \
     bash infra/agent-sandbox/run-k8s-e2e.sh
 else
@@ -246,6 +266,7 @@ rc_env=(
   "RUNTIME_RC_PORT=${runtime_port}"
   "RUNTIME_RC_EVIDENCE_DIR=${evidence_dir}"
   "RUNTIME_RC_CHANNEL_EVIDENCE=${channel_evidence}"
+  "RUNTIME_RC_WORKSPACE_NAMESPACE=${workspace_namespace}"
 )
 if [[ "${GENERATION_MATRIX_SKIP_PREFLIGHT:-0}" == "1" ]]; then
   rc_env+=("RUNTIME_RC_SKIP_PREFLIGHT=1")

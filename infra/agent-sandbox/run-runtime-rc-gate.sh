@@ -7,7 +7,7 @@ KUBECTL="${KUBECTL:-kubectl}"
 K3D="${K3D:-k3d}"
 cluster_name="${ANYDESIGN_E2E_CLUSTER:-zerondesign-e2e}"
 runtime_port="${RUNTIME_RC_PORT:-18080}"
-workspace_namespace="${RUNTIME_RC_WORKSPACE_NAMESPACE:-anydesign-sandboxes}"
+workspace_namespace="${RUNTIME_RC_WORKSPACE_NAMESPACE:-ws-runtime-rc}"
 website_workspace_namespace="${RUNTIME_RC_WEBSITE_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
 docs_workspace_namespace="${RUNTIME_RC_DOCS_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
 concurrent_workspace_gate="${RUNTIME_RC_CONCURRENT_WORKSPACE_GATE:-0}"
@@ -15,8 +15,8 @@ cd "${ROOT_DIR}"
 
 for candidate_namespace in \
   "${workspace_namespace}" "${website_workspace_namespace}" "${docs_workspace_namespace}"; do
-  if [[ ! "${candidate_namespace}" =~ ^ws-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ \
-    && "${candidate_namespace}" != "anydesign-sandboxes" ]]; then
+  if [[ ! "${candidate_namespace}" =~ ^ws-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || (( ${#candidate_namespace} > 63 )); then
     printf 'Runtime RC Workspace values must be ws-* Kubernetes Namespaces\n' >&2
     exit 2
   fi
@@ -143,6 +143,7 @@ if [[ "${rc_mode}" == "release" && "${cluster_exists}" == "true" ]]; then
 fi
 if [[ "${cluster_exists}" == "false" ]]; then
   ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+    ANYDESIGN_E2E_NAMESPACE="${workspace_namespace}" \
     E2E_EVIDENCE_DIR="${evidence_dir}" \
     bash infra/agent-sandbox/run-k8s-e2e.sh
 else
@@ -158,14 +159,8 @@ for required in \
   deployment/anydesign-npm-proxy; do
   "${KUBECTL}" get "${required}" -n anydesign-runtime >/dev/null
 done
-if [[ "${workspace_namespace}" == "anydesign-sandboxes" ]]; then
-  "${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml >/dev/null
-fi
 for candidate_namespace in $(printf '%s\n' \
   "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
-  if [[ "${candidate_namespace}" == "anydesign-sandboxes" ]]; then
-    continue
-  fi
   "${KUBECTL}" get serviceaccount anydesign-runtime \
     -n anydesign-runtime >/dev/null
   "${KUBECTL}" get serviceaccount anydesign-sandbox \
@@ -226,6 +221,7 @@ admin_token="$(openssl rand -hex 32)"
 principal_id="rc-harness-principal"
 principal_key_dir="$(mktemp -d)"
 principal_private_key="${principal_key_dir}/private.pem"
+principal_private_key_der="${principal_key_dir}/private.der"
 principal_public_key="${principal_key_dir}/public.der"
 port_forward_pid=""
 gate_id="$(date +%s)"
@@ -293,13 +289,32 @@ report_error() {
 }
 trap report_error ERR
 trap cleanup EXIT
-node -e '
+if "${KUBECTL}" get secret zerondesign-web-runtime-principal \
+  -n anydesign-runtime >/dev/null 2>&1; then
+  principal_private_key_base64="$("${KUBECTL}" get secret \
+    zerondesign-web-runtime-principal -n anydesign-runtime \
+    -o 'jsonpath={.data.private-key-base64}' \
+    | node -e 'process.stdin.on("data",d=>process.stdout.write(Buffer.from(d.toString(),"base64")))')"
+  node -e '
+const {createPrivateKey,createPublicKey}=require("node:crypto");
+const {writeFileSync}=require("node:fs");
+const privateKey=createPrivateKey({key:Buffer.from(process.argv[1],"base64"),format:"der",type:"pkcs8"});
+writeFileSync(process.argv[2],privateKey.export({format:"pem",type:"pkcs8"}));
+writeFileSync(process.argv[3],privateKey.export({format:"der",type:"pkcs8"}));
+writeFileSync(process.argv[4],createPublicKey(privateKey).export({format:"der",type:"spki"}));
+' "${principal_private_key_base64}" "${principal_private_key}" \
+    "${principal_private_key_der}" "${principal_public_key}"
+else
+  node -e '
 const {generateKeyPairSync}=require("node:crypto");
 const {writeFileSync}=require("node:fs");
 const {privateKey,publicKey}=generateKeyPairSync("ed25519");
 writeFileSync(process.argv[1],privateKey.export({format:"pem",type:"pkcs8"}));
-writeFileSync(process.argv[2],publicKey.export({format:"der",type:"spki"}));
-' "${principal_private_key}" "${principal_public_key}"
+writeFileSync(process.argv[2],privateKey.export({format:"der",type:"pkcs8"}));
+writeFileSync(process.argv[3],publicKey.export({format:"der",type:"spki"}));
+' "${principal_private_key}" "${principal_private_key_der}" "${principal_public_key}"
+  principal_private_key_base64="$(base64 <"${principal_private_key_der}" | tr -d '\n')"
+fi
 
 if [[ -n "${RUNTIME_RC_REUSE_IMAGE:-}" ]]; then
   if [[ "${rc_mode}" == "release" ]]; then
@@ -346,6 +361,10 @@ rm -f "${runtime_image_archive}"
 "${KUBECTL}" create secret generic anydesign-runtime-public-principal \
   -n anydesign-runtime \
   --from-file="public.der=${principal_public_key}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+"${KUBECTL}" create secret generic zerondesign-web-runtime-principal \
+  -n anydesign-runtime \
+  --from-literal="private-key-base64=${principal_private_key_base64}" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
 if "${KUBECTL}" -n anydesign-runtime get secret anydesign-runtime-postgres >/dev/null 2>&1; then
   postgres_password="$("${KUBECTL}" -n anydesign-runtime get secret anydesign-runtime-postgres \
@@ -1376,6 +1395,7 @@ ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
   NPM_PROXY_PROJECT_EVIDENCE_FILE="${evidence}" \
   bash infra/agent-sandbox/run-npm-proxy-gate.sh
 ANYDESIGN_E2E_CLUSTER="${cluster_name}" \
+  ANYDESIGN_E2E_NAMESPACE="${workspace_namespace}" \
   RECOVERY_EVIDENCE_PATH="${recovery_evidence}" \
   ACTIVE_RECOVERY_EVIDENCE_PATH="${active_recovery_evidence}" \
   RECOVERY_RUNTIME_EVIDENCE_FILE="${evidence}" \

@@ -130,8 +130,10 @@ database schema or allow production auto-migration. The gate proves that a
 project rejected by a disabled Workspace never reaches Runtime, while a
 successful project registration is present in both catalogs. PostgreSQL and
 Web are then restarted and the ordered product-catalog digest must remain
-unchanged. Credentials stay in the `zerondesign-web-product-postgres` and
-`zerondesign-web-auth` Kubernetes Secrets. A repeat run may reuse an imported
+unchanged. Credentials stay in the `zerondesign-web-product-postgres`,
+`zerondesign-web-auth`, and `zerondesign-web-runtime-principal` Kubernetes
+Secrets. The Runtime RC gate creates the last Secret from the same Ed25519 key
+pair whose public half Runtime verifies. A repeat run may reuse an imported
 image through `WEB_PRODUCT_POSTGRES_E2E_REUSE_IMAGE`.
 
 To replace manually copied Published Work TLS Secrets with cert-manager-owned

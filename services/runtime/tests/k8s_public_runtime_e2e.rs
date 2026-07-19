@@ -119,9 +119,15 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     );
 
     let store = RuntimeStore::with_checkpoint_dir(&storage);
+    let workspace_namespace =
+        std::env::var("ANYDESIGN_E2E_NAMESPACE").unwrap_or_else(|_| "ws-runtime-rc".into());
     for project_id in ["website-k3d", "docs-k3d"] {
         store
-            .upsert_project_access(project_id, "k3d-e2e-owner".to_string(), "ws-k3d".into())
+            .upsert_project_access(
+                project_id,
+                "k3d-e2e-owner".to_string(),
+                workspace_namespace.clone(),
+            )
             .await
             .unwrap();
     }

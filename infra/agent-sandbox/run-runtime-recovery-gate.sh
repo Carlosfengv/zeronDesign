@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KUBECTL="${KUBECTL:-kubectl}"
 cluster_name="${ANYDESIGN_E2E_CLUSTER:?ANYDESIGN_E2E_CLUSTER is required}"
-namespace="${ANYDESIGN_E2E_NAMESPACE:-anydesign-sandboxes}"
+namespace="${ANYDESIGN_E2E_NAMESPACE:-ws-runtime-rc}"
 evidence_path="${RECOVERY_EVIDENCE_PATH:-${ROOT_DIR}/services/runtime/target/e2e-evidence/recovery-${cluster_name}.json}"
 active_recovery_evidence="${ACTIVE_RECOVERY_EVIDENCE_PATH:?ACTIVE_RECOVERY_EVIDENCE_PATH is required}"
 runtime_evidence_file="${RECOVERY_RUNTIME_EVIDENCE_FILE:?RECOVERY_RUNTIME_EVIDENCE_FILE is required}"

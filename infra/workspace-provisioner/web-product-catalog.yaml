@@ -60,6 +60,11 @@ spec:
                 secretKeyRef:
                   name: anydesign-runtime-internal-admin
                   key: token
+            - name: RUNTIME_PRINCIPAL_PRIVATE_KEY_BASE64
+              valueFrom:
+                secretKeyRef:
+                  name: zerondesign-web-runtime-principal
+                  key: private-key-base64
           readinessProbe:
             httpGet:
               path: /api/health

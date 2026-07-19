@@ -29,7 +29,7 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
 
     let kubectl = std::env::var("KUBECTL").unwrap_or_else(|_| "kubectl".to_string());
     let namespace =
-        std::env::var("ANYDESIGN_E2E_NAMESPACE").unwrap_or_else(|_| "anydesign-sandboxes".into());
+        std::env::var("ANYDESIGN_E2E_NAMESPACE").unwrap_or_else(|_| "ws-runtime-rc".into());
     let warm_pool = std::env::var("ANYDESIGN_E2E_WARM_POOL")
         .unwrap_or_else(|_| "anydesign-astro-website-pool".into());
     let claim_name = std::env::var("ANYDESIGN_E2E_CLAIM").unwrap_or_else(|_| {
@@ -43,20 +43,28 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     });
     let second_claim_name = format!("{claim_name}-parallel");
     if std::env::var("ANYDESIGN_E2E_SKIP_APPLY").ok().as_deref() != Some("1") {
-        kubectl_apply(
+        kubectl_apply_in_namespace(
             &kubectl,
             "infra/agent-sandbox/rbac/runtime-service-account.yaml",
+            &namespace,
         )
         .await;
-        kubectl_apply(&kubectl, "infra/agent-sandbox/network/default-deny.yaml").await;
-        kubectl_apply(
+        kubectl_apply_in_namespace(
+            &kubectl,
+            "infra/agent-sandbox/network/default-deny.yaml",
+            &namespace,
+        )
+        .await;
+        kubectl_apply_in_namespace(
             &kubectl,
             "infra/agent-sandbox/astro-website/sandbox-template.yaml",
+            &namespace,
         )
         .await;
-        kubectl_apply(
+        kubectl_apply_in_namespace(
             &kubectl,
             "infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml",
+            &namespace,
         )
         .await;
     }
@@ -432,6 +440,7 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
             "cluster": {
                 "name": std::env::var("E2E_K3D_CLUSTER").unwrap_or_default(),
                 "kubeContext": format!("k3d-{}", std::env::var("E2E_K3D_CLUSTER").unwrap_or_default()),
+                "workspaceNamespace": namespace,
             },
             "sandbox": {
                 "imageRef": std::env::var("E2E_SANDBOX_IMAGE").unwrap_or_default(),
@@ -467,22 +476,11 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     drop(second_cleanup);
 }
 
-async fn kubectl_apply(kubectl: &str, path: &str) {
-    kubectl_args(kubectl, &["apply", "-f", path]).await;
-}
-
-async fn kubectl_args(kubectl: &str, args: &[&str]) {
-    let output = Command::new(kubectl)
-        .args(args)
-        .output()
-        .await
-        .unwrap_or_else(|error| panic!("failed to start {kubectl} {args:?}: {error}"));
-    assert!(
-        output.status.success(),
-        "{kubectl} {args:?} failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+async fn kubectl_apply_in_namespace(kubectl: &str, path: &str, namespace: &str) {
+    let manifest = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read Kubernetes manifest {path}: {error}"))
+        .replace("anydesign-sandboxes", namespace);
+    kubectl_stdin(kubectl, &["apply", "-f", "-"], &manifest).await;
 }
 
 async fn kubectl_stdin(kubectl: &str, args: &[&str], stdin: &str) {

@@ -8,6 +8,12 @@ K3D="${K3D:-k3d}"
 cd "${ROOT_DIR}"
 
 cluster_name="${ANYDESIGN_E2E_CLUSTER:-zerondesign-e2e}"
+sandbox_namespace="${ANYDESIGN_E2E_NAMESPACE:-ws-runtime-rc}"
+if [[ ! "${sandbox_namespace}" =~ ^ws-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+  || (( ${#sandbox_namespace} > 63 )); then
+  printf 'ANYDESIGN_E2E_NAMESPACE must be a ws-* Kubernetes Namespace\n' >&2
+  exit 2
+fi
 lock_file="infra/agent-sandbox/images.lock.json"
 locked_image() {
   node -e '
@@ -172,13 +178,15 @@ assert_deployment_digest \
   app=agent-sandbox-controller \
   "${controller_image}"
 
-"${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml
+sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  infra/agent-sandbox/rbac/runtime-service-account.yaml \
+  | "${KUBECTL}" apply -f -
 
 key_dir="$(mktemp -d)"
 cleanup_key_dir() {
-  "${KUBECTL}" get sandboxclaim -n anydesign-sandboxes -o name 2>/dev/null \
+  "${KUBECTL}" get sandboxclaim -n "${sandbox_namespace}" -o name 2>/dev/null \
     | rg '^sandboxclaim[^/]*/project-(website-k3d|docs-k3d)-' \
-    | xargs -r "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null 2>&1 || true
+    | xargs -r "${KUBECTL}" delete -n "${sandbox_namespace}" --ignore-not-found=true >/dev/null 2>&1 || true
   rm -rf "${key_dir}"
 }
 trap cleanup_key_dir EXIT
@@ -221,9 +229,9 @@ openssl pkey \
   -pubout \
   -outform DER \
   -out "${public_key_file}"
-if "${KUBECTL}" get configmap "${verifier_config_map}" -n anydesign-sandboxes >/dev/null 2>&1; then
+if "${KUBECTL}" get configmap "${verifier_config_map}" -n "${sandbox_namespace}" >/dev/null 2>&1; then
   "${KUBECTL}" get configmap "${verifier_config_map}" \
-    -n anydesign-sandboxes \
+    -n "${sandbox_namespace}" \
     -o 'jsonpath={.binaryData.current\.der}' \
     | openssl base64 -d -A >"${previous_public_key_file}" || true
 fi
@@ -231,7 +239,7 @@ if [[ ! -s "${previous_public_key_file}" ]]; then
   cp "${public_key_file}" "${previous_public_key_file}"
 fi
 "${KUBECTL}" create configmap "${verifier_config_map}" \
-  -n anydesign-sandboxes \
+  -n "${sandbox_namespace}" \
   --from-file="current.der=${public_key_file}" \
   --from-file="previous.der=${previous_public_key_file}" \
   --dry-run=client \
@@ -265,14 +273,14 @@ openssl x509 -req -sha256 -days 2 \
   -extfile "${key_dir}/runtime-tls.ext" \
   -out "${runtime_tls_cert_file}" >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes \
-  -subj "/CN=workspace-channel.anydesign-sandboxes.svc.cluster.local" \
+  -subj "/CN=workspace-channel.${sandbox_namespace}.svc.cluster.local" \
   -keyout "${sandbox_tls_key_file}" \
   -out "${sandbox_tls_csr_file}" >/dev/null 2>&1
-cat >"${key_dir}/sandbox-tls.ext" <<'EOF'
+cat >"${key_dir}/sandbox-tls.ext" <<EOF
 basicConstraints=CA:FALSE
 keyUsage=digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=DNS:*.anydesign-sandboxes.svc.cluster.local,DNS:*.anydesign-sandboxes.svc,IP:127.0.0.1,URI:spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox
+subjectAltName=DNS:*.${sandbox_namespace}.svc.cluster.local,DNS:*.${sandbox_namespace}.svc,IP:127.0.0.1,URI:spiffe://anydesign.local/ns/${sandbox_namespace}/sa/anydesign-sandbox
 EOF
 openssl x509 -req -sha256 -days 2 \
   -in "${sandbox_tls_csr_file}" \
@@ -288,24 +296,34 @@ openssl x509 -req -sha256 -days 2 \
   --from-file="tls.key=${runtime_tls_key_file}" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 "${KUBECTL}" create secret generic anydesign-sandbox-channel-server \
-  -n anydesign-sandboxes \
+  -n "${sandbox_namespace}" \
   --from-file="ca.crt=${channel_ca_bundle_file}" \
   --from-file="tls.crt=${sandbox_tls_cert_file}" \
   --from-file="tls.key=${sandbox_tls_key_file}" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f -
 
-"${KUBECTL}" apply -f infra/agent-sandbox/network/default-deny.yaml
+sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  infra/agent-sandbox/network/default-deny.yaml \
+  | "${KUBECTL}" apply -f -
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/config-map.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/deployment.yaml
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/service.yaml
-sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
+sed \
+  -e "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  -e "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
   infra/agent-sandbox/astro-website/sandbox-template.yaml \
   | "${KUBECTL}" apply -f -
-"${KUBECTL}" apply -f infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml
-sed "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
+sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml \
+  | "${KUBECTL}" apply -f -
+sed \
+  -e "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  -e "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
   infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml \
   | "${KUBECTL}" apply -f -
-"${KUBECTL}" apply -f infra/agent-sandbox/fumadocs-docs/sandbox-warm-pool.yaml
+sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  infra/agent-sandbox/fumadocs-docs/sandbox-warm-pool.yaml \
+  | "${KUBECTL}" apply -f -
 
 "${KUBECTL}" rollout status deployment/anydesign-npm-proxy \
   -n anydesign-runtime \
@@ -318,7 +336,7 @@ assert_deployment_digest \
 
 if [[ "${ANYDESIGN_E2E_RESET_WARM_POOL:-1}" == "1" ]]; then
   "${KUBECTL}" delete sandboxes.agents.x-k8s.io \
-    -n anydesign-sandboxes \
+    -n "${sandbox_namespace}" \
     -l agents.x-k8s.io/launch-type=warm \
     --ignore-not-found=true
 fi
@@ -327,25 +345,25 @@ deadline=$((SECONDS + 180))
 warm_pod=""
 while true; do
   ready_replicas="$("${KUBECTL}" get sandboxwarmpool anydesign-astro-website-pool \
-    -n anydesign-sandboxes \
+    -n "${sandbox_namespace}" \
     -o 'jsonpath={.status.readyReplicas}' 2>/dev/null || true)"
   warm_selector="$("${KUBECTL}" get sandboxwarmpool anydesign-astro-website-pool \
-    -n anydesign-sandboxes \
+    -n "${sandbox_namespace}" \
     -o 'jsonpath={.status.selector}' 2>/dev/null || true)"
   if [[ "${ready_replicas:-0}" -ge 1 && -n "${warm_selector}" ]]; then
     while IFS= read -r pod; do
       [[ -n "${pod}" ]] || continue
-      phase="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes \
+      phase="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" \
         -o 'jsonpath={.status.phase}' 2>/dev/null || true)"
-      ready="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes \
+      ready="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" \
         -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-      image="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes \
+      image="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" \
         -o 'jsonpath={.spec.containers[0].image}' 2>/dev/null || true)"
       if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${runtime_profile_sandbox_image}" ]]; then
         warm_pod="${pod}"
         break
       fi
-    done < <("${KUBECTL}" get pod -n anydesign-sandboxes \
+    done < <("${KUBECTL}" get pod -n "${sandbox_namespace}" \
       -l "${warm_selector}" \
       -o name 2>/dev/null | sed 's|^pod/||')
   fi
@@ -359,9 +377,9 @@ while true; do
   sleep 2
 done
 
-pod_image="$(${KUBECTL} get pod "${warm_pod}" -n anydesign-sandboxes \
+pod_image="$(${KUBECTL} get pod "${warm_pod}" -n "${sandbox_namespace}" \
   -o 'jsonpath={.spec.containers[0].image}')"
-pod_image_id="$(${KUBECTL} get pod "${warm_pod}" -n anydesign-sandboxes \
+pod_image_id="$(${KUBECTL} get pod "${warm_pod}" -n "${sandbox_namespace}" \
   -o 'jsonpath={.status.containerStatuses[0].imageID}')"
 if [[ "${pod_image}" != "${runtime_profile_sandbox_image}" || "${pod_image_id}" != "${expected_image_id}" ]]; then
   printf 'sandbox image parity failed: expected=%s expectedID=%s actual=%s imageID=%s\n' \
@@ -372,20 +390,20 @@ docs_deadline=$((SECONDS + 180))
 docs_warm_pod=""
 while [[ -z "${docs_warm_pod}" ]]; do
   docs_ready_replicas="$("${KUBECTL}" get sandboxwarmpool anydesign-fumadocs-docs-pool \
-    -n anydesign-sandboxes -o 'jsonpath={.status.readyReplicas}' 2>/dev/null || true)"
+    -n "${sandbox_namespace}" -o 'jsonpath={.status.readyReplicas}' 2>/dev/null || true)"
   docs_warm_selector="$("${KUBECTL}" get sandboxwarmpool anydesign-fumadocs-docs-pool \
-    -n anydesign-sandboxes -o 'jsonpath={.status.selector}' 2>/dev/null || true)"
+    -n "${sandbox_namespace}" -o 'jsonpath={.status.selector}' 2>/dev/null || true)"
   if [[ "${docs_ready_replicas:-0}" -ge 1 && -n "${docs_warm_selector}" ]]; then
     while IFS= read -r pod; do
       [[ -n "${pod}" ]] || continue
-      phase="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.status.phase}' 2>/dev/null || true)"
-      ready="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
-      image="$("${KUBECTL}" get pod "${pod}" -n anydesign-sandboxes -o 'jsonpath={.spec.containers[0].image}' 2>/dev/null || true)"
+      phase="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" -o 'jsonpath={.status.phase}' 2>/dev/null || true)"
+      ready="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+      image="$("${KUBECTL}" get pod "${pod}" -n "${sandbox_namespace}" -o 'jsonpath={.spec.containers[0].image}' 2>/dev/null || true)"
       if [[ "${phase}" == "Running" && "${ready}" == "True" && "${image}" == "${runtime_profile_sandbox_image}" ]]; then
         docs_warm_pod="${pod}"
         break
       fi
-    done < <("${KUBECTL}" get pod -n anydesign-sandboxes -l "${docs_warm_selector}" -o name 2>/dev/null | sed 's|^pod/||')
+    done < <("${KUBECTL}" get pod -n "${sandbox_namespace}" -l "${docs_warm_selector}" -o name 2>/dev/null | sed 's|^pod/||')
   fi
   if (( SECONDS >= docs_deadline )); then
     printf 'SandboxWarmPool anydesign-fumadocs-docs-pool did not produce a current-image ready Pod\n' >&2
@@ -393,7 +411,7 @@ while [[ -z "${docs_warm_pod}" ]]; do
   fi
   [[ -n "${docs_warm_pod}" ]] || sleep 2
 done
-docs_image_id="$(${KUBECTL} get pod "${docs_warm_pod}" -n anydesign-sandboxes -o 'jsonpath={.status.containerStatuses[0].imageID}')"
+docs_image_id="$(${KUBECTL} get pod "${docs_warm_pod}" -n "${sandbox_namespace}" -o 'jsonpath={.status.containerStatuses[0].imageID}')"
 if [[ "${docs_image_id}" != "${expected_image_id}" ]]; then
   printf 'docs sandbox image parity failed: expectedID=%s imageID=%s\n' "${expected_image_id}" "${docs_image_id}" >&2
   exit 4
@@ -416,6 +434,7 @@ cargo test --manifest-path services/runtime/Cargo.toml \
 
 RUN_AGENT_SANDBOX_E2E=1 \
 ANYDESIGN_E2E_SKIP_APPLY=1 \
+ANYDESIGN_E2E_NAMESPACE="${sandbox_namespace}" \
 KUBECTL="${KUBECTL}" \
 WORKSPACE_CHANNEL_SIGNING_KEY_FILE="${private_key_file}" \
 WORKSPACE_CHANNEL_TLS_MODE=required \
@@ -450,7 +469,7 @@ evidence.transport={
 fs.writeFileSync(process.argv[1],JSON.stringify(evidence,null,2)+"\n");
 ' "${evidence_path}" \
   "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime' | shasum -a 256 | awk '{print $1}')" \
-  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
+  "$(printf '%s' "spiffe://anydesign.local/ns/${sandbox_namespace}/sa/anydesign-sandbox" | shasum -a 256 | awk '{print $1}')" \
   "${runtime_cert_serial_hash}" "${sandbox_cert_serial_hash}" \
   "${runtime_cert_expires_at}" "${sandbox_cert_expires_at}"
 
@@ -461,6 +480,7 @@ if [[ ! -x "${browser_executable}" ]]; then
   exit 5
 fi
 RUN_PUBLIC_RUNTIME_K8S_E2E=1 \
+ANYDESIGN_E2E_NAMESPACE="${sandbox_namespace}" \
 KUBECTL="${KUBECTL}" \
 WORKSPACE_CHANNEL_SIGNING_KEY_FILE="${private_key_file}" \
 WORKSPACE_CHANNEL_TLS_MODE=required \

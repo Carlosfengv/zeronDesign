@@ -286,6 +286,7 @@ async fn design_profiles_are_project_private_and_platform_profiles_are_read_only
     config.public_principal_public_key_files = vec![key_path.clone()];
     config.public_principal_issuer = "anydesign-bff".into();
     config.public_principal_audience = "anydesign-runtime-public".into();
+    config.internal_admin_token = Some("profile-platform-admin".into());
     let state = http_api::app_state(config);
     state
         .store
@@ -314,6 +315,15 @@ async fn design_profiles_are_project_private_and_platform_profiles_are_read_only
         .create_design_profile(platform_profile.clone())
         .await
         .unwrap();
+    let mut archived_platform_profile =
+        authorization_dcp_profile("profile-platform-archived", "unused");
+    archived_platform_profile.scope = json!({ "platform": true });
+    archived_platform_profile.status = "archived".into();
+    state
+        .store
+        .create_design_profile(archived_platform_profile)
+        .await
+        .unwrap();
 
     let issuer = PublicPrincipalJwtIssuer::from_signing_key(
         signing_key,
@@ -339,7 +349,7 @@ async fn design_profiles_are_project_private_and_platform_profiles_are_read_only
         "project-other",
         PROJECT_WRITE_OPERATION,
     );
-    let app = http_api::router_with_state(state);
+    let app = http_api::router_with_state(state.clone());
 
     let private_visible = app
         .clone()
@@ -380,7 +390,35 @@ async fn design_profiles_are_project_private_and_platform_profiles_are_read_only
         .unwrap();
     assert_eq!(platform_visible.status(), StatusCode::OK);
 
+    let archived_platform_hidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles/profile-platform-archived")
+                .header("authorization", format!("Bearer {other_read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_platform_hidden.status(), StatusCode::FORBIDDEN);
+
+    let archived_platform_admin_visible = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/design-profiles/profile-platform-archived")
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", "profile-platform-admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_platform_admin_visible.status(), StatusCode::OK);
+
     let platform_write = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
@@ -395,6 +433,31 @@ async fn design_profiles_are_project_private_and_platform_profiles_are_read_only
         .await
         .unwrap();
     assert_eq!(platform_write.status(), StatusCode::FORBIDDEN);
+
+    state
+        .store
+        .bind_project_design_profile("project-other", "profile-platform")
+        .await
+        .unwrap();
+    state
+        .store
+        .archive_design_profile("profile-platform")
+        .await
+        .unwrap();
+    let archived_platform_binding_hidden = app
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-other/design-profile")
+                .header("authorization", format!("Bearer {other_read}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_platform_binding_hidden.status(),
+        StatusCode::FORBIDDEN
+    );
 
     std::fs::remove_dir_all(key_path.parent().unwrap()).unwrap();
 }

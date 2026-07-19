@@ -97,6 +97,16 @@ async fn authorize_profile_record(
     let scope = record
         .get("scope")
         .ok_or_else(|| conflict_error(anyhow::anyhow!("design profile scope is missing")))?;
+    if !write
+        && scope.get("platform").and_then(Value::as_bool) == Some(true)
+        && !internal_admin_authorized(&state.config, headers)
+        && record.get("status").and_then(Value::as_str) != Some("active")
+    {
+        return Err(forbidden(
+            "non-active platform design profiles require platform administrator authorization"
+                .to_string(),
+        ));
+    }
     authorize_profile_scope(state, authorization, headers, scope, write).await
 }
 
@@ -415,6 +425,11 @@ async fn project_design_profile(
         .project_profile(&project_id)
         .await
         .map_err(design_profile_service_error)?;
+    if let Some(record) = profile.as_ref() {
+        let record =
+            serde_json::to_value(record).map_err(|error| conflict_error(anyhow::anyhow!(error)))?;
+        authorize_profile_record(&state, &authorization, &headers, &record, false).await?;
+    }
     Ok(Json(ProjectDesignProfileResponse {
         project_id,
         design_profile: profile.clone(),

@@ -18,7 +18,7 @@ use std::{
 };
 
 const RUNTIME_SAN: &str = "spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime";
-const SANDBOX_SAN: &str = "spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox";
+const SANDBOX_SAN: &str = "spiffe://anydesign.local/ns/ws-runtime-rc/sa/anydesign-sandbox";
 
 struct ServerProcess(Child);
 
