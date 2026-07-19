@@ -5,8 +5,12 @@ import {
   type BriefResponse,
   type ConversationItem,
   type DeploymentStateResponse,
+  type DesignProfile,
+  type DesignProfileRecord,
+  type ListDesignProfilesResponse,
   type PublicationOperationResponse,
   type ProfileTokenSyncOperationResponse,
+  type ProjectDesignProfileResponse,
   type ReleasePackagingResponse,
   type WorkRelease,
 } from "@zerondesign/shared";
@@ -16,8 +20,14 @@ type Project = {
   id: string;
   name: string;
   kind: "website" | "docs";
+  workspaceNamespace: string;
   status: string;
   latestRunId?: string;
+};
+
+type Workspace = {
+  namespace: string;
+  name: string;
 };
 
 type Preview = { versionId: string; previewUrl: string };
@@ -102,6 +112,7 @@ type DesignContextSnapshot = {
 
 export function ProjectShell() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selected, setSelected] = useState<Project | null>(null);
   const [prompt, setPrompt] = useState("");
   const [message, setMessage] = useState("准备创建你的第一个项目");
@@ -112,6 +123,8 @@ export function ProjectShell() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [publication, setPublication] = useState<PublicationSnapshot | null>(null);
   const [designContext, setDesignContext] = useState<DesignContextSnapshot | null>(null);
+  const [designProfiles, setDesignProfiles] = useState<DesignProfileRecord[]>([]);
+  const [boundDesignProfile, setBoundDesignProfile] = useState<DesignProfile | null>(null);
   const [profileSync, setProfileSync] = useState<ProfileTokenSyncOperationResponse | null>(null);
   const [conflictDecisions, setConflictDecisions] = useState<Record<string, "keep_current" | "apply_target">>({});
   const [publishing, setPublishing] = useState(false);
@@ -164,6 +177,21 @@ export function ProjectShell() {
     setConflictDecisions({});
   }, []);
 
+  const loadDesignProfiles = useCallback(async (project: Project) => {
+    const [profilesResponse, bindingResponse] = await Promise.all([
+      fetch(`/api/projects/${project.id}/design-profiles`, { cache: "no-store" }),
+      fetch(`/api/projects/${project.id}/design-profile-binding`, { cache: "no-store" }),
+    ]);
+    if (profilesResponse.ok) {
+      const payload = await profilesResponse.json() as ListDesignProfilesResponse;
+      setDesignProfiles(payload.designProfiles);
+    }
+    if (bindingResponse.ok) {
+      const payload = await bindingResponse.json() as ProjectDesignProfileResponse;
+      setBoundDesignProfile(payload.designProfile);
+    }
+  }, []);
+
   const connectEvents = useCallback((project: Project, runId: string) => {
     eventSource.current?.close();
     setActiveRunId(runId);
@@ -199,14 +227,17 @@ export function ProjectShell() {
   }, [loadConversation, loadPreview, loadVersions]);
 
   useEffect(() => {
-    void fetch("/api/projects")
-      .then(async (response) => {
-        if (!response.ok) throw new Error((await response.json()).error);
-        return response.json() as Promise<{ projects: Project[] }>;
-      })
-      .then((payload) => {
-        setProjects(payload.projects);
-        setSelected(payload.projects[0] ?? null);
+    void Promise.all([
+      fetchJson<{ projects: Project[] }>("/api/projects", { cache: "no-store" }),
+      fetchJson<{ workspaces: Workspace[] }>("/api/workspaces", { cache: "no-store" }),
+    ])
+      .then(([projectPayload, workspacePayload]) => {
+        setProjects(projectPayload.projects);
+        setWorkspaces(workspacePayload.workspaces);
+        setSelected(projectPayload.projects[0] ?? null);
+        if (workspacePayload.workspaces.length === 0) {
+          setMessage("还没有可用的 Workspace，请平台管理员先完成 Namespace 注册");
+        }
       })
       .catch((error: Error) => setMessage(error.message));
     return () => eventSource.current?.close();
@@ -220,6 +251,8 @@ export function ProjectShell() {
     setVersions([]);
     setPublication(null);
     setDesignContext(null);
+    setDesignProfiles([]);
+    setBoundDesignProfile(null);
     setProfileSync(null);
     setConflictDecisions({});
     if (!selected) return;
@@ -227,9 +260,10 @@ export function ProjectShell() {
     void loadPreview(selected);
     void loadVersions(selected);
     void loadPublication(selected);
+    void loadDesignProfiles(selected);
     if (selected.latestRunId) connectEvents(selected, selected.latestRunId);
     if (selected.latestRunId) void loadDesignContext(selected, selected.latestRunId);
-  }, [connectEvents, loadConversation, loadDesignContext, loadPreview, loadPublication, loadVersions, selected]);
+  }, [connectEvents, loadConversation, loadDesignContext, loadDesignProfiles, loadPreview, loadPublication, loadVersions, selected]);
 
   useEffect(() => {
     if (!selected || !activeRunId) return;
@@ -253,15 +287,37 @@ export function ProjectShell() {
     const data = new FormData(event.currentTarget);
     const response = await fetch("/api/projects", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: data.get("name"), kind: data.get("kind") }),
+      body: JSON.stringify({
+        name: data.get("name"),
+        kind: data.get("kind"),
+        workspaceNamespace: data.get("workspaceNamespace"),
+      }),
     });
     const payload = await response.json();
-    if (!response.ok) return setMessage(payload.error);
+    if (!response.ok) {
+      if (payload.project) {
+        const failedProject = payload.project as Project;
+        setProjects((current) => [failedProject, ...current]);
+        setSelected(failedProject);
+      }
+      return setMessage(payload.error);
+    }
     const project = payload.project as Project;
     setProjects((current) => [project, ...current]);
     setSelected(project);
     setMessage("项目已创建，可以描述你想生成的内容");
     event.currentTarget.reset();
+  }
+
+  async function retryProjectRegistration(project: Project) {
+    setMessage(`正在重新登记 ${project.workspaceNamespace}…`);
+    const response = await fetch(`/api/projects/${project.id}/registration`, { method: "POST" });
+    const payload = await response.json();
+    if (!response.ok) return setMessage(payload.error);
+    const registered = payload.project as Project;
+    setProjects((current) => current.map((item) => item.id === registered.id ? registered : item));
+    setSelected(registered);
+    setMessage("Workspace 登记已完成，可以开始创建作品");
   }
 
   async function startBrief(event: FormEvent<HTMLFormElement>) {
@@ -414,6 +470,40 @@ export function ProjectShell() {
     }
   }
 
+  async function bindDesignProfile(designProfileId: string) {
+    if (!selected) return;
+    try {
+      setMessage("正在绑定 Design Profile…");
+      await fetchJson<ProjectDesignProfileResponse>(
+        `/api/projects/${selected.id}/design-profile-binding`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ designProfileId }),
+        },
+      );
+      await loadDesignProfiles(selected);
+      setMessage("Design Profile 已绑定；新的 Run 将固定使用其当前激活版本");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Design Profile 绑定失败");
+    }
+  }
+
+  async function unbindDesignProfile() {
+    if (!selected) return;
+    try {
+      setMessage("正在取消 Design Profile 绑定…");
+      await fetchJson<ProjectDesignProfileResponse>(
+        `/api/projects/${selected.id}/design-profile-binding`,
+        { method: "DELETE" },
+      );
+      await loadDesignProfiles(selected);
+      setMessage("Design Profile 绑定已取消");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法取消 Design Profile 绑定");
+    }
+  }
+
   async function publishCurrent() {
     if (!selected || !preview) return;
     setPublishing(true);
@@ -522,8 +612,17 @@ export function ProjectShell() {
         <div className="brand">zeronDesign <span>alpha</span></div>
         <form className="new-project" onSubmit={create}>
           <input name="name" aria-label="项目名称" placeholder="项目名称" required />
+          <select name="workspaceNamespace" aria-label="Workspace Namespace" required disabled={workspaces.length === 0}>
+            {workspaces.length === 0
+              ? <option value="">暂无可用 Workspace</option>
+              : workspaces.map((workspace) => (
+                <option value={workspace.namespace} key={workspace.namespace}>
+                  {workspace.name} · {workspace.namespace}
+                </option>
+              ))}
+          </select>
           <select name="kind" aria-label="项目类型" defaultValue="website"><option value="website">Website</option><option value="docs">Docs</option></select>
-          <button type="submit">新建项目</button>
+          <button type="submit" disabled={workspaces.length === 0}>新建项目</button>
         </form>
         <nav aria-label="项目列表">{projects.map((project) => (
           <button
@@ -532,12 +631,18 @@ export function ProjectShell() {
             key={project.id}
             onClick={() => setSelected(project)}
           >
-            <strong>{project.name}</strong><small>{project.kind} · {project.status}</small>
+            <strong>{project.name}</strong><small>{project.kind} · {project.workspaceNamespace} · {project.status}</small>
           </button>
         ))}</nav>
       </aside>
       <section className="workspace">
         <header><div><small>WORKSPACE</small><h1>{selected?.name ?? "新项目"}</h1></div><div className="status" data-testid="runtime-status">{message}</div></header>
+        {(selected?.status === "registering" || selected?.status === "registration_failed") && (
+          <section className="registration-warning">
+            <p>这个项目尚未完成 Runtime Workspace 登记，当前不会启动 Run。</p>
+            <button type="button" onClick={() => void retryProjectRegistration(selected)}>重试登记</button>
+          </section>
+        )}
         <div className="panes">
           <section className="chat">
             <div className="messages">
@@ -546,6 +651,13 @@ export function ProjectShell() {
                 ? <PermissionCard item={item} key={item.id} projectId={selected.id} onResolved={permissionResolved} />
                 : <article className={`message ${item.role ?? "system"}`} key={item.id}><small>{item.role ?? item.kind}</small><p>{item.text}</p></article>)}
               {brief && <article className="brief-card"><small>STRUCTURED BRIEF · {brief.status}</small><h3>{brief.brief.projectType} / {brief.brief.recommendedTemplate}</h3><p>{brief.brief.visualDirection}</p><p>受众：{brief.brief.audience}</p>{brief.status === "draft" && <button disabled={Boolean(activeRunId && activeRunId !== brief.runId)} onClick={confirmBrief}>确认 Brief</button>}{brief.status === "confirmed" && <button disabled={Boolean(activeRunId)} onClick={startBuild}>开始 Build</button>}</article>}
+              {selected && <DesignProfileBindingCard
+                profiles={designProfiles}
+                boundProfile={boundDesignProfile}
+                disabled={Boolean(activeRunId)}
+                onBind={bindDesignProfile}
+                onUnbind={unbindDesignProfile}
+              />}
               {selected && designContext && <DesignContextCard
                 context={designContext}
                 operation={profileSync}
@@ -566,6 +678,43 @@ export function ProjectShell() {
       </section>
     </main>
   );
+}
+
+function DesignProfileBindingCard({
+  profiles,
+  boundProfile,
+  disabled,
+  onBind,
+  onUnbind,
+}: {
+  profiles: DesignProfileRecord[];
+  boundProfile: DesignProfile | null;
+  disabled: boolean;
+  onBind: (designProfileId: string) => Promise<void>;
+  onUnbind: () => Promise<void>;
+}) {
+  const activeProfiles = profiles.filter((profile) => profile.status === "active");
+  return <article className="design-profile-binding-card" data-testid="design-profile-binding-card">
+    <small>DESIGN PROFILE · PROJECT BINDING</small>
+    <h3>{boundProfile ? `${boundProfile.name} · v${boundProfile.version}` : "未绑定"}</h3>
+    <p>{boundProfile
+      ? `来源：${"platform" in boundProfile.scope ? "平台" : "当前项目"}`
+      : "选择项目内创建的 Profile，或平台管理员发布的全局 Profile。"}</p>
+    <div className="profile-binding-actions">
+      <select
+        aria-label="Design Profile"
+        disabled={disabled || activeProfiles.length === 0}
+        value={boundProfile?.id ?? ""}
+        onChange={(event) => event.target.value && void onBind(event.target.value)}
+      >
+        <option value="">选择激活的 Profile</option>
+        {activeProfiles.map((profile) => <option value={profile.id} key={`${profile.id}:${profile.version}`}>
+          {profile.name} · v{profile.version} · {"platform" in profile.scope ? "平台" : "项目"}
+        </option>)}
+      </select>
+      {boundProfile && <button type="button" disabled={disabled} onClick={() => void onUnbind()}>取消绑定</button>}
+    </div>
+  </article>;
 }
 
 function DesignContextCard({

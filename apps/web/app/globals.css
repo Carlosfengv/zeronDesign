@@ -24,13 +24,19 @@ h1 { margin: 2px 0 0; font-size: 18px; }
 .panes { display: grid; grid-template-columns: minmax(360px, 42%) 1fr; min-height: 0; }
 .chat { min-height: 0; display: flex; flex-direction: column; justify-content: space-between; gap: 22px; padding: 28px; border-right: 1px solid #2c2b28; }
 .messages { min-height: 0; overflow: auto; display: grid; align-content: start; gap: 10px; padding-right: 4px; }
-.message, .brief-card, .permission-card, .design-context-card { max-width: 92%; padding: 12px 14px; border: 1px solid #33322e; border-radius: 10px; background: #1a1a18; }
+.message, .brief-card, .permission-card, .design-context-card, .design-profile-binding-card { max-width: 92%; padding: 12px 14px; border: 1px solid #33322e; border-radius: 10px; background: #1a1a18; }
 .message.user { justify-self: end; background: #2a2925; }
 .message small, .brief-card small, .permission-card small { color: #858178; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
 .message p, .brief-card p, .permission-card p { margin: 6px 0 0; color: #d0cbc1; line-height: 1.5; white-space: pre-wrap; }
 .brief-card { max-width: 100%; border-color: #5d594f; background: #23221e; }
 .brief-card h3 { margin: 10px 0 4px; }
 .brief-card button { margin-top: 14px; }
+.design-profile-binding-card { max-width: 100%; border-color: #554a68; background: #211c29; }
+.design-profile-binding-card small { color: #b8a4d4; font-size: 9px; letter-spacing: .12em; }
+.design-profile-binding-card h3 { margin: 9px 0 5px; }
+.design-profile-binding-card p { margin: 0 0 10px; color: #c9c0d4; font-size: 11px; }
+.profile-binding-actions { display: flex; gap: 8px; }
+.profile-binding-actions select { min-width: 0; flex: 1; }
 .permission-card { max-width: 100%; border-color: #76694a; background: #28241b; }
 .permission-card h3 { margin: 9px 0 3px; }
 .permission-card textarea { width: 100%; min-height: 82px; margin-top: 12px; background: #1d1b17; }
