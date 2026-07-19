@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anydesign-object-store
+  namespace: anydesign-runtime
+  labels:
+    app: anydesign-object-store
+spec:
+  selector:
+    app: anydesign-object-store
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: anydesign-object-store
+  namespace: anydesign-runtime
+spec:
+  serviceName: anydesign-object-store
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anydesign-object-store
+  template:
+    metadata:
+      labels:
+        app: anydesign-object-store
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          args:
+            - server
+            - /data
+            - --console-address
+            - :9001
+          ports:
+            - name: s3
+              containerPort: 9000
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: access-key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: secret-key
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            periodSeconds: 2
+            failureThreshold: 90
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 4Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: anydesign-object-store-ingress
+  namespace: anydesign-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app: anydesign-object-store
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: anydesign-runtime
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: zerondesign-object-storage-e2e
+      ports:
+        - protocol: TCP
+          port: 9000

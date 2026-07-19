@@ -89,16 +89,40 @@ spec:
                 secretKeyRef:
                   name: anydesign-runtime-internal-admin
                   key: token
-            - name: K8S_NAMESPACE
-              value: anydesign-sandboxes
             - name: RUNTIME_EXECUTION_PROFILE_READINESS_MODE
-              value: kubernetes
+              # Workspace provisioning owns the namespace-scoped template and
+              # pool readiness contract. Runtime has no safe global tenant
+              # Namespace to probe; the actual SandboxClaim still fails closed.
+              value: static
             - name: RUNTIME_EXECUTION_PROFILE_READINESS_TTL_SECONDS
               value: "15"
             - name: RUNTIME_PUBLIC_BASE_URL
               value: http://anydesign-runtime.anydesign-runtime.svc.cluster.local:8080
             - name: RUNTIME_STORAGE_DIR
               value: /var/lib/anydesign-runtime/data
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-postgres
+                  key: url
+            - name: OBJECT_STORAGE_URL
+              value: s3://anydesign-runtime/greenfield
+            - name: OBJECT_STORAGE_ENDPOINT
+              value: http://anydesign-object-store.anydesign-runtime.svc.cluster.local:9000
+            - name: OBJECT_STORAGE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: access-key
+            - name: OBJECT_STORAGE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: secret-key
+            - name: OBJECT_STORAGE_REGION
+              value: us-east-1
+            - name: OBJECT_STORAGE_ALLOW_HTTP
+              value: "true"
             - name: WORKSPACE_CHANNEL_SIGNING_KEY_FILE
               value: /var/run/anydesign/signer/private.der
             - name: WORKSPACE_CHANNEL_TLS_MODE
@@ -110,7 +134,7 @@ spec:
             - name: WORKSPACE_CHANNEL_CLIENT_KEY_FILE
               value: /var/run/anydesign/workspace-channel-tls/tls.key
             - name: WORKSPACE_CHANNEL_SERVER_SAN
-              value: spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox
+              value: spiffe://anydesign.local/ns/{namespace}/sa/anydesign-sandbox
             - name: RUNTIME_NPM_REGISTRY
               value: http://anydesign-npm-proxy.anydesign-runtime.svc.cluster.local:4873/
           readinessProbe:

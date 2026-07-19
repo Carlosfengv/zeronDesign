@@ -882,6 +882,16 @@ const server =
           throw new Error("invalid WORKSPACE_CHANNEL_TLS_MODE");
         })();
 
+server.on("connection", (socket) => {
+  socket.on("error", () => socket.destroy());
+});
+server.on("secureConnection", (socket) => {
+  socket.on("error", () => socket.destroy());
+});
+server.on("tlsClientError", (_error, socket) => {
+  if (!socket.destroyed) socket.destroy();
+});
+
 server.on("upgrade", (request, socket) => {
   if (!request.url || !request.url.startsWith("/workspace")) {
     socket.destroy();

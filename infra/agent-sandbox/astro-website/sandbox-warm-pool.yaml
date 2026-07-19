@@ -4,6 +4,8 @@ metadata:
   name: anydesign-astro-website-pool
   namespace: anydesign-sandboxes
 spec:
-  replicas: 1
+  # v1beta1 SandboxClaim requires a pool reference. Zero replicas keeps this as
+  # template indirection without a resident pre-warmed Sandbox.
+  replicas: 0
   sandboxTemplateRef:
     name: anydesign-astro-website

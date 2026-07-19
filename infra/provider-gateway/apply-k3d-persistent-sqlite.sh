@@ -102,9 +102,11 @@ if [[ "${current_volume}" != "provider-gateway-sqlite" ]]; then
     sqlite3 "${work_dir}/backup/gateway.db" "PRAGMA quick_check;" | grep -qx ok
   fi
 
-  "${KUBECTL}" scale deployment "${DEPLOYMENT}" -n "${NAMESPACE}" --replicas=0 >/dev/null
-  "${KUBECTL}" rollout status deployment/"${DEPLOYMENT}" \
-    -n "${NAMESPACE}" --timeout=120s >/dev/null
+  if "${KUBECTL}" get deployment "${DEPLOYMENT}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+    "${KUBECTL}" scale deployment "${DEPLOYMENT}" -n "${NAMESPACE}" --replicas=0 >/dev/null
+    "${KUBECTL}" rollout status deployment/"${DEPLOYMENT}" \
+      -n "${NAMESPACE}" --timeout=120s >/dev/null
+  fi
 
   sed "s|zerondesign/provider-gateway:k3d-local|${IMAGE}|g" \
     "${ROOT_DIR}/infra/provider-gateway/k3d-sqlite-migration-pod.yaml" \

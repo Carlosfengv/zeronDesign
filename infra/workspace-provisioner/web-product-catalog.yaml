@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerondesign-web
+  namespace: anydesign-runtime
+  labels:
+    app: zerondesign-web
+spec:
+  selector:
+    app: zerondesign-web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zerondesign-web
+  namespace: anydesign-runtime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerondesign-web
+  template:
+    metadata:
+      labels:
+        app: zerondesign-web
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: zerondesign/web:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: ZERONDESIGN_PRODUCT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zerondesign-web-product-postgres
+                  key: url
+            - name: ZERONDESIGN_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: zerondesign-web-auth
+                  key: session-secret
+            - name: ZERONDESIGN_PLATFORM_ADMIN_IDS
+              value: rc-harness-principal
+            - name: RUNTIME_BASE_URL
+              value: http://anydesign-runtime.anydesign-runtime.svc.cluster.local:8080
+            - name: RUNTIME_INTERNAL_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-internal-admin
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

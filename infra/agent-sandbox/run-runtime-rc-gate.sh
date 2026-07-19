@@ -7,7 +7,24 @@ KUBECTL="${KUBECTL:-kubectl}"
 K3D="${K3D:-k3d}"
 cluster_name="${ANYDESIGN_E2E_CLUSTER:-zerondesign-e2e}"
 runtime_port="${RUNTIME_RC_PORT:-18080}"
+workspace_namespace="${RUNTIME_RC_WORKSPACE_NAMESPACE:-anydesign-sandboxes}"
+website_workspace_namespace="${RUNTIME_RC_WEBSITE_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
+docs_workspace_namespace="${RUNTIME_RC_DOCS_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
+concurrent_workspace_gate="${RUNTIME_RC_CONCURRENT_WORKSPACE_GATE:-0}"
 cd "${ROOT_DIR}"
+
+for candidate_namespace in \
+  "${workspace_namespace}" "${website_workspace_namespace}" "${docs_workspace_namespace}"; do
+  if [[ ! "${candidate_namespace}" =~ ^ws-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ \
+    && "${candidate_namespace}" != "anydesign-sandboxes" ]]; then
+    printf 'Runtime RC Workspace values must be ws-* Kubernetes Namespaces\n' >&2
+    exit 2
+  fi
+done
+if [[ "${concurrent_workspace_gate}" != "0" && "${concurrent_workspace_gate}" != "1" ]]; then
+  printf 'RUNTIME_RC_CONCURRENT_WORKSPACE_GATE must be 0 or 1\n' >&2
+  exit 2
+fi
 
 rc_mode="${RUNTIME_RC_MODE:-audit}"
 if [[ "${rc_mode}" != "audit" && "${rc_mode}" != "release" ]]; then
@@ -141,33 +158,49 @@ for required in \
   deployment/anydesign-npm-proxy; do
   "${KUBECTL}" get "${required}" -n anydesign-runtime >/dev/null
 done
-"${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml >/dev/null
-for authorization in \
-  'get sandboxes.agents.x-k8s.io' \
-  'get sandboxtemplates.extensions.agents.x-k8s.io' \
-  'get sandboxwarmpools.extensions.agents.x-k8s.io' \
-  'create sandboxclaims.extensions.agents.x-k8s.io'; do
-  verb="${authorization%% *}"
-  resource="${authorization#* }"
-  allowed="$("${KUBECTL}" auth can-i "${verb}" "${resource}" \
-    -n anydesign-sandboxes \
-    --as=system:serviceaccount:anydesign-runtime:anydesign-runtime)"
-  if [[ "${allowed}" != "yes" ]]; then
-    printf 'Runtime ServiceAccount lacks required Kubernetes permission: %s %s\n' \
-      "${verb}" "${resource}" >&2
-    exit 3
+if [[ "${workspace_namespace}" == "anydesign-sandboxes" ]]; then
+  "${KUBECTL}" apply -f infra/agent-sandbox/rbac/runtime-service-account.yaml >/dev/null
+fi
+for candidate_namespace in $(printf '%s\n' \
+  "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
+  if [[ "${candidate_namespace}" == "anydesign-sandboxes" ]]; then
+    continue
+  fi
+  "${KUBECTL}" get serviceaccount anydesign-runtime \
+    -n anydesign-runtime >/dev/null
+  "${KUBECTL}" get serviceaccount anydesign-sandbox \
+    -n "${candidate_namespace}" >/dev/null
+done
+for candidate_namespace in $(printf '%s\n' \
+  "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
+  for authorization in \
+    'get sandboxes.agents.x-k8s.io' \
+    'get sandboxtemplates.extensions.agents.x-k8s.io' \
+    'get sandboxwarmpools.extensions.agents.x-k8s.io' \
+    'create sandboxclaims.extensions.agents.x-k8s.io'; do
+    verb="${authorization%% *}"
+    resource="${authorization#* }"
+    allowed="$("${KUBECTL}" auth can-i "${verb}" "${resource}" \
+      -n "${candidate_namespace}" \
+      --as=system:serviceaccount:anydesign-runtime:anydesign-runtime)"
+    if [[ "${allowed}" != "yes" ]]; then
+      printf 'Runtime ServiceAccount lacks required Kubernetes permission in %s: %s %s\n' \
+        "${candidate_namespace}" "${verb}" "${resource}" >&2
+      exit 3
+    fi
+  done
+  existing_rc_claims="$(${KUBECTL} get sandboxclaims -n "${candidate_namespace}" -o name 2>/dev/null \
+    | rg '/project-rc-' || true)"
+  if [[ -n "${existing_rc_claims}" ]]; then
+    if [[ "${rc_mode}" == "release" ]]; then
+      printf 'release mode requires zero pre-existing RC SandboxClaims in %s:\n%s\n' \
+        "${candidate_namespace}" "${existing_rc_claims}" >&2
+      exit 2
+    fi
+    printf '%s\n' "${existing_rc_claims}" \
+      | xargs "${KUBECTL}" delete -n "${candidate_namespace}" --ignore-not-found=true >/dev/null
   fi
 done
-existing_rc_claims="$(${KUBECTL} get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
-  | rg '/project-rc-' || true)"
-if [[ -n "${existing_rc_claims}" ]]; then
-  if [[ "${rc_mode}" == "release" ]]; then
-    printf 'release mode requires zero pre-existing RC SandboxClaims:\n%s\n' "${existing_rc_claims}" >&2
-    exit 2
-  fi
-  printf '%s\n' "${existing_rc_claims}" \
-    | xargs "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null
-fi
 channel_evidence="${RUNTIME_RC_CHANNEL_EVIDENCE:-${evidence_dir}/k3d-channel.json}"
 if [[ ! -s "${channel_evidence}" ]]; then
   printf 'workspace channel evidence is required: %s\n' "${channel_evidence}" >&2
@@ -204,7 +237,7 @@ active_recovery_evidence="${evidence_dir}/active-recovery.json"
 recovery_baseline_file="${gate_work_dir}/recovery-baseline.json"
 rm -f "${active_recovery_evidence}"
 "${KUBECTL}" get sandboxclaims.extensions.agents.x-k8s.io \
-  -n anydesign-sandboxes -o json \
+  -n "${workspace_namespace}" -o json \
   | node -e '
 const fs = require("node:fs");
 const claims = JSON.parse(fs.readFileSync(0, "utf8")).items;
@@ -242,9 +275,12 @@ cleanup() {
   fi
   [[ -z "${provider_secret_file}" ]] || rm -f "${provider_secret_file}"
   if [[ -n "${gate_id}" ]]; then
-    "${KUBECTL}" get sandboxclaims -n anydesign-sandboxes -o name 2>/dev/null \
-      | rg "/project-rc-(website|docs)(-dcp-enforced(-dcp-provider)?)?-${gate_id}-" \
-      | xargs -r "${KUBECTL}" delete -n anydesign-sandboxes --ignore-not-found=true >/dev/null 2>&1 || true
+    for candidate_namespace in $(printf '%s\n' \
+      "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
+      "${KUBECTL}" get sandboxclaims -n "${candidate_namespace}" -o name 2>/dev/null \
+        | rg "/project-rc-(website|docs)(-dcp-enforced(-dcp-provider)?)?-${gate_id}-" \
+        | xargs -r "${KUBECTL}" delete -n "${candidate_namespace}" --ignore-not-found=true >/dev/null 2>&1 || true
+    done
   fi
   rm -rf "${principal_key_dir}"
   rm -rf "${gate_work_dir}"
@@ -257,8 +293,13 @@ report_error() {
 }
 trap report_error ERR
 trap cleanup EXIT
-openssl genpkey -algorithm ED25519 -out "${principal_private_key}" 2>/dev/null
-openssl pkey -in "${principal_private_key}" -pubout -outform DER -out "${principal_public_key}" 2>/dev/null
+node -e '
+const {generateKeyPairSync}=require("node:crypto");
+const {writeFileSync}=require("node:fs");
+const {privateKey,publicKey}=generateKeyPairSync("ed25519");
+writeFileSync(process.argv[1],privateKey.export({format:"pem",type:"pkcs8"}));
+writeFileSync(process.argv[2],publicKey.export({format:"der",type:"spki"}));
+' "${principal_private_key}" "${principal_public_key}"
 
 if [[ -n "${RUNTIME_RC_REUSE_IMAGE:-}" ]]; then
   if [[ "${rc_mode}" == "release" ]]; then
@@ -273,6 +314,7 @@ else
   if ! cargo vendor \
     --manifest-path services/runtime/Cargo.toml \
     --locked \
+    --versioned-dirs \
     services/runtime/target/docker-vendor > /dev/null 2>"${vendor_log}"; then
     cat "${vendor_log}" >&2
     exit 1
@@ -305,6 +347,92 @@ rm -f "${runtime_image_archive}"
   -n anydesign-runtime \
   --from-file="public.der=${principal_public_key}" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+if "${KUBECTL}" -n anydesign-runtime get secret anydesign-runtime-postgres >/dev/null 2>&1; then
+  postgres_password="$("${KUBECTL}" -n anydesign-runtime get secret anydesign-runtime-postgres \
+    -o 'jsonpath={.data.password}' | node -e 'process.stdin.on("data",d=>process.stdout.write(Buffer.from(d.toString(),"base64")))')"
+else
+  postgres_password="$(openssl rand -hex 24)"
+fi
+postgres_url="postgres://anydesign_runtime:${postgres_password}@anydesign-postgres.anydesign-runtime.svc.cluster.local:5432/anydesign_runtime"
+"${KUBECTL}" create secret generic anydesign-runtime-postgres \
+  -n anydesign-runtime \
+  --from-literal="password=${postgres_password}" \
+  --from-literal="url=${postgres_url}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+"${KUBECTL}" apply -f infra/workspace-provisioner/postgres-control-plane.yaml >/dev/null
+"${KUBECTL}" -n anydesign-runtime rollout status statefulset/anydesign-postgres \
+  --timeout=180s >/dev/null
+if "${KUBECTL}" -n anydesign-runtime get secret anydesign-runtime-object-storage >/dev/null 2>&1; then
+  object_storage_access_key="$("${KUBECTL}" -n anydesign-runtime \
+    get secret anydesign-runtime-object-storage -o 'jsonpath={.data.access-key}' \
+    | node -e 'process.stdin.on("data",d=>process.stdout.write(Buffer.from(d.toString(),"base64")))')"
+  object_storage_secret_key="$("${KUBECTL}" -n anydesign-runtime \
+    get secret anydesign-runtime-object-storage -o 'jsonpath={.data.secret-key}' \
+    | node -e 'process.stdin.on("data",d=>process.stdout.write(Buffer.from(d.toString(),"base64")))')"
+else
+  object_storage_access_key="zerondesign$(openssl rand -hex 8)"
+  object_storage_secret_key="$(openssl rand -hex 24)"
+fi
+"${KUBECTL}" create secret generic anydesign-runtime-object-storage \
+  -n anydesign-runtime \
+  --from-literal="access-key=${object_storage_access_key}" \
+  --from-literal="secret-key=${object_storage_secret_key}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+"${KUBECTL}" apply -f infra/workspace-provisioner/object-storage.yaml >/dev/null
+"${KUBECTL}" -n anydesign-runtime rollout status statefulset/anydesign-object-store \
+  --timeout=240s >/dev/null
+object_storage_init_job="anydesign-object-store-init-${gate_id}"
+"${KUBECTL}" apply -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${object_storage_init_job}
+  namespace: anydesign-runtime
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: zerondesign-object-storage-e2e
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: init
+          image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          command: ["sh", "-ec"]
+          args:
+            - for attempt in \$(seq 1 60); do if mc alias set local http://anydesign-object-store.anydesign-runtime.svc.cluster.local:9000 "\${MINIO_ACCESS_KEY}" "\${MINIO_SECRET_KEY}" && mc mb --ignore-existing local/anydesign-runtime; then exit 0; fi; sleep 2; done; exit 1
+          env:
+            - name: HOME
+              value: /tmp
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-object-storage
+                  key: secret-key
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+EOF
+if ! "${KUBECTL}" -n anydesign-runtime wait --for=condition=complete \
+  "job/${object_storage_init_job}" --timeout=180s >/dev/null; then
+  "${KUBECTL}" -n anydesign-runtime logs "job/${object_storage_init_job}" --all-containers=true >&2 || true
+  exit 3
+fi
+"${KUBECTL}" -n anydesign-runtime delete job "${object_storage_init_job}" \
+  --wait=true >/dev/null
 
 "${KUBECTL}" create configmap fixture-model-gateway \
   -n anydesign-runtime \
@@ -599,7 +727,7 @@ capture_dependency_workspace_evidence() {
   local project_json="$1" proxy_host="anydesign-npm-proxy.anydesign-runtime.svc.cluster.local"
   local pod_uid pods_json record project_pod project_ip lock_hash request_count proxy_logs_file
   pod_uid="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).podUid)' "${project_json}")"
-  pods_json="$(${KUBECTL} get pods -n anydesign-sandboxes -o json)"
+  pods_json="$(${KUBECTL} get pods -n "${workspace_namespace}" -o json)"
   record="$(node -e '
 const pods=JSON.parse(process.argv[1]).items;
 const pod=pods.find(item=>item.metadata.uid===process.argv[2]&&!item.metadata.deletionTimestamp);
@@ -607,11 +735,11 @@ if(!pod||pod.status.phase!=="Running")process.exit(2);
 process.stdout.write(`${pod.metadata.name}\t${pod.status.podIP||""}`);
 ' "${pods_json}" "${pod_uid}")"
   IFS=$'\t' read -r project_pod project_ip <<<"${record}"
-  ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+  ${KUBECTL} exec -n "${workspace_namespace}" "${project_pod}" -- node -e \
     "require('dns').lookup('${proxy_host}',e=>{if(e)throw e})"
-  ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+  ${KUBECTL} exec -n "${workspace_namespace}" "${project_pod}" -- node -e \
     "fetch('http://${proxy_host}:4873/-/ping').then(r=>{if(!r.ok)process.exit(2)})"
-  if ${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- node -e \
+  if ${KUBECTL} exec -n "${workspace_namespace}" "${project_pod}" -- node -e \
     "const t=setTimeout(()=>process.exit(0),4000);fetch('https://registry.npmjs.org/').then(()=>{clearTimeout(t);process.exit(3)}).catch(()=>{clearTimeout(t);process.exit(0)})"; then
     :
   else
@@ -619,7 +747,7 @@ process.stdout.write(`${pod.metadata.name}\t${pod.status.podIP||""}`);
       "${project_pod}" "${pod_uid}" >&2
     return 1
   fi
-  lock_hash="$(${KUBECTL} exec -n anydesign-sandboxes "${project_pod}" -- sh -lc '
+  lock_hash="$(${KUBECTL} exec -n "${workspace_namespace}" "${project_pod}" -- sh -lc '
 test -d /workspace/project/node_modules || exit 10
 for file in /workspace/project/package-lock.json /workspace/project/pnpm-lock.yaml; do
   if [ -f "$file" ]; then sha256sum "$file" | awk "{print \$1}"; exit 0; fi
@@ -653,6 +781,8 @@ run_fixture() {
   local output_file="$4"
   local inject_recovery="${5:-false}"
   local repair_expected_text="${6:-${expected_text}}"
+  local selected_workspace_namespace="${7:-${workspace_namespace}}"
+  local workspace_namespace="${selected_workspace_namespace}"
   local brief_payload brief_run conversation brief_id build_payload build_run events artifact_url
   local build_state base_version_id binding_id edit_payload edit_run release_data project_evidence artifact_status artifact_assertions artifact_assertion_path artifact_assertion_url dependency_evidence
   local dcp_build_diagnostics dcp_edit_diagnostics dcp_repair_diagnostics
@@ -683,7 +813,7 @@ run_fixture() {
     -H 'content-type: application/json' \
     -H 'x-anydesign-internal: true' \
     -H "x-runtime-admin-token: ${admin_token}" \
-    -d "{\"ownerPrincipalId\":\"${principal_id}\"}" \
+    -d "$(node -e 'process.stdout.write(JSON.stringify({ownerPrincipalId:process.argv[1],workspaceNamespace:process.argv[2]}))' "${principal_id}" "${workspace_namespace}")" \
     "${base_url}/internal/projects/${project_id}/access" >/dev/null
   principal_token="$(issue_principal_token "${project_id}")"
   reserve_real_provider_run brief "${project_id}"
@@ -1011,17 +1141,23 @@ process.stdout.write(JSON.stringify(evidence));
 write_real_project_evidence() {
   local kind="$1"
   local project_json="$2"
+  local evidence_mode="fixture" provider_model="deterministic-tool-sequence"
+  local credential_present="false"
+  if [[ "${active_provider_mode}" == "deepseek" ]]; then
+    evidence_mode="real"
+    provider_model="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
+    credential_present="true"
+  fi
   node -e '
 const fs=require("fs");
 fs.writeFileSync(process.argv[1],JSON.stringify({
   schemaVersion:"real-provider-project-evidence@1",
   recordedAt:new Date().toISOString(),
-  provider:{mode:process.argv[3],model:process.argv[4],credentialPresent:true},
+  provider:{mode:process.argv[3],model:process.argv[4],credentialPresent:process.argv[5]==="true"},
   project:JSON.parse(process.argv[2]),
 },null,2)+"\n");
 ' "${evidence_dir}/real-provider-${kind}.json" "${project_json}" \
-    "real" \
-    "${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
+    "${evidence_mode}" "${provider_model}" "${credential_present}"
 }
 
 website=""
@@ -1030,12 +1166,14 @@ provider_dcp=""
 if [[ "${project_filter}" != "all" ]]; then
   if [[ "${project_filter}" == "website" ]]; then
     website_file="${gate_work_dir}/website.json"
-    run_fixture "rc-website-${gate_id}" website 'RC Website Edited' "${website_file}" false
+    run_fixture "rc-website-${gate_id}" website 'RC Website Edited' "${website_file}" false \
+      'RC Website Edited' "${website_workspace_namespace}"
     website="$(cat "${website_file}")"
     write_real_project_evidence website "${website}"
   else
     docs_file="${gate_work_dir}/docs.json"
-    run_fixture "rc-docs-${gate_id}" docs 'RC Docs Edited' "${docs_file}" false
+    run_fixture "rc-docs-${gate_id}" docs 'RC Docs Edited' "${docs_file}" false \
+      'RC Docs Edited' "${docs_workspace_namespace}"
     docs="$(cat "${docs_file}")"
     write_real_project_evidence docs "${docs}"
   fi
@@ -1047,10 +1185,10 @@ fixture_website_file="${gate_work_dir}/fixture-website.json"
 fixture_docs_file="${gate_work_dir}/fixture-docs.json"
 fixture_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 run_fixture "rc-website-${gate_id}-fixture" website 'RC Website Edited' \
-  "${fixture_website_file}" false &
+  "${fixture_website_file}" false 'RC Website Edited' "${website_workspace_namespace}" &
 fixture_website_pid=$!
 run_fixture "rc-docs-${gate_id}-fixture" docs 'RC Docs Edited' \
-  "${fixture_docs_file}" false &
+  "${fixture_docs_file}" false 'RC Docs Edited' "${docs_workspace_namespace}" &
 fixture_docs_pid=$!
 wait "${fixture_website_pid}"
 wait "${fixture_docs_pid}"
@@ -1070,7 +1208,35 @@ fs.writeFileSync(process.argv[1],JSON.stringify({
 
 recovery_probe_file="${gate_work_dir}/recovery-probe.json"
 run_fixture "rc-website-${gate_id}-recovery" website 'RC Website Edited' \
-  "${recovery_probe_file}" true
+  "${recovery_probe_file}" true 'RC Website Edited' "${website_workspace_namespace}"
+
+if [[ "${concurrent_workspace_gate}" == "1" ]]; then
+  concurrent_workspace_evidence="${evidence_dir}/workspace-concurrency-recovery.json"
+  node - "${concurrent_workspace_evidence}" "${fixture_evidence}" \
+    "${active_recovery_evidence}" "${recovery_probe_file}" <<'NODE'
+const fs=require("fs");
+const [output,fixturePath,recoveryPath,recoveryProjectPath]=process.argv.slice(2);
+const fixture=JSON.parse(fs.readFileSync(fixturePath,"utf8"));
+const recovery=JSON.parse(fs.readFileSync(recoveryPath,"utf8"));
+const recoveryProject=JSON.parse(fs.readFileSync(recoveryProjectPath,"utf8"));
+const namespaces=fixture.projects.map(project=>project.workspaceNamespace);
+if(fixture.execution?.mode!=="concurrent"||fixture.execution?.passed!==true)throw new Error("concurrent fixture evidence failed");
+if(new Set(namespaces).size!==2)throw new Error("concurrent fixtures did not use distinct Workspaces");
+if(recovery.runtimeRestart?.result!=="pass"||recovery.portForwardKill?.result!=="pass")throw new Error("active Preview recovery failed");
+fs.writeFileSync(output,`${JSON.stringify({
+  schemaVersion:"workspace-concurrency-recovery-evidence@1",
+  recordedAt:new Date().toISOString(),
+  execution:fixture.execution,
+  projects:fixture.projects,
+  activePreviewRecovery:recovery,
+  recoveryProject,
+  passed:true,
+},null,2)}\n`);
+NODE
+  printf 'Workspace concurrent Build and active Preview recovery gate passed: %s\n' \
+    "${concurrent_workspace_evidence}"
+  exit 0
+fi
 
 dcp_project_id="rc-website-dcp-enforced-${gate_id}"
 dcp_fixture_policy="$(configure_enforced_dcp_fixture "${dcp_project_id}")"
@@ -1196,7 +1362,7 @@ const node=cluster.items[0];
 process.stdout.write(JSON.stringify({name:process.argv[2],kubeContext:process.argv[3],createdAt:node.metadata.creationTimestamp,nodeUid:node.metadata.uid}));
 ' "${KUBECTL}" "${cluster_name}" "${context}")" \
   "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-runtime/sa/anydesign-runtime' | shasum -a 256 | awk '{print $1}')" \
-  "$(printf '%s' 'spiffe://anydesign.local/ns/anydesign-sandboxes/sa/anydesign-sandbox' | shasum -a 256 | awk '{print $1}')" \
+  "$(printf '%s' "spiffe://anydesign.local/ns/${workspace_namespace}/sa/anydesign-sandbox" | shasum -a 256 | awk '{print $1}')" \
   "required" "true" "${provider_evidence_mode}" "${provider_model}" \
   "" "${provider_credential_present}" "${fixture_evidence}" \
   "${channel_evidence}" "${runtime_manifest_digest}" "${dcp_fixture}" "${provider_dcp}" \

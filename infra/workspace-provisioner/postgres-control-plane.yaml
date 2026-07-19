@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anydesign-postgres
+  namespace: anydesign-runtime
+  labels:
+    app: anydesign-postgres
+spec:
+  selector:
+    app: anydesign-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: anydesign-postgres
+  namespace: anydesign-runtime
+spec:
+  serviceName: anydesign-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anydesign-postgres
+  template:
+    metadata:
+      labels:
+        app: anydesign-postgres
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:17-bookworm
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: anydesign_runtime
+            - name: POSTGRES_USER
+              value: anydesign_runtime
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: anydesign-runtime-postgres
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U anydesign_runtime -d anydesign_runtime
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U anydesign_runtime -d anydesign_runtime
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: anydesign-postgres-ingress
+  namespace: anydesign-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app: anydesign-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: anydesign-runtime
+        - podSelector:
+            matchLabels:
+              app: zerondesign-web
+      ports:
+        - protocol: TCP
+          port: 5432

@@ -1,0 +1,8 @@
+.git
+apps/web/node_modules
+apps/web/.next
+apps/web/.data
+packages/shared/node_modules
+services/runtime/target/debug
+services/runtime/target/release
+services/runtime/target/e2e-evidence

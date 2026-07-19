@@ -1,0 +1,45 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: zerondesign-works-selfsigned-bootstrap
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/managed-by: zerondesign-platform
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: zerondesign-works-root-ca
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/managed-by: zerondesign-platform
+spec:
+  secretName: zerondesign-works-root-ca
+  commonName: zeronDesign local Published Work CA
+  isCA: true
+  duration: 8760h
+  renewBeforePercentage: 10
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - cert sign
+    - crl sign
+  issuerRef:
+    name: zerondesign-works-selfsigned-bootstrap
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: zerondesign-works-ca
+  labels:
+    app.kubernetes.io/managed-by: zerondesign-platform
+spec:
+  ca:
+    secretName: zerondesign-works-root-ca
