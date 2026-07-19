@@ -35,11 +35,6 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
             "designFidelityMode must be profile_only or source_fallback".to_string(),
         ));
     }
-    optional("workspaceId", command.input_context.workspace_id.as_deref())?;
-    optional(
-        "organizationId",
-        command.input_context.organization_id.as_deref(),
-    )?;
     if let Some(model_resource_id) = command.input_context.model_resource_id.as_deref() {
         if model_resource_id.len() > 128
             || !model_resource_id.bytes().all(|byte| {

@@ -86,7 +86,7 @@ mod tests {
         );
 
         store
-            .upsert_project_access("project-1", "owner-1".to_string(), None, None)
+            .upsert_project_access("project-1", "owner-1".to_string(), "ws-test".into())
             .await
             .unwrap();
         assert_eq!(

@@ -116,7 +116,7 @@ impl PersistentStore {
     pub fn reserve_project_daily_input_tokens(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         requested_tokens: u64,
         limit: u64,
@@ -125,7 +125,7 @@ impl PersistentStore {
             self,
             reserve_project_daily_input_tokens(
                 period_utc,
-                organization_id,
+                workspace_id,
                 project_id,
                 requested_tokens,
                 limit
@@ -153,7 +153,7 @@ impl PersistentStore {
     pub fn settle_project_daily_usage(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         reserved_input_tokens: u64,
         actual_input_tokens: u64,
@@ -162,7 +162,7 @@ impl PersistentStore {
             self,
             settle_project_daily_usage(
                 period_utc,
-                organization_id,
+                workspace_id,
                 project_id,
                 reserved_input_tokens,
                 actual_input_tokens
@@ -425,11 +425,11 @@ impl SqliteStore {
             );
             CREATE TABLE IF NOT EXISTS project_daily_quota_usage (
                 period_utc TEXT NOT NULL,
-                organization_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
                 project_id TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(period_utc, organization_id, project_id)
+                PRIMARY KEY(period_utc, workspace_id, project_id)
             );
             CREATE TABLE IF NOT EXISTS project_concurrency_leases (
                 lease_id TEXT PRIMARY KEY,
@@ -689,7 +689,7 @@ impl SqliteStore {
     pub fn reserve_project_daily_input_tokens(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         requested_tokens: u64,
         limit: u64,
@@ -699,15 +699,15 @@ impl SqliteStore {
         let limit = i64::try_from(limit).map_err(|_| anyhow!("daily token limit is too large"))?;
         let affected = self.connection.execute(
             "INSERT INTO project_daily_quota_usage
-                (period_utc, organization_id, project_id, input_tokens)
+                (period_utc, workspace_id, project_id, input_tokens)
              SELECT ?1, ?2, ?3, ?4 WHERE ?4 <= ?5
-             ON CONFLICT(period_utc, organization_id, project_id) DO UPDATE SET
+             ON CONFLICT(period_utc, workspace_id, project_id) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 updated_at = CURRENT_TIMESTAMP
              WHERE input_tokens + excluded.input_tokens <= ?5",
             params![
                 period_utc,
-                organization_id,
+                workspace_id,
                 project_id,
                 requested_tokens,
                 limit
@@ -719,7 +719,7 @@ impl SqliteStore {
     pub fn settle_project_daily_usage(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         reserved_input_tokens: u64,
         actual_input_tokens: u64,
@@ -732,8 +732,8 @@ impl SqliteStore {
             "UPDATE project_daily_quota_usage
              SET input_tokens = MAX(0, input_tokens + ?4 - ?5),
                  updated_at = CURRENT_TIMESTAMP
-             WHERE period_utc = ?1 AND organization_id = ?2 AND project_id = ?3",
-            params![period_utc, organization_id, project_id, actual, reserved],
+             WHERE period_utc = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![period_utc, workspace_id, project_id, actual, reserved],
         )?;
         Ok(())
     }

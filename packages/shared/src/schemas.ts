@@ -213,30 +213,22 @@ export const DesignProfileSchemaVersionSchema = z.enum([
   "design-profile@2",
 ]);
 
-export const DesignProfileScopeSchema = z
-  .object({
-    projectId: z.string().min(1).optional(),
-    workspaceId: z.string().min(1).optional(),
-    organizationId: z.string().min(1).optional(),
-  })
-  .refine(
-    (scope) => Boolean(scope.projectId || scope.workspaceId || scope.organizationId),
-    "DesignProfile scope requires projectId, workspaceId, or organizationId",
-  );
+export const WorkspaceNamespaceSchema = z
+  .string()
+  .min(1)
+  .max(63)
+  .regex(
+    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/,
+    "workspace namespace must be a Kubernetes DNS label",
+  )
+  .refine((value) => value.startsWith("ws-"), "workspace namespace must start with ws-");
 
-export const DesignSourceScopeSchema = z
-  .object({
-    projectId: z.string().min(1).optional(),
-    workspaceId: z.string().min(1).optional(),
-    organizationId: z.string().min(1).optional(),
-  })
-  .strict()
-  .refine(
-    (scope) =>
-      [scope.projectId, scope.workspaceId, scope.organizationId].filter(Boolean)
-        .length === 1,
-    "Design source scope requires exactly one of projectId, workspaceId, or organizationId",
-  );
+export const DesignProfileScopeSchema = z.union([
+  z.object({ projectId: z.string().min(1) }).strict(),
+  z.object({ platform: z.literal(true) }).strict(),
+]);
+
+export const DesignSourceScopeSchema = DesignProfileScopeSchema;
 
 export const DesignSourceFileNameSchema = z
   .string()

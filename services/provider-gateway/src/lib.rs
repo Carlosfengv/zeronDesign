@@ -161,7 +161,6 @@ pub struct GatewayTurnRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnScope {
-    pub organization_id: String,
     pub workspace_id: String,
     pub project_id: String,
     pub run_id: String,
@@ -338,8 +337,6 @@ pub struct ModelSelectionLimits {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyScope {
-    #[serde(default)]
-    pub organization_ids: Vec<String>,
     #[serde(default)]
     pub workspace_ids: Vec<String>,
     #[serde(default)]
@@ -595,7 +592,7 @@ enum IdempotencyEntry {
 
 struct PolicyQuotaLease {
     period_utc: String,
-    organization_id: String,
+    workspace_id: String,
     project_id: String,
     reserved_input_tokens: u64,
     concurrency_lease_id: Option<String>,
@@ -717,7 +714,7 @@ pub struct GitopsReconcileReport {
 }
 
 /// In-process low-cardinality metric registry.  Deliberately do not include
-/// organization, project, run, or request identifiers in any metric key.
+/// workspace, project, run, or request identifiers in any metric key.
 #[derive(Default)]
 struct GatewayMetrics {
     counters: BTreeMap<MetricKey, u64>,
@@ -1476,7 +1473,7 @@ impl GatewayService {
                 .await
                 .reserve_project_daily_input_tokens(
                     &period_utc,
-                    &request.scope.organization_id,
+                    &request.scope.workspace_id,
                     &request.scope.project_id,
                     estimated_input_tokens,
                     limit,
@@ -1507,7 +1504,7 @@ impl GatewayService {
             if limit == 0 {
                 self.release_policy_quota_reservation(
                     &period_utc,
-                    &request.scope.organization_id,
+                    &request.scope.workspace_id,
                     &request.scope.project_id,
                     reserved_input_tokens,
                     request,
@@ -1523,7 +1520,7 @@ impl GatewayService {
             }
             let key = format!(
                 "{}:{}:{}:{}",
-                policy.id, policy.revision, request.scope.organization_id, request.scope.project_id
+                policy.id, policy.revision, request.scope.workspace_id, request.scope.project_id
             );
             let lease_id = format!(
                 "{}:{}:{}",
@@ -1550,7 +1547,7 @@ impl GatewayService {
             if !acquired {
                 self.release_policy_quota_reservation(
                     &period_utc,
-                    &request.scope.organization_id,
+                    &request.scope.workspace_id,
                     &request.scope.project_id,
                     reserved_input_tokens,
                     request,
@@ -1571,7 +1568,7 @@ impl GatewayService {
         };
         Ok(PolicyQuotaLease {
             period_utc,
-            organization_id: request.scope.organization_id.clone(),
+            workspace_id: request.scope.workspace_id.clone(),
             project_id: request.scope.project_id.clone(),
             reserved_input_tokens,
             concurrency_lease_id,
@@ -1591,7 +1588,7 @@ impl GatewayService {
                 .await
                 .settle_project_daily_usage(
                     &lease.period_utc,
-                    &lease.organization_id,
+                    &lease.workspace_id,
                     &lease.project_id,
                     lease.reserved_input_tokens,
                     usage.input_tokens,
@@ -1636,7 +1633,7 @@ impl GatewayService {
     async fn release_policy_quota_reservation(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         reserved_input_tokens: u64,
         request: &GatewayTurnRequest,
@@ -1650,7 +1647,7 @@ impl GatewayService {
             .await
             .settle_project_daily_usage(
                 period_utc,
-                organization_id,
+                workspace_id,
                 project_id,
                 reserved_input_tokens,
                 0,
@@ -1673,7 +1670,7 @@ impl GatewayService {
     ) -> std::result::Result<(), GatewayApiError> {
         self.release_policy_quota_reservation(
             &lease.period_utc,
-            &lease.organization_id,
+            &lease.workspace_id,
             &lease.project_id,
             lease.reserved_input_tokens,
             request,
@@ -1747,12 +1744,6 @@ impl GatewayService {
                     .iter()
                     .any(|workspace_id| workspace_id == &scope.workspace_id)
                     as u8;
-                let org_specific = policy
-                    .scope
-                    .organization_ids
-                    .iter()
-                    .any(|organization_id| organization_id == &scope.organization_id)
-                    as u8;
                 let phase_specific = policy
                     .applies_to
                     .phases
@@ -1767,7 +1758,6 @@ impl GatewayService {
                 (
                     project_specific,
                     workspace_specific,
-                    org_specific,
                     phase_specific,
                     profile_specific,
                     policy.revision,
@@ -3778,14 +3768,17 @@ fn validate_model_selection_policy(
     }
     if policy
         .scope
-        .organization_ids
+        .workspace_ids
         .iter()
-        .chain(&policy.scope.workspace_ids)
-        .chain(&policy.scope.project_ids)
-        .any(|id| id.trim().is_empty())
+        .any(|id| !is_workspace_namespace(id))
+        || policy
+            .scope
+            .project_ids
+            .iter()
+            .any(|id| id.trim().is_empty())
     {
         return Err(anyhow!(
-            "model selection policy scope contains an empty identifier"
+            "model selection policy scope contains an invalid identifier"
         ));
     }
     let allowed_phases = ["brief", "build", "repair", "review", "edit", "export"];
@@ -3852,8 +3845,7 @@ fn validate_turn_request(request: &GatewayTurnRequest) -> std::result::Result<()
     if request.schema_version != TURN_REQUEST_SCHEMA
         || request.request_id.trim().is_empty()
         || request.idempotency_key.trim().is_empty()
-        || request.scope.organization_id.trim().is_empty()
-        || request.scope.workspace_id.trim().is_empty()
+        || !is_workspace_namespace(&request.scope.workspace_id)
         || request.scope.project_id.trim().is_empty()
         || request.scope.run_id.trim().is_empty()
         || request.scope.agent_profile.trim().is_empty()
@@ -3934,6 +3926,16 @@ fn validate_turn_request(request: &GatewayTurnRequest) -> std::result::Result<()
         ));
     }
     Ok(())
+}
+
+fn is_workspace_namespace(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (4..=63).contains(&bytes.len())
+        && value.starts_with("ws-")
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 fn provider_call_timeout(
@@ -4022,12 +4024,6 @@ fn json_within_limits(value: &Value, depth: usize) -> bool {
 }
 
 fn policy_matches_turn(policy: &ModelSelectionPolicy, scope: &TurnScope) -> bool {
-    let org_matches = policy.scope.organization_ids.is_empty()
-        || policy
-            .scope
-            .organization_ids
-            .iter()
-            .any(|organization_id| organization_id == &scope.organization_id);
     let project_matches = policy.scope.project_ids.is_empty()
         || policy
             .scope
@@ -4052,7 +4048,7 @@ fn policy_matches_turn(policy: &ModelSelectionPolicy, scope: &TurnScope) -> bool
             .agent_profiles
             .iter()
             .any(|profile| profile == &scope.agent_profile);
-    org_matches && workspace_matches && project_matches && phase_matches && profile_matches
+    workspace_matches && project_matches && phase_matches && profile_matches
 }
 
 fn capabilities_match(resource: &ModelResource, required: &RequiredCapabilities) -> bool {
@@ -4117,8 +4113,7 @@ fn readiness_probe_request(resource: &ModelResource) -> GatewayTurnRequest {
         idempotency_key: format!("readiness-{}-{}", resource.id, resource.revision),
         deadline_at: (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
         scope: TurnScope {
-            organization_id: "provider-gateway-admin".to_string(),
-            workspace_id: "provider-gateway-admin".to_string(),
+            workspace_id: "ws-provider-admin".to_string(),
             project_id: "provider-gateway-readiness".to_string(),
             run_id: format!("readiness-{}-{}", resource.id, resource.revision),
             turn: 1,
@@ -4898,8 +4893,7 @@ mod tests {
             id: "policy-1".to_string(),
             revision: 1,
             scope: PolicyScope {
-                organization_ids: vec!["org-1".to_string()],
-                workspace_ids: vec!["workspace-1".to_string()],
+                workspace_ids: vec!["ws-one".to_string()],
                 project_ids: vec!["project-1".to_string()],
             },
             applies_to: PolicyApplicability::default(),
@@ -4923,8 +4917,7 @@ mod tests {
             idempotency_key: "run-1:turn-1".to_string(),
             deadline_at: (Utc::now() + chrono::Duration::minutes(2)).to_rfc3339(),
             scope: TurnScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
                 run_id: "run-1".to_string(),
                 turn: 1,
@@ -5521,7 +5514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_scoped_policy_overrides_an_organization_default() {
+    async fn workspace_scoped_policy_overrides_a_platform_default() {
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_openai))
             .with_state(Arc::new(AtomicUsize::new(0)));
@@ -5530,10 +5523,10 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         unsafe { env::set_var("PROVIDER_GATEWAY_TEST_KEY", "test-key") };
 
-        let mut organization_default = policy();
-        organization_default.id = "organization-default".to_string();
-        organization_default.scope.workspace_ids.clear();
-        organization_default.scope.project_ids.clear();
+        let mut platform_default = policy();
+        platform_default.id = "platform-default".to_string();
+        platform_default.scope.workspace_ids.clear();
+        platform_default.scope.project_ids.clear();
         let mut workspace_policy = policy();
         workspace_policy.id = "workspace-override".to_string();
         workspace_policy.scope.project_ids.clear();
@@ -5555,7 +5548,7 @@ mod tests {
                 resource("allowed", format!("http://{address}")),
                 resource("workspace-model", format!("http://{address}")),
             ],
-            policies: vec![organization_default, workspace_policy],
+            policies: vec![platform_default, workspace_policy],
         })
         .unwrap();
 

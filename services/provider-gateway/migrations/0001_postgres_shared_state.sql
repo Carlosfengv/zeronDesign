@@ -78,11 +78,11 @@ CREATE TABLE IF NOT EXISTS model_resource_health (
 
 CREATE TABLE IF NOT EXISTS project_daily_quota_usage (
     period_utc TEXT NOT NULL,
-    organization_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     input_tokens BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (period_utc, organization_id, project_id)
+    PRIMARY KEY (period_utc, workspace_id, project_id)
 );
 
 CREATE TABLE IF NOT EXISTS project_concurrency_leases (

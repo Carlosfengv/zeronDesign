@@ -726,15 +726,11 @@ describe("shared schemas", () => {
         inputContext: {
           briefId: "brief-1",
           designProfileId: "design-profile-1",
-          workspaceId: "workspace-1",
-          organizationId: "org-1",
         },
       }).inputContext,
     ).toMatchObject({
       briefId: "brief-1",
       designProfileId: "design-profile-1",
-      workspaceId: "workspace-1",
-      organizationId: "org-1",
     });
     expect(() =>
       StartRunRequestSchema.parse({

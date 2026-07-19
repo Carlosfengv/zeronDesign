@@ -111,8 +111,7 @@ async fn http_model_gateway_client_posts_versioned_scoped_turn_request() {
                 deferred_tools: vec![],
             },
             ModelGatewayScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
             },
         )
@@ -121,8 +120,7 @@ async fn http_model_gateway_client_posts_versioned_scoped_turn_request() {
 
     let request = captured_request.lock().await.clone().unwrap();
     assert_eq!(request["schemaVersion"], "provider-gateway-turn-request@1");
-    assert_eq!(request["scope"]["organizationId"], "org-1");
-    assert_eq!(request["scope"]["workspaceId"], "workspace-1");
+    assert_eq!(request["scope"]["workspaceId"], "ws-one");
     assert_eq!(request["scope"]["projectId"], "project-1");
     assert_eq!(request["scope"]["runId"], "run-1");
     assert_eq!(request["routing"]["modelResourceId"], Value::Null);
@@ -155,8 +153,7 @@ async fn http_model_gateway_client_passes_explicit_model_resource_to_gateway_pol
                 deferred_tools: vec![],
             },
             ModelGatewayScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
             },
         )
@@ -219,8 +216,7 @@ async fn runtime_gateway_provider_round_trip_preserves_governed_selection_bounda
         id: "website-edit-policy".to_string(),
         revision: 2,
         scope: PolicyScope {
-            organization_ids: vec!["org-1".to_string()],
-            workspace_ids: vec!["workspace-1".to_string()],
+            workspace_ids: vec!["ws-one".to_string()],
             project_ids: vec!["project-1".to_string()],
         },
         applies_to: PolicyApplicability {
@@ -266,8 +262,7 @@ async fn runtime_gateway_provider_round_trip_preserves_governed_selection_bounda
                 deferred_tools: vec![],
             },
             ModelGatewayScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
             },
         )
@@ -365,8 +360,7 @@ async fn http_model_gateway_client_retries_retryable_gateway_failures() {
                 deferred_tools: vec![],
             },
             ModelGatewayScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
             },
         )
@@ -394,8 +388,7 @@ async fn http_model_gateway_client_retries_internal_transport_errors() {
                 deferred_tools: vec![],
             },
             ModelGatewayScope {
-                organization_id: "org-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
+                workspace_id: "ws-one".to_string(),
                 project_id: "project-1".to_string(),
             },
         )

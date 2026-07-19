@@ -318,7 +318,7 @@ impl PostgresStore {
     pub fn reserve_project_daily_input_tokens(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         requested_tokens: u64,
         limit: u64,
@@ -328,21 +328,15 @@ impl PostgresStore {
             let limit = to_i64(limit, "daily token limit")?;
             let affected = client.execute(
                 "INSERT INTO project_daily_quota_usage
-                    (period_utc, organization_id, project_id, input_tokens)
+                    (period_utc, workspace_id, project_id, input_tokens)
                  SELECT $1::text, $2::text, $3::text, $4::bigint
                  WHERE $4::bigint <= $5::bigint
-                 ON CONFLICT (period_utc, organization_id, project_id) DO UPDATE SET
+                 ON CONFLICT (period_utc, workspace_id, project_id) DO UPDATE SET
                     input_tokens = project_daily_quota_usage.input_tokens + EXCLUDED.input_tokens,
                     updated_at = CURRENT_TIMESTAMP
                  WHERE project_daily_quota_usage.input_tokens + EXCLUDED.input_tokens
                        <= $5::bigint",
-                &[
-                    &period_utc,
-                    &organization_id,
-                    &project_id,
-                    &requested,
-                    &limit,
-                ],
+                &[&period_utc, &workspace_id, &project_id, &requested, &limit],
             )?;
             Ok(affected == 1)
         })
@@ -402,7 +396,7 @@ impl PostgresStore {
     pub fn settle_project_daily_usage(
         &self,
         period_utc: &str,
-        organization_id: &str,
+        workspace_id: &str,
         project_id: &str,
         reserved_input_tokens: u64,
         actual_input_tokens: u64,
@@ -414,14 +408,8 @@ impl PostgresStore {
                 "UPDATE project_daily_quota_usage
                  SET input_tokens = GREATEST(0, input_tokens + $4 - $5),
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE period_utc = $1 AND organization_id = $2 AND project_id = $3",
-                &[
-                    &period_utc,
-                    &organization_id,
-                    &project_id,
-                    &actual,
-                    &reserved,
-                ],
+                 WHERE period_utc = $1 AND workspace_id = $2 AND project_id = $3",
+                &[&period_utc, &workspace_id, &project_id, &actual, &reserved],
             )?;
             Ok(())
         })

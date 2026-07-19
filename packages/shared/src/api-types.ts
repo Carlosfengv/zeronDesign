@@ -14,6 +14,7 @@ import {
   DesignSourceFileNameSchema,
   DesignSourceScopeSchema,
   ProjectVersionStatusSchema,
+  WorkspaceNamespaceSchema,
 } from "./schemas.js";
 
 export const ContentSourceSchema = z.object({
@@ -37,8 +38,6 @@ export const StartRunRequestSchema = z
         parentRunId: z.string().min(1).optional(),
         designProfileId: z.string().min(1).optional(),
         designFidelityMode: z.enum(["profile_only", "source_fallback"]).optional(),
-        workspaceId: z.string().min(1).optional(),
-        organizationId: z.string().min(1).optional(),
         findingIds: z.array(z.string().min(1)).optional(),
       })
       .default({}),
@@ -653,18 +652,16 @@ export const HealthResponseSchema = z.object({
 
 export const UpsertProjectAccessRequestSchema = z.object({
   ownerPrincipalId: z.string().min(1),
-  workspaceId: z.string().min(1).optional(),
-  organizationId: z.string().min(1).optional(),
-});
+  workspaceNamespace: WorkspaceNamespaceSchema,
+}).strict();
 
 export const ProjectAccessRecordSchema = z.object({
   projectId: z.string().min(1),
   ownerPrincipalId: z.string().min(1),
-  workspaceId: z.string().min(1).nullable().optional(),
-  organizationId: z.string().min(1).nullable().optional(),
+  workspaceNamespace: WorkspaceNamespaceSchema,
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
-});
+}).strict();
 
 export const ProjectAccessResponseSchema = z.object({
   projectAccess: ProjectAccessRecordSchema,

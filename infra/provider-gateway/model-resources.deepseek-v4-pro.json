@@ -38,7 +38,6 @@
       "id": "local-deepseek-v4-pro-default",
       "revision": 3,
       "scope": {
-        "organizationIds": [],
         "workspaceIds": [],
         "projectIds": []
       },

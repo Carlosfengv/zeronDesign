@@ -10,8 +10,7 @@
     "scope": {
       "type": "object",
       "properties": {
-        "organizationIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "workspaceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "workspaceIds": { "type": "array", "items": { "type": "string", "pattern": "^ws-[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", "maxLength": 63 } },
         "projectIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },

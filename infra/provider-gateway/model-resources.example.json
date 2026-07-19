@@ -38,8 +38,7 @@
       "id": "website-generation-default",
       "revision": 3,
       "scope": {
-        "organizationIds": ["org-1"],
-        "workspaceIds": ["workspace-1"],
+        "workspaceIds": ["ws-example"],
         "projectIds": []
       },
       "appliesTo": {

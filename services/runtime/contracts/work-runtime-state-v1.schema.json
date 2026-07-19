@@ -4,10 +4,11 @@
   "title": "WorkRuntimeState v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "projectId", "desiredPublication", "desiredReleaseId", "currentReleaseId", "previousReleaseId", "lastSuccessfulReleaseId", "desiredGeneration", "hostSlug", "runtimeProfileId", "currentDeploymentName", "previousDeploymentName", "serviceName", "ingressName", "deploymentUid", "deploymentResourceVersion", "serviceUid", "serviceResourceVersion", "ingressUid", "ingressResourceVersion", "observedGeneration", "status", "lastError", "createdAt", "updatedAt"],
+  "required": ["schemaVersion", "projectId", "workspaceNamespace", "desiredPublication", "desiredReleaseId", "currentReleaseId", "previousReleaseId", "lastSuccessfulReleaseId", "desiredGeneration", "hostSlug", "runtimeProfileId", "currentDeploymentName", "previousDeploymentName", "serviceName", "ingressName", "deploymentUid", "deploymentResourceVersion", "serviceUid", "serviceResourceVersion", "ingressUid", "ingressResourceVersion", "observedGeneration", "status", "lastError", "createdAt", "updatedAt"],
   "properties": {
     "schemaVersion": { "const": "work-runtime-state@1" },
     "projectId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "workspaceNamespace": { "type": "string", "pattern": "^ws-[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", "maxLength": 63 },
     "desiredPublication": { "enum": ["unpublished", "published"] },
     "desiredReleaseId": { "type": ["string", "null"] },
     "currentReleaseId": { "type": ["string", "null"] },

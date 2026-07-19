@@ -313,8 +313,7 @@ pub struct ProjectRuntimeState {
 pub struct ProjectAccessRecord {
     pub project_id: String,
     pub owner_principal_id: String,
-    pub workspace_id: Option<String>,
-    pub organization_id: Option<String>,
+    pub workspace_namespace: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -679,12 +678,7 @@ impl DesignProfile {
         if self.version == 0 {
             return Err("version must be positive".to_string());
         }
-        if object_string(&self.scope, "projectId").is_none()
-            && object_string(&self.scope, "workspaceId").is_none()
-            && object_string(&self.scope, "organizationId").is_none()
-        {
-            return Err("scope requires projectId, workspaceId, or organizationId".to_string());
-        }
+        validate_design_profile_scope(&self.scope)?;
         if object_string(&self.product, "name")
             .map(str::trim)
             .unwrap_or("")
@@ -742,12 +736,8 @@ impl DesignProfile {
         object_string(&self.scope, "projectId")
     }
 
-    pub fn workspace_id(&self) -> Option<&str> {
-        object_string(&self.scope, "workspaceId")
-    }
-
-    pub fn organization_id(&self) -> Option<&str> {
-        object_string(&self.scope, "organizationId")
+    pub fn is_platform_scope(&self) -> bool {
+        self.scope.get("platform").and_then(Value::as_bool) == Some(true)
     }
 
     pub fn stable_hash(&self) -> String {
@@ -1344,28 +1334,45 @@ fn object_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 pub fn validate_design_source_scope(scope: &Value) -> Result<(), String> {
+    validate_design_profile_scope(scope)
+}
+
+pub fn validate_design_profile_scope(scope: &Value) -> Result<(), String> {
     let object = scope
         .as_object()
         .ok_or_else(|| "scope must be an object".to_string())?;
-    let known = ["projectId", "workspaceId", "organizationId"];
+    let known = ["projectId", "platform"];
     if object.keys().any(|key| !known.contains(&key.as_str())) {
         return Err("scope contains unsupported fields".to_string());
     }
-    let mut populated = Vec::new();
-    for key in known {
-        let Some(value) = object.get(key) else {
-            continue;
-        };
-        let value = value
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("scope.{key} must be a non-empty string"))?;
-        populated.push(value);
+    match (object.get("projectId"), object.get("platform")) {
+        (Some(project_id), None)
+            if project_id
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty()) =>
+        {
+            Ok(())
+        }
+        (None, Some(Value::Bool(true))) => Ok(()),
+        _ => Err("scope requires exactly one of projectId or platform=true".to_string()),
     }
-    if populated.len() != 1 {
+}
+
+pub fn validate_workspace_namespace(namespace: &str) -> Result<(), String> {
+    if namespace.len() < 4 || namespace.len() > 63 || !namespace.starts_with("ws-") {
         return Err(
-            "scope requires exactly one of projectId, workspaceId, or organizationId".to_string(),
+            "workspaceNamespace must be a 4-63 character Kubernetes namespace starting with ws-"
+                .to_string(),
         );
+    }
+    let bytes = namespace.as_bytes();
+    if !bytes[0].is_ascii_lowercase()
+        || !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err("workspaceNamespace must be a Kubernetes DNS label".to_string());
     }
     Ok(())
 }

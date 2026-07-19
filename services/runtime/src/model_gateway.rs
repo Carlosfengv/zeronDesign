@@ -107,7 +107,6 @@ pub struct ModelRequest {
 /// Direct provider clients deliberately ignore it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelGatewayScope {
-    pub organization_id: String,
     pub workspace_id: String,
     pub project_id: String,
 }
@@ -423,7 +422,6 @@ impl HttpModelGatewayClient {
             "idempotencyKey": format!("{}:turn-{}", request.run_id, request.turn),
             "deadlineAt": (Utc::now() + ChronoDuration::from_std(self.request_timeout).unwrap_or_else(|_| ChronoDuration::seconds(180))).to_rfc3339(),
             "scope": {
-                "organizationId": scope.organization_id,
                 "workspaceId": scope.workspace_id,
                 "projectId": scope.project_id,
                 "runId": request.run_id,

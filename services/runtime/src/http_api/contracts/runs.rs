@@ -23,8 +23,6 @@ pub struct StartRunInputContext {
     pub parent_run_id: Option<String>,
     pub design_profile_id: Option<String>,
     pub design_fidelity_mode: Option<String>,
-    pub workspace_id: Option<String>,
-    pub organization_id: Option<String>,
     #[serde(default)]
     pub model_resource_id: Option<String>,
     #[serde(default)]
@@ -45,8 +43,6 @@ impl From<StartRunRequest> for crate::run_lifecycle::StartRunCommand {
                 parent_run_id: request.input_context.parent_run_id,
                 design_profile_id: request.input_context.design_profile_id,
                 design_fidelity_mode: request.input_context.design_fidelity_mode,
-                workspace_id: request.input_context.workspace_id,
-                organization_id: request.input_context.organization_id,
                 model_resource_id: request.input_context.model_resource_id,
                 finding_ids: request.input_context.finding_ids,
             },

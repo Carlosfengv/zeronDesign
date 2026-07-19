@@ -10,10 +10,9 @@
     "deadlineAt": { "type": "string", "format": "date-time" },
     "scope": {
       "type": "object",
-      "required": ["organizationId", "workspaceId", "projectId", "runId", "turn", "phase", "agentProfile"],
+      "required": ["workspaceId", "projectId", "runId", "turn", "phase", "agentProfile"],
       "properties": {
-        "organizationId": { "type": "string", "minLength": 1 },
-        "workspaceId": { "type": "string", "minLength": 1 },
+        "workspaceId": { "type": "string", "pattern": "^ws-[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", "maxLength": 63 },
         "projectId": { "type": "string", "minLength": 1 },
         "runId": { "type": "string", "minLength": 1 },
         "turn": { "type": "integer", "minimum": 1 },
