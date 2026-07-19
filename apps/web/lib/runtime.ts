@@ -22,9 +22,13 @@ export type RuntimePrincipalContext = {
 };
 
 export function runtimeClient(principal?: RuntimePrincipalContext) {
+  const internalAdminToken = process.env.RUNTIME_INTERNAL_ADMIN_TOKEN?.trim();
+  if (!principal && !internalAdminToken) {
+    throw new Error("RUNTIME_INTERNAL_ADMIN_TOKEN is required for internal Runtime operations");
+  }
   return createRuntimeClient({
     baseUrl: runtimeBaseUrl(),
-    internalAdminToken: process.env.RUNTIME_INTERNAL_ADMIN_TOKEN?.trim(),
+    internalAdminToken: principal ? undefined : internalAdminToken,
     publicPrincipalToken: principal ? issueRuntimePrincipal(principal) : undefined,
   });
 }

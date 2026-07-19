@@ -17,7 +17,7 @@ export async function POST(
   try {
     const ownerId = await requireUserId();
     const { projectId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const input = CreateReleaseSchema.parse(await request.json());
     const readClient = runtimeClient({
@@ -38,7 +38,7 @@ export async function POST(
       { runtimeProfileId: "static-web-v1" },
       `release:${project.id}:${versionId}:${randomUUID()}`,
     );
-    recordReleasePackaging({
+    await recordReleasePackaging({
       projectId: project.id,
       versionId,
       releaseId: result.release.id,

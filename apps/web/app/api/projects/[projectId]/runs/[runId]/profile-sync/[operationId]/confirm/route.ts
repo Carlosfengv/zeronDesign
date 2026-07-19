@@ -13,8 +13,8 @@ export async function POST(
   try {
     const ownerId = await requireUserId();
     const { projectId, runId, operationId } = await context.params;
-    const project = getProject(projectId, ownerId);
-    if (!project || !ownsProjectRun({ projectId: project.id, runId, ownerId })) {
+    const project = await getProject(projectId, ownerId);
+    if (!project || !(await ownsProjectRun({ projectId: project.id, runId, ownerId }))) {
       return Response.json({ error: "run not found" }, { status: 404 });
     }
     const input = ConfirmDesignProfileSyncRequestSchema.parse(await request.json());
@@ -24,7 +24,7 @@ export async function POST(
       operations: ["project.write"],
     }).confirmDesignProfileSync(runId, operationId, input);
     if (operation.childRunId) {
-      recordProjectRun({
+      await recordProjectRun({
         runId: operation.childRunId,
         projectId: project.id,
         phase: "edit",

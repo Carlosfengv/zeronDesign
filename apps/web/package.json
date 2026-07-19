@@ -15,14 +15,19 @@
   "dependencies": {
     "@zerondesign/shared": "file:../../packages/shared",
     "next": "16.2.10",
+    "pg": "^8.22.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
   }
 }

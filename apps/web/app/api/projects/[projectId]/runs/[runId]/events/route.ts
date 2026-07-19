@@ -13,8 +13,8 @@ export async function GET(
   try {
     const ownerId = await requireUserId();
     const { projectId, runId } = await context.params;
-    const project = getProject(projectId, ownerId);
-    if (!project || !ownsProjectRun({ projectId, runId, ownerId })) {
+    const project = await getProject(projectId, ownerId);
+    if (!project || !(await ownsProjectRun({ projectId, runId, ownerId }))) {
       return Response.json({ error: "run not found" }, { status: 404 });
     }
     const lastEventId = request.headers.get("last-event-id");

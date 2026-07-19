@@ -13,7 +13,7 @@ export async function GET(
     const ownerId = await requireUserId();
     const { briefId } = await context.params;
     const projectId = new URL(request.url).searchParams.get("projectId") ?? "";
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) {
       return Response.json({ error: "brief not found" }, { status: 404 });
     }

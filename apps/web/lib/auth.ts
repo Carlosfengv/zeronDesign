@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
 
 export class AuthenticationRequiredError extends Error {}
+export class AuthorizationForbiddenError extends Error {}
 
 type SessionPayload = { sub: string; exp: number };
 
@@ -16,6 +17,20 @@ export async function requireUserId(): Promise<string> {
   const developmentUser = process.env.ZERONDESIGN_DEV_USER_ID?.trim();
   if (process.env.NODE_ENV !== "production" && developmentUser) return developmentUser;
   throw new AuthenticationRequiredError("authentication required");
+}
+
+export async function requirePlatformAdminId(): Promise<string> {
+  const userId = await requireUserId();
+  const administrators = new Set(
+    (process.env.ZERONDESIGN_PLATFORM_ADMIN_IDS ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  if (!administrators.has(userId)) {
+    throw new AuthorizationForbiddenError("platform administrator authorization required");
+  }
+  return userId;
 }
 
 export function issueSession(userId: string, expiresAt: Date, secret: string): string {

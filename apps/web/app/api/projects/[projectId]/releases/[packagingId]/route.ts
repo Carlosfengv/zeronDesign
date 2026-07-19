@@ -13,7 +13,7 @@ export async function GET(
   try {
     const ownerId = await requireUserId();
     const { projectId, packagingId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const client = runtimeClient({
       userId: ownerId,
@@ -24,7 +24,7 @@ export async function GET(
     if (result.release.projectId !== project.runtimeProjectId) {
       return Response.json({ error: "release packaging not found" }, { status: 404 });
     }
-    updatePublicationJob({
+    await updatePublicationJob({
       projectId: project.id,
       status: result.packaging.status,
       lastError: result.packaging.lastError,

@@ -27,7 +27,7 @@ export async function GET(
   try {
     const ownerId = await requireUserId();
     const { projectId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const client = runtimeClient({
       userId: ownerId,
@@ -41,7 +41,7 @@ export async function GET(
     } catch (error) {
       if (!(error instanceof RuntimeApiError) || error.status !== 404) throw error;
     }
-    const job = getPublicationJob(project.id);
+    const job = await getPublicationJob(project.id);
     const activeJob = job && !["completed", "failed", "cancelled"].includes(job.status)
       ? job
       : null;
@@ -62,7 +62,7 @@ export async function POST(
   try {
     const ownerId = await requireUserId();
     const { projectId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const input = PublicationActionSchema.parse(await request.json());
     const readClient = runtimeClient({
@@ -84,7 +84,7 @@ export async function POST(
       projectId: project.runtimeProjectId,
       operations: ["publication.write"],
     });
-    const previousJob = getPublicationJob(project.id);
+    const previousJob = await getPublicationJob(project.id);
     const requestedReleaseId = input.action === "unpublish" ? undefined : input.releaseId;
     const reusableIntent = previousJob?.phase === "publication"
       && previousJob.status === "requesting"
@@ -99,7 +99,7 @@ export async function POST(
       currentReleaseId = previousJob.expectedCurrentReleaseId;
       expectedGeneration = previousJob.expectedGeneration!;
     } else {
-      recordPublicationIntent({
+      await recordPublicationIntent({
         projectId: project.id,
         action: input.action,
         releaseId: requestedReleaseId,
@@ -121,7 +121,7 @@ export async function POST(
         },
         idempotencyKey,
       );
-      recordPublicationOperation({
+      await recordPublicationOperation({
         projectId: project.id,
         action: input.action,
         operationId: result.operation.id,
@@ -142,7 +142,7 @@ export async function POST(
     const result = input.action === "rollback"
       ? await writeClient.rollbackWork(project.runtimeProjectId, publicationRequest, idempotencyKey)
       : await writeClient.publishWork(project.runtimeProjectId, publicationRequest, idempotencyKey);
-    recordPublicationOperation({
+    await recordPublicationOperation({
       projectId: project.id,
       action: input.action,
       releaseId: input.releaseId,

@@ -15,7 +15,7 @@ export async function POST(
   try {
     const ownerId = await requireUserId();
     const { projectId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const { message } = StartEditSchema.parse(await request.json());
     const readClient = runtimeClient({
@@ -38,7 +38,7 @@ export async function POST(
         sandboxBindingId: state.sandboxBindingId,
       },
     });
-    recordProjectRun({ runId: started.runId, projectId: project.id, phase: "edit" });
+    await recordProjectRun({ runId: started.runId, projectId: project.id, phase: "edit" });
     const resumed = await writeClient.continueRun(started.runId, { userMessage: message });
     return Response.json(resumed, { status: 202 });
   } catch (error) {

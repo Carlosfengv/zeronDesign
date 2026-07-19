@@ -15,7 +15,7 @@ export async function GET(
   try {
     const ownerId = await requireUserId();
     const { projectId, versionId, artifactPath = [] } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "version not found" }, { status: 404 });
     const principal = {
       userId: ownerId,

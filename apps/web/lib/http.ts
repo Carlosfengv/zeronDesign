@@ -1,10 +1,24 @@
-import { AuthenticationRequiredError } from "./auth";
+import { AuthenticationRequiredError, AuthorizationForbiddenError } from "./auth";
+import { WorkspaceUnavailableError } from "./db";
+import { ProjectNotFoundError, ProjectRegistrationIncompleteError } from "./project-access";
 import { RuntimeApiError } from "@zerondesign/shared";
 import { ZodError } from "zod";
 
 export function apiError(error: unknown): Response {
   if (error instanceof AuthenticationRequiredError) {
     return Response.json({ error: error.message }, { status: 401 });
+  }
+  if (error instanceof AuthorizationForbiddenError) {
+    return Response.json({ error: error.message }, { status: 403 });
+  }
+  if (error instanceof ProjectNotFoundError) {
+    return Response.json({ error: error.message }, { status: 404 });
+  }
+  if (error instanceof ProjectRegistrationIncompleteError) {
+    return Response.json({ error: error.message }, { status: 409 });
+  }
+  if (error instanceof WorkspaceUnavailableError) {
+    return Response.json({ error: error.message }, { status: 403 });
   }
   if (error instanceof RuntimeApiError) {
     const errorCode = runtimeErrorCode(error.payload);

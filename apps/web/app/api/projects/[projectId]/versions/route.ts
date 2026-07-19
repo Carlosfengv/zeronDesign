@@ -14,7 +14,7 @@ export async function GET(
   try {
     const ownerId = await requireUserId();
     const { projectId } = await context.params;
-    const project = getProject(projectId, ownerId);
+    const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
     const client = runtimeClient({
       userId: ownerId,
@@ -22,7 +22,7 @@ export async function GET(
       operations: ["project.read", "preview.read"],
     });
     const conversation = await client.getConversation(project.runtimeProjectId);
-    const versionIds = new Set(listProjectVersionIds(project.id));
+    const versionIds = new Set(await listProjectVersionIds(project.id));
     for (const item of conversation.items) {
       const versionId = versionIdFromConversation(item);
       if (versionId) versionIds.add(versionId);
@@ -39,7 +39,7 @@ export async function GET(
       await Promise.all([...versionIds].map(async (versionId) => {
         try {
           const version = await client.getPreviewVersion(project.runtimeProjectId, versionId);
-          recordProjectVersion({ projectId: project.id, versionId, status: version.status });
+          await recordProjectVersion({ projectId: project.id, versionId, status: version.status });
           return {
             ...version,
             current: versionId === currentVersionId,
