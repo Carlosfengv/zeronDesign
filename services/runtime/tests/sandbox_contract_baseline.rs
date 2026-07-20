@@ -1,7 +1,7 @@
 use anydesign_runtime::tools::sandbox::sandbox_tools;
 use sha2::{Digest, Sha256};
 
-const SANDBOX_TOOL_CONTRACT_V2: &[(&str, &str)] = &[
+const SANDBOX_TOOL_CONTRACT_V3: &[(&str, &str)] = &[
     (
         "fs.read",
         "5f44faa29592ec02a89e7547856c46c4d100b0a62a9866c3d05a25154d081cd9",
@@ -52,7 +52,7 @@ const SANDBOX_TOOL_CONTRACT_V2: &[(&str, &str)] = &[
     ),
     (
         "project.init",
-        "7efdb0f4172e80528a487cb72726a9b1da76d8b14c1da3110d49d5443063d981",
+        "8781ebd697ac4f523326a58ddb0cc9d32eb5ba6c9cbdf65fce8a6df5ed703a44",
     ),
     (
         "project.write_page",
@@ -73,6 +73,26 @@ const SANDBOX_TOOL_CONTRACT_V2: &[(&str, &str)] = &[
     (
         "package.install",
         "fc417296e9e1217b55d1e4f80e26196a813cd4278114775a57fe586738311791",
+    ),
+    (
+        "draft.snapshot_create",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "draft.restore",
+        "32aeb9ad4a853695425d3145ffe0708e682a361b1b8a8ca1f030e539fbb66224",
+    ),
+    (
+        "preview.dev_start",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "preview.dev_status",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "preview.dev_stop",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
     ),
     (
         "preview.rebuilding",
@@ -130,10 +150,34 @@ const SANDBOX_TOOL_CONTRACT_V2: &[(&str, &str)] = &[
         "browser.inspect",
         "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
     ),
+    (
+        "asset.import",
+        "72ddc184071956a867aa757c1aa2adabb2fe3c2a17892bc63eb634bcba051535",
+    ),
+    (
+        "asset.list",
+        "d746974fa9afd5e951f76f9af38954b0ad7f436f2120dc974da65e5ee39f856f",
+    ),
+    (
+        "asset.generate",
+        "de9e90f4abd6d9a73363613ffc023b03f5e857ffbb0db8915568a23004bd74a1",
+    ),
+    (
+        "component.search",
+        "bae96199c2ec6f8822d69811be99ff3d95382624d2d1fc4945fc1854b5bef78c",
+    ),
+    (
+        "component.inspect",
+        "a579101e8cd5fbdbc7007aa3bc749e1ab39bb8e50e82ebd23a16df96b6cd3125",
+    ),
+    (
+        "component.install",
+        "86d8d94cf19ca3a858cbe6004c674d4932ce20896b9683be5ff5badd48bdabb9",
+    ),
 ];
 
 #[test]
-fn sandbox_tool_order_and_input_schemas_match_v2_contract() {
+fn sandbox_tool_order_and_input_schemas_match_v3_contract() {
     let tools = sandbox_tools();
     let actual = tools
         .iter()
@@ -143,7 +187,7 @@ fn sandbox_tool_order_and_input_schemas_match_v2_contract() {
             (tool.name(), format!("{digest:x}"))
         })
         .collect::<Vec<_>>();
-    let expected = SANDBOX_TOOL_CONTRACT_V2
+    let expected = SANDBOX_TOOL_CONTRACT_V3
         .iter()
         .map(|(name, digest)| (*name, (*digest).to_string()))
         .collect::<Vec<_>>();

@@ -238,7 +238,7 @@ try {
     generationPrompt,
     model: process.env.DEEPSEEK_MODEL || process.env.AGENT_MODEL || "deepseek-chat",
     providerReportedModel: process.env.DEEPSEEK_RESOLVED_MODEL || null,
-    template: "astro-website",
+    template: "next-app",
     baseUrl,
     artifactUrl,
     streamLog: path.join(evidenceDir, "http-stream.log"),
@@ -278,7 +278,7 @@ function baselineConfig(preset) {
       expectedPrimaryToken: "#663af3",
       stylePatterns: [/glass|frost/i, /midnight|05060f/i],
       prompt: [
-        "Generate a single-page Astro website for a fictional authentication product called AuthKit.",
+        "Generate a single-page Next.js website for a fictional authentication product called AuthKit.",
         "Use the attached design markdown as the visual source of truth.",
         "The page content can be invented, but it must visibly follow the midnight frosted-glass cathedral direction.",
         "The build must produce a promoted artifact whose visible text includes AuthKit.",
@@ -296,7 +296,7 @@ function baselineConfig(preset) {
       expectedPrimaryToken: "#000000",
       stylePatterns: [/warm|editorial|taupe|fdfcfc/i, /voice|audio|sphere/i],
       prompt: [
-        "Generate a single-page Astro website for a fictional AI voice platform called Voxora.",
+        "Generate a single-page Next.js website for a fictional AI voice platform called Voxora.",
         "Use the attached design markdown as the visual source of truth.",
         "The page must visibly follow the warm editorial paper direction and show concrete voice or audio product evidence.",
         "The build must produce a promoted artifact whose visible text includes Voxora.",

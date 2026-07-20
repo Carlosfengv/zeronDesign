@@ -31,7 +31,7 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
     let namespace =
         std::env::var("ANYDESIGN_E2E_NAMESPACE").unwrap_or_else(|_| "ws-runtime-rc".into());
     let warm_pool = std::env::var("ANYDESIGN_E2E_WARM_POOL")
-        .unwrap_or_else(|_| "anydesign-astro-website-pool".into());
+        .unwrap_or_else(|_| "anydesign-next-app-pool".into());
     let claim_name = std::env::var("ANYDESIGN_E2E_CLAIM").unwrap_or_else(|_| {
         format!(
             "anydesign-e2e-{}",
@@ -57,13 +57,13 @@ async fn k8s_sandbox_claim_workspace_channel_smoke() {
         .await;
         kubectl_apply_in_namespace(
             &kubectl,
-            "infra/agent-sandbox/astro-website/sandbox-template.yaml",
+            "infra/agent-sandbox/next-app/sandbox-template.yaml",
             &namespace,
         )
         .await;
         kubectl_apply_in_namespace(
             &kubectl,
-            "infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml",
+            "infra/agent-sandbox/next-app/sandbox-warm-pool.yaml",
             &namespace,
         )
         .await;

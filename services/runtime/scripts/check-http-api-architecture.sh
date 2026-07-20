@@ -130,7 +130,7 @@ if grep -nE '^async fn|state\.store|\.store\.' "$HTTP_DIR/routes/internal.rs" ||
   fail "INTERNAL-001: Internal facade and Release Evidence route must delegate to use-case modules and service"
 fi
 
-for internal_use_case in template_build preview_promotion project_access release_evidence sandbox_release; do
+for internal_use_case in template_build preview_promotion project_access release_evidence sandbox_release visual_artifact; do
   if [[ ! -f "$HTTP_DIR/routes/internal/$internal_use_case.rs" ]]; then
     fail "INTERNAL-002: Internal use case route module is missing: $internal_use_case"
   fi
@@ -141,12 +141,12 @@ if grep -nE 'axum|HeaderMap|StatusCode|Router|std::fs|tokio::fs' "$RELEASE_EVIDE
 fi
 
 if grep -RInEi --include='*.rs' --exclude='artifacts.rs' \
-  'astro-website|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \
+  'next-app|fumadocs-docs|docusaurus|template[[:space:]]*==|match[[:space:]]+template' \
   "$HTTP_DIR/routes"; then
   fail "HTTP-004: route handlers contain concrete template or framework dispatch"
 fi
 
-for family in artifacts capture design_profiles design_sources internal previews projects run_events runs system; do
+for family in artifacts capture design_profiles design_sources draft_preview_events internal previews projects run_events runs system; do
   if [[ ! -f "$ROOT/services/runtime/tests/http_api/routes/$family.rs" ]]; then
     fail "HTTP-005: route family is missing an independently discovered test module: $family"
   fi

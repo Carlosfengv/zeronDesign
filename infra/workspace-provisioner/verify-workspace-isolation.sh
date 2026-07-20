@@ -10,7 +10,7 @@ source_workspace="$1"
 other_workspace="$2"
 runtime_namespace="${RUNTIME_SYSTEM_NAMESPACE:-anydesign-runtime}"
 kubectl_bin="${KUBECTL:-kubectl}"
-sandbox_image="${SANDBOX_IMAGE:-ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0}"
+sandbox_image="${SANDBOX_IMAGE:-ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0}"
 smoke_name="${WORKSPACE_ISOLATION_SMOKE_NAME:-workspace-isolation-smoke}"
 evidence_path="${WORKSPACE_ISOLATION_EVIDENCE_PATH:-}"
 client_name="${smoke_name}-runtime-client"
@@ -49,6 +49,19 @@ for workspace_namespace in "${source_workspace}" "${other_workspace}"; do
       "${workspace_namespace}" "${warm_replicas}" >&2
     exit 1
   fi
+
+  runtime_ingress_ports="$("${kubectl_bin}" get networkpolicy \
+    zerondesign-allow-runtime -n "${workspace_namespace}" \
+    -o 'jsonpath={range .spec.ingress[*].ports[*]}{.port}{"\n"}{end}' \
+    | sort -n -u)"
+  for required_port in 3000 3001 4321; do
+    if ! grep -Fxq "${required_port}" <<<"${runtime_ingress_ports}"; then
+      printf '%s Runtime ingress policy omits required Sandbox port %s; configured ports: %s\n' \
+        "${workspace_namespace}" "${required_port}" \
+        "$(tr '\n' ',' <<<"${runtime_ingress_ports}" | sed 's/,$//')" >&2
+      exit 1
+    fi
+  done
 done
 
 for workspace_namespace in "${source_workspace}" "${other_workspace}"; do
@@ -89,7 +102,7 @@ metadata:
     anydesign.dev/isolation-smoke: "true"
 spec:
   warmPoolRef:
-    name: anydesign-astro-website-pool
+    name: anydesign-next-app-pool
   lifecycle:
     ttlSecondsAfterFinished: 300
 EOF

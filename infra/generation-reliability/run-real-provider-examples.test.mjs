@@ -180,10 +180,15 @@ async function runScenario({
   let runCounter = 0;
   let briefEventRequests = 0;
   const receivedBriefPrompts = [];
+  const receivedWorkspaceNamespaces = [];
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     if (request.method === "PUT" && url.pathname.endsWith("/access")) {
-      return json(response, 200, { granted: true });
+      collectJson(request).then((body) => {
+        receivedWorkspaceNamespaces.push(body.workspaceNamespace);
+        json(response, 200, { granted: true });
+      });
+      return;
     }
     if (request.method === "POST" && url.pathname === "/runs") {
       collectJson(request).then((body) => {
@@ -216,7 +221,13 @@ async function runScenario({
         phase === "brief" && briefEventRequests++ < briefFailuresBeforeSuccess;
       const events = [
         ...(includeModelExecution
-          ? [{ type: "model.execution", snapshot: { modelResourceId: "deepseek-v4-pro" } }]
+          ? [{
+              type: "model.execution",
+              snapshot: {
+                modelResourceId: "deepseek-v4-pro",
+                providerRequestId: "provider-request-id-must-not-persist",
+              },
+            }]
           : []),
         {
           type: "model.usage",
@@ -282,6 +293,7 @@ async function runScenario({
         GENERATION_REAL_RUN_IDLE_TIMEOUT_MS: "30000",
         GENERATION_REAL_MAX_CASE_ATTEMPTS: String(maxCaseAttempts),
         GENERATION_REAL_CASE_RETRY_COOLDOWN_MS: "0",
+        GENERATION_REAL_WORKSPACE_NAMESPACE: "ws-real-provider-test",
         GENERATION_SOURCE_COMMIT: "fixture-commit",
         GENERATION_SOURCE_DIRTY: "false",
         GENERATION_PROVIDER_CONFIG_DIGEST: "a".repeat(64),
@@ -341,6 +353,13 @@ async function runScenario({
     assert.equal(caseEvidence.runs.length, expectedRunCount);
     assert.equal(caseEvidence.attempts.length, expectedAttemptCount);
     assert.ok(receivedBriefPrompts.length >= 1);
+    assert.ok(receivedWorkspaceNamespaces.length >= 1);
+    assert.ok(
+      receivedWorkspaceNamespaces.every(
+        (namespace) => namespace === "ws-real-provider-test",
+      ),
+      "runner must bind every generated project to the configured Workspace namespace",
+    );
     assert.ok(
       receivedBriefPrompts.every((prompt) => prompt === "Create a fixture artifact"),
       "runner must send the user's prompt without appending internal acceptance instructions",
@@ -351,6 +370,18 @@ async function runScenario({
       assert.equal(run.eventStream.eventCount, includeModelExecution ? 4 : 3);
       assert.equal(run.toolCalls, 1);
       assert.ok(fs.existsSync(path.join(suiteDirectory, run.eventStream.path)));
+      for (const execution of run.modelExecutions) {
+        assert.equal(execution.providerRequestId, undefined);
+        assert.equal(execution.providerRequestIdPresent, true);
+      }
+      const eventText = fs.readFileSync(
+        path.join(suiteDirectory, run.eventStream.path),
+        "utf8",
+      );
+      assert.ok(!eventText.includes("provider-request-id-must-not-persist"));
+      if (includeModelExecution) {
+        assert.ok(eventText.includes('"providerRequestIdPresent":true'));
+      }
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));

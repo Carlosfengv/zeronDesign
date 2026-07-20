@@ -40,7 +40,7 @@ function runtimeState(versionId) {
     sourceSnapshotUri: `runtime://snapshots/${versionId}`,
     sandboxBindingId: "binding-1",
     appRoot: "project",
-    templateKey: "astro-website",
+    templateKey: "next-app",
     styleContractPath: "/workspace/state/style-contract.json",
     styleContract: {
       tokenFile: "project/src/styles/tokens.css",
@@ -1399,7 +1399,7 @@ function main() {
           type: "tool.failed",
           tool: "project.build",
           toolUseId: "tool-build",
-          error: "astro: command not found",
+          error: "next: command not found",
           recoverable: true,
           metadata: {
             recoverable: true,

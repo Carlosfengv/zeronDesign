@@ -7,7 +7,7 @@ LOG_DIR="${RUNTIME_E2E_LOG_DIR:-$ROOT_DIR/.runtime-evidence/style-only-local-$TI
 FIXTURE_DIR="${RUNTIME_E2E_STYLE_FIXTURE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/runtime-style-fixture.XXXXXX")}"
 FIXTURE_PARENT="$(dirname "$FIXTURE_DIR")"
 
-mkdir -p "$FIXTURE_DIR/_astro"
+mkdir -p "$FIXTURE_DIR/_next"
 cat > "$FIXTURE_DIR/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
@@ -15,8 +15,8 @@ cat > "$FIXTURE_DIR/index.html" <<'HTML'
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Runtime Style Artifact Fixture</title>
-    <link rel="stylesheet" href="/_astro/app.css" />
-    <link rel="stylesheet" href="/_astro/../../runtime-style-escape.css" />
+    <link rel="stylesheet" href="/_next/app.css" />
+    <link rel="stylesheet" href="/_next/../../runtime-style-escape.css" />
   </head>
   <body>
     <main>
@@ -25,7 +25,7 @@ cat > "$FIXTURE_DIR/index.html" <<'HTML'
   </body>
 </html>
 HTML
-cat > "$FIXTURE_DIR/_astro/app.css" <<'CSS'
+cat > "$FIXTURE_DIR/_next/app.css" <<'CSS'
 :root {
   --runtime-primary: #f97316;
 }

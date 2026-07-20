@@ -119,7 +119,7 @@ const report = {
   parameters: {
     modelStreaming: process.env.MODEL_STREAMING || "1",
     runtimePolicy: "local-e2e",
-    template: "astro-website",
+    template: "next-app",
     viewport: "1440x1000",
   },
   groups,

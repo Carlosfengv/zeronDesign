@@ -3,6 +3,9 @@
 `provision-workspace.sh` idempotently creates one Kubernetes Namespace as one
 zeronDesign Workspace. It installs quota, limits, default-deny networking,
 namespace-scoped Runtime RBAC, Sandbox templates, and zero-replica pool objects.
+Runtime ingress is limited to the managed preview ports: Next.js Dev on `3000`,
+the authenticated Workspace Channel on `3001`, and legacy Next.js preview on
+`4321`.
 
 ```bash
 RUNTIME_SYSTEM_NAMESPACE=anydesign-runtime \
@@ -52,7 +55,8 @@ bash infra/workspace-provisioner/verify-workspace-isolation.sh \
   ws-greenfield-a ws-greenfield-b
 ```
 
-The gate cold-starts one real `SandboxClaim`, proves that the second Workspace
+The gate verifies all managed preview ports in the Runtime ingress policy,
+cold-starts one real `SandboxClaim`, proves that the second Workspace
 does not receive its Sandbox, Pod, Service, or PVC, checks namespace-scoped
 RBAC and the disabled service-account token mount, and performs a Runtime to
 Sandbox mTLS handshake with the namespace-bound SPIFFE identity. Its temporary

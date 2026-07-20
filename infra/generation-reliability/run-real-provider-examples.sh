@@ -7,18 +7,36 @@ KUBECTL="${KUBECTL:-kubectl}"
 cluster_name="${GENERATION_REAL_CLUSTER:-zerondesign-e2e}"
 context="k3d-${cluster_name}"
 namespace="anydesign-runtime"
+workspace_namespace="${GENERATION_REAL_WORKSPACE_NAMESPACE:?GENERATION_REAL_WORKSPACE_NAMESPACE must name a managed Workspace namespace}"
 cases_file="${GENERATION_REAL_CASES_FILE:-${SCRIPT_DIR}/real-provider-cases.json}"
 evidence_dir="${GENERATION_REAL_EVIDENCE_DIR:-${ROOT_DIR}/services/runtime/target/e2e-evidence/${cluster_name}/real-provider-runs}"
 runtime_port="${GENERATION_REAL_RUNTIME_PORT:-}"
 
 cd "${ROOT_DIR}"
 
-for command in "${KUBECTL}" jq node openssl curl base64; do
+for command in "${KUBECTL}" jq node curl base64 grep; do
   command -v "${command}" >/dev/null || {
     printf 'generation_real.missing_command: %s\n' "${command}" >&2
     exit 2
   }
 done
+
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
+if ! command -v "${OPENSSL_BIN}" >/dev/null \
+  || ! "${OPENSSL_BIN}" list -public-key-algorithms 2>/dev/null | grep -qi ed25519; then
+  for candidate in /opt/homebrew/bin/openssl /usr/local/bin/openssl; do
+    if [[ -x "${candidate}" ]] \
+      && "${candidate}" list -public-key-algorithms 2>/dev/null | grep -qi ed25519; then
+      OPENSSL_BIN="${candidate}"
+      break
+    fi
+  done
+fi
+if ! command -v "${OPENSSL_BIN}" >/dev/null \
+  || ! "${OPENSSL_BIN}" list -public-key-algorithms 2>/dev/null | grep -qi ed25519; then
+  printf 'generation_real.openssl_ed25519_unavailable: %s\n' "${OPENSSL_BIN}" >&2
+  exit 2
+fi
 
 [[ -f "${cases_file}" ]] || {
   printf 'real-provider case manifest does not exist: %s\n' "${cases_file}" >&2
@@ -61,6 +79,14 @@ process.stdout.write(`${budget.maxTurns} ${budget.maxToolCalls} ${budget.maxInpu
   -n "${namespace}" --timeout=180s >/dev/null
 "${KUBECTL}" --context "${context}" rollout status deployment/provider-gateway \
   -n provider-system --timeout=180s >/dev/null
+workspace_label="$("${KUBECTL}" --context "${context}" get namespace "${workspace_namespace}" \
+  -o jsonpath='{.metadata.labels.zerondesign\.dev/workspace}')"
+[[ "${workspace_label}" == "true" ]] || {
+  printf 'GENERATION_REAL_WORKSPACE_NAMESPACE is not a managed Workspace: %s\n' \
+    "${workspace_namespace}" >&2
+  exit 2
+}
+export GENERATION_REAL_WORKSPACE_NAMESPACE="${workspace_namespace}"
 
 mkdir -p "${evidence_dir}"
 RUNTIME_PROVIDER_GATEWAY_CONTEXT="${context}" \
@@ -184,9 +210,13 @@ trap cleanup EXIT
   | base64 --decode >"${admin_token_file}"
 chmod 600 "${admin_token_file}"
 
-openssl genpkey -algorithm ED25519 -out "${principal_private_key}" 2>/dev/null
-openssl pkey -in "${principal_private_key}" -pubout -outform DER \
+"${OPENSSL_BIN}" genpkey -algorithm ED25519 -out "${principal_private_key}" 2>/dev/null
+"${OPENSSL_BIN}" pkey -in "${principal_private_key}" -pubout -outform DER \
   -out "${principal_public_key}" 2>/dev/null
+[[ -s "${principal_private_key}" && -s "${principal_public_key}" ]] || {
+  printf 'generation_real.principal_key_generation_failed\n' >&2
+  exit 2
+}
 
 "${KUBECTL}" --context "${context}" create secret generic \
   anydesign-runtime-public-principal \

@@ -30,11 +30,11 @@ if ! grep -Eq 'ArtifactResolver::load_for_version' "$ARTIFACT_FILE_ADAPTER" || \
   fail "ART-003: new artifacts must resolve from the verified manifest through the file adapter"
 fi
 
-if grep -Ein 'astro|fumadocs|nextjs' "$MANIFEST" "$PUBLISHER"; then
+if grep -Ein 'next|fumadocs|nextjs' "$MANIFEST" "$PUBLISHER"; then
   fail "ART-004: generic artifact manifest/publisher code must not dispatch on frameworks"
 fi
 
-if grep -Ein '/_astro|/docs|fumadocs|astro' "$ARTIFACT_ROUTES"; then
+if grep -Ein '/_next|/docs|fumadocs|next' "$ARTIFACT_ROUTES"; then
   fail "ART-005: artifact routes must not add framework-specific paths or rewrites"
 fi
 

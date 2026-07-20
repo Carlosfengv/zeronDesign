@@ -161,7 +161,7 @@ function packageSummary() {
     declaredEnforcementMode: "enforced", effectiveCompatibilityMode: "enforced",
     enforcementPolicy: { source: "persistent", enabled: true, policyRevision: 2, policyUpdatedBy: "smoke-operator" },
     verificationPolicyId: "website-verification@1", warnings: [], surface: "website",
-    template: "astro-website", designProfileId: "profile-1", designProfileVersion: 2,
+    template: "next-app", designProfileId: "profile-1", designProfileVersion: 2,
     effectiveProfileHash: simulateProfileDrift ? HASH_E : HASH_D,
   };
 }
@@ -186,7 +186,7 @@ function profile() {
       card: { intent: "group", usage: ["list"], avoid: ["nesting"] },
       badge: { intent: "status", usage: ["state"], avoid: ["decoration"] },
     } }, content: {}, accessibility: {},
-    technical: { allowedTemplates: ["astro-website"], preferredTemplates: { website: "astro-website", docs: "fumadocs-docs" }, cssStrategy: "runtime-style-contract", dependencyPolicy: {}, filePolicy: { designProfilePath: "/workspace/inputs/design-profile.json", designMarkdownPath: "/workspace/inputs/design.md", styleContractPath: "/workspace/state/style-contract.json" } },
+    technical: { allowedTemplates: ["next-app"], preferredTemplates: { website: "next-app", docs: "fumadocs-docs" }, cssStrategy: "runtime-style-contract", dependencyPolicy: {}, filePolicy: { designProfilePath: "/workspace/inputs/design-profile.json", designMarkdownPath: "/workspace/inputs/design.md", styleContractPath: "/workspace/state/style-contract.json" } },
     governance: { conflictBehavior: "ask" }, createdAt: TIMESTAMP, updatedAt: TIMESTAMP,
   };
 }
@@ -195,7 +195,7 @@ function operation(status = "planned", childRunId = null) {
   return {
     operationId: "sync-1", status, expiresAt: TIMESTAMP, planHash: HASH_E, sourceContentHash: HASH_A,
     targetDesignProfileId: "profile-1", targetDesignProfileVersion: 2, targetEffectiveProfileHash: HASH_D,
-    styleContractIdentity: { hash: HASH_F, version: "runtime-style-contract@p3", template: "astro-website", appRoot: "project", tokenMappings: { "color.primary": "--primary" } },
+    styleContractIdentity: { hash: HASH_F, version: "runtime-style-contract@p3", template: "next-app", appRoot: "project", tokenMappings: { "color.primary": "--primary" } },
     snapshots: { baseHash: HASH_A, currentHash: HASH_B, targetHash: HASH_C },
     items: simulateProfileConflict ? [{
       token: "color.primary",
@@ -233,7 +233,7 @@ async function startRuntimeMock(requests) {
     }
     let payload;
     if (url.pathname === "/briefs/brief-1") {
-      payload = { briefId: "brief-1", projectId: smokeRuntimeProjectId, runId: "brief-run-1", status: "confirmed", runStatus: "completed", brief: { projectType: "website", audience: "test", contentHierarchy: ["hero"], pageStructure: [], visualDirection: "clear", recommendedTemplate: "astro-website", assumptions: [], missingInformation: [] } };
+      payload = { briefId: "brief-1", projectId: smokeRuntimeProjectId, runId: "brief-run-1", status: "confirmed", runStatus: "completed", brief: { projectType: "website", audience: "test", contentHierarchy: ["hero"], pageStructure: [], visualDirection: "clear", recommendedTemplate: "next-app", assumptions: [], missingInformation: [] } };
     } else if (url.pathname === "/runs" && request.method === "POST") {
       payload = { runId: "run-1", status: "queued" };
     } else if (url.pathname.endsWith("/design-context-manifest")) {
@@ -243,7 +243,7 @@ async function startRuntimeMock(requests) {
     } else if (url.pathname.endsWith("/design-profile") && request.method === "GET") {
       payload = { projectId, designProfile: profile() };
     } else if (url.pathname.includes("/fidelity-report")) {
-      payload = { designProfileId: "profile-1", version: 2, schemaVersion: "design-profile@2", surface: "website", template: "astro-website", styleContractVersion: "runtime-style-contract@p3", effectiveProfileHash: HASH_D, sourceIntegrity: "verified", sourceHashMatches: true, requiredSignatureRuleIds: [], capsuleIncludedRuleIds: [], capsuleMissingRuleIds: [], unsupportedExtendedTokens: [], warnings: [] };
+      payload = { designProfileId: "profile-1", version: 2, schemaVersion: "design-profile@2", surface: "website", template: "next-app", styleContractVersion: "runtime-style-contract@p3", effectiveProfileHash: HASH_D, sourceIntegrity: "verified", sourceHashMatches: true, requiredSignatureRuleIds: [], capsuleIncludedRuleIds: [], capsuleMissingRuleIds: [], unsupportedExtendedTokens: [], warnings: [] };
     } else if (url.pathname.endsWith("/design-profile-sync-plan")) {
       payload = operation();
     } else if (url.pathname.endsWith("/confirm")) {

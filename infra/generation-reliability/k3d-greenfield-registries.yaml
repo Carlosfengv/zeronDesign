@@ -1,0 +1,4 @@
+mirrors:
+  "k3d-greenfield-registry.localhost:5000":
+    endpoint:
+      - "http://k3d-greenfield-registry.localhost:5000"

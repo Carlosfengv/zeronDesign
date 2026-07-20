@@ -156,6 +156,7 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: ${runtime_namespace}
       ports:
+        - { protocol: TCP, port: 3000 }
         - { protocol: TCP, port: 3001 }
         - { protocol: TCP, port: 4321 }
 ---
@@ -231,7 +232,7 @@ if [[ -n "${WORKSPACE_CHANNEL_TLS_MANIFEST:-}" ]]; then
     "${WORKSPACE_CHANNEL_TLS_MANIFEST}" | "${kubectl_bin}" apply -f -
 fi
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-for template in astro-website fumadocs-docs; do
+for template in next-app fumadocs-docs; do
   sed \
     -e "s/namespace: anydesign-sandboxes/namespace: ${workspace_namespace}/g" \
     -e "s#/ns/anydesign-runtime/#/ns/${runtime_namespace}/#g" \

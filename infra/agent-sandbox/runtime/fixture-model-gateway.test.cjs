@@ -46,7 +46,7 @@ const docsBriefTwo = responseForBody(
   request("run-docs-brief", "rc-docs-fixture", "brief", 2),
 );
 assert.equal(websiteBriefTwo.toolCalls[0].name, "brief.write_draft");
-assert.equal(websiteBriefTwo.toolCalls[0].input.recommendedTemplate, "astro-website");
+assert.equal(websiteBriefTwo.toolCalls[0].input.recommendedTemplate, "next-app");
 assert.equal(docsBriefTwo.toolCalls[0].name, "brief.write_draft");
 assert.equal(docsBriefTwo.toolCalls[0].input.recommendedTemplate, "fumadocs-docs");
 

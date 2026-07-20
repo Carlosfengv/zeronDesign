@@ -35,8 +35,8 @@ cargo test --manifest-path services/runtime/Cargo.toml --test preview_promotion 
   startup_reconcile_replays_promotion_after_immutable_bytes_before_cas -- --exact
 
 old_pod="$(${KUBECTL} get pods -n "${namespace}" --no-headers \
-  | awk '$3=="Running" && $1 ~ /astro-website-pool/ {print $1; exit}')"
-[[ -n "${old_pod}" ]] || { printf 'ready Astro warm Pod is required\n' >&2; exit 3; }
+  | awk '$3=="Running" && $1 ~ /next-app-pool/ {print $1; exit}')"
+[[ -n "${old_pod}" ]] || { printf 'ready Next App warm Pod is required\n' >&2; exit 3; }
 old_uid="$(${KUBECTL} get pod -n "${namespace}" "${old_pod}" -o jsonpath='{.metadata.uid}')"
 ${KUBECTL} delete pod -n "${namespace}" "${old_pod}" --wait=false >/dev/null
 
@@ -56,7 +56,7 @@ while (( SECONDS < deadline )); do
       break 2
     fi
   done < <(${KUBECTL} get pods -n "${namespace}" --no-headers \
-    | awk '$3=="Running" && $1 ~ /astro-website-pool/ {print $1}')
+    | awk '$3=="Running" && $1 ~ /next-app-pool/ {print $1}')
   sleep 2
 done
 [[ -n "${new_uid}" ]] || { printf 'replacement warm Pod did not become ready\n' >&2; exit 4; }

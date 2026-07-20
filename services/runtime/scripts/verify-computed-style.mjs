@@ -150,7 +150,7 @@ function inferLocalArtifactRoot(filePath) {
   let current = fs.statSync(filePath).isDirectory() ? filePath : path.dirname(filePath);
   while (true) {
     if (
-      fs.existsSync(path.join(current, "_astro")) ||
+      fs.existsSync(path.join(current, "_next")) ||
       fs.existsSync(path.join(current, "_next"))
     ) {
       return current;
@@ -191,7 +191,7 @@ function rootRelativeArtifactPath(root, href) {
 
 function rewriteRootRelativeAssetUrls(html, root) {
   return html.replace(
-    /\b(href|src)=(["'])(\/(?:_astro|_next)\/[^"']+)\2/g,
+    /\b(href|src)=(["'])(\/(?:_next|_next)\/[^"']+)\2/g,
     (match, attr, quote, href) => {
       const target = rootRelativeArtifactPath(root, href);
       if (!target) {
@@ -204,7 +204,7 @@ function rewriteRootRelativeAssetUrls(html, root) {
 
 function inlineLocalStylesheetLinks(html, root) {
   return html.replace(
-    /<link\b[^>]*\bhref=(["'])(\/(?:_astro|_next)\/[^"']+\.css(?:\?[^"']*)?)\1[^>]*>/g,
+    /<link\b[^>]*\bhref=(["'])(\/(?:_next|_next)\/[^"']+\.css(?:\?[^"']*)?)\1[^>]*>/g,
     (tag, _quote, href) => {
       const cssPath = rootRelativeArtifactPath(root, href);
       if (!cssPath || !fs.existsSync(cssPath) || !fs.statSync(cssPath).isFile()) {

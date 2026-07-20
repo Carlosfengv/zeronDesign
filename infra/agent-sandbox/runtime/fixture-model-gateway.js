@@ -69,7 +69,7 @@ function briefResponse(body, state) {
           ? [{ title: "Overview", level: 1, content: "Runtime lifecycle" }]
           : [{ title: "Home", purpose: "Explain the product", keyContent: ["hero", "proof"] }],
         visualDirection: "quiet technical confidence",
-        recommendedTemplate: docs ? "fumadocs-docs" : "astro-website",
+        recommendedTemplate: docs ? "fumadocs-docs" : "next-app",
         assumptions: [],
         missingInformation: [],
         acceptanceCriteria: {
@@ -95,7 +95,7 @@ function buildResponse(body, state) {
       type: "tool_calls",
       toolCalls: [
         tool("fixture-init", "project.init", {
-          template: state.docs ? "fumadocs-docs" : "astro-website",
+          template: state.docs ? "fumadocs-docs" : "next-app",
         }),
       ],
     };
@@ -134,7 +134,7 @@ function buildResponse(body, state) {
   }
   if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-build", "project.build", { cwd: "project" })] };
   if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-preview", "preview.start")] };
-  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-open", "browser.open", { url: "http://127.0.0.1:4321" })] };
+  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
   if (turn === 6) return { type: "tool_calls", toolCalls: [tool("fixture-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
   if (turn === 7) return { type: "tool_calls", toolCalls: [tool("fixture-promote", "preview.publish", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
   return { type: "tool_calls", toolCalls: [tool("fixture-complete", "run.complete", {
@@ -160,7 +160,7 @@ function enforcedDcpBuildResponse(state) {
   if (turn === 1) {
     return {
       type: "tool_calls",
-      toolCalls: [tool("fixture-dcp-init", "project.init", { template: "astro-website" })],
+      toolCalls: [tool("fixture-dcp-init", "project.init", { template: "next-app" })],
     };
   }
   if (turn === 2) {
@@ -206,7 +206,7 @@ function editResponse(body, state) {
   if (turn === 0) return { type: "tool_calls", toolCalls: [tool("fixture-edit-script", "fs.write", { path: "project/build.cjs", text: buildScript })] };
   if (turn === 1) return { type: "tool_calls", toolCalls: [tool("fixture-edit-build", "project.build", { cwd: "project" })] };
   if (turn === 2) return { type: "tool_calls", toolCalls: [tool("fixture-edit-preview", "preview.start")] };
-  if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-edit-open", "browser.open", { url: "http://127.0.0.1:4321" })] };
+  if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-edit-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
   if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-edit-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
   if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-edit-promote", "preview.publish", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
   return { type: "tool_calls", toolCalls: [tool("fixture-edit-complete", "run.complete", {

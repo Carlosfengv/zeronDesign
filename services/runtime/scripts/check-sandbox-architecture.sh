@@ -36,7 +36,7 @@ if [[ -d "$SANDBOX_DIR" ]]; then
     fi
   fi
 
-  if [[ -d "$SANDBOX_DIR/fs" ]] && rg -n -i 'astro|fumadocs|next\.config|docusaurus' "$SANDBOX_DIR/fs"; then
+  if [[ -d "$SANDBOX_DIR/fs" ]] && rg -n -i 'next|fumadocs|next\.config|docusaurus' "$SANDBOX_DIR/fs"; then
     fail "FS-001: generic fs tools contain framework-specific knowledge"
   fi
 
@@ -57,7 +57,7 @@ if [[ -d "$TEMPLATES_DIR" ]]; then
 fi
 
 if [[ -f "$PROFILES_BUILD" ]]; then
-  writer_count="$(rg -c '^fn write_(astro|fumadocs)_project' "$PROFILES_BUILD" || true)"
+  writer_count="$(rg -c '^fn write_(next|fumadocs)_project' "$PROFILES_BUILD" || true)"
   writer_count="${writer_count:-0}"
   if (( writer_count > 2 )); then
     fail "TPL-001: profiles/build.rs added another template writer"
@@ -65,7 +65,7 @@ if [[ -f "$PROFILES_BUILD" ]]; then
   if [[ "$STRICT" == "1" ]] && (( writer_count > 0 )); then
     fail "TPL-001: strict mode forbids duplicate template writers in profiles/build.rs"
   fi
-  if rg -n 'TemplateKind|customize_(astro|fumadocs)_project|write_(astro|fumadocs)_project' "$PROFILES_BUILD"; then
+  if rg -n 'TemplateKind|customize_(next|fumadocs)_project|write_(next|fumadocs)_project' "$PROFILES_BUILD"; then
     fail "TPL-001/TPL-003: profiles/build.rs contains template-specific build dispatch"
   fi
   if [[ "$STRICT" == "1" ]]; then
@@ -76,7 +76,7 @@ if [[ -f "$PROFILES_BUILD" ]]; then
   fi
 fi
 
-if rg -n 'template\s*==\s*Some\("(astro-website|fumadocs-docs)"\)|template\s*==\s*"(astro-website|fumadocs-docs)"|match\s+template[^\n]*\{' \
+if rg -n 'template\s*==\s*Some\("(next-app|fumadocs-docs)"\)|template\s*==\s*"(next-app|fumadocs-docs)"|match\s+template[^\n]*\{' \
   "$SANDBOX_DIR" --glob '*.rs' --glob '!**/templates/**'; then
   fail "TPL-003: generic sandbox code branches on a concrete template id"
 fi

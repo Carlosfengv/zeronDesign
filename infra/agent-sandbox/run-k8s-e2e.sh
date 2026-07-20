@@ -132,15 +132,15 @@ if [[ "${dirty}" != "0" ]]; then
   } | shasum -a 256 | awk '{print substr($1, 1, 12)}')"
   image_tag="${git_sha}-dirty-${worktree_fingerprint}"
 fi
-sandbox_image="anydesign/astro-website-sandbox:${image_tag}"
+sandbox_image="anydesign/agent-sandbox:${image_tag}"
 # Runtime's built-in sandbox execution profile deliberately pins this public
 # reference.  The isolated gate imports the locally built bytes under the same
 # reference so readiness verifies the production identity instead of accepting
 # a test-only tag.
-runtime_profile_sandbox_image="ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0"
+runtime_profile_sandbox_image="ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0"
 
 docker build \
-  -f infra/agent-sandbox/astro-website/Dockerfile \
+  -f infra/agent-sandbox/base/Dockerfile \
   --provenance=false \
   --build-arg "SANDBOX_BASE_IMAGE=${sandbox_base_image}" \
   -t "${sandbox_image}" \
@@ -310,19 +310,19 @@ sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
 "${KUBECTL}" apply -f infra/agent-sandbox/npm-proxy/service.yaml
 sed \
   -e "s/anydesign-sandboxes/${sandbox_namespace}/g" \
-  -e "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
-  infra/agent-sandbox/astro-website/sandbox-template.yaml \
-  | "${KUBECTL}" apply -f -
-sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
-  infra/agent-sandbox/astro-website/sandbox-warm-pool.yaml \
-  | "${KUBECTL}" apply -f -
-sed \
-  -e "s/anydesign-sandboxes/${sandbox_namespace}/g" \
-  -e "s|image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
+  -e "s|image: ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
   infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml \
   | "${KUBECTL}" apply -f -
 sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
   infra/agent-sandbox/fumadocs-docs/sandbox-warm-pool.yaml \
+  | "${KUBECTL}" apply -f -
+sed \
+  -e "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  -e "s|image: ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0|image: ${runtime_profile_sandbox_image}|" \
+  infra/agent-sandbox/next-app/sandbox-template.yaml \
+  | "${KUBECTL}" apply -f -
+sed "s/anydesign-sandboxes/${sandbox_namespace}/g" \
+  infra/agent-sandbox/next-app/sandbox-warm-pool.yaml \
   | "${KUBECTL}" apply -f -
 
 "${KUBECTL}" rollout status deployment/anydesign-npm-proxy \
@@ -344,10 +344,10 @@ fi
 deadline=$((SECONDS + 180))
 warm_pod=""
 while true; do
-  ready_replicas="$("${KUBECTL}" get sandboxwarmpool anydesign-astro-website-pool \
+  ready_replicas="$("${KUBECTL}" get sandboxwarmpool anydesign-next-app-pool \
     -n "${sandbox_namespace}" \
     -o 'jsonpath={.status.readyReplicas}' 2>/dev/null || true)"
-  warm_selector="$("${KUBECTL}" get sandboxwarmpool anydesign-astro-website-pool \
+  warm_selector="$("${KUBECTL}" get sandboxwarmpool anydesign-next-app-pool \
     -n "${sandbox_namespace}" \
     -o 'jsonpath={.status.selector}' 2>/dev/null || true)"
   if [[ "${ready_replicas:-0}" -ge 1 && -n "${warm_selector}" ]]; then
@@ -371,7 +371,7 @@ while true; do
     break
   fi
   if (( SECONDS >= deadline )); then
-    printf 'SandboxWarmPool anydesign-astro-website-pool did not become ready; readyReplicas=%s\n' "${ready_replicas:-0}" >&2
+    printf 'SandboxWarmPool anydesign-next-app-pool did not become ready; readyReplicas=%s\n' "${ready_replicas:-0}" >&2
     exit 3
   fi
   sleep 2

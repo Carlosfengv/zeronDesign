@@ -48,7 +48,7 @@ impl ModelClient for RoutingFixtureModel {
                 Ok(ModelResponse::ToolCalls(vec![ToolCall::new(
                     "website-dcp-init",
                     "project.init",
-                    json!({ "template": "astro-website" }),
+                    json!({ "template": "next-app" }),
                 )]))
             }
             (AgentPhase::Build, "website-k3d", 3) => Ok(website_build_response()),
@@ -350,7 +350,7 @@ async fn bind_observe_website_dcp_profile(store: &RuntimeStore, project_id: &str
             website_context: json!({ "enforcementMode": "observe" }),
             content: json!({}),
             accessibility: json!({}),
-            technical: json!({ "allowedTemplates": ["astro-website"] }),
+            technical: json!({ "allowedTemplates": ["next-app"] }),
             governance: json!({ "conflictBehavior": "ask" }),
             signature_rules: Vec::new(),
             overrides: json!({}),
@@ -849,7 +849,7 @@ fn website_brief() -> Brief {
         content_hierarchy: vec!["hero".to_string()],
         page_structure: json!([{ "title": "Home", "level": 1 }]),
         visual_direction: "high contrast".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: vec![],
         missing_information: vec![],
     }

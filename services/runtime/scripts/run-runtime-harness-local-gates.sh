@@ -45,7 +45,7 @@ run_step "runtime http api" \
   cargo test --manifest-path services/runtime/Cargo.toml --test http_api -- --nocapture
 
 run_step "runtime template build agent" \
-  cargo test --manifest-path services/runtime/Cargo.toml --test astro_build_agent -- --nocapture
+  cargo test --manifest-path services/runtime/Cargo.toml --test next_build_agent -- --nocapture
 
 run_step "shared package tests" \
   npm test --prefix packages/shared
@@ -141,7 +141,7 @@ run_step "computed-style custom property smoke" \
   bash -c 'tmpdir=".runtime-evidence/style-only-custom-property-$(date +%Y%m%d-%H%M%S)"; RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_STYLE_SELECTOR=":root" RUNTIME_E2E_STYLE_PROPERTY="--runtime-primary" RUNTIME_E2E_STYLE_EXPECTED="#f97316" bash services/runtime/scripts/smoke-computed-style-artifact.sh >/tmp/runtime-style-custom-property.out; grep -q "\"property\": \"--runtime-primary\"" "$tmpdir/evidence-summary.json"; grep -q "\"actual\": \"#f97316\"" "$tmpdir/evidence-summary.json"; echo "STYLE_CUSTOM_PROPERTY_EVIDENCE_DIR=$tmpdir"'
 
 run_step "computed-style metadata records target" \
-  bash -c 'tmpdir="$(mktemp -d)"; fixture="$(mktemp -d)"; mkdir -p "$fixture/_astro"; printf "<link rel=\"stylesheet\" href=\"/_astro/app.css\"><h1 id=\"probe\">x</h1>" > "$fixture/index.html"; printf ":root{--runtime-primary:#f97316}#probe{color:var(--runtime-primary)}" > "$fixture/_astro/app.css"; RUNTIME_E2E_STYLE_ONLY=1 RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_ARTIFACT_URL="file://$fixture/index.html" RUNTIME_E2E_STYLE_PROJECT=real-http-docs RUNTIME_E2E_STYLE_STAGE=edit RUNTIME_E2E_STYLE_SELECTOR="#probe" RUNTIME_E2E_STYLE_PROPERTY=color RUNTIME_E2E_STYLE_EXPECTED="#f97316" bash services/runtime/scripts/run-real-provider-http-lifecycle-e2e.sh >/tmp/runtime-style-metadata.out; grep -q "styleProject=real-http-docs" "$tmpdir/run-metadata.env"; grep -q "styleStage=edit" "$tmpdir/run-metadata.env"'
+  bash -c 'tmpdir="$(mktemp -d)"; fixture="$(mktemp -d)"; mkdir -p "$fixture/_next"; printf "<link rel=\"stylesheet\" href=\"/_next/app.css\"><h1 id=\"probe\">x</h1>" > "$fixture/index.html"; printf ":root{--runtime-primary:#f97316}#probe{color:var(--runtime-primary)}" > "$fixture/_next/app.css"; RUNTIME_E2E_STYLE_ONLY=1 RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_ARTIFACT_URL="file://$fixture/index.html" RUNTIME_E2E_STYLE_PROJECT=real-http-docs RUNTIME_E2E_STYLE_STAGE=edit RUNTIME_E2E_STYLE_SELECTOR="#probe" RUNTIME_E2E_STYLE_PROPERTY=color RUNTIME_E2E_STYLE_EXPECTED="#f97316" bash services/runtime/scripts/run-real-provider-http-lifecycle-e2e.sh >/tmp/runtime-style-metadata.out; grep -q "styleProject=real-http-docs" "$tmpdir/run-metadata.env"; grep -q "styleStage=edit" "$tmpdir/run-metadata.env"'
 
 run_step "git diff whitespace" \
   git diff --check

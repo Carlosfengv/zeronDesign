@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -30,6 +31,14 @@ const privateKey = crypto.createPrivateKey(
 );
 const adminToken = fs.readFileSync(adminTokenFile, "utf8").trim();
 const principalId = "generation-real-provider-suite";
+const workspaceNamespace = (
+  process.env.GENERATION_REAL_WORKSPACE_NAMESPACE || ""
+).trim();
+if (!/^ws-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(workspaceNamespace)) {
+  throw new Error(
+    "GENERATION_REAL_WORKSPACE_NAMESPACE must be a valid ws-* Kubernetes namespace",
+  );
+}
 const suiteId = new Date().toISOString().replace(/[-:.TZ]/g, "");
 const suiteStartedAt = new Date().toISOString();
 const suiteRoot = path.resolve(evidenceDirectory);
@@ -58,6 +67,11 @@ const caseRetryCooldownMs = Number.parseInt(
   process.env.GENERATION_REAL_CASE_RETRY_COOLDOWN_MS || "45000",
   10,
 );
+const designProfileFixture = (
+  process.env.GENERATION_REAL_DESIGN_PROFILE_FIXTURE || ""
+).trim();
+const draftPreviewAcceptance =
+  process.env.GENERATION_REAL_DRAFT_PREVIEW_ACCEPTANCE === "1";
 
 fs.mkdirSync(suiteDirectory, { recursive: true });
 
@@ -150,6 +164,7 @@ for (const [index, testCase] of selectedCases.entries()) {
     kind: testCase.kind,
     locale: testCase.locale,
     projectId: baseProjectId,
+    workspaceNamespace,
     expectedRoute: testCase.expectedRoute,
     expectedText: testCase.expectedText,
     startedAt: caseStartedAt,
@@ -159,6 +174,8 @@ for (const [index, testCase] of selectedCases.entries()) {
     runs: [],
     attempts: [],
     artifact: null,
+    designProfile: null,
+    draftPreview: null,
     releaseEvidence: null,
     error: null,
   };
@@ -176,6 +193,9 @@ for (const [index, testCase] of selectedCases.entries()) {
 
     try {
       await grantProjectAccess(projectId);
+      if (designProfileFixture) {
+        result.designProfile = configureAndBindDesignProfile(projectId);
+      }
 
       let brief;
       try {
@@ -208,40 +228,44 @@ for (const [index, testCase] of selectedCases.entries()) {
         throw error;
       }
 
-      const principalToken = issuePrincipalToken(projectId);
-      const artifactUrl = new URL(
-        `/artifacts/${encodeURIComponent(projectId)}/current${testCase.expectedRoute}`,
-        baseUrl,
-      );
-      const artifactResponse = await fetchWithTimeout(
-        artifactUrl,
-        {
-          headers: { authorization: `Bearer ${principalToken}` },
-        },
-        120_000,
-      );
-      const artifactBody = await artifactResponse.text();
-      if (!artifactResponse.ok) {
-        throw new Error(
-          `artifact route returned ${artifactResponse.status}: ${artifactBody.slice(0, 500)}`,
+      if (draftPreviewAcceptance) {
+        result.draftPreview = await verifyDraftPreview(projectId, testCase);
+      } else {
+        const principalToken = issuePrincipalToken(projectId);
+        const artifactUrl = new URL(
+          `/artifacts/${encodeURIComponent(projectId)}/current${testCase.expectedRoute}`,
+          baseUrl,
         );
-      }
-      if (!artifactBody.includes(testCase.expectedText)) {
-        throw classifiedError(
-          "acceptance_rejected",
-          `artifact route does not contain expected text: ${testCase.expectedText}`,
-          "rejected",
+        const artifactResponse = await fetchWithTimeout(
+          artifactUrl,
+          {
+            headers: { authorization: `Bearer ${principalToken}` },
+          },
+          120_000,
         );
+        const artifactBody = await artifactResponse.text();
+        if (!artifactResponse.ok) {
+          throw new Error(
+            `artifact route returned ${artifactResponse.status}: ${artifactBody.slice(0, 500)}`,
+          );
+        }
+        if (!artifactBody.includes(testCase.expectedText)) {
+          throw classifiedError(
+            "acceptance_rejected",
+            `artifact route does not contain expected text: ${testCase.expectedText}`,
+            "rejected",
+          );
+        }
+        result.artifact = {
+          url: artifactUrl.toString(),
+          route: testCase.expectedRoute,
+          httpStatus: artifactResponse.status,
+          expectedText: testCase.expectedText,
+          expectedTextFound: true,
+          bodySha256: sha256(artifactBody),
+          bodyBytes: Buffer.byteLength(artifactBody),
+        };
       }
-      result.artifact = {
-        url: artifactUrl.toString(),
-        route: testCase.expectedRoute,
-        httpStatus: artifactResponse.status,
-        expectedText: testCase.expectedText,
-        expectedTextFound: true,
-        bodySha256: sha256(artifactBody),
-        bodyBytes: Buffer.byteLength(artifactBody),
-      };
 
       const releaseEvidenceResponse = await fetchWithTimeout(
         new URL(
@@ -396,6 +420,7 @@ const summary = {
     title: result.title,
     kind: result.kind,
     projectId: result.projectId,
+    workspaceNamespace: result.workspaceNamespace,
     status: result.status,
     expectedRoute: result.expectedRoute,
     expectedText: result.expectedText,
@@ -480,6 +505,146 @@ function validateManifest(value) {
   }
 }
 
+function configureAndBindDesignProfile(projectId) {
+  const fixture = path.resolve(designProfileFixture);
+  if (!fs.statSync(fixture).isFile()) {
+    throw new Error(`Design Profile fixture is not a file: ${fixture}`);
+  }
+  const selectionEvidence = path.join(
+    suiteDirectory,
+    `design-profile-selection-${projectId}.json`,
+  );
+  execFileSync(
+    process.execPath,
+    [
+      path.resolve("infra/generation-reliability/configure-real-design-profile.mjs"),
+      baseUrl,
+      principalPrivateKeyFile,
+      projectId,
+      fixture,
+      selectionEvidence,
+    ],
+    { stdio: "inherit" },
+  );
+  const selection = JSON.parse(fs.readFileSync(selectionEvidence, "utf8"));
+  const designProfileId = selection.selectedDesignProfile?.id;
+  if (!designProfileId) {
+    throw new Error("Design Profile selection evidence omitted the selected id");
+  }
+  const adaptationEvidence = path.join(
+    suiteDirectory,
+    `design-profile-adaptation-${projectId}.json`,
+  );
+  execFileSync(
+    process.execPath,
+    [
+      path.resolve("infra/generation-reliability/adapt-real-design-profile-style-only.mjs"),
+      baseUrl,
+      principalPrivateKeyFile,
+      projectId,
+      designProfileId,
+      adaptationEvidence,
+    ],
+    { stdio: "inherit" },
+  );
+  const adaptation = JSON.parse(fs.readFileSync(adaptationEvidence, "utf8"));
+  return {
+    id: designProfileId,
+    name: adaptation.name,
+    version: adaptation.toVersion,
+    selectedFixture: selection.randomSelection.selectedFixture,
+    selectedFixtureSha256: selection.randomSelection.selectedFixtureSha256,
+    allowedTemplates: ["next-app"],
+    preferredWebsiteTemplate: "next-app",
+    bindingVerified: selection.bindingVerified && adaptation.bindingVerified,
+  };
+}
+
+async function verifyDraftPreview(projectId, testCase) {
+  const deadline = Date.now() + 180_000;
+  let session;
+  while (Date.now() < deadline) {
+    const token = issuePrincipalToken(projectId);
+    const response = await fetchWithTimeout(
+      new URL(`/projects/${encodeURIComponent(projectId)}/draft-preview`, baseUrl),
+      { headers: { authorization: `Bearer ${token}` } },
+      30_000,
+    );
+    if (response.ok) {
+      session = await response.json();
+      if (
+        session.status === "ready" &&
+        session.lastReadyRevision >= session.durableRevision
+      ) {
+        break;
+      }
+    } else if (response.status !== 404) {
+      throw new Error(
+        `draft preview lookup returned ${response.status}: ${(await response.text()).slice(0, 500)}`,
+      );
+    }
+    await delay(1_000);
+  }
+  if (!session || session.status !== "ready") {
+    throw new Error(
+      `Draft Preview did not become ready: ${JSON.stringify(session || null)}`,
+    );
+  }
+  if (session.templateId !== "next-app") {
+    throw new Error(`Draft Preview used unexpected template: ${session.templateId}`);
+  }
+  const proxyPath = new URL(session.proxyUrl).pathname;
+  const leaseId = proxyPath.split("/").filter(Boolean).at(-1);
+  if (!leaseId) throw new Error("Draft Preview proxy URL omitted a lease id");
+  const prefix = `/projects/${projectId}/previews/${leaseId}`;
+  const previewUrl = new URL(
+    `/previews/${encodeURIComponent(leaseId)}${testCase.expectedRoute}`,
+    baseUrl,
+  );
+  const previewResponse = await fetchWithTimeout(
+    previewUrl,
+    {
+      headers: {
+        authorization: `Bearer ${issuePrincipalToken(projectId)}`,
+        "x-anydesign-preview-prefix": prefix,
+      },
+    },
+    120_000,
+  );
+  const previewBody = await previewResponse.text();
+  if (!previewResponse.ok) {
+    throw new Error(
+      `Draft Preview route returned ${previewResponse.status}: ${previewBody.slice(0, 500)}`,
+    );
+  }
+  if (!previewBody.includes(testCase.expectedText)) {
+    throw classifiedError(
+      "acceptance_rejected",
+      `Draft Preview does not contain expected text: ${testCase.expectedText}`,
+      "rejected",
+    );
+  }
+  return {
+    sessionId: session.sessionId,
+    sessionEpoch: session.sessionEpoch,
+    leaseId,
+    templateId: session.templateId,
+    status: session.status,
+    workspaceRevision: session.workspaceRevision,
+    lastReadyRevision: session.lastReadyRevision,
+    durableRevision: session.durableRevision,
+    durableSnapshotId: session.durableSnapshotId,
+    hmr: true,
+    url: previewUrl.toString(),
+    route: testCase.expectedRoute,
+    httpStatus: previewResponse.status,
+    expectedText: testCase.expectedText,
+    expectedTextFound: true,
+    bodySha256: sha256(previewBody),
+    bodyBytes: Buffer.byteLength(previewBody),
+  };
+}
+
 async function grantProjectAccess(projectId) {
   const response = await fetchWithTimeout(
     new URL(`/internal/projects/${encodeURIComponent(projectId)}/access`, baseUrl),
@@ -490,7 +655,10 @@ async function grantProjectAccess(projectId) {
         "x-anydesign-internal": "true",
         "x-runtime-admin-token": adminToken,
       },
-      body: JSON.stringify({ ownerPrincipalId: principalId }),
+      body: JSON.stringify({
+        ownerPrincipalId: principalId,
+        workspaceNamespace,
+      }),
     },
     120_000,
   );
@@ -804,6 +972,7 @@ async function readRunEvents(projectId, runId, phase) {
             `run ${runId} emitted invalid SSE JSON`,
           );
         }
+        event = sanitizeEvidenceEvent(event);
         events.push(event);
         resetIdleTimer();
         fs.writeSync(eventFileDescriptor, `${JSON.stringify(event)}\n`);
@@ -908,6 +1077,19 @@ function summarizeRun(phase, runId, events, eventEvidence = null) {
         event.type === "tool.failed" && event.recoverable !== true,
     ).length,
     eventStream: eventEvidence,
+  };
+}
+
+function sanitizeEvidenceEvent(event) {
+  if (event?.type !== "model.execution" || !event.snapshot) return event;
+  const { providerRequestId, ...snapshot } = event.snapshot;
+  return {
+    ...event,
+    snapshot: {
+      ...snapshot,
+      providerRequestIdPresent:
+        typeof providerRequestId === "string" && providerRequestId.length > 0,
+    },
   };
 }
 

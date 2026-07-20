@@ -49,8 +49,13 @@ cluster and Provider Gateway:
 
 ```bash
 GENERATION_REAL_CLUSTER=zerondesign-e2e \
+GENERATION_REAL_WORKSPACE_NAMESPACE=ws-real-provider-website \
 bash infra/generation-reliability/run-real-provider-examples.sh
 ```
+
+`GENERATION_REAL_WORKSPACE_NAMESPACE` is required and must identify an existing
+managed Workspace namespace. The runner persists that namespace in project
+access and evidence; it never falls back to a shared sandbox namespace.
 
 The manifest is `real-provider-cases.json`. It contains three Website and two
 Docs prompts written as ordinary user requests: audience, desired content, and
@@ -83,6 +88,27 @@ are streamed incrementally to NDJSON; the suite summary uses
 `generation-real-provider-suite-evidence@2` and records the commit, dirty flag,
 Provider config digest, resource revision, manifest digest, and acceptance-probe
 digest.
+
+Publish one accepted immutable Artifact as an isolated k3d validation Work:
+
+```bash
+GENERATION_REAL_CLUSTER=zerondesign-greenfield \
+GENERATION_REAL_WORKSPACE_NAMESPACE=ws-greenfield-b \
+GENERATION_REAL_PROJECT_ID=real-project-id \
+GENERATION_REAL_VERSION_ID=version-id \
+GENERATION_REAL_RUN_ID=run-id \
+GENERATION_REAL_EXPECTED_TEXT='Expected title' \
+GENERATION_REAL_PUBLICATION_PATH=/docs/ \
+bash infra/generation-reliability/publish-real-provider-validation.sh
+```
+
+`GENERATION_REAL_PUBLICATION_PATH` defaults to `/` and supports static-export
+routes such as `/docs/`. The script verifies the Artifact manifest, builds the
+pinned-base static runtime, creates an isolated Deployment/Service/Ingress with
+an exact-host cert-manager Certificate, and checks HTTPS content plus Release
+identity. Its evidence intentionally records `publicationMode=validation` and
+`productReleaseApiCompleted=false`; it does not replace the product Release API
+or a digest-pinned Release Packager deployment.
 
 Successful runs write `generation-matrix-summary.json`. Failed runs write a
 redacted `failure-*` directory containing cluster state, events, and bounded

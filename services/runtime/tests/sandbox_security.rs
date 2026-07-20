@@ -6,15 +6,14 @@ const NETWORK_POLICY_YAML: &str =
 const RBAC_YAML: &str =
     include_str!("../../../infra/agent-sandbox/rbac/runtime-service-account.yaml");
 const TEMPLATE_YAML: &str =
-    include_str!("../../../infra/agent-sandbox/astro-website/sandbox-template.yaml");
+    include_str!("../../../infra/agent-sandbox/next-app/sandbox-template.yaml");
 const DOCS_TEMPLATE_YAML: &str =
     include_str!("../../../infra/agent-sandbox/fumadocs-docs/sandbox-template.yaml");
 const RUNTIME_DEPLOYMENT_YAML: &str =
     include_str!("../../../infra/agent-sandbox/runtime/deployment.yaml");
 const PROVIDER_GATEWAY_DEPLOYMENT_YAML: &str =
     include_str!("../../../infra/provider-gateway/k3d-persistent-sqlite-deployment.yaml");
-const ASTRO_SANDBOX_DOCKERFILE: &str =
-    include_str!("../../../infra/agent-sandbox/astro-website/Dockerfile");
+const SANDBOX_DOCKERFILE: &str = include_str!("../../../infra/agent-sandbox/base/Dockerfile");
 const WORKSPACE_INIT_SH: &str = include_str!("../../../infra/agent-sandbox/base/workspace-init.sh");
 const WORKSPACE_CHANNEL_SERVER_JS: &str =
     include_str!("../../../infra/agent-sandbox/base/workspace-channel-server.js");
@@ -174,7 +173,7 @@ fn sandbox_network_policy_allows_runtime_preview_and_internal_npm_proxy_only() {
 #[test]
 fn sandbox_templates_delegate_egress_only_to_repository_network_policies() {
     for (yaml, name) in [
-        (TEMPLATE_YAML, "anydesign-astro-website"),
+        (TEMPLATE_YAML, "anydesign-next-app"),
         (DOCS_TEMPLATE_YAML, "anydesign-fumadocs-docs"),
     ] {
         let docs = yaml_documents(yaml);
@@ -242,7 +241,7 @@ fn runtime_rbac_cannot_read_secrets_or_mutate_sandbox_pods() {
 #[test]
 fn workspace_channel_requires_mtls_workload_identities() {
     let template_docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&template_docs, "SandboxTemplate", "anydesign-astro-website");
+    let template = named_doc(&template_docs, "SandboxTemplate", "anydesign-next-app");
     assert_yaml_contains(template, "serviceAccountName");
     assert_yaml_contains(template, "anydesign-sandbox");
     assert_yaml_contains(template, "WORKSPACE_CHANNEL_TLS_MODE");
@@ -264,7 +263,7 @@ fn workspace_channel_requires_mtls_workload_identities() {
 #[test]
 fn sandbox_template_does_not_expose_control_plane_database_configuration() {
     let docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&docs, "SandboxTemplate", "anydesign-astro-website");
+    let template = named_doc(&docs, "SandboxTemplate", "anydesign-next-app");
     for forbidden in [
         "DATABASE_URL",
         "POSTGRES",
@@ -284,8 +283,8 @@ fn sandbox_template_does_not_expose_control_plane_database_configuration() {
 #[test]
 fn sandbox_template_runs_workspace_init_before_agent_work() {
     let docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&docs, "SandboxTemplate", "anydesign-astro-website");
-    let command = field(astro_template_container(template), "command")
+    let template = named_doc(&docs, "SandboxTemplate", "anydesign-next-app");
+    let command = field(next_template_container(template), "command")
         .as_sequence()
         .expect("container.command must be a list")
         .iter()
@@ -302,8 +301,8 @@ fn sandbox_template_runs_workspace_init_before_agent_work() {
 #[test]
 fn sandbox_template_starts_workspace_channel_server_after_workspace_init() {
     let docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&docs, "SandboxTemplate", "anydesign-astro-website");
-    let command = field(astro_template_container(template), "command")
+    let template = named_doc(&docs, "SandboxTemplate", "anydesign-next-app");
+    let command = field(next_template_container(template), "command")
         .as_sequence()
         .expect("container.command must be a list")
         .iter()
@@ -326,27 +325,27 @@ fn sandbox_template_starts_workspace_channel_server_after_workspace_init() {
 #[test]
 fn sandbox_template_uses_image_with_baked_bootstrap_assets() {
     let docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&docs, "SandboxTemplate", "anydesign-astro-website");
-    let image = field(astro_template_container(template), "image")
+    let template = named_doc(&docs, "SandboxTemplate", "anydesign-next-app");
+    let image = field(next_template_container(template), "image")
         .as_str()
         .expect("container.image must be set");
 
     assert!(
-        image.contains("zerondesign/astro-website-sandbox"),
+        image.contains("zerondesign/agent-sandbox"),
         "SandboxTemplate must not use the plain node image because bootstrap scripts must be baked into the sandbox image"
     );
     assert!(
-        ASTRO_SANDBOX_DOCKERFILE.contains(
+        SANDBOX_DOCKERFILE.contains(
             "ARG SANDBOX_BASE_IMAGE=node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
         )
-            && ASTRO_SANDBOX_DOCKERFILE.contains("FROM ${SANDBOX_BASE_IMAGE}")
-            && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh")
-            && ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-channel-server.js")
-            && ASTRO_SANDBOX_DOCKERFILE.contains("/opt/anydesign/bootstrap"),
-        "Astro sandbox Dockerfile must bake the workspace init and channel server into /opt/anydesign/bootstrap"
+            && SANDBOX_DOCKERFILE.contains("FROM ${SANDBOX_BASE_IMAGE}")
+            && SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh")
+            && SANDBOX_DOCKERFILE.contains("COPY base/workspace-channel-server.js")
+            && SANDBOX_DOCKERFILE.contains("/opt/anydesign/bootstrap"),
+        "sandbox Dockerfile must bake the workspace init and channel server into /opt/anydesign/bootstrap"
     );
     assert!(
-        !ASTRO_SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh /workspace"),
+        !SANDBOX_DOCKERFILE.contains("COPY base/workspace-init.sh /workspace"),
         "bootstrap assets must not be baked under /workspace because the workspace volume can hide image files"
     );
 }
@@ -354,9 +353,9 @@ fn sandbox_template_uses_image_with_baked_bootstrap_assets() {
 #[test]
 fn sandbox_template_mounts_pvc_backed_workspace() {
     let docs = yaml_documents(TEMPLATE_YAML);
-    let template = named_doc(&docs, "SandboxTemplate", "anydesign-astro-website");
+    let template = named_doc(&docs, "SandboxTemplate", "anydesign-next-app");
     let spec = field(template, "spec");
-    let container = astro_template_container(template);
+    let container = next_template_container(template);
     let mounts = field(container, "volumeMounts").as_sequence().unwrap();
     let volume_claim_templates = field(spec, "volumeClaimTemplates").as_sequence().unwrap();
 
@@ -450,7 +449,7 @@ fn field_optional<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_mapping()?.get(Value::String(key.to_string()))
 }
 
-fn astro_template_container(template: &Value) -> &Value {
+fn next_template_container(template: &Value) -> &Value {
     let containers = field(
         field(field(field(template, "spec"), "podTemplate"), "spec"),
         "containers",
@@ -460,8 +459,8 @@ fn astro_template_container(template: &Value) -> &Value {
 
     containers
         .iter()
-        .find(|container| field(container, "name").as_str() == Some("astro-website"))
-        .expect("astro-website container must exist")
+        .find(|container| field(container, "name").as_str() == Some("next-app"))
+        .expect("next-app container must exist")
 }
 
 fn string_list(value: &Value) -> Vec<String> {

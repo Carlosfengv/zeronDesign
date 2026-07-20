@@ -636,7 +636,7 @@ const profile={
   runtimeTokenMapping:{"color.background":"#ffffff","color.surface":"#f8fafc","color.surfaceStrong":"#e2e8f0","color.text":"#0f172a","color.muted":"#475569","color.primary":"#2563eb","color.primaryContrast":"#ffffff","color.border":"#cbd5e1","radius.card":"8px","radius.control":"6px","font.sans":"Inter, sans-serif","shadow.soft":"0 1px 2px rgba(15, 23, 42, 0.12)"},
   components:{primitives:{button:{intent:"clear action",usage:["primary actions"],avoid:["overuse"]},input:{intent:"precise entry",usage:["forms"],avoid:["placeholder-only labels"]},card:{intent:"group repeated items",usage:["lists"],avoid:["nested cards"]},badge:{intent:"show status",usage:["statuses"],avoid:["decorative noise"]}}},
   websiteContext:{enforcementMode:"enforced",craftPacks:["accessibility-baseline","responsive-layout"]},content:{},accessibility:{},
-  technical:{allowedTemplates:["astro-website"],preferredTemplates:{website:"astro-website"},cssStrategy:"runtime-style-contract",dependencyPolicy:{},filePolicy:{designProfilePath:"/workspace/inputs/design-profile.json",designMarkdownPath:"/workspace/inputs/design.md",styleContractPath:"/workspace/state/style-contract.json"}},
+  technical:{allowedTemplates:["next-app"],preferredTemplates:{website:"next-app"},cssStrategy:"runtime-style-contract",dependencyPolicy:{},filePolicy:{designProfilePath:"/workspace/inputs/design-profile.json",designMarkdownPath:"/workspace/inputs/design.md",styleContractPath:"/workspace/state/style-contract.json"}},
   governance:{conflictBehavior:"ask"}
 };
 process.stdout.write(JSON.stringify({projectId,name:"RC Enforced DCP Profile",profile}));
