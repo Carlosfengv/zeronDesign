@@ -16,7 +16,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -268,6 +271,20 @@ pub struct ProviderCapabilities {
     pub streaming: bool,
     #[serde(default)]
     pub vision: bool,
+    #[serde(default)]
+    pub vision_input: bool,
+    #[serde(default)]
+    pub supported_image_media_types: Vec<String>,
+    #[serde(default)]
+    pub max_image_bytes: u64,
+    #[serde(default)]
+    pub max_image_count: u32,
+}
+
+impl ProviderCapabilities {
+    pub fn supports_vision_input(&self) -> bool {
+        self.vision || self.vision_input
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1922,6 +1939,216 @@ impl GatewayService {
         );
     }
 
+    async fn resolve_visual_artifacts_for_resource(
+        &self,
+        resource: &ModelResource,
+        request: &GatewayTurnRequest,
+    ) -> std::result::Result<GatewayTurnRequest, GatewayApiError> {
+        let mut locations = Vec::new();
+        for (message_index, message) in request.input.messages.iter().enumerate() {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter().enumerate() {
+                if block.get("type").and_then(Value::as_str) == Some("image") {
+                    locations.push((message_index, block_index));
+                }
+            }
+        }
+        if locations.is_empty() {
+            return Ok(request.clone());
+        }
+        if !request.routing.required_capabilities.vision {
+            return Err(GatewayApiError::new(
+                StatusCode::BAD_REQUEST,
+                request.request_id.clone(),
+                "vision_capability_not_requested",
+                "Image content blocks require routing.requiredCapabilities.vision=true",
+                false,
+            ));
+        }
+        if !resource.capabilities.supports_vision_input()
+            || resource.capabilities.max_image_count == 0
+            || locations.len() > resource.capabilities.max_image_count as usize
+        {
+            return Err(GatewayApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                request.request_id.clone(),
+                "vision_resource_unavailable",
+                "The selected resource cannot accept this image count",
+                false,
+            ));
+        }
+        let runtime_base_url = env::var("PROVIDER_GATEWAY_RUNTIME_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                GatewayApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    request.request_id.clone(),
+                    "visual_artifact_source_unavailable",
+                    "Runtime visual artifact source is not configured",
+                    true,
+                )
+            })?;
+        let runtime_token = optional_env_or_file(
+            "PROVIDER_GATEWAY_RUNTIME_ARTIFACT_TOKEN",
+            "PROVIDER_GATEWAY_RUNTIME_ARTIFACT_TOKEN_FILE",
+        )
+        .map_err(|_| {
+            GatewayApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                request.request_id.clone(),
+                "visual_artifact_source_unavailable",
+                "Runtime visual artifact credential is unavailable",
+                true,
+            )
+        })?
+        .ok_or_else(|| {
+            GatewayApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                request.request_id.clone(),
+                "visual_artifact_source_unavailable",
+                "Runtime visual artifact credential is not configured",
+                true,
+            )
+        })?;
+        let mut resolved = request.clone();
+        for (message_index, block_index) in locations {
+            let block = &request.input.messages[message_index]["content"][block_index];
+            let artifact_id = block
+                .get("artifactId")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                })
+                .ok_or_else(|| {
+                    GatewayApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        request.request_id.clone(),
+                        "invalid_visual_artifact",
+                        "Image content block has an invalid artifactId",
+                        false,
+                    )
+                })?;
+            let expected_media_type =
+                block
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        GatewayApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            request.request_id.clone(),
+                            "invalid_visual_artifact",
+                            "Image content block requires mediaType",
+                            false,
+                        )
+                    })?;
+            if !resource
+                .capabilities
+                .supported_image_media_types
+                .iter()
+                .any(|candidate| candidate == expected_media_type)
+            {
+                return Err(GatewayApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    request.request_id.clone(),
+                    "vision_media_type_unsupported",
+                    "The selected resource does not support the bound image media type",
+                    false,
+                ));
+            }
+            let endpoint = format!(
+                "{}/internal/runs/{}/visual-artifacts/{}/content",
+                runtime_base_url.trim_end_matches('/'),
+                request.scope.run_id,
+                artifact_id
+            );
+            let response = self
+                .inner
+                .client
+                .get(endpoint)
+                .header("x-anydesign-internal", "true")
+                .header("x-runtime-admin-token", &runtime_token)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|_| {
+                    GatewayApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        request.request_id.clone(),
+                        "visual_artifact_source_unavailable",
+                        "Runtime visual artifact source could not be reached",
+                        true,
+                    )
+                })?;
+            if !response.status().is_success() {
+                return Err(GatewayApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    request.request_id.clone(),
+                    "visual_artifact_not_bound",
+                    "The visual artifact is unavailable or not bound to this Run",
+                    false,
+                ));
+            }
+            let headers = response.headers().clone();
+            let actual_media_type = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let actual_sha256 = headers
+                .get("x-visual-artifact-sha256")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let actual_width = headers
+                .get("x-visual-artifact-width")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let actual_height = headers
+                .get("x-visual-artifact-height")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let bytes = response.bytes().await.map_err(|_| {
+                GatewayApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    request.request_id.clone(),
+                    "visual_artifact_source_unavailable",
+                    "Runtime visual artifact bytes could not be read",
+                    true,
+                )
+            })?;
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let expected_sha256 = block
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let expected_width = block.get("width").and_then(Value::as_u64);
+            let expected_height = block.get("height").and_then(Value::as_u64);
+            if bytes.is_empty()
+                || bytes.len() as u64 > resource.capabilities.max_image_bytes
+                || actual_media_type != expected_media_type
+                || actual_sha256 != expected_sha256
+                || digest != expected_sha256
+                || actual_width != expected_width
+                || actual_height != expected_height
+            {
+                return Err(GatewayApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    request.request_id.clone(),
+                    "visual_artifact_integrity_failed",
+                    "Bound visual artifact metadata or content integrity check failed",
+                    false,
+                ));
+            }
+            resolved.input.messages[message_index]["content"][block_index]["dataBase64"] =
+                Value::String(BASE64_STANDARD.encode(&bytes));
+        }
+        Ok(resolved)
+    }
+
     async fn call_openai_compatible_once(
         &self,
         resource: &ModelResource,
@@ -1933,8 +2160,11 @@ impl GatewayService {
             resource.endpoint.base_url.trim_end_matches('/'),
             ensure_leading_slash(&resource.endpoint.chat_completions_path)
         );
-        let tool_aliases = ProviderToolAliasMap::from_request(request)?;
-        let body = openai_request_body(request, resource, &tool_aliases)?;
+        let resolved_request = self
+            .resolve_visual_artifacts_for_resource(resource, request)
+            .await?;
+        let tool_aliases = ProviderToolAliasMap::from_request(&resolved_request)?;
+        let body = openai_request_body(&resolved_request, resource, &tool_aliases)?;
         // Runtime's deadline is the authoritative bound for a logical turn.
         // A resource may tighten it, but may never extend it.
         let timeout = provider_call_timeout(resource, request)?;
@@ -3614,6 +3844,23 @@ fn validate_model_resource(resource: &ModelResource) -> Result<()> {
             "model resource secret reference backend is unsupported"
         ));
     }
+    if resource.capabilities.supports_vision_input() {
+        let supported_media_types = &resource.capabilities.supported_image_media_types;
+        if supported_media_types.is_empty()
+            || supported_media_types.iter().any(|media_type| {
+                !matches!(
+                    media_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                )
+            })
+            || resource.capabilities.max_image_bytes == 0
+            || resource.capabilities.max_image_count == 0
+        {
+            return Err(anyhow!(
+                "vision-capable model resource requires bounded PNG, JPEG, or WebP inputs"
+            ));
+        }
+    }
     let url = reqwest::Url::parse(&resource.endpoint.base_url)
         .context("model resource base URL is invalid")?;
     let local_test_host = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
@@ -4055,7 +4302,7 @@ fn capabilities_match(resource: &ModelResource, required: &RequiredCapabilities)
     (!required.tool_calls || resource.capabilities.tool_calls)
         && (!required.strict_tool_schema || resource.capabilities.strict_tool_schema)
         && (!required.streaming || resource.capabilities.streaming)
-        && (!required.vision || resource.capabilities.vision)
+        && (!required.vision || resource.capabilities.supports_vision_input())
 }
 
 fn build_turn_response(
@@ -4349,11 +4596,18 @@ fn normalize_messages(
                 messages.push(json!({ "role": "assistant", "tool_calls": orphan_calls }));
             }
             let content = message.get("content").cloned().unwrap_or(Value::Null);
+            let multimodal = provider_content_blocks(&content)?;
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": content_to_string(&content),
+                "content": content_blocks_text(&content),
             }));
+            if let Some(multimodal) = multimodal.filter(provider_content_has_image) {
+                messages.push(json!({
+                    "role": "user",
+                    "content": multimodal,
+                }));
+            }
             pending_tool_call_ids.remove(call_id);
             index += 1;
             continue;
@@ -4363,10 +4617,100 @@ fn normalize_messages(
             .get("content")
             .or_else(|| message.get("text"))
             .ok_or_else(|| "message requires content or text".to_string())?;
-        messages.push(json!({ "role": role, "content": content_to_string(content) }));
+        if let Some(multimodal) = provider_content_blocks(content)? {
+            if role == "user" {
+                messages.push(json!({ "role": role, "content": multimodal }));
+            } else if provider_content_has_image(&multimodal) {
+                messages.push(json!({ "role": role, "content": content_blocks_text(content) }));
+                messages.push(json!({ "role": "user", "content": multimodal }));
+            } else {
+                messages.push(json!({ "role": role, "content": content_blocks_text(content) }));
+            }
+        } else {
+            messages.push(json!({ "role": role, "content": content_to_string(content) }));
+        }
         index += 1;
     }
     Ok(messages)
+}
+
+fn provider_content_blocks(content: &Value) -> std::result::Result<Option<Value>, String> {
+    let Some(blocks) = content.as_array() else {
+        return Ok(None);
+    };
+    let mut normalized = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => normalized.push(json!({
+                "type": "text",
+                "text": block.get("text").and_then(Value::as_str).unwrap_or_default(),
+            })),
+            Some("json") => normalized.push(json!({
+                "type": "text",
+                "text": serde_json::to_string(block.get("value").unwrap_or(&Value::Null))
+                    .unwrap_or_default(),
+            })),
+            Some("image") => {
+                let media_type = block
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "image content block requires mediaType".to_string())?;
+                let data = block
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "image content block was not resolved by the Gateway".to_string()
+                    })?;
+                normalized.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{media_type};base64,{data}"),
+                        "detail": "high",
+                    },
+                }));
+            }
+            Some(other) => return Err(format!("unsupported content block type: {other}")),
+            None => return Err("content block requires type".to_string()),
+        }
+    }
+    Ok(Some(Value::Array(normalized)))
+}
+
+fn provider_content_has_image(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("image_url"))
+    })
+}
+
+fn content_blocks_text(content: &Value) -> String {
+    let Some(blocks) = content.as_array() else {
+        return content_to_string(content);
+    };
+    let mut parts = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            Some("json") => parts.push(
+                serde_json::to_string(block.get("value").unwrap_or(&Value::Null))
+                    .unwrap_or_default(),
+            ),
+            Some("image") => {
+                let artifact_id = block
+                    .get("artifactId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                parts.push(format!("[bound visual artifact: {artifact_id}]"));
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
 }
 
 fn content_to_string(content: &Value) -> String {
@@ -4882,6 +5226,7 @@ mod tests {
                 strict_tool_schema: true,
                 streaming: false,
                 vision: false,
+                ..Default::default()
             },
             defaults: ModelDefaults::default(),
         }
@@ -4951,6 +5296,180 @@ mod tests {
             }),
             input_json_schema: None,
         }
+    }
+
+    #[test]
+    fn vision_resources_require_explicit_bounded_image_capabilities() {
+        let mut vision_resource = resource("allowed", "https://example.com".to_string());
+        vision_resource.capabilities.vision_input = true;
+        assert!(validate_model_resource(&vision_resource).is_err());
+
+        vision_resource.capabilities.supported_image_media_types =
+            vec!["image/png".to_string(), "image/jpeg".to_string()];
+        vision_resource.capabilities.max_image_bytes = 10 * 1024 * 1024;
+        vision_resource.capabilities.max_image_count = 8;
+        assert!(validate_model_resource(&vision_resource).is_ok());
+
+        let mut required = RequiredCapabilities::default();
+        required.vision = true;
+        assert!(capabilities_match(&vision_resource, &required));
+    }
+
+    #[test]
+    fn resolved_visual_content_blocks_become_real_openai_image_inputs() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.routing.required_capabilities.vision = true;
+        turn_request.input.messages = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Review this candidate" },
+                {
+                    "type": "image",
+                    "artifactId": "visual-1",
+                    "mediaType": "image/png",
+                    "sha256": "a".repeat(64),
+                    "width": 1440,
+                    "height": 900,
+                    "dataBase64": "AQID"
+                }
+            ]
+        })];
+        let mut vision_resource = resource("allowed", "https://example.com".to_string());
+        vision_resource.capabilities.vision_input = true;
+        vision_resource.capabilities.supported_image_media_types = vec!["image/png".to_string()];
+        vision_resource.capabilities.max_image_bytes = 8 * 1024 * 1024;
+        vision_resource.capabilities.max_image_count = 4;
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let body = openai_request_body(&turn_request, &vision_resource, &aliases).unwrap();
+
+        assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+    }
+
+    #[test]
+    fn unresolved_visual_content_blocks_fail_closed() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "artifactId": "visual-1",
+                "mediaType": "image/png",
+                "sha256": "a".repeat(64),
+                "width": 1,
+                "height": 1
+            }]
+        })];
+        let resource = resource("vision", "https://example.com".to_string());
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+        let error = openai_request_body(&turn_request, &resource, &aliases).unwrap_err();
+        assert_eq!(error.envelope.error.code, "invalid_turn_request");
+    }
+
+    #[tokio::test]
+    async fn gateway_resolves_only_runtime_bound_visual_artifact_bytes() {
+        let image_bytes = vec![1_u8, 2, 3, 4];
+        let image_sha = format!("{:x}", Sha256::digest(&image_bytes));
+        let expected_token = "runtime-visual-secret".to_string();
+        let app = Router::new().route(
+            "/internal/runs/{run_id}/visual-artifacts/{artifact_id}/content",
+            get({
+                let image_bytes = image_bytes.clone();
+                let image_sha = image_sha.clone();
+                move |headers: HeaderMap| {
+                    let image_bytes = image_bytes.clone();
+                    let image_sha = image_sha.clone();
+                    let expected_token = expected_token.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("x-runtime-admin-token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some(expected_token.as_str())
+                        );
+                        let mut response_headers = HeaderMap::new();
+                        response_headers
+                            .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+                        response_headers.insert(
+                            "x-visual-artifact-sha256",
+                            HeaderValue::from_str(&image_sha).unwrap(),
+                        );
+                        response_headers
+                            .insert("x-visual-artifact-width", HeaderValue::from_static("1"));
+                        response_headers
+                            .insert("x-visual-artifact-height", HeaderValue::from_static("1"));
+                        (response_headers, image_bytes)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unsafe {
+            env::set_var(
+                "PROVIDER_GATEWAY_RUNTIME_BASE_URL",
+                format!("http://{address}"),
+            );
+            env::set_var(
+                "PROVIDER_GATEWAY_RUNTIME_ARTIFACT_TOKEN",
+                "runtime-visual-secret",
+            );
+        }
+
+        let mut vision_resource = resource("allowed", "https://example.com".to_string());
+        vision_resource.capabilities.vision_input = true;
+        vision_resource.capabilities.supported_image_media_types = vec!["image/png".to_string()];
+        vision_resource.capabilities.max_image_bytes = 8 * 1024 * 1024;
+        vision_resource.capabilities.max_image_count = 4;
+        let service = GatewayService::new(GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(":memory:".to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: None,
+            resources: vec![vision_resource.clone()],
+            policies: vec![policy()],
+        })
+        .unwrap();
+        let mut turn_request = request(Some("allowed"));
+        turn_request.routing.required_capabilities.vision = true;
+        turn_request.input.messages = vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "artifactId": "visual-1",
+                "mediaType": "image/png",
+                "sha256": image_sha,
+                "width": 1,
+                "height": 1
+            }]
+        })];
+        let resolved = service
+            .resolve_visual_artifacts_for_resource(&vision_resource, &turn_request)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.input.messages[0]["content"][0]["dataBase64"],
+            BASE64_STANDARD.encode(&image_bytes)
+        );
+        unsafe {
+            env::remove_var("PROVIDER_GATEWAY_RUNTIME_BASE_URL");
+            env::remove_var("PROVIDER_GATEWAY_RUNTIME_ARTIFACT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn frozen_model_resource_schema_exposes_bounded_vision_inputs() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../contracts/model-resource.schema.json")).unwrap();
+        let capabilities = &schema["properties"]["capabilities"]["properties"];
+        assert_eq!(capabilities["visionInput"]["type"], "boolean");
+        assert_eq!(capabilities["maxImageBytes"]["type"], "integer");
+        assert_eq!(capabilities["maxImageCount"]["type"], "integer");
     }
 
     #[test]
@@ -5152,7 +5671,7 @@ mod tests {
                 "role": "tool",
                 "toolUseId": "call-read",
                 "toolName": "fs.read",
-                "content": {"path":"project/src/index.astro","text":"hello"}
+                "content": {"path":"project/src/index.next","text":"hello"}
             }),
             json!({
                 "role": "tool",
@@ -5396,6 +5915,7 @@ mod tests {
                 strict_tool_schema: false,
                 streaming: false,
                 vision: false,
+                ..Default::default()
             },
             defaults: ModelDefaults::default(),
         };

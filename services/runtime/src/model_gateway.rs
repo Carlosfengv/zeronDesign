@@ -437,7 +437,7 @@ impl HttpModelGatewayClient {
                     "toolCalls": !request.tools.is_empty() || !request.deferred_tools.is_empty(),
                     "strictToolSchema": false,
                     "streaming": false,
-                    "vision": false,
+                    "vision": runtime_messages_require_vision(&request.messages),
                 }
             },
             "input": {
@@ -646,7 +646,7 @@ impl OpenAiCompatibleModelClient {
     }
 
     async fn execute(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let (mut body, tool_name_map) = openai_chat_request(&request, self.strict_tools);
+        let (mut body, tool_name_map) = openai_chat_request(&request, self.strict_tools)?;
         if self.streaming {
             body["stream"] = Value::Bool(true);
         }
@@ -1123,13 +1123,13 @@ fn chat_completions_endpoint(base_url: &str) -> String {
 fn openai_chat_request(
     request: &ModelRequest,
     strict_tools: bool,
-) -> (Value, HashMap<String, String>) {
+) -> Result<(Value, HashMap<String, String>)> {
     let tool_name_map = openai_tool_name_map(request);
     let mut messages = vec![json!({
         "role": "system",
         "content": request.system_prompt,
     })];
-    messages.extend(openai_messages_from_runtime(&request.messages));
+    messages.extend(openai_messages_from_runtime(&request.messages)?);
     let tools = request
         .tools
         .iter()
@@ -1143,14 +1143,14 @@ fn openai_chat_request(
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    (body, tool_name_map)
+    Ok((body, tool_name_map))
 }
 
-fn openai_messages_from_runtime(messages: &[Value]) -> Vec<Value> {
+fn openai_messages_from_runtime(messages: &[Value]) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     let mut pending_tool_call_ids = HashSet::new();
     for message in messages {
-        let Some(openai_message) = openai_message_from_runtime(message) else {
+        let Some(openai_message) = openai_message_from_runtime(message)? else {
             continue;
         };
         match openai_message.get("role").and_then(Value::as_str) {
@@ -1179,12 +1179,14 @@ fn openai_messages_from_runtime(messages: &[Value]) -> Vec<Value> {
             }
         }
     }
-    output
+    Ok(output)
 }
 
-fn openai_message_from_runtime(message: &Value) -> Option<Value> {
-    let role = message.get("role").and_then(Value::as_str)?;
-    match role {
+fn openai_message_from_runtime(message: &Value) -> Result<Option<Value>> {
+    let Some(role) = message.get("role").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(match role {
         "assistant" => {
             let tool_calls = message
                 .get("toolCalls")
@@ -1219,14 +1221,70 @@ fn openai_message_from_runtime(message: &Value) -> Option<Value> {
         })),
         "user" => Some(json!({
             "role": "user",
-            "content": message_text(message),
+            "content": openai_user_content(message)?,
         })),
         "system" | "model" | "runtime" => Some(json!({
             "role": "system",
             "content": message_text(message),
         })),
         _ => None,
+    })
+}
+
+fn runtime_messages_require_vision(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            })
+    })
+}
+
+fn openai_user_content(message: &Value) -> Result<Value> {
+    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+        return Ok(Value::String(message_text(message)));
+    };
+    let mut content = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => content.push(json!({
+                "type": "text",
+                "text": block.get("text").and_then(Value::as_str).unwrap_or_default(),
+            })),
+            Some("json") => content.push(json!({
+                "type": "text",
+                "text": serde_json::to_string(block.get("value").unwrap_or(&Value::Null))?,
+            })),
+            Some("image") => {
+                let media_type = block
+                    .get("mediaType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("image content block requires mediaType"))?;
+                let data = block
+                    .get("dataBase64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "direct provider image content requires Runtime-resolved dataBase64"
+                        )
+                    })?;
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{media_type};base64,{data}"),
+                        "detail": "high",
+                    },
+                }));
+            }
+            Some(other) => return Err(anyhow!("unsupported content block type: {other}")),
+            None => return Err(anyhow!("content block requires type")),
+        }
     }
+    Ok(Value::Array(content))
 }
 
 fn openai_tool_call_from_runtime(call: &Value) -> Option<Value> {
@@ -1416,5 +1474,49 @@ impl ModelClient for EmptyModelClient {
         Ok(ModelResponse::TextOnly(
             "No model gateway configured for this runtime skeleton.".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod visual_content_tests {
+    use super::*;
+
+    #[test]
+    fn direct_openai_provider_receives_resolved_image_bytes() {
+        let message = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Compare this image" },
+                {
+                    "type": "image",
+                    "artifactId": "visual-1",
+                    "mediaType": "image/png",
+                    "sha256": "a".repeat(64),
+                    "width": 1,
+                    "height": 1,
+                    "dataBase64": "AQID"
+                }
+            ]
+        });
+        assert!(runtime_messages_require_vision(&[message.clone()]));
+        let content = openai_user_content(&message).unwrap();
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AQID");
+    }
+
+    #[test]
+    fn direct_openai_provider_rejects_unresolved_image_references() {
+        let message = json!({
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "artifactId": "visual-1",
+                "mediaType": "image/png",
+                "sha256": "a".repeat(64),
+                "width": 1,
+                "height": 1
+            }]
+        });
+        assert!(openai_user_content(&message).is_err());
     }
 }

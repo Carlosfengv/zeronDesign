@@ -12,7 +12,42 @@
     "endpoint": { "type": "object" },
     "auth": { "type": "object", "required": ["type", "secretRef"] },
     "physicalModel": { "type": "string" },
-    "capabilities": { "type": "object" },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "toolCalls": { "type": "boolean" },
+        "strictToolSchema": { "type": "boolean" },
+        "streaming": { "type": "boolean" },
+        "vision": { "type": "boolean" },
+        "visionInput": { "type": "boolean" },
+        "supportedImageMediaTypes": {
+          "type": "array",
+          "items": { "enum": ["image/png", "image/jpeg", "image/webp"] },
+          "uniqueItems": true
+        },
+        "maxImageBytes": { "type": "integer", "minimum": 0 },
+        "maxImageCount": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              { "properties": { "vision": { "const": true } }, "required": ["vision"] },
+              { "properties": { "visionInput": { "const": true } }, "required": ["visionInput"] }
+            ]
+          },
+          "then": {
+            "required": ["supportedImageMediaTypes", "maxImageBytes", "maxImageCount"],
+            "properties": {
+              "supportedImageMediaTypes": { "minItems": 1 },
+              "maxImageBytes": { "minimum": 1 },
+              "maxImageCount": { "minimum": 1 }
+            }
+          }
+        }
+      ]
+    },
     "defaults": {
       "type": "object",
       "properties": {

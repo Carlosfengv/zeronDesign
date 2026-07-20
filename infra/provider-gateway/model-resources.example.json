@@ -22,7 +22,11 @@
         "toolCalls": true,
         "strictToolSchema": true,
         "streaming": false,
-        "vision": false
+        "vision": false,
+        "visionInput": false,
+        "supportedImageMediaTypes": [],
+        "maxImageBytes": 0,
+        "maxImageCount": 0
       },
       "defaults": {
         "requestTimeoutMs": 120000,
