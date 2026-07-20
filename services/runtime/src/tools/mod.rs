@@ -1,7 +1,6 @@
 pub mod brief;
 pub mod content;
 pub mod control_plane;
-pub mod mcp;
 pub mod registry;
 pub mod run;
 pub mod runtime;

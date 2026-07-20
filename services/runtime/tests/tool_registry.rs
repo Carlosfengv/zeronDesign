@@ -119,33 +119,36 @@ fn disabled_tools_are_not_sent_to_model() {
 fn deferred_and_mcp_metadata_is_retained_but_not_eager_loaded() {
     let mut registry = ToolRegistry::new();
     let mut mcp_tool = ToolDefinition::deferred_mcp_stub(
-        "mcp__figma__get_file",
+        "mcp__example__lookup",
         object_schema(json!({}), &[]),
         McpToolInfo {
-            server_name: "figma".to_string(),
-            tool_name: "get_file".to_string(),
+            server_name: "example".to_string(),
+            tool_name: "lookup".to_string(),
         },
-        "real Figma MCP is out of Phase A scope",
+        "example MCP adapter is not configured",
         220,
     );
     mcp_tool.input_json_schema = Some(json!({
         "type": "object",
-        "properties": { "fileKey": { "type": "string" } },
-        "required": ["fileKey"]
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"]
     }));
     registry.register(mcp_tool);
 
     assert!(registry.model_tool_definitions().is_empty());
     let deferred = registry.deferred_metadata();
     assert_eq!(deferred.len(), 1);
-    assert_eq!(deferred[0].mcp_info.as_ref().unwrap().server_name, "figma");
+    assert_eq!(
+        deferred[0].mcp_info.as_ref().unwrap().server_name,
+        "example"
+    );
     assert_eq!(
         deferred[0].model_input_schema(),
         deferred[0].input_json_schema.as_ref().unwrap()
     );
     assert_eq!(
         deferred[0].mcp_stub.as_ref().unwrap().reason,
-        "real Figma MCP is out of Phase A scope"
+        "example MCP adapter is not configured"
     );
 }
 
@@ -171,13 +174,13 @@ fn model_and_deferred_tool_catalogs_can_be_limited_by_token_budget() {
     shell_tool.estimated_token_cost = 80;
     registry.register(shell_tool);
     registry.register(ToolDefinition::deferred_mcp_stub(
-        "mcp__figma__get_file",
+        "mcp__example__lookup",
         object_schema(json!({}), &[]),
         McpToolInfo {
-            server_name: "figma".to_string(),
-            tool_name: "get_file".to_string(),
+            server_name: "example".to_string(),
+            tool_name: "lookup".to_string(),
         },
-        "real Figma MCP is out of Phase A scope",
+        "example MCP adapter is not configured",
         180,
     ));
 
@@ -188,50 +191,7 @@ fn model_and_deferred_tool_catalogs_can_be_limited_by_token_budget() {
     assert!(registry.deferred_metadata_within_budget(120).is_empty());
     let deferred = registry.deferred_metadata_within_budget(200);
     assert_eq!(deferred.len(), 1);
-    assert_eq!(deferred[0].name, "mcp__figma__get_file");
-}
-
-#[tokio::test]
-async fn executable_mcp_stub_uses_permission_audit_and_returns_recoverable_error() {
-    let store = RuntimeStore::new();
-    let run = store
-        .create_run(
-            "project-1".to_string(),
-            AgentPhase::Build,
-            "build".to_string(),
-            "internal-balanced".to_string(),
-            vec![],
-        )
-        .await;
-    let executor = control_plane_executor();
-    let stub = executor
-        .get("mcp__figma__get_file")
-        .expect("figma MCP stub should be registered");
-
-    assert_eq!(stub.tool_loading(), ToolLoadingPolicy::Deferred);
-    assert_eq!(stub.mcp_info().unwrap().server_name, "figma");
-    assert!(stub.input_json_schema().is_some());
-
-    let result = executor
-        .execute(
-            store.clone(),
-            &run.id,
-            "tool-figma-1",
-            "mcp__figma__get_file",
-            json!({ "fileKey": "abc123" }),
-        )
-        .await;
-
-    assert!(result.result.is_error);
-    assert!(result.result.content["error"]
-        .as_str()
-        .unwrap()
-        .contains("MCP adapter not configured"));
-    let audit = store.audit_records().await;
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0].tool, "mcp__figma__get_file");
-    assert_eq!(audit[0].decision, "allow");
-    assert!(audit[0].reason.contains("MCP stub"));
+    assert_eq!(deferred[0].name, "mcp__example__lookup");
 }
 
 #[tokio::test]
@@ -252,7 +212,7 @@ async fn sandbox_open_channel_tool_requires_ready_binding() {
             "project-project-1-sandbox-1".to_string(),
             "project-project-1-sandbox-1".to_string(),
             "workspace-project-project-1-sandbox-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -317,14 +277,14 @@ async fn sandbox_claim_wait_ready_open_channel_sequence_uses_binding_contract() 
             &run.id,
             "tool-sandbox-claim",
             "sandbox.claim",
-            json!({ "templateKey": "astro-website" }),
+            json!({ "templateKey": "next-app" }),
         )
         .await;
     assert!(!claimed.result.is_error);
     assert_eq!(claimed.result.content["status"], "claiming");
     assert_eq!(
         claimed.result.content["warmPoolName"],
-        "anydesign-astro-website-pool"
+        "anydesign-next-app-pool"
     );
     assert_eq!(claimed.result.content["mode"], "phase_a_contract");
 
@@ -493,7 +453,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
             &run.id,
             "tool-kube-claim",
             "sandbox.claim",
-            json!({ "templateKey": "astro-website" }),
+            json!({ "templateKey": "next-app" }),
         )
         .await;
 
@@ -509,7 +469,7 @@ async fn sandbox_tools_can_use_injected_kubernetes_backend() {
     let created = client.created.lock().unwrap().clone();
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].namespace, "ws-kube-sandboxes");
-    assert_eq!(created[0].warm_pool_name, "anydesign-astro-website-pool");
+    assert_eq!(created[0].warm_pool_name, "anydesign-next-app-pool");
     assert_eq!(created[0].workspace_pvc_name, workspace_pvc_name);
 
     let ready = executor
@@ -618,7 +578,7 @@ async fn run_sandbox_binding_rejects_cross_project_workspace() {
             "project-project-2-sandbox-1".to_string(),
             "project-project-2-sandbox-1".to_string(),
             "workspace-project-project-2-sandbox-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -644,7 +604,7 @@ async fn sandbox_binding_rejects_reused_workspace_pvc() {
             "project-project-1-sandbox-1".to_string(),
             "project-project-1-sandbox-1".to_string(),
             "workspace-shared".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -657,7 +617,7 @@ async fn sandbox_binding_rejects_reused_workspace_pvc() {
             "project-project-2-sandbox-1".to_string(),
             "project-project-2-sandbox-1".to_string(),
             "workspace-shared".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )

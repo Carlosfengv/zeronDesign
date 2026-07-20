@@ -16,7 +16,7 @@ use crate::{
         SandboxKubeClient,
     },
     tools::{
-        brief, content, mcp, run,
+        brief, content, run,
         runtime::{
             ProgressSink, Tool, ToolContext, ToolError, ToolExecutor, ToolResult, ValidationError,
         },
@@ -139,7 +139,6 @@ pub fn control_plane_executor_with_backends(
         workspace_backend,
         command_backend,
     ));
-    tools.extend(mcp::mcp_stub_tools());
     ToolExecutor::new(tools, Default::default())
 }
 

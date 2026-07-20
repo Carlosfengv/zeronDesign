@@ -38,7 +38,7 @@ fn default_snapshot(source_checkpoint_id: Option<String>) -> RunProfileSnapshot 
         permission_mode: PermissionMode::Normal,
         transcript_mode: TranscriptMode::Main,
         source_checkpoint_id,
-        mcp_server_names: vec!["figma".to_string()],
+        mcp_server_names: vec![],
     }
 }
 
