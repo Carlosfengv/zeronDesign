@@ -88,7 +88,7 @@ describe("mock BFF shared runtime contract types", () => {
       sandboxClaimName: "project-project-1-sandbox-1",
       workspacePvcName: "workspace-project-project-1-sandbox-1",
       channelServiceName: "workspace-channel-7f9b",
-      warmPoolName: "anydesign-astro-website-pool",
+      warmPoolName: "anydesign-next-app-pool",
       namespace: "anydesign-sandboxes",
       status: "ready",
       channelProtocol: "websocket",
@@ -203,7 +203,7 @@ describe("mock BFF shared runtime contract types", () => {
       sandboxBindingId: "sandbox-binding-1",
       sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
       appRoot: "project",
-      templateKey: "astro-website",
+      templateKey: "next-app",
       styleContractPath: "/workspace/state/style-contract.json",
       styleContract: {
         version: "runtime-style-contract@p3",
@@ -353,7 +353,7 @@ describe("mock BFF shared runtime contract types", () => {
       {
         type: "chunk.received",
         runId: "run-1",
-        path: "src/pages/index.astro",
+        path: "app/page.tsx",
         sessionId: "chunk-session-1",
         index: 1,
         total: 2,
@@ -364,7 +364,7 @@ describe("mock BFF shared runtime contract types", () => {
       {
         type: "chunk.committed",
         runId: "run-1",
-        path: "src/pages/index.astro",
+        path: "app/page.tsx",
         sessionId: "chunk-session-1",
         total: 2,
         bytes: 2048,

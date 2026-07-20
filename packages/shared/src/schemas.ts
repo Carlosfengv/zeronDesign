@@ -198,8 +198,8 @@ export const BriefSchema = z.object({
   ]),
   visualDirection: z.string().min(1),
   recommendedTemplate: z.enum([
-    "astro-website",
     "fumadocs-docs",
+    "next-app",
     "nextjs-website",
     "docusaurus-docs",
   ]),
@@ -252,6 +252,449 @@ export const DesignSourceArtifactSchema = z.object({
   sha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
   createdAt: z.string().datetime(),
 });
+
+export const Sha256HexSchema = z.string().regex(/^[a-fA-F0-9]{64}$/);
+export const VisualMediaTypeSchema = z.enum([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
+
+export const DraftSnapshotRetentionStateSchema = z.enum([
+  "active",
+  "deletion_pending",
+  "protected",
+]);
+
+export const DraftSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal("draft-snapshot@1"),
+    snapshotId: z.string().min(1),
+    projectId: z.string().min(1),
+    sourceSnapshotUri: z.string().min(1),
+    sourceHash: Sha256HexSchema,
+    templateId: z.string().min(1),
+    templateVersion: z.string().min(1),
+    dependencyPolicyVersion: z.string().min(1),
+    designContextHash: Sha256HexSchema,
+    createdByRunId: z.string().min(1),
+    basedOnSnapshotId: z.string().min(1).nullish(),
+    restoredFromVersionId: z.string().min(1).nullish(),
+    createdAt: z.string().datetime(),
+    retentionState: DraftSnapshotRetentionStateSchema,
+    deleteAfter: z.string().datetime().nullish(),
+  })
+  .strict();
+
+export const PublishSourceSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("static-snapshot"),
+      projectId: z.string().min(1),
+      snapshotId: z.string().min(1),
+      expectedSourceHash: Sha256HexSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("draft-revision"),
+      projectId: z.string().min(1),
+      sessionId: z.string().min(1),
+      sessionEpoch: z.number().int().positive(),
+      revision: z.number().int().nonnegative(),
+      snapshotId: z.string().min(1),
+      expectedSourceHash: Sha256HexSchema,
+    })
+    .strict(),
+]);
+
+export const EditBaseSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("work-version"),
+      versionId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("draft"),
+      snapshotId: z.string().min(1),
+      sessionId: z.string().min(1),
+      expectedSessionEpoch: z.number().int().positive(),
+      expectedWorkspaceRevision: z.number().int().nonnegative(),
+      writerLeaseId: z.string().min(1),
+    })
+    .strict(),
+]);
+
+export const VisualArtifactOriginSchema = z.enum(["upload", "browser", "generated"]);
+
+export const VisualArtifactSchema = z
+  .object({
+    schemaVersion: z.literal("visual-artifact@1"),
+    id: z.string().min(1),
+    projectId: z.string().min(1),
+    mediaType: VisualMediaTypeSchema,
+    sizeBytes: z.number().int().positive(),
+    width: z.number().int().positive().max(16_384),
+    height: z.number().int().positive().max(16_384),
+    sha256: Sha256HexSchema,
+    storageUri: z.string().min(1),
+    origin: VisualArtifactOriginSchema,
+    originMetadata: z.record(z.string(), z.unknown()).default({}),
+    createdAt: z.string().datetime(),
+    retentionState: DraftSnapshotRetentionStateSchema,
+    deleteAfter: z.string().datetime().nullish(),
+  })
+  .strict();
+
+export const VisualViewportSchema = z
+  .object({
+    width: z.number().int().positive().max(16_384),
+    height: z.number().int().positive().max(16_384),
+    deviceScaleFactor: z.number().positive().max(4).default(1),
+  })
+  .strict();
+
+export const RunVisualTargetSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("draft"),
+      sessionId: z.string().min(1),
+      sessionEpoch: z.number().int().positive(),
+      sourceRevision: z.number().int().nonnegative(),
+      sourceHash: Sha256HexSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("version"),
+      versionId: z.string().min(1),
+      artifactManifestHash: Sha256HexSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("static-snapshot"),
+      snapshotId: z.string().min(1),
+      sourceHash: Sha256HexSchema,
+    })
+    .strict(),
+]);
+
+export const RunVisualBindingSchema = z
+  .object({
+    runId: z.string().min(1),
+    artifactId: z.string().min(1),
+    role: z.enum(["reference", "candidate"]),
+    route: z.string().regex(/^\/(?!\/)/, "must be a root-relative route"),
+    viewport: VisualViewportSchema,
+    target: RunVisualTargetSchema,
+    order: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const ToolResultContentBlockSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("text"), text: z.string() }).strict(),
+  z.object({ type: z.literal("json"), value: z.unknown() }).strict(),
+  z
+    .object({
+      type: z.literal("image"),
+      artifactId: z.string().min(1),
+      mediaType: VisualMediaTypeSchema,
+      sha256: Sha256HexSchema,
+      width: z.number().int().positive().max(16_384),
+      height: z.number().int().positive().max(16_384),
+    })
+    .strict(),
+]);
+
+export const ModelVisionCapabilitySchema = z
+  .object({
+    visionInput: z.boolean(),
+    supportedImageMediaTypes: z.array(VisualMediaTypeSchema).default([]),
+    maxImageBytes: z.number().int().nonnegative().default(0),
+    maxImageCount: z.number().int().nonnegative().default(0),
+  })
+  .strict()
+  .superRefine((capability, context) => {
+    if (!capability.visionInput) {
+      return;
+    }
+    if (capability.supportedImageMediaTypes.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["supportedImageMediaTypes"],
+        message: "vision input requires at least one supported image media type",
+      });
+    }
+    if (capability.maxImageBytes === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["maxImageBytes"],
+        message: "vision input requires a positive maxImageBytes",
+      });
+    }
+    if (capability.maxImageCount === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["maxImageCount"],
+        message: "vision input requires a positive maxImageCount",
+      });
+    }
+  });
+
+export const VisualReviewModeSchema = z.enum(["off", "advisory", "required"]);
+export const VisualReviewStatusSchema = z.enum([
+  "not_requested",
+  "queued",
+  "passed",
+  "findings",
+  "unavailable",
+  "failed",
+]);
+
+export const VisualReviewStateSchema = z
+  .object({
+    schemaVersion: z.literal("visual-review-state@1"),
+    mode: VisualReviewModeSchema,
+    status: VisualReviewStatusSchema,
+    target: RunVisualTargetSchema.nullish(),
+    runId: z.string().min(1).nullish(),
+    reason: z.string().min(1).nullish(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+export const DraftPreviewSessionStatusSchema = z.enum([
+  "starting",
+  "ready",
+  "updating",
+  "compile_error",
+  "crashed",
+  "restarting",
+  "failed",
+  "stopped",
+]);
+
+export const DraftPreviewSessionSchema = z
+  .object({
+    schemaVersion: z.literal("draft-preview-session@1"),
+    sessionId: z.string().min(1),
+    projectId: z.string().min(1),
+    sandboxBindingId: z.string().min(1),
+    templateId: z.string().min(1),
+    baseSnapshotId: z.string().min(1),
+    baseVersionId: z.string().min(1).nullish(),
+    writerLeaseId: z.string().min(1),
+    writerLeaseExpiresAt: z.string().datetime(),
+    workspaceRevision: z.number().int().nonnegative(),
+    lastReadyRevision: z.number().int().nonnegative(),
+    durableRevision: z.number().int().nonnegative(),
+    durableSnapshotId: z.string().min(1),
+    publishRevision: z.number().int().nonnegative().nullish(),
+    sessionEpoch: z.number().int().positive(),
+    status: DraftPreviewSessionStatusSchema,
+    proxyUrl: z.string().url(),
+    startedAt: z.string().datetime(),
+    lastActivityAt: z.string().datetime(),
+    restartCount: z.number().int().nonnegative(),
+    lastError: z.string().min(1).nullish(),
+  })
+  .strict()
+  .superRefine((session, context) => {
+    if (session.lastReadyRevision > session.workspaceRevision) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["lastReadyRevision"],
+        message: "lastReadyRevision cannot exceed workspaceRevision",
+      });
+    }
+    if (session.durableRevision > session.workspaceRevision) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["durableRevision"],
+        message: "durableRevision cannot exceed workspaceRevision",
+      });
+    }
+  });
+
+export const ElementBoundingBoxSchema = z
+  .object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number().nonnegative(),
+    height: z.number().nonnegative(),
+  })
+  .strict();
+
+export const ElementSourceCandidateSchema = z
+  .object({
+    path: z.string().min(1),
+    line: z.number().int().positive().nullish(),
+    column: z.number().int().positive().nullish(),
+    exportName: z.string().min(1).nullish(),
+    confidence: z.number().min(0).max(1),
+  })
+  .strict();
+
+export const ElementObservationSchema = z
+  .object({
+    schemaVersion: z.literal("element-observation@1"),
+    observationId: z.string().min(1),
+    projectId: z.string().min(1),
+    sessionId: z.string().min(1),
+    sessionEpoch: z.number().int().positive(),
+    workspaceRevision: z.number().int().nonnegative(),
+    route: z.string().regex(/^\/(?!\/)/, "must be a root-relative route"),
+    viewport: VisualViewportSchema,
+    domPath: z.string().min(1),
+    dataSlot: z.string().min(1).nullish(),
+    accessibleName: z.string().min(1).nullish(),
+    visibleTextHash: Sha256HexSchema.nullish(),
+    boundingBox: ElementBoundingBoxSchema,
+    sourceCandidates: z.array(ElementSourceCandidateSchema),
+    confidence: z.number().min(0).max(1),
+    screenshotCropArtifactId: z.string().min(1),
+    expiresAt: z.string().datetime(),
+    signature: z.string().min(1),
+  })
+  .strict();
+
+export const EditImpactOperationSchema = z.enum([
+  "copy",
+  "style",
+  "layout",
+  "component",
+  "navigation",
+  "delete",
+  "dependency",
+]);
+
+export const EditImpactPlanSchema = z
+  .object({
+    schemaVersion: z.literal("edit-impact-plan@1"),
+    scope: z.enum(["local", "page", "global"]),
+    targets: z.array(z.string().min(1)).min(1),
+    operations: z.array(EditImpactOperationSchema).min(1),
+    risk: z.enum(["low", "medium", "high"]),
+    requiresConfirmation: z.boolean(),
+    editBase: EditBaseSchema,
+    sessionId: z.string().min(1),
+    sessionEpoch: z.number().int().positive(),
+    workspaceRevision: z.number().int().nonnegative(),
+    planHash: Sha256HexSchema,
+  })
+  .strict()
+  .superRefine((plan, context) => {
+    if (plan.risk === "high" && !plan.requiresConfirmation) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["requiresConfirmation"],
+        message: "high-risk edits require confirmation",
+      });
+    }
+  });
+
+export const ProjectAssetSchema = z
+  .object({
+    schemaVersion: z.literal("project-asset@1"),
+    assetId: z.string().min(1),
+    projectId: z.string().min(1),
+    sourceArtifactId: z.string().min(1),
+    source: z.enum(["upload", "generated"]),
+    targetPath: z.string().regex(/^public\/assets\//),
+    contentHash: Sha256HexSchema,
+    license: z.string().min(1),
+    provenance: z.unknown(),
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    altText: z.string().min(1),
+    createdByRunId: z.string().min(1).nullish(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+
+export const HistoryItemSchema = z
+  .discriminatedUnion("kind", [
+    z
+      .object({
+        kind: z.literal("draft_snapshot"),
+        snapshot: DraftSnapshotSchema,
+        recoverable: z.literal(true),
+        publishable: z.literal(false),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("work_version"),
+        version: ProjectVersionSchema,
+        recoverable: z.boolean(),
+        publishable: z.boolean(),
+      })
+      .strict(),
+  ])
+  .superRefine((item, context) => {
+    if (item.kind !== "work_version") {
+      return;
+    }
+    if (item.recoverable !== Boolean(item.version.sourceSnapshotUri)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["recoverable"],
+        message: "work version recoverability must match sourceSnapshotUri",
+      });
+    }
+    if (item.publishable !== (item.version.status === "promoted")) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["publishable"],
+        message: "only promoted work versions are publishable",
+      });
+    }
+  });
+
+export const VisualFindingCategorySchema = z.enum([
+  "layout",
+  "hierarchy",
+  "typography",
+  "color",
+  "spacing",
+  "border_radius",
+  "image_crop",
+  "density",
+  "consistency",
+  "responsive",
+  "advisory_note",
+]);
+
+export const VisualFindingSchema = z
+  .object({
+    schemaVersion: z.literal("visual-finding@1"),
+    findingId: z.string().min(1),
+    reviewRunId: z.string().min(1),
+    target: RunVisualTargetSchema,
+    route: z.string().regex(/^\/(?!\/)/, "must be a root-relative route"),
+    viewport: VisualViewportSchema,
+    category: VisualFindingCategorySchema,
+    severity: z.enum(["info", "warning", "blocking"]),
+    summary: z.string().min(1),
+    evidenceArtifactIds: z.array(z.string().min(1)).min(1),
+    evidenceRegion: ElementBoundingBoxSchema.nullish(),
+    targetObservationId: z.string().min(1).nullish(),
+    suggestedChange: z.string().min(1),
+    status: z.enum(["open", "repairing", "fixed", "accepted"]),
+    modelResourceSnapshot: z
+      .object({
+        modelResourceId: z.string().min(1),
+        revision: z.number().int().positive(),
+        physicalModel: z.string().min(1),
+        capabilitySnapshotHash: Sha256HexSchema,
+        promptPolicyVersion: z.string().min(1),
+      })
+      .strict(),
+  })
+  .strict();
 
 const StringListSchema = z.array(z.string().min(1));
 const FidelityRouteSchema = z.string().regex(/^\/(?!\/)/, "must be a root-relative route");
@@ -483,11 +926,18 @@ export const DesignProfileBaseSchema = z.object({
   technical: z
     .object({
       allowedTemplates: z
-        .array(z.enum(["astro-website", "fumadocs-docs", "nextjs-website", "docusaurus-docs"]))
+        .array(
+          z.enum([
+            "fumadocs-docs",
+            "next-app",
+            "nextjs-website",
+            "docusaurus-docs",
+          ]),
+        )
         .min(1),
       preferredTemplates: z
         .object({
-          website: z.enum(["astro-website", "nextjs-website"]),
+          website: z.enum(["next-app", "nextjs-website"]),
           docs: z.enum(["fumadocs-docs", "docusaurus-docs"]),
         })
         .passthrough(),
@@ -611,6 +1061,36 @@ export type DesignProfileStatus = z.infer<typeof DesignProfileStatusSchema>;
 export type DesignProfileSchemaVersion = z.infer<typeof DesignProfileSchemaVersionSchema>;
 export type DesignProfileScope = z.infer<typeof DesignProfileScopeSchema>;
 export type DesignSourceArtifact = z.infer<typeof DesignSourceArtifactSchema>;
+export type DraftSnapshotRetentionState = z.infer<
+  typeof DraftSnapshotRetentionStateSchema
+>;
+export type DraftSnapshot = z.infer<typeof DraftSnapshotSchema>;
+export type PublishSource = z.infer<typeof PublishSourceSchema>;
+export type EditBase = z.infer<typeof EditBaseSchema>;
+export type VisualMediaType = z.infer<typeof VisualMediaTypeSchema>;
+export type VisualArtifactOrigin = z.infer<typeof VisualArtifactOriginSchema>;
+export type VisualArtifact = z.infer<typeof VisualArtifactSchema>;
+export type VisualViewport = z.infer<typeof VisualViewportSchema>;
+export type RunVisualTarget = z.infer<typeof RunVisualTargetSchema>;
+export type RunVisualBinding = z.infer<typeof RunVisualBindingSchema>;
+export type ToolResultContentBlock = z.infer<typeof ToolResultContentBlockSchema>;
+export type ModelVisionCapability = z.infer<typeof ModelVisionCapabilitySchema>;
+export type VisualReviewMode = z.infer<typeof VisualReviewModeSchema>;
+export type VisualReviewStatus = z.infer<typeof VisualReviewStatusSchema>;
+export type VisualReviewState = z.infer<typeof VisualReviewStateSchema>;
+export type DraftPreviewSessionStatus = z.infer<
+  typeof DraftPreviewSessionStatusSchema
+>;
+export type DraftPreviewSession = z.infer<typeof DraftPreviewSessionSchema>;
+export type ElementBoundingBox = z.infer<typeof ElementBoundingBoxSchema>;
+export type ElementSourceCandidate = z.infer<typeof ElementSourceCandidateSchema>;
+export type ElementObservation = z.infer<typeof ElementObservationSchema>;
+export type EditImpactOperation = z.infer<typeof EditImpactOperationSchema>;
+export type EditImpactPlan = z.infer<typeof EditImpactPlanSchema>;
+export type ProjectAsset = z.infer<typeof ProjectAssetSchema>;
+export type HistoryItem = z.infer<typeof HistoryItemSchema>;
+export type VisualFindingCategory = z.infer<typeof VisualFindingCategorySchema>;
+export type VisualFinding = z.infer<typeof VisualFindingSchema>;
 export type RuntimeTokenMapping = z.infer<typeof RuntimeTokenMappingSchema>;
 export type DesignSignatureRule = z.infer<typeof DesignSignatureRuleSchema>;
 export type DesignProfile = z.infer<typeof DesignProfileSchema>;

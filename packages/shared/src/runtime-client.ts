@@ -13,8 +13,14 @@ import {
   DesignContextManifestResponseSchema,
   ConversationListResponseSchema,
   CreateDesignSourceArtifactRequest,
+  CreateVisualArtifactRequest,
+  CreateRunVisualBindingRequest,
   CreateReleaseRequest,
   CreateDesignProfileRequest,
+  CreateEditImpactPlanRequest,
+  CreateEditImpactPlanRequestSchema,
+  CreateElementObservationRequest,
+  CreateElementObservationRequestSchema,
   DesignSourceArtifactResponseSchema,
   DesignProfileDiffResponseSchema,
   DesignProfileConversionReportSchema,
@@ -22,7 +28,13 @@ import {
   DesignProfileResponseSchema,
   DesignProfileVersionsResponseSchema,
   DeploymentStateResponseSchema,
+  DraftPreviewHeartbeatRequest,
+  DraftPreviewHeartbeatRequestSchema,
+  DraftPreviewTakeoverRequest,
+  DraftPreviewTakeoverRequestSchema,
   ErrorResponseSchema,
+  EditImpactPlanResponseSchema,
+  ElementObservationResponseSchema,
   HealthResponseSchema,
   ImportDesignProfileRequest,
   ImportDesignProfileResponseSchema,
@@ -32,21 +44,34 @@ import {
   PreviewCurrentResponseSchema,
   PreviewVersionResponseSchema,
   PublicationOperationResponseSchema,
+  PublishWorkflowListResponseSchema,
+  PublishWorkflowResponseSchema,
   PublishWorkRequest,
+  StartPublishWorkflowRequest,
+  StartPublishWorkflowRequestSchema,
   ProjectAccessResponseSchema,
+  ProjectAssetListResponseSchema,
+  ProjectAssetResponseSchema,
   ProjectDesignProfileResponseSchema,
+  ProjectHistoryListResponseSchema,
   ProjectRuntimeStateResponseSchema,
   ProfileTokenSyncOperationResponseSchema,
   ResolvePermissionRequest,
   ResolvePermissionResponseSchema,
   ReleasePackagingResponseSchema,
+  RunVisualBindingListResponseSchema,
+  RunVisualBindingResponseSchema,
+  ScheduleVisualReviewRequest,
   StartRunRequest,
   StartRunResponseSchema,
   UpsertProjectAccessRequest,
   UnpublishWorkRequest,
   UpdateDesignProfileRequest,
   WorkReleaseListResponseSchema,
+  VisualArtifactResponseSchema,
+  VisualReviewResultSchema,
 } from "./api-types.js";
+import { DraftPreviewSessionSchema } from "./schemas.js";
 import { AgentEventSchema, type AgentEvent } from "./events.js";
 
 export type RuntimeFetch = (
@@ -171,6 +196,60 @@ export type RuntimeClient = {
   getPublicationOperation(
     operationId: string,
   ): Promise<z.output<typeof PublicationOperationResponseSchema>>;
+  startPublishWorkflow(
+    projectId: string,
+    request: StartPublishWorkflowRequest,
+  ): Promise<z.output<typeof PublishWorkflowResponseSchema>>;
+  getPublishWorkflow(
+    workflowId: string,
+  ): Promise<z.output<typeof PublishWorkflowResponseSchema>>;
+  cancelPublishWorkflow(
+    workflowId: string,
+  ): Promise<z.output<typeof PublishWorkflowResponseSchema>>;
+  listPublishWorkflows(
+    projectId: string,
+  ): Promise<z.output<typeof PublishWorkflowListResponseSchema>>;
+  getCurrentDraftPreview(
+    projectId: string,
+  ): Promise<z.output<typeof DraftPreviewSessionSchema>>;
+  getDraftPreview(
+    sessionId: string,
+  ): Promise<z.output<typeof DraftPreviewSessionSchema>>;
+  heartbeatDraftPreview(
+    sessionId: string,
+    request: DraftPreviewHeartbeatRequest,
+  ): Promise<z.output<typeof DraftPreviewSessionSchema>>;
+  takeoverDraftPreview(
+    sessionId: string,
+    request: DraftPreviewTakeoverRequest,
+  ): Promise<z.output<typeof DraftPreviewSessionSchema>>;
+  createElementObservation(
+    projectId: string,
+    request: CreateElementObservationRequest,
+  ): Promise<z.output<typeof ElementObservationResponseSchema>>;
+  getElementObservation(
+    projectId: string,
+    observationId: string,
+  ): Promise<z.output<typeof ElementObservationResponseSchema>>;
+  createEditImpactPlan(
+    projectId: string,
+    request: CreateEditImpactPlanRequest,
+  ): Promise<z.output<typeof EditImpactPlanResponseSchema>>;
+  getEditImpactPlan(
+    projectId: string,
+    planHash: string,
+  ): Promise<z.output<typeof EditImpactPlanResponseSchema>>;
+  confirmEditImpactPlan(
+    projectId: string,
+    planHash: string,
+  ): Promise<z.output<typeof EditImpactPlanResponseSchema>>;
+  listProjectAssets(
+    projectId: string,
+  ): Promise<z.output<typeof ProjectAssetListResponseSchema>>;
+  getProjectAsset(
+    projectId: string,
+    assetId: string,
+  ): Promise<z.output<typeof ProjectAssetResponseSchema>>;
   getBrief(briefId: string): Promise<z.output<typeof BriefResponseSchema>>;
   confirmBrief(briefId: string): Promise<z.output<typeof BriefResponseSchema>>;
   createDesignSourceArtifact(
@@ -235,6 +314,35 @@ export type RuntimeClient = {
     request: ResolvePermissionRequest,
   ): Promise<z.output<typeof ResolvePermissionResponseSchema>>;
   getConversation(projectId: string): Promise<z.output<typeof ConversationListResponseSchema>>;
+  getProjectHistory(
+    projectId: string,
+  ): Promise<z.output<typeof ProjectHistoryListResponseSchema>>;
+  createVisualArtifact(
+    projectId: string,
+    request: CreateVisualArtifactRequest,
+  ): Promise<z.output<typeof VisualArtifactResponseSchema>>;
+  getVisualArtifact(
+    projectId: string,
+    artifactId: string,
+  ): Promise<z.output<typeof VisualArtifactResponseSchema>>;
+  getVisualArtifactContent(projectId: string, artifactId: string): Promise<Uint8Array>;
+  deleteVisualArtifact(
+    projectId: string,
+    artifactId: string,
+  ): Promise<z.output<typeof VisualArtifactResponseSchema>>;
+  createRunVisualBinding(
+    projectId: string,
+    runId: string,
+    request: CreateRunVisualBindingRequest,
+  ): Promise<z.output<typeof RunVisualBindingResponseSchema>>;
+  listRunVisualBindings(
+    projectId: string,
+    runId: string,
+  ): Promise<z.output<typeof RunVisualBindingListResponseSchema>>;
+  scheduleVisualReview(
+    projectId: string,
+    request: ScheduleVisualReviewRequest,
+  ): Promise<z.output<typeof VisualReviewResultSchema>>;
   getProjectRuntimeState(
     projectId: string,
   ): Promise<z.output<typeof ProjectRuntimeStateResponseSchema>>;
@@ -372,6 +480,88 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       get(`/projects/${encodePathSegment(projectId)}/releases`, WorkReleaseListResponseSchema),
     getPublicationOperation: (operationId) =>
       get(`/operations/${encodePathSegment(operationId)}`, PublicationOperationResponseSchema),
+    startPublishWorkflow: (projectId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/publish-workflows`,
+        StartPublishWorkflowRequestSchema.parse(request),
+        PublishWorkflowResponseSchema,
+      ),
+    getPublishWorkflow: (workflowId) =>
+      get(
+        `/publish-workflows/${encodePathSegment(workflowId)}`,
+        PublishWorkflowResponseSchema,
+      ),
+    cancelPublishWorkflow: (workflowId) =>
+      post(
+        `/publish-workflows/${encodePathSegment(workflowId)}/cancel`,
+        {},
+        PublishWorkflowResponseSchema,
+      ),
+    listPublishWorkflows: (projectId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/publish-workflows`,
+        PublishWorkflowListResponseSchema,
+      ),
+    getCurrentDraftPreview: (projectId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/draft-preview`,
+        DraftPreviewSessionSchema,
+      ),
+    getDraftPreview: (sessionId) =>
+      get(
+        `/draft-preview-sessions/${encodePathSegment(sessionId)}`,
+        DraftPreviewSessionSchema,
+      ),
+    heartbeatDraftPreview: (sessionId, request) =>
+      post(
+        `/draft-preview-sessions/${encodePathSegment(sessionId)}/heartbeat`,
+        DraftPreviewHeartbeatRequestSchema.parse(request),
+        DraftPreviewSessionSchema,
+      ),
+    takeoverDraftPreview: (sessionId, request) =>
+      post(
+        `/draft-preview-sessions/${encodePathSegment(sessionId)}/takeover`,
+        DraftPreviewTakeoverRequestSchema.parse(request),
+        DraftPreviewSessionSchema,
+      ),
+    createElementObservation: (projectId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/element-observations`,
+        CreateElementObservationRequestSchema.parse(request),
+        ElementObservationResponseSchema,
+      ),
+    getElementObservation: (projectId, observationId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/element-observations/${encodePathSegment(observationId)}`,
+        ElementObservationResponseSchema,
+      ),
+    createEditImpactPlan: (projectId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/edit-impact-plans`,
+        CreateEditImpactPlanRequestSchema.parse(request),
+        EditImpactPlanResponseSchema,
+      ),
+    getEditImpactPlan: (projectId, planHash) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/edit-impact-plans/${encodePathSegment(planHash)}`,
+        EditImpactPlanResponseSchema,
+      ),
+    confirmEditImpactPlan: (projectId, planHash) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/edit-impact-plans/${encodePathSegment(planHash)}/confirm`,
+        {},
+        EditImpactPlanResponseSchema,
+      ),
+    listProjectAssets: (projectId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/assets`,
+        ProjectAssetListResponseSchema,
+      ),
+    getProjectAsset: (projectId, assetId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/assets/${encodePathSegment(assetId)}`,
+        ProjectAssetResponseSchema,
+      ),
     getBrief: (briefId) =>
       get(`/briefs/${encodePathSegment(briefId)}`, BriefResponseSchema),
     confirmBrief: (briefId) =>
@@ -503,6 +693,54 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       ),
     getConversation: (projectId) =>
       get(`/projects/${encodePathSegment(projectId)}/conversation`, ConversationListResponseSchema),
+    getProjectHistory: (projectId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/history`,
+        ProjectHistoryListResponseSchema,
+      ),
+    createVisualArtifact: (projectId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/visual-artifacts`,
+        request,
+        VisualArtifactResponseSchema,
+      ),
+    getVisualArtifact: (projectId, artifactId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/visual-artifacts/${encodePathSegment(artifactId)}`,
+        VisualArtifactResponseSchema,
+      ),
+    getVisualArtifactContent: (projectId, artifactId) =>
+      requestBytes(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/visual-artifacts/${encodePathSegment(artifactId)}/content`,
+        { headers: publicHeaders },
+      ),
+    deleteVisualArtifact: (projectId, artifactId) =>
+      requestJson(
+        fetchImpl,
+        baseUrl,
+        `/projects/${encodePathSegment(projectId)}/visual-artifacts/${encodePathSegment(artifactId)}`,
+        VisualArtifactResponseSchema,
+        { method: "DELETE", headers: publicHeaders },
+      ),
+    createRunVisualBinding: (projectId, runId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/runs/${encodePathSegment(runId)}/visual-bindings`,
+        request,
+        RunVisualBindingResponseSchema,
+      ),
+    listRunVisualBindings: (projectId, runId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/runs/${encodePathSegment(runId)}/visual-bindings`,
+        RunVisualBindingListResponseSchema,
+      ),
+    scheduleVisualReview: (projectId, request) =>
+      post(
+        `/projects/${encodePathSegment(projectId)}/visual-reviews`,
+        request,
+        VisualReviewResultSchema,
+      ),
     getProjectRuntimeState: (projectId) =>
       get(
         `/projects/${encodePathSegment(projectId)}/runtime-state`,

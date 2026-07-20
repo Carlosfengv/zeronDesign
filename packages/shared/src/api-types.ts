@@ -5,6 +5,13 @@ import {
   BriefSchema,
   BriefStatusSchema,
   ConversationItemSchema,
+  DraftPreviewSessionSchema,
+  EditBaseSchema,
+  EditImpactOperationSchema,
+  EditImpactPlanSchema,
+  ElementBoundingBoxSchema,
+  ElementObservationSchema,
+  ElementSourceCandidateSchema,
   DesignProfileBaseSchema,
   DesignProfileDraftSchema,
   DesignProfileRecordSchema,
@@ -13,9 +20,105 @@ import {
   DesignSourceArtifactSchema,
   DesignSourceFileNameSchema,
   DesignSourceScopeSchema,
+  HistoryItemSchema,
+  RunVisualBindingSchema,
+  RunVisualTargetSchema,
+  PublishSourceSchema,
+  ProjectAssetSchema,
   ProjectVersionStatusSchema,
+  VisualReviewModeSchema,
+  VisualArtifactSchema,
+  VisualFindingSchema,
+  VisualReviewStateSchema,
   WorkspaceNamespaceSchema,
+  VisualViewportSchema,
 } from "./schemas.js";
+
+export const DraftPreviewHeartbeatRequestSchema = z
+  .object({
+    writerLeaseId: z.string().min(1),
+    sessionEpoch: z.number().int().positive(),
+    ttlSeconds: z.number().int().min(30).max(3600).default(120),
+  })
+  .strict();
+
+export const DraftPreviewTakeoverRequestSchema = z
+  .object({
+    expectedSessionEpoch: z.number().int().positive(),
+    ttlSeconds: z.number().int().min(30).max(3600).default(120),
+  })
+  .strict();
+
+export const CreateElementObservationRequestSchema = z
+  .object({
+    sessionId: z.string().min(1),
+    sessionEpoch: z.number().int().positive(),
+    workspaceRevision: z.number().int().nonnegative(),
+    route: z.string().regex(/^\/(?!\/)/),
+    viewport: VisualViewportSchema,
+    domPath: z.string().min(1),
+    dataSlot: z.string().min(1).nullish(),
+    accessibleName: z.string().min(1).nullish(),
+    visibleTextHash: z.string().regex(/^[a-fA-F0-9]{64}$/).nullish(),
+    boundingBox: ElementBoundingBoxSchema,
+    sourceCandidates: z.array(ElementSourceCandidateSchema).default([]),
+    screenshotCropArtifactId: z.string().min(1),
+  })
+  .strict();
+
+export const CreateEditImpactPlanRequestSchema = z
+  .object({
+    observationId: z.string().min(1).nullish(),
+    scope: z.enum(["local", "page", "global"]),
+    targets: z.array(z.string().min(1)).min(1),
+    operations: z.array(EditImpactOperationSchema).min(1),
+    risk: z.enum(["low", "medium", "high"]),
+    editBase: EditBaseSchema,
+  })
+  .strict();
+
+export const ElementObservationResponseSchema = ElementObservationSchema;
+export const EditImpactPlanResponseSchema = EditImpactPlanSchema;
+export const ProjectAssetResponseSchema = ProjectAssetSchema;
+export const ProjectAssetListResponseSchema = z.array(ProjectAssetSchema);
+
+export const CreateVisualArtifactRequestSchema = z
+  .object({
+    contentBase64: z.string().min(1),
+    clientSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
+    originMetadata: z.record(z.string(), z.unknown()).default({}),
+  })
+  .strict();
+
+export const VisualArtifactResponseSchema = z
+  .object({ artifact: VisualArtifactSchema })
+  .strict();
+
+export const CreateRunVisualBindingRequestSchema = RunVisualBindingSchema.omit({ runId: true });
+export const RunVisualBindingResponseSchema = z
+  .object({ binding: RunVisualBindingSchema })
+  .strict();
+export const RunVisualBindingListResponseSchema = z
+  .object({ bindings: z.array(RunVisualBindingSchema) })
+  .strict();
+export const VisualReviewBindingInputSchema = RunVisualBindingSchema.omit({
+  runId: true,
+  target: true,
+});
+export const ScheduleVisualReviewRequestSchema = z
+  .object({
+    mode: VisualReviewModeSchema,
+    target: RunVisualTargetSchema,
+    model: z.string().min(1).optional(),
+    bindings: z.array(VisualReviewBindingInputSchema).min(1),
+  })
+  .strict();
+export const VisualReviewResultSchema = z
+  .object({
+    state: VisualReviewStateSchema,
+    findings: z.array(VisualFindingSchema),
+  })
+  .strict();
 
 export const ContentSourceSchema = z.object({
   id: z.string().min(1),
@@ -34,6 +137,8 @@ export const StartRunRequestSchema = z
         contentSources: z.array(ContentSourceSchema).optional(),
         briefId: z.string().min(1).optional(),
         baseVersionId: z.string().min(1).optional(),
+        editBase: EditBaseSchema.optional(),
+        editImpactPlanHash: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
         sandboxBindingId: z.string().min(1).optional(),
         parentRunId: z.string().min(1).optional(),
         designProfileId: z.string().min(1).optional(),
@@ -57,7 +162,7 @@ export const StartRunRequestSchema = z
     if (request.phase !== "edit") {
       return;
     }
-    if (!request.inputContext.baseVersionId) {
+    if (!request.inputContext.baseVersionId && request.inputContext.editBase?.kind !== "draft") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["inputContext", "baseVersionId"],
@@ -408,6 +513,11 @@ export const ConversationListResponseSchema = z.object({
   items: z.array(ConversationItemSchema),
 });
 
+export const ProjectHistoryListResponseSchema = z.object({
+  projectId: z.string().min(1),
+  items: z.array(HistoryItemSchema),
+});
+
 export const RuntimeStyleContractSchema = z
   .object({
     version: z
@@ -588,6 +698,96 @@ export const PublishOperationSchema = z.object({
 });
 export const PublicationOperationResponseSchema = z.object({ operation: PublishOperationSchema });
 
+export const PublishWorkflowStatusSchema = z.enum([
+  "requested",
+  "source_frozen",
+  "building",
+  "validating",
+  "release_packaging",
+  "release_validated",
+  "desired_state_committed",
+  "reconciling",
+  "workload_ready",
+  "traffic_switched",
+  "external_probe_passed",
+  "rolling_back",
+  "completed",
+  "failed",
+  "cancelled",
+  "rolled_back",
+  "rollback_failed",
+]);
+
+export const PublishWorkflowCheckpointSchema = z.enum([
+  "requested",
+  "source_frozen",
+  "building",
+  "validating",
+  "release_packaging",
+  "release_validated",
+  "desired_state_committed",
+  "reconciling",
+  "workload_ready",
+  "traffic_switched",
+  "external_probe_passed",
+  "rolling_back",
+  "completed",
+  "rolled_back",
+]);
+
+export const PublishWorkflowStageEvidenceSchema = z
+  .object({
+    stage: PublishWorkflowCheckpointSchema,
+    inputHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    childOperationId: z.string().min(1).nullish(),
+    attempt: z.number().int().positive(),
+    completedAt: z.string().datetime(),
+  })
+  .strict();
+
+export const StartPublishWorkflowRequestSchema = z
+  .object({
+    source: PublishSourceSchema,
+    idempotencyKey: z.string().min(1).max(200),
+    expectedCurrentReleaseId: z.string().min(1).nullish(),
+    expectedGeneration: z.number().int().nonnegative(),
+    visualReviewMode: VisualReviewModeSchema.default("advisory"),
+    runtimeProfileId: z.literal("static-web-v1").default("static-web-v1"),
+  })
+  .strict();
+
+export const PublishWorkflowSchema = z
+  .object({
+    schemaVersion: z.literal("publish-workflow@1"),
+    id: z.string().min(1),
+    idempotencyKeyHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    requestHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+    projectId: z.string().min(1),
+    source: PublishSourceSchema,
+    status: PublishWorkflowStatusSchema,
+    checkpoint: PublishWorkflowCheckpointSchema,
+    visualReviewMode: VisualReviewModeSchema,
+    expectedCurrentReleaseId: z.string().min(1).nullish(),
+    expectedGeneration: z.number().int().nonnegative(),
+    versionId: z.string().min(1).nullish(),
+    releaseId: z.string().min(1).nullish(),
+    publicationOperationId: z.string().min(1).nullish(),
+    publicUrl: z.string().url().nullish(),
+    evidence: z.array(PublishWorkflowStageEvidenceSchema),
+    lastError: z.string().min(1).nullish(),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+export const PublishWorkflowResponseSchema = z.object({
+  workflow: PublishWorkflowSchema,
+});
+
+export const PublishWorkflowListResponseSchema = z.object({
+  workflows: z.array(PublishWorkflowSchema),
+});
+
 export const PublicationDesiredStateSchema = z.enum(["unpublished", "published"]);
 export const WorkRuntimeStatusSchema = z.enum([
   "unpublished", "publishing", "published", "updating", "unpublishing", "publish_failed",
@@ -689,6 +889,13 @@ export type BriefResponse = z.infer<typeof BriefResponseSchema>;
 export type CreateDesignSourceArtifactRequest = z.infer<
   typeof CreateDesignSourceArtifactRequestSchema
 >;
+export type CreateVisualArtifactRequest = z.input<typeof CreateVisualArtifactRequestSchema>;
+export type VisualArtifactResponse = z.infer<typeof VisualArtifactResponseSchema>;
+export type CreateRunVisualBindingRequest = z.input<typeof CreateRunVisualBindingRequestSchema>;
+export type RunVisualBindingResponse = z.infer<typeof RunVisualBindingResponseSchema>;
+export type RunVisualBindingListResponse = z.infer<typeof RunVisualBindingListResponseSchema>;
+export type ScheduleVisualReviewRequest = z.input<typeof ScheduleVisualReviewRequestSchema>;
+export type VisualReviewResult = z.infer<typeof VisualReviewResultSchema>;
 export type DesignSourceArtifactResponse = z.infer<typeof DesignSourceArtifactResponseSchema>;
 export type DesignProfileConversionReport = z.infer<
   typeof DesignProfileConversionReportSchema
@@ -717,6 +924,9 @@ export type ResolvePermissionResponse = z.infer<typeof ResolvePermissionResponse
 export type PreviewCurrentResponse = z.infer<typeof PreviewCurrentResponseSchema>;
 export type PreviewVersionResponse = z.infer<typeof PreviewVersionResponseSchema>;
 export type ConversationListResponse = z.infer<typeof ConversationListResponseSchema>;
+export type ProjectHistoryListResponse = z.infer<
+  typeof ProjectHistoryListResponseSchema
+>;
 export type RuntimeStyleContract = z.infer<typeof RuntimeStyleContractSchema>;
 export type RuntimeLatestBuild = z.infer<typeof RuntimeLatestBuildSchema>;
 export type RuntimeDependencyState = z.infer<typeof RuntimeDependencyStateSchema>;
@@ -730,6 +940,29 @@ export type PublishWorkRequest = z.input<typeof PublishWorkRequestSchema>;
 export type UnpublishWorkRequest = z.input<typeof UnpublishWorkRequestSchema>;
 export type PublishOperation = z.infer<typeof PublishOperationSchema>;
 export type PublicationOperationResponse = z.infer<typeof PublicationOperationResponseSchema>;
+export type PublishWorkflowStatus = z.infer<typeof PublishWorkflowStatusSchema>;
+export type PublishWorkflowCheckpoint = z.infer<typeof PublishWorkflowCheckpointSchema>;
+export type PublishWorkflowStageEvidence = z.infer<
+  typeof PublishWorkflowStageEvidenceSchema
+>;
+export type StartPublishWorkflowRequest = z.input<
+  typeof StartPublishWorkflowRequestSchema
+>;
+export type PublishWorkflow = z.infer<typeof PublishWorkflowSchema>;
+export type PublishWorkflowResponse = z.infer<typeof PublishWorkflowResponseSchema>;
+export type PublishWorkflowListResponse = z.infer<typeof PublishWorkflowListResponseSchema>;
+export type DraftPreviewHeartbeatRequest = z.input<
+  typeof DraftPreviewHeartbeatRequestSchema
+>;
+export type DraftPreviewTakeoverRequest = z.input<
+  typeof DraftPreviewTakeoverRequestSchema
+>;
+export type CreateElementObservationRequest = z.input<
+  typeof CreateElementObservationRequestSchema
+>;
+export type CreateEditImpactPlanRequest = z.input<
+  typeof CreateEditImpactPlanRequestSchema
+>;
 export type WorkRuntimeState = z.infer<typeof WorkRuntimeStateSchema>;
 export type DeploymentStateResponse = z.infer<typeof DeploymentStateResponseSchema>;
 export type WorkReleaseListResponse = z.infer<typeof WorkReleaseListResponseSchema>;

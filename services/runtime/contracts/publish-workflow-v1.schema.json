@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerondesign.local/contracts/publish-workflow-v1.schema.json",
+  "title": "PublishWorkflow@1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "idempotencyKeyHash",
+    "requestHash",
+    "projectId",
+    "source",
+    "status",
+    "checkpoint",
+    "visualReviewMode",
+    "expectedCurrentReleaseId",
+    "expectedGeneration",
+    "versionId",
+    "releaseId",
+    "publicationOperationId",
+    "publicUrl",
+    "evidence",
+    "lastError",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "publish-workflow@1" },
+    "id": { "type": "string", "minLength": 1 },
+    "idempotencyKeyHash": { "$ref": "#/$defs/sha256" },
+    "requestHash": { "$ref": "#/$defs/sha256" },
+    "projectId": { "type": "string", "minLength": 1 },
+    "source": { "$ref": "#/$defs/publishSource" },
+    "status": {
+      "enum": [
+        "requested",
+        "source_frozen",
+        "building",
+        "validating",
+        "release_packaging",
+        "release_validated",
+        "desired_state_committed",
+        "reconciling",
+        "workload_ready",
+        "traffic_switched",
+        "external_probe_passed",
+        "rolling_back",
+        "completed",
+        "failed",
+        "cancelled",
+        "rolled_back",
+        "rollback_failed"
+      ]
+    },
+    "checkpoint": { "$ref": "#/$defs/checkpoint" },
+    "visualReviewMode": { "enum": ["off", "advisory", "required"] },
+    "expectedCurrentReleaseId": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "expectedGeneration": { "type": "integer", "minimum": 0 },
+    "versionId": { "type": ["string", "null"], "minLength": 1 },
+    "releaseId": { "type": ["string", "null"], "minLength": 1 },
+    "publicationOperationId": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "publicUrl": { "type": ["string", "null"], "format": "uri" },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "stage",
+          "inputHash",
+          "childOperationId",
+          "attempt",
+          "completedAt"
+        ],
+        "properties": {
+          "stage": { "$ref": "#/$defs/checkpoint" },
+          "inputHash": { "$ref": "#/$defs/sha256" },
+          "childOperationId": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "completedAt": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "lastError": { "type": ["string", "null"], "minLength": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$"
+    },
+    "checkpoint": {
+      "enum": [
+        "requested",
+        "source_frozen",
+        "building",
+        "validating",
+        "release_packaging",
+        "release_validated",
+        "desired_state_committed",
+        "reconciling",
+        "workload_ready",
+        "traffic_switched",
+        "external_probe_passed",
+        "rolling_back",
+        "completed",
+        "rolled_back"
+      ]
+    },
+    "publishSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "projectId",
+            "snapshotId",
+            "expectedSourceHash"
+          ],
+          "properties": {
+            "kind": { "const": "static-snapshot" },
+            "projectId": { "type": "string", "minLength": 1 },
+            "snapshotId": { "type": "string", "minLength": 1 },
+            "expectedSourceHash": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "projectId",
+            "sessionId",
+            "sessionEpoch",
+            "revision",
+            "snapshotId",
+            "expectedSourceHash"
+          ],
+          "properties": {
+            "kind": { "const": "draft-revision" },
+            "projectId": { "type": "string", "minLength": 1 },
+            "sessionId": { "type": "string", "minLength": 1 },
+            "sessionEpoch": { "type": "integer", "minimum": 1 },
+            "revision": { "type": "integer", "minimum": 0 },
+            "snapshotId": { "type": "string", "minLength": 1 },
+            "expectedSourceHash": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    }
+  }
+}

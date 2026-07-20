@@ -143,3 +143,56 @@ export const AgentEventSchema = AgentEventBaseSchema.superRefine((event, ctx) =>
 });
 
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
+
+const DraftPreviewEventBaseSchema = z.object({
+  projectId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionEpoch: z.number().int().positive(),
+  workspaceRevision: z.number().int().nonnegative(),
+  timestamp: z.string().datetime(),
+});
+
+export const DraftPreviewEventSchema = z.discriminatedUnion("type", [
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_starting"),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_ready"),
+    proxyUrl: z.string().url(),
+    readyRevision: z.number().int().nonnegative(),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_updating"),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_compile_error"),
+    error: z.string().min(1),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_restarting"),
+    restartCount: z.number().int().positive(),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_failed"),
+    error: z.string().min(1),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("preview.dev_stopped"),
+    reason: z.string().min(1),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("source.revision_committed"),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("source.revision_durable"),
+    snapshotId: z.string().min(1),
+    sourceHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  }).strict(),
+  DraftPreviewEventBaseSchema.extend({
+    type: z.literal("source.snapshot_created"),
+    snapshotId: z.string().min(1),
+    sourceHash: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  }).strict(),
+]);
+
+export type DraftPreviewEvent = z.infer<typeof DraftPreviewEventSchema>;

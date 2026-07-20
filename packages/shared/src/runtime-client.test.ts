@@ -78,8 +78,8 @@ const designProfile = () => ({
   content: {},
   accessibility: {},
   technical: {
-    allowedTemplates: ["astro-website", "fumadocs-docs"],
-    preferredTemplates: { website: "astro-website", docs: "fumadocs-docs" },
+    allowedTemplates: ["next-app", "fumadocs-docs"],
+    preferredTemplates: { website: "next-app", docs: "fumadocs-docs" },
     cssStrategy: "runtime-style-contract",
     dependencyPolicy: {},
     filePolicy: {
@@ -120,7 +120,7 @@ describe("runtime client", () => {
     const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
     const release = {
       id: "release-1", projectId: "project-1", versionId: "version-1", runId: "run-1",
-      templateId: "astro-website", templateVersion: "astro-website@runtime-p3",
+      templateId: "next-app", templateVersion: "next-app@1",
       artifactManifestHash: "a".repeat(64), runtimeManifestHash: "b".repeat(64),
       sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
       runtimeProfileId: "static-web-v1", runtimeImageRef: null, runtimeImageDigest: null,
@@ -240,7 +240,7 @@ describe("runtime client", () => {
           { title: "Home", purpose: "Explain the product", keyContent: ["hero"] },
         ],
         visualDirection: "clear editorial",
-        recommendedTemplate: "astro-website",
+        recommendedTemplate: "next-app",
         assumptions: [],
         missingInformation: [],
       },
@@ -452,9 +452,16 @@ describe("runtime client", () => {
     });
 
     await client.getConversation("project-1");
+    await client.getProjectHistory("project-1");
 
     expect(calls[0].init?.headers).toEqual({
       authorization: "Bearer project.jwt.token",
+    });
+    expect(calls[1]).toEqual({
+      url: "http://runtime.local/projects/project-1/history",
+      init: {
+        headers: { authorization: "Bearer project.jwt.token" },
+      },
     });
     expect(client.runEventsProxyHeaders("run-1/3")).toEqual({
       authorization: "Bearer project.jwt.token",
@@ -707,7 +714,7 @@ describe("runtime client", () => {
       version: 3,
       schemaVersion: "design-profile@2",
       surface: "website",
-      template: "astro-website",
+      template: "next-app",
       styleContractVersion: "runtime-style-contract@p3",
       effectiveProfileHash: "b".repeat(64),
       sourceIntegrity: "verified",
@@ -762,7 +769,7 @@ describe("runtime client", () => {
       (
         await client.getDesignProfileFidelityReport("design-profile-draft-1", 3, {
           surface: "website",
-          template: "astro-website",
+          template: "next-app",
         })
       ).capsuleMissingRuleIds,
     ).toEqual([]);
@@ -771,7 +778,7 @@ describe("runtime client", () => {
       "http://runtime.local/design-profiles/import",
       "http://runtime.local/design-profiles/design-profile-draft-1/versions/1/conversion-report",
       "http://runtime.local/design-profiles/design-profile-draft-1/activate",
-      "http://runtime.local/design-profiles/design-profile-draft-1/versions/3/fidelity-report?surface=website&template=astro-website",
+      "http://runtime.local/design-profiles/design-profile-draft-1/versions/3/fidelity-report?surface=website&template=next-app",
     ]);
     for (const call of calls.slice(0, 3)) {
       expect(call.init?.headers).toMatchObject({
@@ -818,7 +825,7 @@ describe("runtime client", () => {
       verificationPolicyId: "website-verification@1",
       warnings: [],
       surface: "website",
-      template: "astro-website",
+      template: "next-app",
       designProfileId: "profile-1",
       designProfileVersion: 2,
       effectiveProfileHash: "d".repeat(64),
@@ -834,7 +841,7 @@ describe("runtime client", () => {
       targetEffectiveProfileHash: "d".repeat(64),
       styleContractIdentity: {
         hash: "f".repeat(64), version: "runtime-style-contract@p3",
-        template: "astro-website", appRoot: "project", tokenMappings: { "color.primary": "--primary" },
+        template: "next-app", appRoot: "project", tokenMappings: { "color.primary": "--primary" },
       },
       snapshots: { baseHash: hash, currentHash: "b".repeat(64), targetHash: "c".repeat(64) },
       items: [], conflictDecisions: {}, childRunId: null,
@@ -930,6 +937,50 @@ describe("runtime client", () => {
         timestamp,
       },
     });
+  });
+
+  it("uses ProjectAsset routes", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const asset = {
+      schemaVersion: "project-asset@1",
+      assetId: "asset-1",
+      projectId: "project-1",
+      sourceArtifactId: "visual-1",
+      source: "upload",
+      targetPath: "public/assets/abc-hero.png",
+      contentHash: "c".repeat(64),
+      license: "user-owned",
+      provenance: { origin: "upload" },
+      width: 1200,
+      height: 800,
+      altText: "Hero",
+      createdByRunId: "run-1",
+      createdAt: timestamp,
+    } as const;
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      const target = url.toString();
+      if (target.endsWith("/assets")) {
+        return { ok: true, status: 200, async json() { return [asset]; } };
+      }
+      if (target.endsWith("/assets/asset-1")) {
+        return { ok: true, status: 200, async json() { return asset; } };
+      }
+      return { ok: false, status: 404, async json() { return {}; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      publicPrincipalToken: "principal-token",
+    });
+
+    await client.listProjectAssets("project-1");
+    await client.getProjectAsset("project-1", "asset-1");
+
+    expect(calls.map((call) => call.url)).toEqual([
+      "http://runtime.local/projects/project-1/assets",
+      "http://runtime.local/projects/project-1/assets/asset-1",
+    ]);
   });
 
   it("subscribes with EventSource and closes on terminal run.completed", () => {

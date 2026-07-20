@@ -1,0 +1,425 @@
+{
+  "draftSnapshot": {
+    "schemaVersion": "draft-snapshot@1",
+    "snapshotId": "draft-snapshot-1",
+    "projectId": "project-1",
+    "sourceSnapshotUri": "object://source-snapshots/project-1/draft-snapshot-1.tar.zst",
+    "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "templateId": "next-app",
+    "templateVersion": "next-app@1",
+    "dependencyPolicyVersion": "dependency-policy@1",
+    "designContextHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "createdByRunId": "run-build-1",
+    "basedOnSnapshotId": null,
+    "restoredFromVersionId": null,
+    "createdAt": "2026-07-19T04:00:00Z",
+    "retentionState": "active",
+    "deleteAfter": null
+  },
+  "publishSources": [
+    {
+      "kind": "static-snapshot",
+      "projectId": "project-1",
+      "snapshotId": "draft-snapshot-1",
+      "expectedSourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "kind": "draft-revision",
+      "projectId": "project-1",
+      "sessionId": "draft-session-1",
+      "sessionEpoch": 2,
+      "revision": 9,
+      "snapshotId": "draft-snapshot-9",
+      "expectedSourceHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "editBases": [
+    {
+      "kind": "work-version",
+      "versionId": "version-1"
+    },
+    {
+      "kind": "draft",
+      "snapshotId": "draft-snapshot-9",
+      "sessionId": "draft-session-1",
+      "expectedSessionEpoch": 2,
+      "expectedWorkspaceRevision": 9,
+      "writerLeaseId": "writer-lease-1"
+    }
+  ],
+  "visualArtifact": {
+    "schemaVersion": "visual-artifact@1",
+    "id": "visual-artifact-1",
+    "projectId": "project-1",
+    "mediaType": "image/png",
+    "sizeBytes": 2048,
+    "width": 1440,
+    "height": 900,
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "storageUri": "object://visual-artifacts/project-1/visual-artifact-1.png",
+    "origin": "browser",
+    "originMetadata": {
+      "route": "/"
+    },
+    "createdAt": "2026-07-19T04:01:00Z",
+    "retentionState": "protected",
+    "deleteAfter": null
+  },
+  "runVisualBindings": [
+    {
+      "runId": "run-review-1",
+      "artifactId": "visual-artifact-reference",
+      "role": "reference",
+      "route": "/",
+      "viewport": {
+        "width": 1440,
+        "height": 900,
+        "deviceScaleFactor": 1
+      },
+      "target": {
+        "kind": "static-snapshot",
+        "snapshotId": "draft-snapshot-1",
+        "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "order": 0
+    },
+    {
+      "runId": "run-review-1",
+      "artifactId": "visual-artifact-candidate",
+      "role": "candidate",
+      "route": "/dashboard",
+      "viewport": {
+        "width": 390,
+        "height": 844,
+        "deviceScaleFactor": 2
+      },
+      "target": {
+        "kind": "draft",
+        "sessionId": "draft-session-1",
+        "sessionEpoch": 2,
+        "sourceRevision": 9,
+        "sourceHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "order": 1
+    },
+    {
+      "runId": "run-review-2",
+      "artifactId": "visual-artifact-version",
+      "role": "candidate",
+      "route": "/",
+      "viewport": {
+        "width": 1440,
+        "height": 900,
+        "deviceScaleFactor": 1
+      },
+      "target": {
+        "kind": "version",
+        "versionId": "version-1",
+        "artifactManifestHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "order": 0
+    }
+  ],
+  "toolResultContentBlocks": [
+    {
+      "type": "text",
+      "text": "Desktop candidate screenshot"
+    },
+    {
+      "type": "json",
+      "value": {
+        "route": "/"
+      }
+    },
+    {
+      "type": "image",
+      "artifactId": "visual-artifact-1",
+      "mediaType": "image/png",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "width": 1440,
+      "height": 900
+    }
+  ],
+  "modelVisionCapabilities": [
+    {
+      "visionInput": false,
+      "supportedImageMediaTypes": [],
+      "maxImageBytes": 0,
+      "maxImageCount": 0
+    },
+    {
+      "visionInput": true,
+      "supportedImageMediaTypes": [
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ],
+      "maxImageBytes": 10485760,
+      "maxImageCount": 8
+    }
+  ],
+  "visualReviewStates": [
+    {
+      "schemaVersion": "visual-review-state@1",
+      "mode": "advisory",
+      "status": "unavailable",
+      "target": {
+        "kind": "static-snapshot",
+        "snapshotId": "draft-snapshot-1",
+        "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "runId": null,
+      "reason": "visual.resource_unavailable",
+      "updatedAt": "2026-07-19T04:02:00Z"
+    },
+    {
+      "schemaVersion": "visual-review-state@1",
+      "mode": "required",
+      "status": "passed",
+      "target": {
+        "kind": "version",
+        "versionId": "version-1",
+        "artifactManifestHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "runId": "run-review-2",
+      "reason": null,
+      "updatedAt": "2026-07-19T04:03:00Z"
+    }
+  ],
+  "draftPreviewSession": {
+    "schemaVersion": "draft-preview-session@1",
+    "sessionId": "draft-session-1",
+    "projectId": "project-1",
+    "sandboxBindingId": "sandbox-binding-1",
+    "templateId": "next-app",
+    "baseSnapshotId": "draft-snapshot-1",
+    "baseVersionId": null,
+    "writerLeaseId": "writer-lease-1",
+    "writerLeaseExpiresAt": "2026-07-19T05:00:00Z",
+    "workspaceRevision": 9,
+    "lastReadyRevision": 9,
+    "durableRevision": 9,
+    "durableSnapshotId": "draft-snapshot-9",
+    "publishRevision": null,
+    "sessionEpoch": 2,
+    "status": "ready",
+    "proxyUrl": "https://draft.example.test/project-1",
+    "startedAt": "2026-07-19T04:00:00Z",
+    "lastActivityAt": "2026-07-19T04:05:00Z",
+    "restartCount": 1,
+    "lastError": null
+  },
+  "draftPreviewEvents": [
+    {
+      "type": "preview.dev_ready",
+      "projectId": "project-1",
+      "sessionId": "draft-session-1",
+      "sessionEpoch": 2,
+      "workspaceRevision": 9,
+      "proxyUrl": "https://draft.example.test/project-1",
+      "readyRevision": 9,
+      "timestamp": "2026-07-19T04:05:00Z"
+    },
+    {
+      "type": "source.revision_durable",
+      "projectId": "project-1",
+      "sessionId": "draft-session-1",
+      "sessionEpoch": 2,
+      "workspaceRevision": 9,
+      "snapshotId": "draft-snapshot-9",
+      "sourceHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "timestamp": "2026-07-19T04:05:01Z"
+    }
+  ],
+  "elementObservation": {
+    "schemaVersion": "element-observation@1",
+    "observationId": "element-observation-1",
+    "projectId": "project-1",
+    "sessionId": "draft-session-1",
+    "sessionEpoch": 2,
+    "workspaceRevision": 9,
+    "route": "/dashboard",
+    "viewport": {
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1
+    },
+    "domPath": "main > section:nth-child(1) > h1",
+    "dataSlot": "hero-title",
+    "accessibleName": "Operations overview",
+    "visibleTextHash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "boundingBox": {
+      "x": 120,
+      "y": 96,
+      "width": 680,
+      "height": 72
+    },
+    "sourceCandidates": [
+      {
+        "path": "app/dashboard/page.tsx",
+        "line": 24,
+        "column": 8,
+        "exportName": "DashboardPage",
+        "confidence": 0.96
+      }
+    ],
+    "confidence": 0.96,
+    "screenshotCropArtifactId": "visual-artifact-crop-1",
+    "expiresAt": "2026-07-19T04:20:00Z",
+    "signature": "runtime-signature-1"
+  },
+  "editImpactPlan": {
+    "schemaVersion": "edit-impact-plan@1",
+    "scope": "local",
+    "targets": [
+      "app/dashboard/page.tsx:24"
+    ],
+    "operations": [
+      "copy",
+      "style"
+    ],
+    "risk": "low",
+    "requiresConfirmation": false,
+    "editBase": {
+      "kind": "draft",
+      "snapshotId": "draft-snapshot-9",
+      "sessionId": "draft-session-1",
+      "expectedSessionEpoch": 2,
+      "expectedWorkspaceRevision": 9,
+      "writerLeaseId": "writer-lease-1"
+    },
+    "sessionId": "draft-session-1",
+    "sessionEpoch": 2,
+    "workspaceRevision": 9,
+    "planHash": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "historyItems": [
+    {
+      "kind": "draft_snapshot",
+      "snapshot": {
+        "schemaVersion": "draft-snapshot@1",
+        "snapshotId": "draft-snapshot-1",
+        "projectId": "project-1",
+        "sourceSnapshotUri": "object://source-snapshots/project-1/draft-snapshot-1.tar.zst",
+        "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "templateId": "next-app",
+        "templateVersion": "next-app@1",
+        "dependencyPolicyVersion": "dependency-policy@1",
+        "designContextHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "createdByRunId": "run-build-1",
+        "basedOnSnapshotId": null,
+        "restoredFromVersionId": null,
+        "createdAt": "2026-07-19T04:00:00Z",
+        "retentionState": "active",
+        "deleteAfter": null
+      },
+      "recoverable": true,
+      "publishable": false
+    },
+    {
+      "kind": "work_version",
+      "version": {
+        "id": "version-1",
+        "projectId": "project-1",
+        "sourceSnapshotUri": "object://source-snapshots/project-1/draft-snapshot-1.tar.zst",
+        "previewUrl": "https://preview.example.test/version-1",
+        "screenshotUri": null,
+        "screenshotId": null,
+        "status": "promoted",
+        "createdByRunId": "run-publish-1",
+        "createdAt": "2026-07-19T04:10:00Z",
+        "promotedAt": "2026-07-19T04:11:00Z"
+      },
+      "recoverable": true,
+      "publishable": true
+    }
+  ],
+  "visualFinding": {
+    "schemaVersion": "visual-finding@1",
+    "findingId": "visual-finding-1",
+    "reviewRunId": "run-review-2",
+    "target": {
+      "kind": "version",
+      "versionId": "version-1",
+      "artifactManifestHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "route": "/dashboard",
+    "viewport": {
+      "width": 390,
+      "height": 844,
+      "deviceScaleFactor": 2
+    },
+    "category": "responsive",
+    "severity": "warning",
+    "summary": "Primary heading wraps into the action row on mobile.",
+    "evidenceArtifactIds": [
+      "visual-artifact-candidate"
+    ],
+    "evidenceRegion": {
+      "x": 20,
+      "y": 72,
+      "width": 350,
+      "height": 120
+    },
+    "targetObservationId": "element-observation-1",
+    "suggestedChange": "Stack the action row below the heading under 640px.",
+    "status": "open",
+    "modelResourceSnapshot": {
+      "modelResourceId": "vision-model-1",
+      "revision": 3,
+      "physicalModel": "vision-model-v3",
+      "capabilitySnapshotHash": "4444444444444444444444444444444444444444444444444444444444444444",
+      "promptPolicyVersion": "visual-review-policy@1"
+    }
+  },
+  "projectAsset": {
+    "schemaVersion": "project-asset@1",
+    "assetId": "project-asset-1",
+    "projectId": "project-1",
+    "sourceArtifactId": "visual-artifact-reference",
+    "source": "upload",
+    "targetPath": "public/assets/5555555555555555-hero.png",
+    "contentHash": "6666666666666666666666666666666666666666666666666666666666666666",
+    "license": "user-owned",
+    "provenance": { "origin": "upload" },
+    "width": 1440,
+    "height": 900,
+    "altText": "Uploaded hero image",
+    "createdByRunId": "run-build-1",
+    "createdAt": "2026-07-19T04:03:00Z"
+  },
+  "publishWorkflow": {
+    "schemaVersion": "publish-workflow@1",
+    "id": "publish-workflow-1",
+    "idempotencyKeyHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "requestHash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "projectId": "project-1",
+    "source": {
+      "kind": "static-snapshot",
+      "projectId": "project-1",
+      "snapshotId": "draft-snapshot-1",
+      "expectedSourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "status": "requested",
+    "checkpoint": "requested",
+    "visualReviewMode": "advisory",
+    "expectedCurrentReleaseId": null,
+    "expectedGeneration": 0,
+    "versionId": null,
+    "releaseId": null,
+    "publicationOperationId": null,
+    "publicUrl": null,
+    "evidence": [
+      {
+        "stage": "requested",
+        "inputHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "childOperationId": null,
+        "attempt": 1,
+        "completedAt": "2026-07-19T04:04:00Z"
+      }
+    ],
+    "lastError": null,
+    "createdAt": "2026-07-19T04:04:00Z",
+    "updatedAt": "2026-07-19T04:04:00Z"
+  }
+}

@@ -9,12 +9,26 @@ import {
   ConversationItemSchema,
   DesignProfileSchema,
   DesignSourceArtifactSchema,
+  DraftPreviewSessionSchema,
+  DraftSnapshotSchema,
+  EditBaseSchema,
+  EditImpactPlanSchema,
+  ElementObservationSchema,
+  HistoryItemSchema,
+  ModelVisionCapabilitySchema,
   ProjectVersionSchema,
+  ProjectAssetSchema,
   ReviewFindingSchema,
+  RunVisualBindingSchema,
   SandboxBindingSchema,
   SandboxBindingStatusSchema,
+  PublishSourceSchema,
+  ToolResultContentBlockSchema,
+  VisualArtifactSchema,
+  VisualFindingSchema,
+  VisualReviewStateSchema,
 } from "./schemas.js";
-import { AgentEventSchema } from "./events.js";
+import { AgentEventSchema, DraftPreviewEventSchema } from "./events.js";
 import {
   CancelRunResponseSchema,
   BindProjectDesignProfileRequestSchema,
@@ -32,6 +46,7 @@ import {
   ListDesignProfilesResponseSchema,
   PromotePreviewRequestSchema,
   PromotePreviewResponseSchema,
+  PublishWorkflowSchema,
   PreviewCurrentResponseSchema,
   ProjectRuntimeStateResponseSchema,
   ResolvePermissionResponseSchema,
@@ -125,8 +140,8 @@ const designProfile = () => ({
   content: {},
   accessibility: {},
   technical: {
-    allowedTemplates: ["astro-website", "fumadocs-docs"],
-    preferredTemplates: { website: "astro-website", docs: "fumadocs-docs" },
+    allowedTemplates: ["next-app", "fumadocs-docs"],
+    preferredTemplates: { website: "next-app", docs: "fumadocs-docs" },
     cssStrategy: "runtime-style-contract",
     dependencyPolicy: {},
     filePolicy: {
@@ -179,7 +194,7 @@ describe("shared schemas", () => {
             permissionMode: "normal",
             transcriptMode: "main",
             sourceCheckpointId: null,
-            mcpServerNames: ["figma"],
+            mcpServerNames: [],
           },
           startedAt: timestamp,
           updatedAt: timestamp,
@@ -201,7 +216,7 @@ describe("shared schemas", () => {
         sandboxClaimName: "project-project-1-sandbox-1",
         workspacePvcName: "workspace-project-project-1-sandbox-1",
         channelServiceName: status === "claiming" ? undefined : "workspace-channel-7f9b",
-        warmPoolName: "anydesign-astro-website-pool",
+        warmPoolName: "anydesign-next-app-pool",
         namespace: "anydesign-sandboxes",
         status,
         channelProtocol: "websocket",
@@ -220,7 +235,7 @@ describe("shared schemas", () => {
         projectId: "project-1",
         sandboxName: "project-project-1-sandbox-1",
         sandboxClaimName: "project-project-1-sandbox-1",
-        warmPoolName: "anydesign-astro-website-pool",
+        warmPoolName: "anydesign-next-app-pool",
         namespace: "anydesign-sandboxes",
         status: "ready",
         channelProtocol: "websocket",
@@ -469,6 +484,132 @@ describe("shared schemas", () => {
     ).toThrow();
   });
 
+  it("round-trips the shared visual runtime contract fixture", () => {
+    const fixturePath = path.resolve(
+      process.cwd(),
+      "../../services/runtime/contracts/visual-runtime-contract-v1.fixture.json",
+    );
+    const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
+
+    expect(DraftSnapshotSchema.parse(fixture.draftSnapshot).schemaVersion).toBe(
+      "draft-snapshot@1",
+    );
+    expect(
+      fixture.publishSources.map((source: unknown) =>
+        PublishSourceSchema.parse(source),
+      ),
+    ).toHaveLength(2);
+    expect(
+      fixture.editBases.map((base: unknown) => EditBaseSchema.parse(base)),
+    ).toHaveLength(2);
+    expect(VisualArtifactSchema.parse(fixture.visualArtifact).schemaVersion).toBe(
+      "visual-artifact@1",
+    );
+    expect(
+      fixture.runVisualBindings.map((binding: unknown) =>
+        RunVisualBindingSchema.parse(binding),
+      ),
+    ).toHaveLength(3);
+    expect(
+      fixture.toolResultContentBlocks.map((block: unknown) =>
+        ToolResultContentBlockSchema.parse(block),
+      ),
+    ).toHaveLength(3);
+    expect(
+      fixture.modelVisionCapabilities.map((capability: unknown) =>
+        ModelVisionCapabilitySchema.parse(capability),
+      ),
+    ).toHaveLength(2);
+    expect(
+      fixture.visualReviewStates.map((state: unknown) =>
+        VisualReviewStateSchema.parse(state),
+      ),
+    ).toHaveLength(2);
+    expect(
+      DraftPreviewSessionSchema.parse(fixture.draftPreviewSession).schemaVersion,
+    ).toBe("draft-preview-session@1");
+    expect(
+      fixture.draftPreviewEvents.map((event: unknown) =>
+        DraftPreviewEventSchema.parse(event),
+      ),
+    ).toHaveLength(2);
+    expect(
+      ElementObservationSchema.parse(fixture.elementObservation).schemaVersion,
+    ).toBe("element-observation@1");
+    expect(EditImpactPlanSchema.parse(fixture.editImpactPlan).schemaVersion).toBe(
+      "edit-impact-plan@1",
+    );
+    expect(
+      fixture.historyItems.map((item: unknown) => HistoryItemSchema.parse(item)),
+    ).toHaveLength(2);
+    expect(VisualFindingSchema.parse(fixture.visualFinding).schemaVersion).toBe(
+      "visual-finding@1",
+    );
+    expect(ProjectAssetSchema.parse(fixture.projectAsset).schemaVersion).toBe(
+      "project-asset@1",
+    );
+    expect(PublishWorkflowSchema.parse(fixture.publishWorkflow).schemaVersion).toBe(
+      "publish-workflow@1",
+    );
+  });
+
+  it("rejects an unbounded enabled vision capability", () => {
+    expect(
+      ModelVisionCapabilitySchema.safeParse({
+        visionInput: true,
+        supportedImageMediaTypes: [],
+        maxImageBytes: 0,
+        maxImageCount: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      ModelVisionCapabilitySchema.safeParse({
+        visionInput: false,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("validates local ProjectAssets and Draft Edit starts", () => {
+    const editBase = {
+      kind: "draft" as const,
+      snapshotId: "snapshot-1",
+      sessionId: "session-1",
+      expectedSessionEpoch: 1,
+      expectedWorkspaceRevision: 0,
+      writerLeaseId: "lease-1",
+    };
+    expect(
+      StartRunRequestSchema.safeParse({
+        projectId: "project-1",
+        phase: "edit",
+        agentProfile: "edit",
+        inputContext: {
+          editBase,
+          editImpactPlanHash: "a".repeat(64),
+          sandboxBindingId: "binding-1",
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      ProjectAssetSchema.parse({
+        schemaVersion: "project-asset@1",
+        assetId: "asset-1",
+        projectId: "project-1",
+        sourceArtifactId: "visual-1",
+        source: "upload",
+        targetPath: "public/assets/abc-hero.png",
+        contentHash: "b".repeat(64),
+        license: "user-owned",
+        provenance: { origin: "upload" },
+        width: 1200,
+        height: 800,
+        altText: "Hero image",
+        createdByRunId: "run-1",
+        createdAt: timestamp,
+      }).source,
+    ).toBe("upload");
+  });
+
   it("validates Brief JSON required by the runtime contract", () => {
     const brief = BriefSchema.parse({
       projectType: "website",
@@ -482,12 +623,12 @@ describe("shared schemas", () => {
         },
       ],
       visualDirection: "quiet technical confidence",
-      recommendedTemplate: "astro-website",
+      recommendedTemplate: "next-app",
       assumptions: [],
       missingInformation: [],
     });
 
-    expect(brief.recommendedTemplate).toBe("astro-website");
+    expect(brief.recommendedTemplate).toBe("next-app");
   });
 
   it("accepts Brief lifecycle statuses used by the runtime gate", () => {
@@ -701,7 +842,7 @@ describe("shared schemas", () => {
         sandboxClaimName: "project-project-1-sandbox-1",
         workspacePvcName: "workspace-project-project-1-sandbox-1",
         channelServiceName: "workspace-channel-7f9b",
-        warmPoolName: "anydesign-astro-website-pool",
+        warmPoolName: "anydesign-next-app-pool",
         namespace: "anydesign-sandboxes",
         status: "ready",
         channelProtocol: "websocket",
@@ -810,7 +951,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         styleContractPath: "/workspace/state/style-contract.json",
         styleContract: runtimeStyleContract(),
         latestBuild: {
@@ -828,7 +969,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         styleContractPath: "/workspace/state/style-contract.json",
         styleContract: runtimeStyleContract(),
         latestBuild: {
@@ -846,7 +987,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         styleContractPath: "/workspace/state/style-contract.json",
         styleContract: {
           tokens: { "color.primary": "--runtime-primary" },
@@ -866,7 +1007,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         styleContractPath: "/workspace/state/style-contract.json",
         styleContract: {
           ...runtimeStyleContract(),
@@ -887,7 +1028,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         styleContractPath: "/workspace/state/style-contract.json",
         styleContract: {
           ...runtimeStyleContract(),
@@ -908,7 +1049,7 @@ describe("shared schemas", () => {
         sandboxBindingId: "sandbox-binding-1",
         sourceSnapshotUri: "runtime://snapshots/project-1/version-1",
         appRoot: "project",
-        templateKey: "astro-website",
+        templateKey: "next-app",
         latestBuild: {},
         dependencyState: { needsRestore: false },
         preview: { status: "running" },
