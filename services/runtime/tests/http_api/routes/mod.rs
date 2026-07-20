@@ -3,6 +3,7 @@ mod briefs;
 mod capture;
 mod design_profiles;
 mod design_sources;
+mod draft_preview_events;
 mod internal;
 mod previews;
 mod projects;

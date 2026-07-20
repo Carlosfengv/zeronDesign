@@ -40,11 +40,13 @@ use crate::{
     preview_access::{PreviewAccessContext, PreviewAccessError, PreviewAccessService},
     profiles::build::{run_template_build, TemplateBuildRequest},
     project::resolve_built_in_template_for_init,
+    project_asset::{ProjectAssetError, ProjectAssetStore},
     public_principal::{
         PublicPrincipalError, PublicPrincipalVerifier, PREVIEW_READ_OPERATION,
         PROJECT_READ_OPERATION, PROJECT_WRITE_OPERATION, PUBLICATION_READ_OPERATION,
         PUBLICATION_WRITE_OPERATION,
     },
+    publish_workflow::PublishWorkflowService,
     release_evidence::{ReleaseEvidenceError, ReleaseEvidenceService},
     run_lifecycle::RunLifecycleService,
     runtime::{
@@ -61,10 +63,14 @@ use crate::{
         DesignProfileValidationIssue, DesignSourceArtifact, ProjectAccessRecord,
         DESIGN_PROFILE_SCHEMA_V2, MAX_DESIGN_SOURCE_BYTES,
     },
+    visual_artifact_store::{VisualArtifactStore, MAX_VISUAL_ARTIFACT_INPUT_BYTES},
+    visual_contracts::{HistoryItem, RunVisualBinding, RunVisualTarget},
+    visual_review::{ScheduleVisualReviewRequest, VisualReviewResult, VisualReviewService},
 };
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Extension, Path, Query, State},
+    extract::{ws::WebSocketUpgrade, DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     routing::{get, post, put},
@@ -78,6 +84,8 @@ use std::{path::PathBuf, sync::Arc};
 
 const MAX_DESIGN_SOURCE_REQUEST_BYTES: usize = 384 * 1024;
 const MAX_DESIGN_SOURCE_BASE64_BYTES: usize = MAX_DESIGN_SOURCE_BYTES.div_ceil(3) * 4;
+const MAX_VISUAL_ARTIFACT_BASE64_BYTES: usize = MAX_VISUAL_ARTIFACT_INPUT_BYTES.div_ceil(3) * 4;
+const MAX_VISUAL_ARTIFACT_REQUEST_BYTES: usize = MAX_VISUAL_ARTIFACT_BASE64_BYTES + 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -167,7 +175,7 @@ mod tests {
             &LocalWorkspaceBackend,
             &ctx,
             &workspace_root.join("project"),
-            "astro-website",
+            "next-app",
         )
         .await
         .unwrap();
@@ -176,11 +184,11 @@ mod tests {
                 "projectId": run.project_id,
                 "runId": run.id,
                 "appRoot": "project",
-                "templateKey": "astro-website",
-                "templateVersion": "astro-website@runtime-p3",
-                "templateManifestSha256": "7374f4f493c49752bbcbdad49992b02d089f79c1f01784c42fa7224668136e3f",
-                "framework": "astro",
-                "sandboxExecutionProfileId": "astro-website",
+                "templateKey": "next-app",
+                "templateVersion": "next-app@1",
+                "templateManifestSha256": "919771231a9745aee050a3280518189d4b8d9f106d6ba334a896f41eac253067",
+                "framework": "nextjs",
+                "sandboxExecutionProfileId": "next-app",
                 "sandboxExecutionProfileVersion": "0.1.0",
                 "packageManager": "npm",
                 "lockfile": "package-lock.json",
@@ -204,7 +212,7 @@ mod tests {
             .get_project_runtime_state("startup-recovery-project")
             .await
             .unwrap();
-        assert_eq!(state.template_key, "astro-website");
+        assert_eq!(state.template_key, "next-app");
         assert!(!workspace_root
             .join("state/project-init-transactions/startup-recovery-project/journal.json")
             .exists());
@@ -229,13 +237,13 @@ mod tests {
             .upsert_project_runtime_state_with_template_identity(
                 "incompatible-project",
                 "project".to_string(),
-                "astro-website".to_string(),
-                "astro-website@runtime-p3".to_string(),
+                "next-app".to_string(),
+                "next-app@1".to_string(),
                 Some(
                     "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
                 ),
-                "astro".to_string(),
-                Some("astro-website".to_string()),
+                "next".to_string(),
+                Some("next-app".to_string()),
                 Some("0.1.0".to_string()),
                 "npm".to_string(),
                 "package-lock.json".to_string(),

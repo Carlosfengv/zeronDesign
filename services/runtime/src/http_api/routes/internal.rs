@@ -5,6 +5,7 @@ mod project_access;
 mod release_evidence;
 mod sandbox_release;
 mod template_build;
+mod visual_artifact;
 
 use super::super::*;
 
@@ -17,4 +18,5 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
         .merge(design_context_enforcement::router())
         .merge(release_evidence::router())
         .merge(sandbox_release::router())
+        .merge(visual_artifact::router())
 }

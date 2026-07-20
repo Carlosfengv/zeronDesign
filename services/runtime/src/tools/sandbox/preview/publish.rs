@@ -4,7 +4,10 @@ use super::preview_fidelity::{
 };
 use super::preview_validation::collect_and_persist_generation_validation;
 use super::*;
-use crate::runtime_storage::FileAcceptanceReportStore;
+use crate::{
+    runtime_storage::FileAcceptanceReportStore, types::canonical_json_hash,
+    visual_contracts::RUNTIME_DEPENDENCY_POLICY_VERSION,
+};
 
 const DEFAULT_MAX_ACCEPTANCE_REPAIR_CYCLES: u32 = 3;
 
@@ -248,6 +251,21 @@ impl Tool for PreviewPublishTool {
         ctx: ToolContext,
         progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
+        if ctx
+            .run
+            .project_state_snapshot
+            .as_ref()
+            .is_some_and(|state| state.template_key == "next-app")
+        {
+            return Err(typed_recoverable(
+                "preview.publish is a legacy candidate/version operation and is not valid for next-app generation",
+                "template.operation_unsupported",
+                json!({
+                    "template": "next-app",
+                    "suggestedAction": "Call project.build, preview.start, browser.screenshot, and draft.snapshot_create. A WorkVersion is created only by the user-initiated PublishWorkflow."
+                }),
+            ));
+        }
         let source_root = input
             .get("cwd")
             .and_then(Value::as_str)
@@ -405,12 +423,54 @@ impl Tool for PreviewPublishTool {
             Some(candidate),
         )
         .await?;
+        let project_state = ctx.run.project_state_snapshot.as_ref().ok_or_else(|| {
+            ToolError::Terminal(
+                "preview.publish requires a frozen project state to create DraftSnapshot"
+                    .to_string(),
+            )
+        })?;
+        let source_hash = build
+            .get("sourceFingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "preview.publish build did not return sourceFingerprint".to_string(),
+                    "preview.source_fingerprint_missing",
+                    json!({ "build": build }),
+                )
+            })?;
+        let design_context_hash = ctx
+            .run
+            .design_context_content_hash
+            .clone()
+            .unwrap_or_else(|| canonical_json_hash(&json!({ "designContext": "none" })));
+        let draft_snapshot = ctx
+            .store
+            .create_draft_revision_snapshot(
+                &ctx.project_id,
+                source_snapshot_uri.to_string(),
+                source_hash.to_string(),
+                project_state.template_key.clone(),
+                project_state.template_version.clone(),
+                RUNTIME_DEPENDENCY_POLICY_VERSION.to_string(),
+                design_context_hash,
+                &ctx.run.id,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                ToolError::Terminal(format!(
+                    "preview.publish failed to persist DraftSnapshot: {error}"
+                ))
+            })?;
         Ok(ToolResult::ok(json!({
             "published": true,
             "build": build,
             "preview": preview,
             "screenshot": screenshot,
             "promotion": published,
+            "draftSnapshot": draft_snapshot,
             "designProfileFidelity": fidelity,
         })))
     }
@@ -1171,7 +1231,9 @@ pub(super) async fn collect_artifact_files(
                         .strip_prefix(candidate_root)
                         .map_err(|error| ToolError::Terminal(error.to_string()))?
                         .to_path_buf();
-                    if relative == Path::new(".anydesign-candidate-manifest.json") {
+                    if relative == Path::new(".anydesign-candidate-manifest.json")
+                        || relative == Path::new(".snapshot.json")
+                    {
                         continue;
                     }
                     files.push(ArtifactFile {

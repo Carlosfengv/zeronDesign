@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn website_and_docs_profiles_pass_from_shared_evidence() {
-        let website = GenerationContract::website("astro-website", "dist");
+        let website = GenerationContract::website("next-app", "dist");
         let docs = GenerationContract::docs("fumadocs-docs", "out");
 
         assert!(build(&website, passing_browser()).can_promote(&website));
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn validation_report_binds_candidate_artifact_contract_and_template() {
-        let contract = GenerationContract::website("astro-website", "dist");
+        let contract = GenerationContract::website("next-app", "dist");
         let report = build(&contract, passing_browser());
 
         assert_eq!(report.candidate_manifest_hash, "c".repeat(64));
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn unavailable_browser_blocks_required_render_checks() {
-        let contract = GenerationContract::website("astro-website", "dist");
+        let contract = GenerationContract::website("next-app", "dist");
         let report = build(
             &contract,
             json!({ "ok": false, "error": "chromium unavailable", "results": {} }),

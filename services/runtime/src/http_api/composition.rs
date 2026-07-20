@@ -21,12 +21,22 @@ pub(super) fn router_with_services(state: AppState) -> Router {
     let release_evidence = ReleaseEvidenceService::new(state.store.clone(), runtime_evidence);
     let authorization = ApplicationAuthorizationPolicy::new(state.store.clone());
     let preview_access = PreviewAccessService::new(state.store.clone(), authorization.clone());
+    let visual_review = VisualReviewService::new(
+        state.store.clone(),
+        state.model.clone(),
+        state.config.clone(),
+    );
+    let publish_workflow = Arc::new(PublishWorkflowService::new(
+        state.store.clone(),
+        state.config.clone(),
+    ));
     Router::new()
         .merge(routes::system::router())
         .merge(routes::briefs::router())
         .merge(routes::runs::router())
         .merge(routes::run_events::router())
         .merge(routes::design_sources::router())
+        .merge(routes::draft_preview_events::router())
         .merge(routes::design_profiles::router())
         .merge(routes::projects::router())
         .merge(routes::previews::router())
@@ -34,6 +44,8 @@ pub(super) fn router_with_services(state: AppState) -> Router {
         .merge(routes::artifacts::router())
         .merge(routes::internal::router())
         .layer(Extension(preview_access))
+        .layer(Extension(visual_review))
+        .layer(Extension(publish_workflow))
         .layer(Extension(authorization))
         .layer(Extension(release_evidence))
         .layer(Extension(artifact_access))

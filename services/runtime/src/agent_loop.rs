@@ -466,6 +466,13 @@ impl AgentLoop {
                     current_run.phase,
                     &progress_state,
                     consecutive_no_progress,
+                ) && !tool_redundant_after_next_app_draft_ready(
+                    &tool.name,
+                    current_run
+                        .project_state_snapshot
+                        .as_ref()
+                        .map(|state| state.template_key.as_str()),
+                    &progress_state,
                 )
             });
             deferred_tools.retain(|tool| {
@@ -478,6 +485,13 @@ impl AgentLoop {
                     current_run.phase,
                     &progress_state,
                     consecutive_no_progress,
+                ) && !tool_redundant_after_next_app_draft_ready(
+                    &tool.name,
+                    current_run
+                        .project_state_snapshot
+                        .as_ref()
+                        .map(|state| state.template_key.as_str()),
+                    &progress_state,
                 )
             });
             let mut system_prompt =
@@ -797,6 +811,10 @@ impl AgentLoop {
                             &mut last_progress_fingerprint,
                             &mut consecutive_no_progress,
                             current_run.phase,
+                            current_run
+                                .project_state_snapshot
+                                .as_ref()
+                                .map(|state| state.template_key.as_str()),
                             observation_budget_usage,
                         )
                         .await
@@ -2437,6 +2455,7 @@ impl AgentLoop {
         last_fingerprint: &mut String,
         consecutive_no_progress: &mut u32,
         phase: AgentPhase,
+        template_key: Option<&str>,
         observation_budget_usage: ObservationBudgetUsage,
     ) -> Option<String> {
         update_progress_state(state, calls, results);
@@ -2471,8 +2490,13 @@ impl AgentLoop {
                 timestamp: Utc::now(),
             })
             .await;
-        let workflow =
-            workflow_progress_snapshot(phase, state, observation_budget_usage, self.limits);
+        let workflow = workflow_progress_snapshot(
+            phase,
+            template_key,
+            state,
+            observation_budget_usage,
+            self.limits,
+        );
         let _ = self
             .store
             .append_event(AgentEvent::RunWorkflowProgress {
@@ -2923,6 +2947,17 @@ fn observation_tool_redundant_before_first_publish(
         && consecutive_no_progress >= 1
 }
 
+fn tool_redundant_after_next_app_draft_ready(
+    tool_name: &str,
+    template_key: Option<&str>,
+    state: &RunProgressState,
+) -> bool {
+    template_key == Some("next-app")
+        && (state.completed_steps.contains("draft_ready")
+            || state.completed_steps.contains("draft.snapshot_create"))
+        && tool_name != "run.complete"
+}
+
 fn recovered_observation_budget_usage(events: &[AgentEvent]) -> ObservationBudgetUsage {
     let rejected = events
         .iter()
@@ -3032,6 +3067,7 @@ struct WorkflowProgressSnapshot {
 
 fn workflow_progress_snapshot(
     phase: AgentPhase,
+    template_key: Option<&str>,
     state: &RunProgressState,
     usage: ObservationBudgetUsage,
     limits: AgentLoopLimits,
@@ -3075,6 +3111,7 @@ fn workflow_progress_snapshot(
         }
     });
     let has = |step: &str| state.completed_steps.contains(step);
+    let next_app = template_key == Some("next-app");
     let project_initialized = has("project_initialized") || phase != AgentPhase::Build;
     let (stage, next_action) = if phase == AgentPhase::Build && !has("inputs_inventoried") {
         (
@@ -3087,7 +3124,12 @@ fn workflow_progress_snapshot(
             "loading_requirements",
             "Read the missing required Brief or Content Sources file; do not probe optional paths.",
         )
-    } else if state.candidate_digest.is_some() {
+    } else if next_app && (has("draft_ready") || has("draft.snapshot_create")) {
+        (
+            "ready_to_complete",
+            "The next-app Draft is durable and Dev Ready. Call run.complete without additional exploration.",
+        )
+    } else if !next_app && state.candidate_digest.is_some() {
         (
             "ready_to_complete",
             "The Candidate is ready. Call run.complete without additional exploration.",
@@ -3098,7 +3140,12 @@ fn workflow_progress_snapshot(
         } else {
             "repairing_candidate"
         };
-        if has("repair_mutated") {
+        if next_app && has("repair_mutated") {
+            (
+                "building_repair",
+                "A next-app repair mutation is recorded. Call project.build, then restart preview.dev_start and confirm preview.dev_status is Ready; never call preview.publish.",
+            )
+        } else if has("repair_mutated") {
             (
                 "publishing_repair",
                 "A source mutation is already recorded after the failed publish. Call preview.publish now; do not read, list, search, or rebuild separately.",
@@ -3130,6 +3177,26 @@ fn workflow_progress_snapshot(
             "authoring_content",
             "Stop exploring and create or patch the required Website/Docs source now.",
         )
+    } else if next_app && !has("dependencies_ready") {
+        (
+            "restoring_dependencies",
+            "Call project.ensure_dependencies with mode restore before starting the next-app Dev Preview.",
+        )
+    } else if next_app && !has("project.build") {
+        (
+            "building_draft",
+            "Call project.build. Resolve any returned build failure before starting the Dev Preview.",
+        )
+    } else if next_app && !has("preview.dev_start") {
+        (
+            "starting_draft_preview",
+            "Call preview.dev_start. Do not call preview.start or preview.publish for next-app.",
+        )
+    } else if next_app {
+        (
+            "waiting_for_draft_preview",
+            "Call preview.dev_status. If it is Ready and its durableRevision equals workspaceRevision, call run.complete; if the process failed, call preview.dev_stop and preview.dev_start once after fixing the reported cause.",
+        )
     } else {
         (
             "validating_candidate",
@@ -3150,7 +3217,15 @@ fn render_workflow_progress_context(
     usage: ObservationBudgetUsage,
     limits: AgentLoopLimits,
 ) -> String {
-    let workflow = workflow_progress_snapshot(run.phase, state, usage, limits);
+    let workflow = workflow_progress_snapshot(
+        run.phase,
+        run.project_state_snapshot
+            .as_ref()
+            .map(|state| state.template_key.as_str()),
+        state,
+        usage,
+        limits,
+    );
     format!(
         "Runtime Workflow Progress (authoritative; do not redo completed steps):\n{}",
         serde_json::to_string(&json!({
@@ -3245,6 +3320,45 @@ fn update_progress_state(
                     .completed_steps
                     .insert("dependencies_ready".to_string());
             }
+            "preview.dev_start" => {
+                state
+                    .completed_steps
+                    .insert("preview.dev_start".to_string());
+            }
+            "preview.dev_status" => {
+                let status = result.content.get("status").and_then(Value::as_str);
+                let workspace_revision = result
+                    .content
+                    .get("workspaceRevision")
+                    .and_then(Value::as_u64);
+                let durable_revision = result
+                    .content
+                    .get("durableRevision")
+                    .and_then(Value::as_u64);
+                let last_ready_revision = result
+                    .content
+                    .get("lastReadyRevision")
+                    .and_then(Value::as_u64);
+                if status == Some("ready")
+                    && workspace_revision == durable_revision
+                    && last_ready_revision.is_some_and(|ready| {
+                        workspace_revision.is_some_and(|workspace| ready >= workspace)
+                    })
+                {
+                    state.completed_steps.insert("draft_ready".to_string());
+                } else {
+                    state.completed_steps.remove("draft_ready");
+                }
+            }
+            "preview.dev_stop" => {
+                state.completed_steps.remove("preview.dev_start");
+                state.completed_steps.remove("draft_ready");
+            }
+            "draft.snapshot_create" => {
+                state
+                    .completed_steps
+                    .insert("draft.snapshot_create".to_string());
+            }
             "preview.publish" => {
                 state.completed_steps.insert("candidate_ready".to_string());
                 state.completed_steps.remove("repair_required");
@@ -3268,7 +3382,9 @@ fn update_progress_state(
                 canonical_json_hash(&call.input),
             );
             if is_source_mutation_tool(&call.name) {
-                if call.name != "project.init" && target.starts_with("project") {
+                state.completed_steps.remove("draft_ready");
+                state.completed_steps.remove("draft.snapshot_create");
+                if call.name != "project.init" && progress_target_is_project_source(target) {
                     state.completed_steps.insert("source_authored".to_string());
                 }
                 if state.completed_steps.contains("repair_required") {
@@ -3300,12 +3416,19 @@ fn update_progress_state(
             "brief.write_draft"
                 | "project.init"
                 | "project.build"
+                | "preview.dev_start"
+                | "draft.snapshot_create"
                 | "preview.publish"
                 | "run.complete"
         ) {
             state.completed_steps.insert(call.name.clone());
         }
     }
+}
+
+fn progress_target_is_project_source(target: &str) -> bool {
+    let normalized = target.trim_start_matches("/workspace/");
+    normalized == "project" || normalized.starts_with("project/")
 }
 
 fn preview_failure_requires_repair(error_kind: Option<&str>) -> bool {
@@ -3809,12 +3932,19 @@ fn system_prompt_for_run(run: &AgentRun, repair_target_context: Option<&str>) ->
 }
 
 fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> {
+    let next_app = run
+        .project_state_snapshot
+        .as_ref()
+        .is_some_and(|state| state.template_key == "next-app");
     let phase_instruction = match run.phase {
         AgentPhase::Brief => {
-            "Create a structured Brief draft from the provided content sources only. Use content.list_sources and content.read_source to inspect user inputs. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to astro-website for website projects or fumadocs-docs for docs projects. Keep acceptanceCriteria conservative and limited to user-observable release gates. For requiredRoutes, copy literal URL paths only when the user explicitly provides them; otherwise include exactly one template entry route: / for astro-website or /docs/ for fumadocs-docs. Never turn a section heading, feature, topic, checklist item, or document chapter into a route. For requiredText, copy only wording the user explicitly marks as an exact title, headline, visible brand, or quoted phrase. Do not promote feature lists, requested topics, prose instructions, or section coverage into exact-text assertions. Include forbidden template placeholders or explicitly rejected content. Copy genuine exact text literally without translating or paraphrasing it. Call brief.write_draft with the complete Brief and acceptance criteria, then call brief.request_confirmation and wait for user confirmation before completing."
+            "Create a structured Brief draft from the provided content sources only. First call content.list_sources, and pass to content.read_source only an exact content source id returned by that call. A DesignProfile id such as design-profile-* is runtime metadata, not a Content Source; its effective visual guidance is already included in this prompt, so never pass a DesignProfile id to content.read_source. If content.list_sources returns no readable sources, draft the Brief directly from the user request and supplied prompt context. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to next-app for website projects or fumadocs-docs for docs projects. Keep acceptanceCriteria conservative and limited to user-observable release gates. For requiredRoutes, copy literal URL paths only when the user explicitly provides them; otherwise include exactly one template entry route: / for next-app or /docs/ for fumadocs-docs. Never turn a section heading, feature, topic, checklist item, or document chapter into a route. For requiredText, copy only wording the user explicitly marks as an exact title, headline, visible brand, or quoted phrase. Do not promote feature lists, requested topics, prose instructions, or section coverage into exact-text assertions. Include forbidden template placeholders or explicitly rejected content. Copy genuine exact text literally without translating or paraphrasing it. Call brief.write_draft with the complete Brief and acceptance criteria, then call brief.request_confirmation and wait for user confirmation before completing."
+        }
+        AgentPhase::Build if next_app => {
+            "Use the Runtime-owned next-app Draft workflow. First inventory inputs, read the frozen Brief, Content Sources, and only the Design Context files present, then initialize and inspect the project. Turn every frozen acceptance criterion into a checklist before authoring. Preserve each requiredText literal in one rendered text node; do not split it across JSX elements. Read state/style-contract.json before mutations and satisfy every required DesignProfile selector, token, data hook, section, and responsive rule. Edit only Runtime-permitted React source under app/ or components/. After authoring, call project.ensure_dependencies with mode restore, then project.build. Only after the build succeeds call preview.dev_start, followed by preview.dev_status until status is ready and durableRevision equals workspaceRevision. Then call run.complete. Never call preview.publish or preview.start for next-app. If Dev fails, use its process output, stop it, make one bounded repair, rebuild, and start Dev once more. A missing visual model is advisory and must not block a durable Draft or run.complete. Production WorkVersion creation happens only through the user-initiated PublishWorkflow."
         }
         AgentPhase::Build => {
-            "Use the runtime project workflow. First call fs.list on inputs, then read inputs/brief.md and inputs/content-sources.json plus only the optional Design Context files actually present in that listing; do not probe missing optional paths. Before editing, turn the frozen acceptanceCriteria in inputs/brief.md into a checklist and implement every required route and exact required text in the first Candidate; do not substitute another route or paraphrase exact text. Verify that checklist against source before the first preview.publish. Design responsive layouts for a 375px viewport from the first Candidate. Grid or flex children that contain tables, charts, code, or other intrinsic-width content must use min-width: 0; internal horizontal scrollers must be constrained with max-width: 100% and overflow-x: auto. If responsive-layout reports document-level horizontal overflow, inspect grid/flex min-content sizing and fixed or viewport widths first; keep necessary overflow inside the intended component and do not hide document overflow as a substitute for fixing the source. Prefer server-rendered HTML, CSS, or SVG for non-interactive charts and dashboard visuals. Do not add a client-side chart library or browser script unless the user explicitly requests interaction; in Astro, never reference Astro.props or frontmatter variables directly from a client script. Every same-origin href must resolve to a generated route or anchor; render non-navigating states as buttons or plain content instead of broken links. For fumadocs-docs, use the seeded MDX component mapping: Steps/Step, Tabs/Tab, and Accordions/Accordion support both flat child syntax and compound syntax such as <Steps.Step>. Do not create src/mdx-components.tsx, replace components/mdx.jsx, or import fumadocs-ui/dist internals to use those components. Optional files are inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/src/pages/index.astro; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. Edit app source with fs.* under the appRoot, then call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. Inspect the returned validation report and designProfileFidelity report before run.complete. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
+            "Use the runtime project workflow. First call fs.list on inputs, then read inputs/brief.md and inputs/content-sources.json plus only the optional Design Context files actually present in that listing; do not probe missing optional paths. Before editing, turn the frozen acceptanceCriteria in inputs/brief.md into a checklist and implement every required route and exact required text in the first Candidate; do not substitute another route or paraphrase exact text. Verify that checklist against source before the first preview.publish. Design responsive layouts for a 375px viewport from the first Candidate. Grid or flex children that contain tables, charts, code, or other intrinsic-width content must use min-width: 0; internal horizontal scrollers must be constrained with max-width: 100% and overflow-x: auto. If responsive-layout reports document-level horizontal overflow, inspect grid/flex min-content sizing and fixed or viewport widths first; keep necessary overflow inside the intended component and do not hide document overflow as a substitute for fixing the source. Prefer server-rendered HTML, CSS, or SVG for non-interactive charts and dashboard visuals. Do not add a client-side chart library or browser script unless the user explicitly requests interaction; never reference server-only or frontmatter variables directly from a client script. Every same-origin href must resolve to a generated route or anchor; render non-navigating states as buttons or plain content instead of broken links. For fumadocs-docs, use the seeded MDX component mapping: Steps/Step, Tabs/Tab, and Accordions/Accordion support both flat child syntax and compound syntax such as <Steps.Step>. Do not create src/mdx-components.tsx, replace components/mdx.jsx, or import fumadocs-ui/dist internals to use those components. Optional files are inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/app/page.tsx; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. Edit app source with fs.* under the appRoot, then call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. Inspect the returned validation report and designProfileFidelity report before run.complete. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Edit => {
             "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the validated candidate contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read inputs/design-profile.json, inputs/design.md, and new user content sources such as docs markdown when present, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. After source edits are complete, call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the validated candidate, the returned validation report, and the designProfileFidelity report. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property using only exact token names from state/style-contract.json, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. If the candidate and both validation reports satisfy the request, call run.complete; Runtime atomically promotes the candidate and completes the run. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
@@ -3855,7 +3985,15 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         run.phase,
         AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
     ) {
-        "shell.run defaults to the appRoot as its working directory. When cwd is omitted, use appRoot-relative shell paths such as src/pages/index.astro, never project/src/pages/index.astro. Prefer fs.read, fs.list, and fs.search for observations; use shell.run only for commands that are not available through a dedicated Runtime tool."
+        "shell.run defaults to the appRoot as its working directory. When cwd is omitted, use appRoot-relative shell paths such as app/page.tsx, never project/app/page.tsx. Prefer fs.read, fs.list, and fs.search for observations; use shell.run only for commands that are not available through a dedicated Runtime tool."
+    } else {
+        ""
+    };
+    let template_completion_instruction = if matches!(
+        run.phase,
+        AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+    ) {
+        "Completion is template-specific and state/project.json is authoritative; any generic phase_workflow instruction to call preview.publish applies only to legacy static templates. When templateKey is next-app, preview.publish is intentionally unsupported. Prefer preview.dev_start and the automatically durable Draft revision produced by each successful source mutation; check preview.dev_status and complete once the latest revision is durable and Dev Ready. Treat 375px navigation readability as a source acceptance check: desktop navigation links must hide, collapse into a menu, or wrap as intact labels, and must never be squeezed into one-character columns. Provide an application icon through app/icon.svg or explicit App Router metadata so the browser's declared icon request does not return 404. Navigation and icon defects are advisory visual findings and must not block DraftSnapshot creation or run.complete. If managed HMR is unavailable, use project.build, preview.start, browser.open, browser.screenshot, and draft.snapshot_create as a non-blocking fallback. Production Build and WorkVersion creation happen only in the explicit PublishWorkflow. A missing or unavailable visual model is advisory and must not prevent DraftSnapshot creation or run.complete. Never retry preview.publish after Runtime returns template.operation_unsupported for next-app."
     } else {
         ""
     };
@@ -3888,6 +4026,10 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         PromptContextSection {
             id: "phase_workflow",
             content: phase_instruction.to_string(),
+        },
+        PromptContextSection {
+            id: "template_completion",
+            content: template_completion_instruction.to_string(),
         },
         PromptContextSection {
             id: "source_fallback",
@@ -4221,6 +4363,52 @@ mod design_capsule_tests {
         ));
     }
 
+    #[test]
+    fn remote_workspace_source_mutation_advances_authoring_progress() {
+        let read = ToolCall::new(
+            "read-page",
+            "fs.read",
+            json!({ "path": "/workspace/project/app/page.tsx" }),
+        );
+        let read_result = ToolResultMessage {
+            tool_use_id: read.id.clone(),
+            tool_name: read.name.clone(),
+            is_error: false,
+            content: json!({ "path": "/workspace/project/app/page.tsx" }),
+            metadata: None,
+        };
+        let call = ToolCall::new(
+            "write-icon",
+            "fs.write",
+            json!({
+                "path": "/workspace/project/app/icon.svg",
+                "content": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>"
+            }),
+        );
+        let result = ToolResultMessage {
+            tool_use_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            is_error: false,
+            content: json!({ "path": "/workspace/project/app/icon.svg" }),
+            metadata: None,
+        };
+        let mut state = RunProgressState::default();
+
+        update_progress_state(&mut state, &[read], &[read_result]);
+        update_progress_state(&mut state, &[call], &[result]);
+
+        assert!(state.completed_steps.contains("project_source_read"));
+        assert!(state.completed_steps.contains("source_authored"));
+        let workflow = workflow_progress_snapshot(
+            AgentPhase::Edit,
+            Some("next-app"),
+            &state,
+            ObservationBudgetUsage::default(),
+            AgentLoopLimits::default(),
+        );
+        assert_eq!(workflow.stage, "restoring_dependencies");
+    }
+
     fn profile() -> DesignProfile {
         let now = Utc::now();
         DesignProfile {
@@ -4251,7 +4439,7 @@ mod design_capsule_tests {
             website_context: Value::Null,
             content: json!({ "headline": "concise" }),
             accessibility: json!({ "contrast": "AA" }),
-            technical: json!({ "allowedTemplates": ["astro-website"] }),
+            technical: json!({ "allowedTemplates": ["next-app"] }),
             governance: json!({ "conflictBehavior": "ask" }),
             signature_rules: vec![json!({
                 "id": "authkit-primary",
@@ -4476,6 +4664,7 @@ mod design_capsule_tests {
             vec![
                 "runtime_identity",
                 "phase_workflow",
+                "template_completion",
                 "source_fallback",
                 "shell_paths",
                 "runtime_policy"
@@ -4502,6 +4691,9 @@ mod design_capsule_tests {
             .await;
 
         let prompt = PromptContextAssembler::for_run(&run).render();
+        assert!(prompt.contains("pass to content.read_source only an exact content source id"));
+        assert!(prompt.contains("DesignProfile id such as design-profile-* is runtime metadata"));
+        assert!(prompt.contains("never pass a DesignProfile id to content.read_source"));
         assert!(prompt.contains("include exactly one template entry route"));
         assert!(prompt.contains("Never turn a section heading, feature, topic"));
         assert!(prompt.contains("Do not promote feature lists, requested topics"));
@@ -4533,5 +4725,157 @@ mod design_capsule_tests {
         assert!(prompt.contains("Do not add a client-side chart library"));
         assert!(prompt.contains("Every same-origin href must resolve"));
         assert!(prompt.contains("Do not create src/mdx-components.tsx"));
+    }
+
+    #[tokio::test]
+    async fn next_app_prompt_keeps_mobile_navigation_and_icon_findings_advisory() {
+        let store = RuntimeStore::new();
+        let mut run = store
+            .create_run(
+                "project-next-app".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "test-model".to_string(),
+                Vec::new(),
+            )
+            .await;
+        run.project_state_snapshot = Some(crate::types::ProjectRuntimeState {
+            project_id: run.project_id.clone(),
+            revision: 1,
+            app_root: "project".to_string(),
+            template_key: "next-app".to_string(),
+            template_version: "next-app@1".to_string(),
+            template_manifest_sha256: Some("a".repeat(64)),
+            framework: "nextjs".to_string(),
+            sandbox_execution_profile_id: Some("next-app".to_string()),
+            sandbox_execution_profile_version: Some("0.1.0".to_string()),
+            package_manager: "npm".to_string(),
+            lockfile: "package-lock.json".to_string(),
+            registry: "runtime".to_string(),
+            updated_at: Utc::now(),
+        });
+
+        let prompt = PromptContextAssembler::for_run(&run).render();
+        assert!(prompt.contains("375px navigation readability"));
+        assert!(prompt.contains("never be squeezed into one-character columns"));
+        assert!(prompt.contains("app/icon.svg"));
+        assert!(prompt.contains("advisory visual findings"));
+        assert!(prompt.contains("must not block DraftSnapshot creation or run.complete"));
+    }
+
+    #[test]
+    fn next_app_workflow_progress_never_treats_build_digest_as_completion() {
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "inputs_inventoried",
+                "brief_loaded",
+                "content_sources_loaded",
+                "project_initialized",
+                "project_inspected",
+                "source_authored",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state.candidate_digest = Some("build-digest".to_string());
+        let limits = AgentLoopLimits::default();
+        let usage = ObservationBudgetUsage::default();
+
+        let dependencies =
+            workflow_progress_snapshot(AgentPhase::Build, Some("next-app"), &state, usage, limits);
+        assert_eq!(dependencies.stage, "restoring_dependencies");
+        assert!(!dependencies.next_action.contains("preview.publish"));
+
+        state
+            .completed_steps
+            .insert("dependencies_ready".to_string());
+        let build =
+            workflow_progress_snapshot(AgentPhase::Build, Some("next-app"), &state, usage, limits);
+        assert_eq!(build.stage, "building_draft");
+
+        state.completed_steps.insert("project.build".to_string());
+        let start =
+            workflow_progress_snapshot(AgentPhase::Build, Some("next-app"), &state, usage, limits);
+        assert_eq!(start.stage, "starting_draft_preview");
+        assert!(start.next_action.contains("preview.dev_start"));
+
+        state
+            .completed_steps
+            .insert("preview.dev_start".to_string());
+        let waiting =
+            workflow_progress_snapshot(AgentPhase::Build, Some("next-app"), &state, usage, limits);
+        assert_eq!(waiting.stage, "waiting_for_draft_preview");
+
+        state.completed_steps.insert("draft_ready".to_string());
+        let ready =
+            workflow_progress_snapshot(AgentPhase::Build, Some("next-app"), &state, usage, limits);
+        assert_eq!(ready.stage, "ready_to_complete");
+        assert!(ready.next_action.contains("run.complete"));
+    }
+
+    #[test]
+    fn next_app_ready_draft_exposes_only_run_complete() {
+        let mut state = RunProgressState::default();
+        state.completed_steps.insert("draft_ready".to_string());
+
+        assert!(!tool_redundant_after_next_app_draft_ready(
+            "run.complete",
+            Some("next-app"),
+            &state,
+        ));
+        for tool in [
+            "fs.read",
+            "fs.search",
+            "browser.screenshot",
+            "preview.audit_responsive",
+            "draft.snapshot_create",
+        ] {
+            assert!(tool_redundant_after_next_app_draft_ready(
+                tool,
+                Some("next-app"),
+                &state,
+            ));
+        }
+        assert!(!tool_redundant_after_next_app_draft_ready(
+            "fs.read",
+            Some("fumadocs-docs"),
+            &state,
+        ));
+    }
+
+    #[test]
+    fn next_app_dev_status_marks_only_durable_ready_revision_complete() {
+        let call = ToolCall::new("dev-status", "preview.dev_status", json!({}));
+        let ready = ToolResultMessage {
+            tool_use_id: "dev-status".to_string(),
+            tool_name: "preview.dev_status".to_string(),
+            is_error: false,
+            content: json!({
+                "status": "ready",
+                "workspaceRevision": 3,
+                "lastReadyRevision": 3,
+                "durableRevision": 3
+            }),
+            metadata: None,
+        };
+        let mut state = RunProgressState::default();
+        update_progress_state(&mut state, std::slice::from_ref(&call), &[ready]);
+        assert!(state.completed_steps.contains("draft_ready"));
+
+        let stale = ToolResultMessage {
+            tool_use_id: "dev-status".to_string(),
+            tool_name: "preview.dev_status".to_string(),
+            is_error: false,
+            content: json!({
+                "status": "ready",
+                "workspaceRevision": 4,
+                "lastReadyRevision": 3,
+                "durableRevision": 3
+            }),
+            metadata: None,
+        };
+        update_progress_state(&mut state, &[call], &[stale]);
+        assert!(!state.completed_steps.contains("draft_ready"));
     }
 }

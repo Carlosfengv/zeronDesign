@@ -10,7 +10,8 @@ use crate::{
     },
     preview::{promote_preview_cas, validate_preview_promotion, PromotionGateReport},
     project::{
-        check_project_write_path, ProjectInitWorkspaceTransaction, WorkspaceTransactionError,
+        check_project_write_content, check_project_write_path, ProjectInitWorkspaceTransaction,
+        WorkspaceTransactionError,
     },
     templates::{
         BuiltInTemplateRegistry, ManifestHash, RenderPageRequest, SourceSnapshot, TemplateId,
@@ -41,22 +42,30 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::TcpStream, process::Command as TokioCommand, time};
 
+#[path = "asset.rs"]
+mod asset;
 #[path = "browser.rs"]
 mod browser;
 #[path = "support/build.rs"]
 mod build_support;
+#[path = "component.rs"]
+mod component;
 #[path = "fs/delete.rs"]
 mod delete;
 #[path = "design_context_status.rs"]
 mod design_context_status;
 #[path = "diagnostics.rs"]
 mod diagnostics;
+#[path = "draft.rs"]
+mod draft;
 #[path = "support/fs.rs"]
 mod fs_support;
 #[path = "support/package.rs"]
 mod package_support;
 #[path = "preview/acceptance.rs"]
 mod preview_acceptance;
+#[path = "preview/dev.rs"]
+mod preview_dev;
 #[path = "preview/fidelity.rs"]
 mod preview_fidelity;
 #[path = "preview/lifecycle.rs"]
@@ -160,6 +169,11 @@ pub fn sandbox_tools_with_backends(
             command_backend.clone(),
         ),
         project_build::package_install_tool(workspace_backend.clone(), command_backend.clone()),
+        draft::draft_snapshot_create_tool(workspace_backend.clone()),
+        draft::draft_restore_tool(workspace_backend.clone(), command_backend.clone()),
+        preview_dev::preview_dev_start_tool(workspace_backend.clone(), command_backend.clone()),
+        preview_dev::preview_dev_status_tool(workspace_backend.clone(), command_backend.clone()),
+        preview_dev::preview_dev_stop_tool(workspace_backend.clone(), command_backend.clone()),
         preview_publish::preview_rebuilding_tool(),
         preview_publish::preview_report_candidate_tool(workspace_backend.clone()),
         preview_publish::preview_publish_tool(workspace_backend.clone(), command_backend.clone()),
@@ -173,7 +187,13 @@ pub fn sandbox_tools_with_backends(
         design_context_status::design_context_status_tool(),
         browser::browser_open_tool(workspace_backend.clone()),
         browser::browser_screenshot_tool(workspace_backend.clone()),
-        browser::browser_inspect_tool(workspace_backend),
+        browser::browser_inspect_tool(workspace_backend.clone()),
+        asset::asset_import_tool(workspace_backend.clone()),
+        asset::asset_list_tool(),
+        asset::asset_generate_tool(workspace_backend.clone()),
+        component::component_search_tool(),
+        component::component_inspect_tool(),
+        component::component_install_tool(workspace_backend),
     ]
 }
 

@@ -4,7 +4,7 @@ use crate::{
     },
     channel_manager::ChannelManager,
     conversation::RuntimeStore,
-    types::{sha256_hex, PreviewLeaseStatus},
+    types::{sha256_hex, PreviewLeaseMode, PreviewLeaseStatus},
 };
 use std::{error::Error, fmt};
 
@@ -38,6 +38,8 @@ pub struct CandidatePreviewAccess {
     pub project_id: String,
     pub build_id: String,
     pub candidate_manifest_hash: String,
+    pub mode: PreviewLeaseMode,
+    pub target_port: u16,
     pub upstream_endpoint: String,
 }
 
@@ -153,7 +155,14 @@ impl PreviewAccessService {
             ));
         }
         let upstream_endpoint = ChannelManager::shared()
-            .endpoint(&self.store, &binding, &lease.run_id, 4321, "http", "")
+            .endpoint(
+                &self.store,
+                &binding,
+                &lease.run_id,
+                lease.target_port,
+                "http",
+                "",
+            )
             .await
             .map_err(|error| PreviewAccessError::Internal(error.to_string()))?;
         Ok(CandidatePreviewAccess {
@@ -161,6 +170,8 @@ impl PreviewAccessService {
             project_id: lease.project_id,
             build_id: lease.build_id,
             candidate_manifest_hash: lease.candidate_manifest_hash,
+            mode: lease.mode,
+            target_port: lease.target_port,
             upstream_endpoint,
         })
     }

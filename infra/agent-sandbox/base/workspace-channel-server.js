@@ -483,8 +483,18 @@ async function startManagedProcess(request, payload) {
     payload.argv.length === 2 &&
     payload.argv[0] === "node" &&
     payload.argv[1] === MANAGED_PREVIEW_SCRIPT;
+  const isManagedDevPreview =
+    payload.argv.length === 8 &&
+    payload.argv[0] === "env" &&
+    payload.argv[1] === `ANYDESIGN_PREVIEW_BASE_PATH=/previews/${leaseId}` &&
+    payload.argv[2] === "npm" &&
+    payload.argv[3] === "run" &&
+    payload.argv[4] === "dev" &&
+    payload.argv[5] === "--" &&
+    payload.argv[6] === "--port" &&
+    payload.argv[7] === "3000";
   const isTestProcess = testProcessAllowed && payload.argv[0] === "node";
-  if (!isManagedPreview && !isTestProcess) {
+  if (!isManagedPreview && !isManagedDevPreview && !isTestProcess) {
     throw new Error("process.start only allows the runtime managed preview server");
   }
   const cwd = resolveWorkspacePath(request.path || "/workspace", "existing");

@@ -1347,7 +1347,7 @@ mod browser_evidence_tests {
             )
             .await;
         let template = BuiltInTemplateRegistry::built_in()
-            .current(&TemplateId::parse("astro-website").unwrap())
+            .current(&TemplateId::parse("next-app").unwrap())
             .unwrap();
         let profile = DesignProfile {
             id: "craft-pack-profile".to_string(),
@@ -1373,21 +1373,21 @@ mod browser_evidence_tests {
             }),
             content: json!({}),
             accessibility: json!({}),
-            technical: json!({ "allowedTemplates": ["astro-website"] }),
+            technical: json!({ "allowedTemplates": ["next-app"] }),
             governance: json!({}),
             signature_rules: Vec::new(),
             overrides: json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let effective = profile.effective_for("website", "astro-website").unwrap();
+        let effective = profile.effective_for("website", "next-app").unwrap();
         let brief = Brief {
             project_type: "website".to_string(),
             audience: "operators".to_string(),
             content_hierarchy: vec!["hero".to_string()],
             page_structure: json!(["hero"]),
             visual_direction: "clear".to_string(),
-            recommended_template: "astro-website".to_string(),
+            recommended_template: "next-app".to_string(),
             assumptions: Vec::new(),
             missing_information: Vec::new(),
         };
@@ -1406,7 +1406,7 @@ mod browser_evidence_tests {
                 &run.id,
                 &profile,
                 Some("website"),
-                Some("astro-website"),
+                Some("next-app"),
             )
             .await
             .unwrap();

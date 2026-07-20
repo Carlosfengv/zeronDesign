@@ -70,6 +70,11 @@ fn success_lifecycle_effect(observation: &ToolSuccessObservation) -> Option<Valu
             "sourceSnapshotUri": content.get("sourceSnapshotUri").cloned().unwrap_or(Value::Null),
             "packageManager": content.get("packageManager").cloned().unwrap_or(Value::Null),
         }),
+        "draft.snapshot_create" => serde_json::json!({
+            "effect": "draft_snapshot_created",
+            "snapshotId": content.pointer("/draftSnapshot/snapshotId").cloned().unwrap_or(Value::Null),
+            "previewUrl": content.get("previewUrl").cloned().unwrap_or(Value::Null),
+        }),
         "style.update_tokens" => serde_json::json!({
             "effect": "style_contract_updated",
             "tokenFile": content.get("tokenFile").cloned().unwrap_or(Value::Null),
@@ -362,16 +367,16 @@ fn is_preview_server_command(argv: &[String]) -> bool {
         ("npx", _) => argv
             .iter()
             .skip(1)
-            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "next")),
         ("npm" | "pnpm" | "yarn", Some("run")) => argv
             .get(2)
             .is_some_and(|script| matches!(script.as_str(), "preview" | "dev" | "start")),
         ("npm", Some("exec")) => argv
             .iter()
             .skip(2)
-            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "next")),
         ("pnpm" | "yarn", Some("preview" | "dev" | "start")) => true,
-        ("astro", Some("preview" | "dev")) | ("vite", Some("--host" | "--port")) => true,
+        ("next", Some("dev" | "start")) | ("vite", Some("--host" | "--port")) => true,
         ("serve", _) => true,
         _ => false,
     }
@@ -380,19 +385,6 @@ fn is_preview_server_command(argv: &[String]) -> bool {
 fn is_interactive_project_scaffold(argv: &[String]) -> bool {
     let command = argv.first().map(String::as_str).unwrap_or("");
     if command == "npm" && argv.get(1).map(String::as_str) == Some("create") {
-        return true;
-    }
-    if command == "npx"
-        && argv.iter().any(|arg| arg == "astro")
-        && argv.iter().any(|arg| arg == "add")
-    {
-        return true;
-    }
-    if command == "npm"
-        && argv.get(1).map(String::as_str) == Some("exec")
-        && argv.iter().any(|arg| arg == "astro")
-        && argv.iter().any(|arg| arg == "add")
-    {
         return true;
     }
     false
@@ -813,7 +805,7 @@ mod tests {
         let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Brief,
             tool_name: "fs.read".to_string(),
-            input: json!({ "path": "project/src/pages/index.astro" }),
+            input: json!({ "path": "project/app/page.tsx" }),
             default_cwd: Some("project".to_string()),
         });
 
@@ -874,12 +866,12 @@ mod tests {
         let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "fs.read".to_string(),
-            input: json!({ "path": "/workspace/project/src/pages/index.astro" }),
+            input: json!({ "path": "/workspace/project/app/page.tsx" }),
             default_cwd: Some("project".to_string()),
         });
 
         assert!(decision.rejection.is_none());
-        assert_eq!(decision.input["path"], "project/src/pages/index.astro");
+        assert_eq!(decision.input["path"], "project/app/page.tsx");
 
         let cwd_decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
@@ -934,7 +926,7 @@ mod tests {
         let decision = PreToolUseHook.apply(PreToolUseObservation {
             phase: AgentPhase::Build,
             tool_name: "shell.run".to_string(),
-            input: json!({ "argv": ["npm", "create", "astro@latest"] }),
+            input: json!({ "argv": ["npm", "create", "next-app@latest"] }),
             default_cwd: Some("project".to_string()),
         });
 

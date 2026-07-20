@@ -30,7 +30,18 @@ pub(in crate::http_api) async fn candidate_capture_root(
 pub(in crate::http_api) async fn candidate_capture_file(
     Extension(preview_access): Extension<PreviewAccessService>,
     Path((lease_id, preview_path)): Path<(String, String)>,
+    websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if let Ok(websocket) = websocket {
+        return proxy_candidate_preview_websocket(
+            preview_access,
+            lease_id,
+            preview_path,
+            PreviewAccessContext::InternalCapture,
+            websocket,
+        )
+        .await;
+    }
     proxy_candidate_preview(
         preview_access,
         lease_id,
@@ -53,7 +64,20 @@ pub(in crate::http_api) async fn candidate_capture_host_file(
     Extension(preview_access): Extension<PreviewAccessService>,
     Path(preview_path): Path<String>,
     headers: HeaderMap,
+    websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if let Ok(websocket) = websocket {
+        let lease_id = capture_lease_id_from_host(capture_host(&headers)?)
+            .ok_or_else(|| not_found("candidate capture host is invalid".to_string()))?;
+        return proxy_candidate_preview_websocket(
+            preview_access,
+            lease_id,
+            preview_path,
+            PreviewAccessContext::InternalCaptureHost,
+            websocket,
+        )
+        .await;
+    }
     candidate_capture_host_response(preview_access, capture_host(&headers)?, preview_path).await
 }
 
@@ -118,8 +142,19 @@ async fn candidate_preview_file(
     Extension(preview_access): Extension<PreviewAccessService>,
     Path((lease_id, preview_path)): Path<(String, String)>,
     headers: HeaderMap,
+    websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let principal = authenticate_candidate_preview(&state, &headers, &lease_id).await?;
+    if let Ok(websocket) = websocket {
+        return proxy_candidate_preview_websocket(
+            preview_access,
+            lease_id,
+            preview_path,
+            PreviewAccessContext::Public(principal.as_ref()),
+            websocket,
+        )
+        .await;
+    }
     let requested_prefix = preview_prefix_header(&headers)?;
     let prefix_required =
         state.config.public_principal_auth_mode != PublicPrincipalAuthMode::Disabled;

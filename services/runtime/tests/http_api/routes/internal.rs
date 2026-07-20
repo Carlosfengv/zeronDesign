@@ -16,6 +16,11 @@ fn internal_route_family_is_frozen() {
             ),
             ("GET", "/internal/projects/{project_id}/release-evidence"),
             ("POST", "/internal/projects/{project_id}/release-sandbox"),
+            (
+                "GET",
+                "/internal/runs/{run_id}/visual-artifacts/{artifact_id}/content",
+            ),
+            ("POST", "/internal/visual-artifacts/gc"),
         ],
     );
 }

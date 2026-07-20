@@ -10,6 +10,8 @@ const DESIGN_SOURCES_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/design_sources.rs");
 const DESIGN_PROFILES_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/design_profiles.rs");
+const DRAFT_PREVIEW_EVENTS_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/draft_preview_events.rs");
 const PROJECTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/projects.rs");
 const PREVIEWS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/previews.rs");
 const PUBLICATION_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/publication.rs");
@@ -178,6 +180,10 @@ fn executable_route_manifest_matches_every_router_declaration() {
     actual.extend(declared_routes("public", BRIEFS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_PROFILES_ROUTES_SOURCE));
     actual.extend(declared_routes("public", DESIGN_SOURCES_ROUTES_SOURCE));
+    actual.extend(declared_routes(
+        "public",
+        DRAFT_PREVIEW_EVENTS_ROUTES_SOURCE,
+    ));
     actual.extend(declared_routes_in_dir(
         "internal",
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -227,6 +233,7 @@ fn route_manifest_metadata_is_complete_and_fail_closed() {
         "internal_service",
         "project_access_in_production",
         "project_principal_read_when_required",
+        "project_principal_read_write_when_required",
         "project_principal_write_when_required",
         "preview_principal_when_required",
         "public_principal_when_required",

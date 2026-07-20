@@ -3,6 +3,7 @@ pub(super) mod briefs;
 pub(super) mod capture;
 pub(super) mod design_profiles;
 pub(super) mod design_sources;
+pub(super) mod draft_preview_events;
 pub(super) mod internal;
 pub(super) mod previews;
 pub(super) mod projects;
