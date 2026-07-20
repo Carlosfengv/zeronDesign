@@ -208,6 +208,7 @@ async fn runtime_gateway_provider_round_trip_preserves_governed_selection_bounda
             strict_tool_schema: false,
             streaming: false,
             vision: false,
+            ..Default::default()
         },
         defaults: ModelDefaults::default(),
     };
@@ -679,7 +680,7 @@ async fn openai_compatible_client_streams_tool_call_argument_deltas() {
         ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
             "call-stream",
             "fs.write",
-            json!({ "path": "project/src/pages/index.astro", "text": "ok" }),
+            json!({ "path": "project/app/page.tsx", "text": "ok" }),
         )])
     );
 }
@@ -863,7 +864,7 @@ async fn capture_streaming_chat_completion(
     *captured_request.lock().await = Some(body);
     let stream = concat!(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-stream\",\"type\":\"function\",\"function\":{\"name\":\"fs_write\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"project/src/pages/index.astro\\\",\\\"text\\\":\\\"ok\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"project/app/page.tsx\\\",\\\"text\\\":\\\"ok\\\"}\"}}]}}]}\n\n",
         "data: [DONE]\n\n"
     );
     ([("content-type", "text/event-stream")], stream)
@@ -932,7 +933,7 @@ async fn openai_compatible_client_unwraps_object_arguments_wrapper() {
         ModelResponse::ToolCalls(vec![anydesign_runtime::model_gateway::ToolCall::new(
             "call-1",
             "fs.write",
-            json!({ "path": "project/src/pages/index.astro", "text": "ok" }),
+            json!({ "path": "project/app/page.tsx", "text": "ok" }),
         )])
     );
 }
@@ -1073,7 +1074,7 @@ async fn capture_wrapped_object_arguments_completion(Json(_body): Json<Value>) -
                             "type": "function",
                             "function": {
                                 "name": "fs_write",
-                                "arguments": "{\"arguments\":{\"path\":\"project/src/pages/index.astro\",\"text\":\"ok\"}}"
+                                "arguments": "{\"arguments\":{\"path\":\"project/app/page.tsx\",\"text\":\"ok\"}}"
                             }
                         }
                     ]
@@ -1147,7 +1148,7 @@ async fn capture_invalid_tool_arguments_completion(Json(_body): Json<Value>) -> 
                             "type": "function",
                             "function": {
                                 "name": "fs_write",
-                                "arguments": "{\"path\":\"project/src/pages/index.astro\",\"text\":\"<html>"
+                                "arguments": "{\"path\":\"project/app/page.tsx\",\"text\":\"<html>"
                             }
                         }
                     ]

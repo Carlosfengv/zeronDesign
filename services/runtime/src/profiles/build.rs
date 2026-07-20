@@ -35,26 +35,6 @@ pub struct TemplateBuildOutput {
     pub checkpoint_id: String,
 }
 
-pub type AstroBuildRequest = TemplateBuildRequest;
-pub type AstroBuildOutput = TemplateBuildOutput;
-
-pub async fn run_astro_build(
-    store: &RuntimeStore,
-    request: AstroBuildRequest,
-) -> Result<AstroBuildOutput> {
-    let brief = store
-        .get_brief(&request.brief_id)
-        .await
-        .ok_or_else(|| anyhow!("brief not found: {}", request.brief_id))?;
-    if brief.recommended_template != "astro-website" {
-        return Err(anyhow!(
-            "astro build requires recommendedTemplate=astro-website, got {}",
-            brief.recommended_template
-        ));
-    }
-    run_template_build_with_brief(store, request, brief).await
-}
-
 pub async fn run_template_build(
     store: &RuntimeStore,
     request: TemplateBuildRequest,
@@ -282,7 +262,6 @@ fn run_command(cwd: &Path, program: &str, args: &[String], template_id: &str) ->
     let output = Command::new(program)
         .args(args)
         .current_dir(cwd)
-        .env("ASTRO_TELEMETRY_DISABLED", "1")
         .env("NEXT_TELEMETRY_DISABLED", "1")
         .output()
         .with_context(|| format!("failed to start {program} {}", args.join(" ")))?;

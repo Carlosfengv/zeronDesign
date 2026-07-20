@@ -1,6 +1,6 @@
-mod astro_website;
 mod fumadocs_docs;
 mod id;
+mod next_app;
 mod operations;
 mod registry;
 mod spec;
@@ -18,6 +18,8 @@ pub use registry::{
     TemplateRegistryBuildError, UnknownTemplate,
 };
 pub use spec::{
-    BuildSpec, MutationPolicySpec, PreviewSpec, StyleContractSpec, StyleTokenSpec,
+    BuildSpec, ComponentRegistryRef, DependencyPolicyRef, DevelopmentServerSpec,
+    MutationPolicySpec, PreviewSpec, SourceContractSpec, StyleContractSpec, StyleTokenSpec,
     TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateSpec, TemplateWriteMode,
+    ValidationContractSpec,
 };

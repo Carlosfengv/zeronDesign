@@ -459,7 +459,7 @@ mod tests {
             style_contract_identity: StyleContractIdentity {
                 hash: "contract-hash".to_string(),
                 version: "runtime-style-contract@1".to_string(),
-                template: "astro-website".to_string(),
+                template: "next-app".to_string(),
                 app_root: "project".to_string(),
                 token_mappings: tokens(&[("color.primary", "--runtime-primary")]),
             },
@@ -515,7 +515,7 @@ mod tests {
             brief_hash: "brief-hash".to_string(),
             brief_schema_version: "brief@1".to_string(),
             surface: "website".to_string(),
-            template: "astro-website".to_string(),
+            template: "next-app".to_string(),
             template_manifest_sha256: "template-hash".to_string(),
             expected_app_root: "project".to_string(),
             compiler_version: "compiler@1".to_string(),
@@ -629,7 +629,7 @@ mod tests {
     fn plans_from_actual_contract_token_file_and_freezes_mapping_identity() {
         let contract = json!({
             "version": "runtime-style-contract@1",
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project",
             "tokens": { "color.primary": "--runtime-primary" }
         });
@@ -653,7 +653,7 @@ mod tests {
     fn refuses_token_sync_when_contract_mapping_drifted() {
         let contract = json!({
             "version": "runtime-style-contract@1",
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project",
             "tokens": { "color.secondary": "--runtime-secondary" }
         });
@@ -880,7 +880,7 @@ mod tests {
             &target,
             &json!({
                 "version": "runtime-style-contract@1",
-                "template": "astro-website",
+                "template": "next-app",
                 "appRoot": "/workspace/project",
                 "tokens": { "color.primary": "--runtime-primary" }
             }),

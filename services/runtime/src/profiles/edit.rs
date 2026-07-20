@@ -65,8 +65,8 @@ fn conflicts_with_project_type(brief: &Brief, normalized_message: &str) -> bool 
 
 fn conflicts_with_template(brief: &Brief, normalized_message: &str) -> bool {
     let mentioned_templates = [
-        "astro-website",
         "fumadocs-docs",
+        "next-app",
         "nextjs-website",
         "docusaurus-docs",
     ];

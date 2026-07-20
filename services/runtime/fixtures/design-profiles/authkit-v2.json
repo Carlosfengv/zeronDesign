@@ -143,8 +143,8 @@
   },
   "accessibility": { "wcag": "AA", "motion": ["Respect reduced motion."], "semantics": ["Use real form semantics."] },
   "technical": {
-    "allowedTemplates": ["astro-website", "fumadocs-docs"],
-    "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+    "allowedTemplates": ["next-app", "fumadocs-docs"],
+    "preferredTemplates": { "website": "next-app", "docs": "fumadocs-docs" },
     "cssStrategy": "runtime-style-contract",
     "dependencyPolicy": { "preferExisting": true },
     "filePolicy": {
@@ -170,7 +170,7 @@
   ],
   "overrides": {
     "surfaces": { "docs": { "signatureRules": [], "content": { "decoration": "restrained" } } },
-    "templates": { "astro-website": { "content": { "requiredDataHooks": ["data-blueprint-grid", "data-auth-form"] } } }
+    "templates": { "next-app": { "content": { "requiredDataHooks": ["data-blueprint-grid", "data-auth-form"] } } }
   },
   "createdAt": "2026-07-10T00:00:00Z",
   "updatedAt": "2026-07-10T00:00:00Z"

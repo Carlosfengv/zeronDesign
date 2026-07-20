@@ -13,7 +13,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
         - name: fumadocs-docs
-          image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0
+          image: ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0
           env:
             - name: WORKSPACE_CHANNEL_PORT
               value: "3001"

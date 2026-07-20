@@ -1,24 +1,22 @@
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
-  name: anydesign-astro-website
+  name: anydesign-next-app
   namespace: anydesign-sandboxes
 spec:
-  # The repository-owned NetworkPolicies are the only egress authority. The
-  # controller's Managed default adds a public-internet allow policy.
   networkPolicyManagement: Unmanaged
   podTemplate:
     spec:
       serviceAccountName: anydesign-sandbox
       dnsPolicy: ClusterFirst
       containers:
-        - name: astro-website
-          image: ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0
+        - name: next-app
+          image: ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0
           env:
             - name: WORKSPACE_CHANNEL_PORT
               value: "3001"
             - name: CANDIDATE_PREVIEW_PORT
-              value: "4321"
+              value: "3000"
             - name: WORKSPACE_CHANNEL_AUTH_MODE
               value: required
             - name: WORKSPACE_CHANNEL_TLS_MODE
@@ -49,7 +47,7 @@ spec:
             - name: workspace
               containerPort: 3001
             - name: preview
-              containerPort: 4321
+              containerPort: 3000
           volumeMounts:
             - name: workspace
               mountPath: /workspace

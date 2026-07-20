@@ -302,7 +302,7 @@ fn use_kubernetes_readiness() -> bool {
 
 fn enabled_template_ids(configured: Option<&str>) -> Vec<TemplateId> {
     configured
-        .unwrap_or("astro-website,fumadocs-docs")
+        .unwrap_or("next-app,fumadocs-docs")
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -415,9 +415,9 @@ mod tests {
         }
     }
 
-    fn astro_profile() -> Arc<SandboxExecutionProfile> {
+    fn next_profile() -> Arc<SandboxExecutionProfile> {
         let template = BuiltInTemplateRegistry::built_in()
-            .current(&TemplateId::parse("astro-website").unwrap())
+            .current(&TemplateId::parse("next-app").unwrap())
             .unwrap();
         BuiltInSandboxExecutionProfileRegistry::built_in()
             .resolve(&template.sandbox_execution_profile)
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn kubernetes_readiness_validates_resources_and_caches_result() {
-        let profile = astro_profile();
+        let profile = next_profile();
         let calls = Arc::new(AtomicUsize::new(0));
         let readiness = KubernetesSandboxExecutionProfileReadiness::with_runner(
             ReadinessRunner {
@@ -460,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn kubernetes_readiness_fails_closed_on_image_drift() {
-        let profile = astro_profile();
+        let profile = next_profile();
         let readiness = KubernetesSandboxExecutionProfileReadiness::with_runner(
             ReadinessRunner {
                 template: json!({

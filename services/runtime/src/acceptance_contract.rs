@@ -396,7 +396,7 @@ mod tests {
             content_hierarchy: vec!["Hero".to_string()],
             page_structure: json!([]),
             visual_direction: "clean".to_string(),
-            recommended_template: "astro-website".to_string(),
+            recommended_template: "next-app".to_string(),
             assumptions: vec![],
             missing_information: vec![],
         }

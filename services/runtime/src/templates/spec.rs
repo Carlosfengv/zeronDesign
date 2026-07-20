@@ -21,6 +21,51 @@ pub struct PreviewSpec {
     pub screenshot_id: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopmentServerSpec {
+    pub argv: Vec<String>,
+    pub port: u16,
+    pub readiness_path: &'static str,
+    pub hmr: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceContractSpec {
+    pub version: &'static str,
+    pub protected_paths: &'static [&'static str],
+    pub forbidden_roots: &'static [&'static str],
+    pub forbidden_source_patterns: &'static [&'static str],
+    pub forbidden_import_prefixes: &'static [&'static str],
+}
+
+impl SourceContractSpec {
+    pub const OPEN: Self = Self {
+        version: "source-contract@legacy",
+        protected_paths: &[],
+        forbidden_roots: &[],
+        forbidden_source_patterns: &[],
+        forbidden_import_prefixes: &[],
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyPolicyRef {
+    pub version: &'static str,
+    pub catalogs: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentRegistryRef {
+    pub version: &'static str,
+    pub protocol: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationContractSpec {
+    pub version: &'static str,
+    pub static_export_required: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemplateCapabilities {
     pub structured_page_write: bool,
@@ -47,6 +92,7 @@ impl TemplateCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MutationPolicySpec {
     pub forbidden_write_roots: &'static [&'static str],
+    pub protected_write_paths: &'static [&'static str],
     pub error_kind: &'static str,
     pub guidance: &'static str,
 }
@@ -99,6 +145,7 @@ impl StyleContractSpec {
 impl MutationPolicySpec {
     pub const ALLOW_ALL: Self = Self {
         forbidden_write_roots: &[],
+        protected_write_paths: &[],
         error_kind: "project.mutation_forbidden",
         guidance: "Choose a path allowed by the active project template.",
     };
@@ -152,11 +199,16 @@ pub struct TemplateSpec {
     pub files: &'static [TemplateFile],
     pub inspection_files: &'static [&'static str],
     pub build: BuildSpec,
+    pub development_server: Option<DevelopmentServerSpec>,
     pub preview: PreviewSpec,
     pub artifact_delivery: ArtifactDeliverySpec,
+    pub source_contract: SourceContractSpec,
     pub capabilities: TemplateCapabilities,
     pub mutation_policy: MutationPolicySpec,
+    pub dependency_policy: DependencyPolicyRef,
+    pub component_registry: Option<ComponentRegistryRef>,
     pub style: StyleContractSpec,
+    pub validation_contract: ValidationContractSpec,
     pub operations: &'static dyn TemplateOperations,
 }
 
@@ -174,11 +226,16 @@ impl std::fmt::Debug for TemplateSpec {
             .field("files", &self.files)
             .field("inspection_files", &self.inspection_files)
             .field("build", &self.build)
+            .field("development_server", &self.development_server)
             .field("preview", &self.preview)
             .field("artifact_delivery", &self.artifact_delivery)
+            .field("source_contract", &self.source_contract)
             .field("capabilities", &self.capabilities)
             .field("mutation_policy", &self.mutation_policy)
+            .field("dependency_policy", &self.dependency_policy)
+            .field("component_registry", &self.component_registry)
             .field("style", &self.style)
+            .field("validation_contract", &self.validation_contract)
             .field("operations", &self.operations.name())
             .finish()
     }
@@ -196,11 +253,16 @@ impl PartialEq for TemplateSpec {
             && self.files == other.files
             && self.inspection_files == other.inspection_files
             && self.build == other.build
+            && self.development_server == other.development_server
             && self.preview == other.preview
             && self.artifact_delivery == other.artifact_delivery
+            && self.source_contract == other.source_contract
             && self.capabilities == other.capabilities
             && self.mutation_policy == other.mutation_policy
+            && self.dependency_policy == other.dependency_policy
+            && self.component_registry == other.component_registry
             && self.style == other.style
+            && self.validation_contract == other.validation_contract
             && self.operations.name() == other.operations.name()
     }
 }

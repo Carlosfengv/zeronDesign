@@ -54,8 +54,6 @@ export async function GET(
       .replaceAll(runtimePrefix, productPrefix)
       .replaceAll('href="/_next/', `href="${productPrefix}/_next/`)
       .replaceAll('src="/_next/', `src="${productPrefix}/_next/`)
-      .replaceAll('href="/_astro/', `href="${productPrefix}/_astro/`)
-      .replaceAll('src="/_astro/', `src="${productPrefix}/_astro/`)
       .replaceAll('href="/docs', `href="${productPrefix}/docs`)
       .replaceAll('href="/"', `href="${productPrefix}/"`);
     return new Response(html, { status: 200, headers });

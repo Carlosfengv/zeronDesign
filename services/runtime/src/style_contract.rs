@@ -165,13 +165,13 @@ mod tests {
     fn identity_ignores_runtime_only_contract_fields() {
         let expected = json!({
             "version": 1,
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project",
             "tokens": { "color.primary": "--color-primary" },
         });
         let actual = json!({
             "version": 1,
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project",
             "tokens": { "color.primary": "--color-primary" },
             "generatedAt": "runtime-only",

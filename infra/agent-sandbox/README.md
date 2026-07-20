@@ -2,28 +2,28 @@
 
 This directory contains the Phase A Kubernetes contract for the runtime sandbox adapter.
 
-## Publish the Astro sandbox image
+## Publish the framework-neutral sandbox image
 
 The `SandboxTemplate` references:
 
 ```text
-ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0
+ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0
 ```
 
 Build and push that image with:
 
 ```bash
-bash infra/agent-sandbox/astro-website/publish-image.sh
+bash infra/agent-sandbox/base/publish-image.sh
 ```
 
 Useful overrides:
 
 ```bash
-SANDBOX_IMAGE_PLATFORMS=linux/amd64 bash infra/agent-sandbox/astro-website/publish-image.sh
-PUSH_IMAGE=0 bash infra/agent-sandbox/astro-website/publish-image.sh
+SANDBOX_IMAGE_PLATFORMS=linux/amd64 bash infra/agent-sandbox/base/publish-image.sh
+PUSH_IMAGE=0 bash infra/agent-sandbox/base/publish-image.sh
 ```
 
-`PUSH_IMAGE=0` performs a local Docker build only. The real K8s E2E requires the image tag in `astro-website/sandbox-template.yaml` to be pullable by the cluster.
+`PUSH_IMAGE=0` performs a local Docker build only. The real K8s E2E requires the image tag in each active execution profile's `sandbox-template.yaml` to be pullable by the cluster.
 
 ## Run the gated K8s E2E
 
@@ -43,7 +43,7 @@ Useful local overrides:
 ```bash
 ANYDESIGN_E2E_CLUSTER=zerondesign-e2e \
 RUNTIME_BROWSER_EXECUTABLE="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-SANDBOX_BASE_IMAGE=ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0 \
+SANDBOX_BASE_IMAGE=ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0 \
 bash infra/agent-sandbox/run-k8s-e2e.sh
 ```
 
@@ -52,7 +52,7 @@ the reviewed immutable `node:22-bookworm` digest in `images.lock.json`.
 
 The runner builds the current checkout, adds a worktree content fingerprint when
 the tree is dirty, imports the image into k3d, and rejects Pod/image config digest
-mismatches. It deploys Astro and Fumadocs warm pools, the internal npm proxy, and
+mismatches. It deploys Fumadocs and Next App execution profiles, the internal npm proxy, and
 the deny-by-default NetworkPolicy.
 
 Two gates then run:

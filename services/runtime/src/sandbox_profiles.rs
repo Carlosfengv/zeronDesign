@@ -54,15 +54,11 @@ impl BuiltInSandboxExecutionProfileRegistry {
     pub fn built_in() -> Self {
         let profiles = [
             profile(
-                "astro-website",
-                "anydesign-astro-website",
-                "anydesign-astro-website-pool",
-            ),
-            profile(
                 "fumadocs-docs",
                 "anydesign-fumadocs-docs",
                 "anydesign-fumadocs-docs-pool",
             ),
+            profile("next-app", "anydesign-next-app", "anydesign-next-app-pool"),
         ]
         .into_iter()
         .map(|profile| {
@@ -100,7 +96,7 @@ fn profile(id: &str, sandbox_template_name: &str, warm_pool_name: &str) -> Sandb
         version: SandboxExecutionProfileVersion::parse("0.1.0").unwrap(),
         sandbox_template_name: sandbox_template_name.to_string(),
         warm_pool_name: warm_pool_name.to_string(),
-        image_ref: "ghcr.io/carlosfengv/zerondesign/astro-website-sandbox:0.1.0".to_string(),
+        image_ref: "ghcr.io/carlosfengv/zerondesign/agent-sandbox:0.1.0".to_string(),
         capabilities: SandboxCapabilities {
             node_major: 22,
             browser: true,

@@ -18,7 +18,7 @@ async fn main() {
     if emit_patch {
         println!("*** Begin Patch");
     }
-    for template in ["astro-website", "fumadocs-docs"] {
+    for template in ["next-app", "fumadocs-docs"] {
         let workspace = std::env::temp_dir().join(format!(
             "anydesign-template-contract-{template}-{}",
             std::process::id()

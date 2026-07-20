@@ -13,6 +13,6 @@ RUN chmod +x \
   /opt/anydesign/bootstrap/static-preview-server.js
 
 WORKDIR /workspace/project
-EXPOSE 3001 4321
+EXPOSE 3000 3001 4321
 
 CMD ["/bin/sh", "-lc", "/opt/anydesign/bootstrap/workspace-init.sh && exec node /opt/anydesign/bootstrap/workspace-channel-server.js"]

@@ -53,7 +53,7 @@ impl TemplateOperations for ThirdTemplateOperations {
         request: &RenderPageRequest,
     ) -> Result<Vec<RenderedFile>, TemplateOperationError> {
         Ok(vec![RenderedFile {
-            path: "src/pages/index.astro".to_string(),
+            path: "app/page.tsx".to_string(),
             content: format!("<h1>{}</h1>", request.title),
         }])
     }
@@ -73,14 +73,14 @@ fn template_ids_are_open_but_strictly_validated() {
         "nextjs-website"
     );
     assert!(TemplateId::parse("Next JS").is_err());
-    assert!(TemplateId::parse("../astro").is_err());
+    assert!(TemplateId::parse("../next").is_err());
     assert!(TemplateId::parse("").is_err());
 }
 
 #[test]
 fn registry_resolves_exact_version_and_manifest_without_fallback() {
     let registry = BuiltInTemplateRegistry::built_in();
-    let id = TemplateId::parse("astro-website").unwrap();
+    let id = TemplateId::parse("next-app").unwrap();
     let current = registry.current(&id).unwrap();
 
     assert_eq!(
@@ -104,7 +104,7 @@ fn registry_resolves_exact_version_and_manifest_without_fallback() {
 #[test]
 fn compatibility_audit_rejects_missing_or_ambiguous_historical_specs() {
     let built_in = BuiltInTemplateRegistry::built_in();
-    let id = TemplateId::parse("astro-website").unwrap();
+    let id = TemplateId::parse("next-app").unwrap();
     let current = built_in.current(&id).unwrap();
     let mut state: ProjectRuntimeState = serde_json::from_value(json!({
         "projectId": "persisted-project",
@@ -113,7 +113,7 @@ fn compatibility_audit_rejects_missing_or_ambiguous_historical_specs() {
         "templateKey": id.as_str(),
         "templateVersion": current.version.as_str(),
         "templateManifestSha256": current.manifest_sha256.as_str(),
-        "framework": "astro",
+        "framework": "nextjs",
         "packageManager": "npm",
         "lockfile": "package-lock.json",
         "registry": "https://registry.internal.example/npm/",
@@ -131,7 +131,7 @@ fn compatibility_audit_rejects_missing_or_ambiguous_historical_specs() {
 
     let first = (*current).clone();
     let mut second = first.clone();
-    second.version = TemplateVersion::parse("astro-website@runtime-p4").unwrap();
+    second.version = TemplateVersion::parse("next-app@runtime-p4").unwrap();
     second.manifest_sha256 =
         ManifestHash::parse("1111111111111111111111111111111111111111111111111111111111111111")
             .unwrap();
@@ -146,10 +146,10 @@ fn compatibility_audit_rejects_missing_or_ambiguous_historical_specs() {
 #[test]
 fn registry_supports_multiple_versions_and_rejects_duplicate_pairs() {
     let built_in = BuiltInTemplateRegistry::built_in();
-    let id = TemplateId::parse("astro-website").unwrap();
+    let id = TemplateId::parse("next-app").unwrap();
     let first = (*built_in.current(&id).unwrap()).clone();
     let mut second = first.clone();
-    second.version = TemplateVersion::parse("astro-website@runtime-p4").unwrap();
+    second.version = TemplateVersion::parse("next-app@runtime-p4").unwrap();
     second.manifest_sha256 =
         ManifestHash::parse("1111111111111111111111111111111111111111111111111111111111111111")
             .unwrap();
@@ -254,9 +254,9 @@ fn legacy_project_runtime_state_deserializes_without_new_identity_fields() {
         "projectId": "legacy-project",
         "revision": 1,
         "appRoot": "project",
-        "templateKey": "astro-website",
-        "templateVersion": "astro-website@runtime-p3",
-        "framework": "astro",
+        "templateKey": "next-app",
+        "templateVersion": "next-app@1",
+        "framework": "nextjs",
         "packageManager": "npm",
         "lockfile": "package-lock.json",
         "registry": "https://registry.internal.example/npm/",
@@ -274,13 +274,13 @@ fn legacy_project_runtime_state_deserializes_without_new_identity_fields() {
 
 #[tokio::test]
 async fn availability_distinguishes_unknown_disabled_and_unready_templates() {
-    let astro = TemplateId::parse("astro-website").unwrap();
+    let next = TemplateId::parse("next-app").unwrap();
     let docs = TemplateId::parse("fumadocs-docs").unwrap();
     let service = BuiltInTemplateAvailabilityService::new(
         std::sync::Arc::new(BuiltInTemplateRegistry::built_in()),
         std::sync::Arc::new(BuiltInSandboxExecutionProfileRegistry::built_in()),
         std::sync::Arc::new(NeverReady),
-        [astro.clone()],
+        [next.clone()],
     );
 
     assert_eq!(
@@ -301,7 +301,7 @@ async fn availability_distinguishes_unknown_disabled_and_unready_templates() {
     );
     assert_eq!(
         service
-            .resolve_for_init(&astro)
+            .resolve_for_init(&next)
             .await
             .unwrap_err()
             .error_kind(),
@@ -313,7 +313,7 @@ async fn availability_distinguishes_unknown_disabled_and_unready_templates() {
 async fn disabling_new_initialization_preserves_existing_project_version_resolution() {
     let registry = std::sync::Arc::new(BuiltInTemplateRegistry::built_in());
     let profiles = std::sync::Arc::new(BuiltInSandboxExecutionProfileRegistry::built_in());
-    let id = TemplateId::parse("astro-website").unwrap();
+    let id = TemplateId::parse("next-app").unwrap();
     let existing = registry.current(&id).unwrap();
     let service = BuiltInTemplateAvailabilityService::new(
         registry.clone(),
@@ -343,7 +343,7 @@ fn built_in_templates_resolve_explicit_warm_pool_profiles() {
     let templates = BuiltInTemplateRegistry::built_in();
     let profiles = BuiltInSandboxExecutionProfileRegistry::built_in();
     for (template, expected_pool) in [
-        ("astro-website", "anydesign-astro-website-pool"),
+        ("next-app", "anydesign-next-app-pool"),
         ("fumadocs-docs", "anydesign-fumadocs-docs-pool"),
     ] {
         let spec = templates
@@ -362,7 +362,7 @@ fn built_in_templates_resolve_explicit_warm_pool_profiles() {
 #[tokio::test]
 async fn built_in_manifest_hashes_match_current_project_init_output() {
     let registry = BuiltInTemplateRegistry::built_in();
-    for template in ["astro-website", "fumadocs-docs"] {
+    for template in ["next-app", "fumadocs-docs"] {
         let actual = initialize_and_hash(template).await;
         let expected = registry
             .current(&TemplateId::parse(template).unwrap())
@@ -370,6 +370,54 @@ async fn built_in_manifest_hashes_match_current_project_init_output() {
             .manifest_sha256
             .clone();
         assert_eq!(actual, expected, "{template} manifest drifted");
+    }
+}
+
+#[test]
+fn next_app_freezes_shadcn_base_ui_tailwind_and_static_export_contracts() {
+    let registry = BuiltInTemplateRegistry::built_in();
+    let spec = registry
+        .current(&TemplateId::parse("next-app").unwrap())
+        .unwrap();
+    assert_eq!(spec.framework.as_str(), "nextjs");
+    assert_eq!(spec.version.as_str(), "next-app@1");
+    assert_eq!(spec.preview.output_directories, vec!["out"]);
+    assert_eq!(
+        spec.dependency_policy.version,
+        "runtime-dependency-policy@1"
+    );
+    assert_eq!(
+        spec.component_registry.unwrap().protocol,
+        "shadcn-registry@v1"
+    );
+    assert!(spec.validation_contract.static_export_required);
+
+    let file = |path: &str| -> &'static str {
+        spec.files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("missing next-app seed file {path}"))
+            .content
+    };
+    assert!(file("package.json").contains("\"@base-ui/react\": \"1.6.0\""));
+    assert!(file("components.json").contains("\"style\": \"base-nova\""));
+    assert!(file("app/globals.css").contains("@theme inline"));
+    assert!(file("next.config.mjs").contains("output: \"export\""));
+    for component in [
+        "button",
+        "card",
+        "input",
+        "label",
+        "textarea",
+        "tabs",
+        "dialog",
+        "dropdown-menu",
+        "select",
+        "tooltip",
+        "skeleton",
+        "separator",
+    ] {
+        file(&format!("components/ui/{component}.tsx"));
     }
 }
 

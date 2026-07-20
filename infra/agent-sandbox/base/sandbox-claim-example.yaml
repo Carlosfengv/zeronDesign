@@ -13,6 +13,6 @@ spec:
       anydesign.dev/workspace-pvc: workspace-project-example-abc123
       anydesign.dev/workspace-scope: sandbox+pvc
   warmPoolRef:
-    name: anydesign-astro-website-pool
+    name: anydesign-next-app-pool
   lifecycle:
     ttlSecondsAfterFinished: 14400

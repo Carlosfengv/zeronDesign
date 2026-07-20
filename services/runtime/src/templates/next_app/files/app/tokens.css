@@ -1,0 +1,27 @@
+:root {
+  --background: oklch(0.985 0.004 95);
+  --foreground: oklch(0.18 0.02 255);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.55 0.21 258);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.94 0.01 250);
+  --secondary-foreground: var(--foreground);
+  --muted: oklch(0.95 0.008 250);
+  --muted-foreground: oklch(0.48 0.025 255);
+  --accent: oklch(0.92 0.035 250);
+  --accent-foreground: var(--foreground);
+  --destructive: oklch(0.58 0.22 28);
+  --border: oklch(0.88 0.015 250);
+  --input: var(--border);
+  --ring: var(--primary);
+  --radius: 0.75rem;
+  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --shadow-soft: 0 18px 50px oklch(0.25 0.04 255 / 0.12);
+  --spacing-page-gutter: clamp(1rem, 4vw, 4rem);
+  --spacing-section: clamp(4rem, 10vw, 8rem);
+}

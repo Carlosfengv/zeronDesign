@@ -53,8 +53,6 @@ export async function GET(
       .replaceAll(runtimePrefix, reviewPrefix)
       .replaceAll('href="/_next/', `href="${reviewPrefix}/_next/`)
       .replaceAll('src="/_next/', `src="${reviewPrefix}/_next/`)
-      .replaceAll('href="/_astro/', `href="${reviewPrefix}/_astro/`)
-      .replaceAll('src="/_astro/', `src="${reviewPrefix}/_astro/`)
       .replaceAll('href="/docs', `href="${reviewPrefix}/docs`)
       .replaceAll('href="/"', `href="${reviewPrefix}/"`);
     return new Response(html, { status: 200, headers });

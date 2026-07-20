@@ -1,11 +1,12 @@
 mod build_overlay;
 
 use super::{
-    BuildOverlayRequest, BuildSpec, FrameworkId, ManifestHash, MutationPolicySpec, PreviewSpec,
-    RenderDocumentRequest, RenderedFile, SandboxExecutionProfileId, SandboxExecutionProfileRef,
-    SandboxExecutionProfileVersion, SourceContractReport, SourceSnapshot, StyleContractSpec,
-    StyleTokenSpec, TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateId,
-    TemplateOperationError, TemplateOperations, TemplateSpec, TemplateVersion, TemplateWriteMode,
+    BuildOverlayRequest, BuildSpec, DependencyPolicyRef, DevelopmentServerSpec, FrameworkId,
+    ManifestHash, MutationPolicySpec, PreviewSpec, RenderDocumentRequest, RenderedFile,
+    SandboxExecutionProfileId, SandboxExecutionProfileRef, SandboxExecutionProfileVersion,
+    SourceContractReport, SourceContractSpec, SourceSnapshot, StyleContractSpec, StyleTokenSpec,
+    TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateId, TemplateOperationError,
+    TemplateOperations, TemplateSpec, TemplateVersion, TemplateWriteMode, ValidationContractSpec,
 };
 use crate::artifact_manifest::ArtifactDeliverySpec;
 use serde_json::Value;
@@ -460,6 +461,12 @@ fn spec_with_identity(
             timeout_ms: 180_000,
             success_marker: "fumadocs docs build completed",
         },
+        development_server: Some(DevelopmentServerSpec {
+            argv: vec!["npm".to_string(), "run".to_string(), "dev".to_string()],
+            port: 3000,
+            readiness_path: "/docs/",
+            hmr: true,
+        }),
         preview: PreviewSpec {
             output_directories: vec!["out".to_string()],
             port: 3000,
@@ -467,6 +474,13 @@ fn spec_with_identity(
             screenshot_id: "shot-fumadocs-home",
         },
         artifact_delivery: ArtifactDeliverySpec::HOST_ROOT,
+        source_contract: SourceContractSpec {
+            version: "fumadocs-source-contract@p5",
+            protected_paths: &[],
+            forbidden_roots: &["pages", "src/pages"],
+            forbidden_source_patterns: &[],
+            forbidden_import_prefixes: &[],
+        },
         capabilities: TemplateCapabilities {
             structured_page_write: false,
             mdx_document_write: true,
@@ -481,9 +495,15 @@ fn spec_with_identity(
                 "src/mdx-components.jsx",
                 "src/mdx-components.tsx",
             ],
+            protected_write_paths: &[],
             error_kind: "docs.routing_root_forbidden",
             guidance: "Keep fumadocs-docs projects on the Next app router and seeded MDX mapping. Write docs routes under app/docs/[[...slug]] and MDX content under content/docs; do not create pages, src/pages, or src/mdx-components.*.",
         },
+        dependency_policy: DependencyPolicyRef {
+            version: "runtime-dependency-policy@legacy",
+            catalogs: &["template-core"],
+        },
+        component_registry: None,
         style: StyleContractSpec {
             version: "runtime-style-contract@p3",
             token_file: "app/tokens.css",
@@ -492,6 +512,10 @@ fn spec_with_identity(
             tailwind_version: "4",
             tailwind_entry_import: "@import \"tailwindcss\"",
             tokens: STYLE_TOKENS,
+        },
+        validation_contract: ValidationContractSpec {
+            version: "generation-validation@1",
+            static_export_required: true,
         },
         operations: &OPERATIONS,
     }

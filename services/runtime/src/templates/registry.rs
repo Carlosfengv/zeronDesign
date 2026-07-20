@@ -1,6 +1,4 @@
-use super::{
-    astro_website, fumadocs_docs, ManifestHash, TemplateId, TemplateSpec, TemplateVersion,
-};
+use super::{fumadocs_docs, next_app, ManifestHash, TemplateId, TemplateSpec, TemplateVersion};
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 pub trait TemplateRegistry: Send + Sync {
@@ -123,10 +121,10 @@ impl BuiltInTemplateRegistry {
 
     pub fn built_in() -> Self {
         Self::new(vec![
-            astro_website::spec(),
             fumadocs_docs::legacy_p3_spec(),
             fumadocs_docs::legacy_p4_spec(),
             fumadocs_docs::spec(),
+            next_app::spec(),
         ])
         .expect("built-in template registry must be valid")
     }
@@ -140,12 +138,7 @@ impl Default for BuiltInTemplateRegistry {
 
 impl TemplateRegistry for BuiltInTemplateRegistry {
     fn default_template(&self) -> Result<Arc<TemplateSpec>, UnknownTemplate> {
-        let id = self
-            .current
-            .keys()
-            .next()
-            .cloned()
-            .ok_or_else(|| UnknownTemplate(TemplateId::parse("default-template").unwrap()))?;
+        let id = TemplateId::parse("next-app").expect("next-app is a valid template id");
         self.current(&id)
     }
 

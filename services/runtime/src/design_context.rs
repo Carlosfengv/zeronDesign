@@ -1018,7 +1018,7 @@ mod tests {
 
     fn template() -> std::sync::Arc<TemplateSpec> {
         BuiltInTemplateRegistry::built_in()
-            .current(&TemplateId::parse("astro-website").unwrap())
+            .current(&TemplateId::parse("next-app").unwrap())
             .unwrap()
     }
 
@@ -1029,7 +1029,7 @@ mod tests {
             content_hierarchy: vec!["Hero".to_string()],
             page_structure: json!({ "sections": ["hero"] }),
             visual_direction: "calm".to_string(),
-            recommended_template: "astro-website".to_string(),
+            recommended_template: "next-app".to_string(),
             assumptions: Vec::new(),
             missing_information: Vec::new(),
         }
@@ -1040,7 +1040,7 @@ mod tests {
             design_profile_id: "dp-1".to_string(),
             version: 2,
             surface: "website".to_string(),
-            template: "astro-website".to_string(),
+            template: "next-app".to_string(),
             base_profile_hash: "a".repeat(64),
             surface_override_hash: None,
             template_override_hash: None,

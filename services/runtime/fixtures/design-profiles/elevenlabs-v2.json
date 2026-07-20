@@ -130,8 +130,8 @@
   },
   "accessibility": { "wcag": "AA", "contrast": "Graphite text must remain legible on taupe surfaces.", "motion": ["Audio motion respects reduced motion."] },
   "technical": {
-    "allowedTemplates": ["astro-website", "fumadocs-docs"],
-    "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+    "allowedTemplates": ["next-app", "fumadocs-docs"],
+    "preferredTemplates": { "website": "next-app", "docs": "fumadocs-docs" },
     "cssStrategy": "runtime-style-contract",
     "dependencyPolicy": { "preferExisting": true },
     "filePolicy": {
@@ -158,7 +158,7 @@
   ],
   "overrides": {
     "surfaces": { "docs": { "content": { "displayScale": "reduced", "productVisuals": "optional" } } },
-    "templates": { "astro-website": { "content": { "requiredDataHooks": ["data-product-visual", "data-voice-product"] } } }
+    "templates": { "next-app": { "content": { "requiredDataHooks": ["data-product-visual", "data-voice-product"] } } }
   },
   "createdAt": "2026-07-10T00:00:00Z",
   "updatedAt": "2026-07-10T00:00:00Z"

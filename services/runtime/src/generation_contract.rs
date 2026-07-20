@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn website_and_docs_contracts_share_platform_checks() {
-        let website = GenerationContract::website("astro-website", "dist");
+        let website = GenerationContract::website("next-app", "dist");
         let docs = GenerationContract::docs("fumadocs-docs", "out");
         for check in [
             "build",
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn required_failed_or_unavailable_checks_block_promotion() {
-        let contract = GenerationContract::website("astro-website", "dist");
+        let contract = GenerationContract::website("next-app", "dist");
         for status in [
             ValidationCheckStatus::Failed,
             ValidationCheckStatus::Unavailable,
@@ -345,14 +345,14 @@ mod tests {
 
     #[test]
     fn all_required_checks_must_pass_before_promotion() {
-        let contract = GenerationContract::website("astro-website", "dist");
+        let contract = GenerationContract::website("next-app", "dist");
         let report = passing_report(&contract);
         assert!(report.can_promote(&contract));
     }
 
     #[test]
     fn generation_contract_digest_changes_with_release_relevant_fields() {
-        let original = GenerationContract::website("astro-website", "dist");
+        let original = GenerationContract::website("next-app", "dist");
         let mut changed_output = original.clone();
         changed_output.build.output_directory = "out".to_string();
         let mut changed_checks = original.clone();
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn duplicate_checks_or_unproven_successes_cannot_promote() {
-        let contract = GenerationContract::website("astro-website", "dist");
+        let contract = GenerationContract::website("next-app", "dist");
 
         let mut duplicate = passing_report(&contract);
         duplicate.checks.push(duplicate.checks[0].clone());
