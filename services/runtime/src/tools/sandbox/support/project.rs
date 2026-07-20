@@ -230,6 +230,28 @@ pub(super) fn ensure_project_mutation_write_path(
     })
 }
 
+pub(super) fn ensure_project_mutation_content(
+    path: &Path,
+    content: &str,
+    ctx: &ToolContext,
+) -> Result<(), ToolError> {
+    check_project_write_content(ctx, path, content).map_err(|violation| {
+        typed_recoverable(
+            format!(
+                "template {} denied static-export-incompatible source in {}",
+                violation.template_id,
+                display_workspace_path(&violation.path, ctx)
+            ),
+            violation.error_kind,
+            json!({
+                "path": display_workspace_path(&violation.path, ctx),
+                "forbiddenPatterns": violation.patterns,
+                "suggestedAction": violation.guidance,
+            }),
+        )
+    })
+}
+
 pub(super) fn display_workspace_path(path: &Path, ctx: &ToolContext) -> String {
     path.strip_prefix(&ctx.workspace_root)
         .map(|path| format!("/workspace/{}", path.display()))

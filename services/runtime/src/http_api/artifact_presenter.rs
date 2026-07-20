@@ -9,7 +9,7 @@ pub(in crate::http_api) fn present_artifact(
     route_prefix: &str,
 ) -> ArtifactHttpResponse {
     // Modern manifest-backed artifacts are served below /artifacts/<project>/..., while
-    // Astro and Next emit root-relative asset URLs. Rewrite every HTML artifact, not only
+    // Next.js and Next emit root-relative asset URLs. Rewrite every HTML artifact, not only
     // the legacy fallback path, so those assets remain reachable from the stable URL.
     let rewrite_html = content.content_type.starts_with("text/html");
     let bytes = if rewrite_html {
@@ -46,8 +46,6 @@ pub(in crate::http_api) fn artifact_read_error(
 fn rewrite_legacy_artifact_html(html: &str, prefix: &str) -> String {
     html.replace("href=\"/_next/", &format!("href=\"{prefix}/_next/"))
         .replace("src=\"/_next/", &format!("src=\"{prefix}/_next/"))
-        .replace("href=\"/_astro/", &format!("href=\"{prefix}/_astro/"))
-        .replace("src=\"/_astro/", &format!("src=\"{prefix}/_astro/"))
         .replace(
             "href=\"/favicon.svg\"",
             &format!("href=\"{prefix}/favicon.svg\""),
@@ -55,7 +53,6 @@ fn rewrite_legacy_artifact_html(html: &str, prefix: &str) -> String {
         .replace("href=\"/docs", &format!("href=\"{prefix}/docs"))
         .replace("href=\"/\"", &format!("href=\"{prefix}/\""))
         .replace("\\\"/_next/", &format!("\\\"{prefix}/_next/"))
-        .replace("\\\"/_astro/", &format!("\\\"{prefix}/_astro/"))
         .replace("\\\"/docs", &format!("\\\"{prefix}/docs"))
         .replace("\\\"/\\\"", &format!("\\\"{prefix}/\\\""))
 }
@@ -65,11 +62,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrites_root_relative_astro_assets_for_manifest_backed_html() {
+    fn rewrites_root_relative_next_assets_for_manifest_backed_html() {
         let (_, body) = present_artifact(
             ArtifactContent {
                 content_type: "text/html; charset=utf-8".to_string(),
-                bytes: br#"<link rel="stylesheet" href="/_astro/app.css">"#.to_vec(),
+                bytes: br#"<link rel="stylesheet" href="/_next/app.css">"#.to_vec(),
                 legacy_html_rewrite: false,
                 nosniff: true,
             },
@@ -79,7 +76,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(body).unwrap(),
-            r#"<link rel="stylesheet" href="/artifacts/project-1/current/_astro/app.css">"#
+            r#"<link rel="stylesheet" href="/artifacts/project-1/current/_next/app.css">"#
         );
     }
 }

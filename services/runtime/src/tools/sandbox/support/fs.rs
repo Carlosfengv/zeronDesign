@@ -342,7 +342,7 @@ pub(super) fn path_validation_error(
     let (error_kind, guidance, suggested_path) = match error {
         PermissionError::ExternalDirectory(_) => (
             "path.external_directory",
-            "Use workspace-relative paths such as project/src/pages/index.astro.",
+            "Use workspace-relative paths such as project/app/page.tsx.",
             Some("project"),
         ),
         PermissionError::InvalidPathComponent(_) => (

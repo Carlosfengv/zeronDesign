@@ -76,8 +76,13 @@ pub(super) async fn project_source_fingerprint(
     Ok(format!("{:x}", digest.finalize()))
 }
 
+pub(super) fn frozen_source_fingerprint(files: &[ArtifactFile]) -> Result<String, ToolError> {
+    crate::artifact_publisher::source_snapshot_fingerprint(files)
+        .map_err(|error| ToolError::Terminal(error.to_string()))
+}
+
 pub(super) fn source_snapshot_skip_dir_names() -> Vec<String> {
-    ["node_modules", "dist", "out", ".next", ".astro", ".source"]
+    ["node_modules", "dist", "out", ".next", ".source"]
         .into_iter()
         .map(str::to_string)
         .collect()

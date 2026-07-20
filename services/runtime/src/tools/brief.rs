@@ -111,7 +111,7 @@ pub fn normalize_draft_input(input: Value) -> Value {
             "recommendedTemplate".to_string(),
             json!(match project_type {
                 "docs" => "fumadocs-docs",
-                _ => "astro-website",
+                _ => "next-app",
             }),
         );
     }
@@ -144,8 +144,7 @@ fn normalize_template(template: &str) -> &'static str {
     match template.trim().to_ascii_lowercase().as_str() {
         "fumadocs" | "fumadocs-docs" | "docs" | "doc" => "fumadocs-docs",
         "docusaurus" | "docusaurus-docs" => "docusaurus-docs",
-        "nextjs" | "nextjs-website" => "nextjs-website",
-        "astro" | "astro-website" | "website" => "astro-website",
-        _ => "astro-website",
+        "next" | "nextjs" | "next-app" | "nextjs-website" | "react" | "website" => "next-app",
+        _ => "next-app",
     }
 }

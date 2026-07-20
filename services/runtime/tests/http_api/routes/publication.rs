@@ -4,6 +4,10 @@ fn publication_route_family_is_frozen() {
         "public",
         &[
             ("POST", "/projects/{project_id}/publish"),
+            ("GET", "/projects/{project_id}/publish-workflows"),
+            ("POST", "/projects/{project_id}/publish-workflows"),
+            ("GET", "/publish-workflows/{workflow_id}"),
+            ("POST", "/publish-workflows/{workflow_id}/cancel"),
             ("POST", "/projects/{project_id}/unpublish"),
             ("POST", "/projects/{project_id}/rollback"),
             ("GET", "/projects/{project_id}/deployment-state"),

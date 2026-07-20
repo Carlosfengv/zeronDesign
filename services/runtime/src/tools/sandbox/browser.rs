@@ -209,6 +209,7 @@ impl Tool for BrowserScreenshotTool {
             "width": capture.as_ref().map(|capture| capture.width),
             "height": capture.as_ref().map(|capture| capture.height),
             "nonblankPixelRatio": capture.as_ref().map(|capture| capture.nonblank_pixel_ratio),
+            "visualArtifact": capture.as_ref().map(|capture| capture.visual_artifact.clone()),
         });
         self.workspace
             .write_string(
@@ -219,6 +220,19 @@ impl Tool for BrowserScreenshotTool {
             )
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        let content_blocks = capture.as_ref().map_or_else(Vec::new, |capture| {
+            vec![
+                json!({ "type": "json", "value": artifact.clone() }),
+                json!({
+                    "type": "image",
+                    "artifactId": capture.visual_artifact.id,
+                    "mediaType": capture.visual_artifact.media_type,
+                    "sha256": capture.visual_artifact.sha256,
+                    "width": capture.visual_artifact.width,
+                    "height": capture.visual_artifact.height,
+                }),
+            ]
+        });
         Ok(ToolResult::ok(json!({
             "screenshotId": artifact["screenshotId"],
             "path": format!("/workspace/outputs/screenshots/{}.json", artifact["screenshotId"].as_str().unwrap_or("unknown")),
@@ -229,6 +243,8 @@ impl Tool for BrowserScreenshotTool {
             "width": artifact["width"],
             "height": artifact["height"],
             "nonblankPixelRatio": artifact["nonblankPixelRatio"],
+            "visualArtifact": artifact["visualArtifact"],
+            "contentBlocks": content_blocks,
         })))
     }
 }
@@ -240,6 +256,7 @@ pub(super) struct RuntimeScreenshotCapture {
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) nonblank_pixel_ratio: f64,
+    pub(super) visual_artifact: crate::visual_contracts::VisualArtifact,
 }
 
 pub(super) async fn capture_runtime_screenshot(
@@ -362,10 +379,27 @@ pub(super) async fn capture_runtime_screenshot(
             },
         ),
         png_sha256: sha256_hex(&png_bytes),
-        document_sha256,
+        document_sha256: document_sha256.clone(),
         width: frame.width,
         height: frame.height,
         nonblank_pixel_ratio,
+        visual_artifact: crate::visual_artifact_store::VisualArtifactStore::open(
+            ctx.runtime_storage_dir.join("visual-artifacts"),
+        )
+        .and_then(|store| {
+            store.create_browser_capture(
+                &ctx.run.project_id,
+                &png_bytes,
+                std::collections::BTreeMap::from([
+                    ("runId".to_string(), json!(ctx.run.id)),
+                    ("screenshotId".to_string(), json!(screenshot_id)),
+                    ("url".to_string(), json!(url)),
+                    ("documentSha256".to_string(), json!(document_sha256)),
+                    ("previewLeaseId".to_string(), json!(preview_lease_id)),
+                ]),
+            )
+        })
+        .map_err(|error| ToolError::Terminal(format!("persist browser VisualArtifact: {error}")))?,
     };
     let metadata_path = screenshot_path.with_extension("json");
     // remote-fs-boundary: allow-begin runtime-browser-screenshot-artifact

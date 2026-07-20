@@ -148,6 +148,74 @@ pub(super) fn validate_package_install_like_input(
     Ok(())
 }
 
+const NEXT_APP_VISUAL_CATALOG: &[&str] = &[
+    "@base-ui/react",
+    "class-variance-authority",
+    "clsx",
+    "date-fns",
+    "embla-carousel-react",
+    "lucide-react",
+    "motion",
+    "recharts",
+    "tailwind-merge",
+];
+
+pub(super) fn validate_template_dependency_catalog(
+    input: &Value,
+    ctx: &ToolContext,
+    tool_name: &str,
+) -> Result<(), ValidationError> {
+    if package_install_mode_from_input(input)? != "add" {
+        return Ok(());
+    }
+    let Some(state) = ctx.run.project_state_snapshot.as_ref() else {
+        return Ok(());
+    };
+    if state.template_key != "next-app" {
+        return Ok(());
+    }
+    let denied = package_specs_from_input(input)
+        .into_iter()
+        .filter(|spec| {
+            package_name_from_spec(spec).is_none_or(|name| !NEXT_APP_VISUAL_CATALOG.contains(&name))
+        })
+        .collect::<Vec<_>>();
+    if denied.is_empty() {
+        return Ok(());
+    }
+    Err(ValidationError::with_kind(
+        format!(
+            "{tool_name} rejected packages outside the next-app visual catalog: {}",
+            denied.join(", ")
+        ),
+        "dependency.not_in_catalog",
+    )
+    .with_metadata(json!({
+        "template": "next-app",
+        "dependencyPolicyVersion": "runtime-dependency-policy@1",
+        "deniedPackages": denied,
+        "suggestedAction": "Use an already seeded dependency or choose a package from the approved visual catalog."
+    })))
+}
+
+fn package_name_from_spec(spec: &str) -> Option<&str> {
+    let spec = spec.trim();
+    if spec.is_empty()
+        || spec.starts_with("git")
+        || spec.starts_with("http:")
+        || spec.starts_with("https:")
+        || spec.starts_with("file:")
+    {
+        return None;
+    }
+    if spec.starts_with('@') {
+        let slash = spec.find('/')?;
+        let version = spec[slash + 1..].find('@').map(|offset| slash + 1 + offset);
+        return Some(version.map_or(spec, |index| &spec[..index]));
+    }
+    Some(spec.split_once('@').map_or(spec, |(name, _)| name))
+}
+
 pub(super) fn package_install_permission(
     tool_name: &str,
     input: &Value,
@@ -196,6 +264,9 @@ pub(super) async fn run_package_install(
     let packages = package_specs_from_input(&input);
     let mode = package_install_mode_from_input(&input)
         .map_err(|error| ToolError::Recoverable(error.message))?;
+    if mode == "add" {
+        preview_dev::validate_dev_mutation(&ctx)?;
+    }
     let registry = input
         .get("registry")
         .and_then(Value::as_str)
@@ -309,6 +380,11 @@ pub(super) async fn run_package_install(
             }),
         ));
     }
+    let draft_preview = if mode == "add" {
+        preview_dev::record_dev_mutation(workspace, &ctx).await
+    } else {
+        None
+    };
 
     Ok(json!({
         "installed": dependency_state["packages"],
@@ -323,6 +399,7 @@ pub(super) async fn run_package_install(
         "logPath": log_path,
         "stdout": output.stdout,
         "stderr": output.stderr,
+        "draftPreview": draft_preview,
     }))
 }
 

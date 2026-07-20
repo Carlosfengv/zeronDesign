@@ -194,7 +194,7 @@ mod tests {
                 brief_hash: "brief".to_string(),
                 brief_schema_version: "brief@1".to_string(),
                 surface: "website".to_string(),
-                template: "astro-website".to_string(),
+                template: "next-app".to_string(),
                 template_manifest_sha256: "template".to_string(),
                 expected_app_root: "project".to_string(),
                 compiler_version: "compiler".to_string(),

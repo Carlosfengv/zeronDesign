@@ -48,8 +48,12 @@ LABEL org.opencontainers.image.source="https://github.com/carlosfengv/zeronDesig
       io.zerondesign.image-lock-hash="${IMAGE_LOCK_HASH}"
 COPY --from=builder /build/target/release/anydesign-runtime /usr/local/bin/anydesign-runtime
 COPY --from=browser-collector-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=browser-collector-runtime /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=builder /build/scripts/check-browser-fonts.mjs /usr/local/lib/anydesign/check-browser-fonts.mjs
-RUN /usr/local/bin/node --version \
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && /usr/local/bin/node --version \
+    && /usr/local/bin/npm --version \
     && /usr/local/bin/node /usr/local/lib/anydesign/check-browser-fonts.mjs
 ENV RUNTIME_REPOSITORY_COMMIT=${REPOSITORY_COMMIT} \
     RUNTIME_REPOSITORY_DIRTY=${REPOSITORY_DIRTY} \

@@ -198,15 +198,18 @@ impl Tool for StyleUpdateTokensTool {
             }));
         }
 
+        preview_dev::validate_dev_mutation(&ctx)?;
         self.workspace
             .write_string(&ctx, &token_path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         record_read_path(&*self.workspace, &ctx, &token_path, &content).await?;
+        let draft_preview = preview_dev::record_dev_mutation(&*self.workspace, &ctx).await;
         Ok(ToolResult::ok(json!({
             "tokenFile": display_workspace_path(&token_path, &ctx),
             "updated": true,
             "changes": changes,
+            "draftPreview": draft_preview,
         })))
     }
 }

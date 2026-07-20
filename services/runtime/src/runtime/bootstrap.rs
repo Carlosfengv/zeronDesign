@@ -13,6 +13,7 @@ use crate::{
         ControlPlaneOnlyBackend, KubernetesWorkRuntimeBackend, WorkRuntimeBackend,
         WorkRuntimeController,
     },
+    publish_workflow::PublishWorkflowController,
     recovery::{recover_interrupted_runs, RecoveryOutcome},
     release::{
         ProcessReleasePackagingBackend, ReleasePackagingController, TrustedReleasePackagingBackend,
@@ -72,6 +73,14 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
         state.store.release_store(),
         work_runtime_backend,
         Duration::from_secs(5),
+    )
+    .spawn(&state.supervisor)?;
+    PublishWorkflowController::new(
+        Arc::new(crate::publish_workflow::PublishWorkflowService::new(
+            state.store.clone(),
+            state.config.clone(),
+        )),
+        Duration::from_millis(500),
     )
     .spawn(&state.supervisor)?;
     let outcomes = recover_interrupted_runs(&state.store).await?;

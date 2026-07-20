@@ -131,12 +131,12 @@ impl Tool for ProjectBuildTool {
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         let build_id = format!("build-{}", finished_at.timestamp_millis());
-        let source_fingerprint = project_source_fingerprint(&*self.workspace, &ctx, &cwd).await?;
         let source_snapshot_path = format!("outputs/build/source-snapshots/{build_id}");
         snapshot_project_source(&*self.workspace, &ctx, &cwd, &source_snapshot_path).await?;
         let source_snapshot_root = ctx.workspace_root.join(&source_snapshot_path);
         let source_snapshot_files =
             collect_artifact_files(&*self.workspace, &ctx, &source_snapshot_root).await?;
+        let source_fingerprint = frozen_source_fingerprint(&source_snapshot_files)?;
         let source_snapshot_uri = FileArtifactPublisher::new(&ctx.runtime_storage_dir)
             .publish_source_snapshot(&ctx.project_id, &build_id, source_snapshot_files)
             .await
@@ -412,9 +412,10 @@ impl Tool for ProjectEnsureDependenciesTool {
     async fn validate_input(
         &self,
         input: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<Value, ValidationError> {
         validate_package_install_like_input(&input, self.name())?;
+        validate_template_dependency_catalog(&input, ctx, self.name())?;
         Ok(input)
     }
 
@@ -472,9 +473,10 @@ impl Tool for PackageInstallTool {
     async fn validate_input(
         &self,
         input: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<Value, ValidationError> {
         validate_package_install_like_input(&input, self.name())?;
+        validate_template_dependency_catalog(&input, ctx, self.name())?;
         Ok(input)
     }
 

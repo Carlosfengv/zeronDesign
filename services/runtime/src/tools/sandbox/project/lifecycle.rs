@@ -30,7 +30,7 @@ impl Tool for ProjectInitTool {
     fn input_schema(&self) -> Value {
         object_schema(
             json!({
-                "template": string_schema("Template key such as astro-website or fumadocs-docs"),
+                "template": string_schema("Template key such as next-app or fumadocs-docs"),
                 "path": string_schema("Workspace relative app root")
             }),
             &["template"],
@@ -266,6 +266,7 @@ impl Tool for ProjectWritePageTool {
             })?;
         let mut written_paths = Vec::with_capacity(rendered.len());
         let mut bytes = 0usize;
+        preview_dev::validate_dev_mutation(&ctx)?;
         for file in rendered {
             let page_path = check_context_workspace_path(&app_root.join(&file.path), &ctx)
                 .map_err(|error| ToolError::PermissionDenied(format!("{error:?}")))?;
@@ -284,6 +285,7 @@ impl Tool for ProjectWritePageTool {
             written_paths.push(display_workspace_path(&page_path, &ctx));
         }
         let primary_path = written_paths.first().cloned().unwrap_or_default();
+        let draft_preview = preview_dev::record_dev_mutation(&*self.workspace, &ctx).await;
         Ok(ToolResult::ok(json!({
             "route": route,
             "path": primary_path,
@@ -291,6 +293,7 @@ impl Tool for ProjectWritePageTool {
             "bytes": bytes,
             "sections": sections.len(),
             "styleProfile": style_profile,
+            "draftPreview": draft_preview,
         })))
     }
 }

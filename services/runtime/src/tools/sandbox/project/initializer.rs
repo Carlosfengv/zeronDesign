@@ -371,7 +371,7 @@ mod tests {
                 .initialize(
                     &ctx,
                     ProjectInitRequest {
-                        template: "astro-website".to_string(),
+                        template: "next-app".to_string(),
                         path: "project".to_string(),
                     },
                 )
@@ -404,7 +404,7 @@ mod tests {
                 .unwrap();
             let expected_template = if prepared_steps.contains(&step) {
                 assert_eq!(recovery, ProjectInitRecoveryOutcome::RolledBackPrepared);
-                "astro-website"
+                "next-app"
             } else {
                 assert_eq!(recovery, ProjectInitRecoveryOutcome::CompletedCommitted);
                 "fumadocs-docs"

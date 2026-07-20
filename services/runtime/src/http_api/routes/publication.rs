@@ -1,6 +1,7 @@
 use super::super::*;
 use crate::{
     publication::{PublicationIntent, PublicationStoreError, PublishOperationKind},
+    publish_workflow::{PublishWorkflowStoreError, StartPublishWorkflowRequest},
     release::{ReleasePackagingInput, ReleaseStoreError, RuntimeProfile, WorkReleaseStatus},
     types::{ArtifactPublishStatus, ProjectVersionStatus},
 };
@@ -10,6 +11,15 @@ const PUBLICATION_BODY_LIMIT_BYTES: usize = 16 * 1024;
 pub(in crate::http_api) fn router() -> Router<AppState> {
     Router::new()
         .route("/projects/{project_id}/publish", post(publish_work))
+        .route(
+            "/projects/{project_id}/publish-workflows",
+            post(start_publish_workflow).get(project_publish_workflows),
+        )
+        .route("/publish-workflows/{workflow_id}", get(publish_workflow))
+        .route(
+            "/publish-workflows/{workflow_id}/cancel",
+            post(cancel_publish_workflow),
+        )
         .route("/projects/{project_id}/unpublish", post(unpublish_work))
         .route("/projects/{project_id}/rollback", post(rollback_work))
         .route(
@@ -24,6 +34,127 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
         )
         .route("/release-packagings/{packaging_id}", get(release_packaging))
         .layer(DefaultBodyLimit::max(PUBLICATION_BODY_LIMIT_BYTES))
+}
+
+async fn start_publish_workflow(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Extension(publish_workflows): Extension<Arc<crate::publish_workflow::PublishWorkflowService>>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<StartPublishWorkflowRequest>,
+) -> Result<(StatusCode, Json<PublishWorkflowResponse>), (StatusCode, Json<ErrorResponse>)> {
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
+    let (workflow, created) = publish_workflows
+        .start(&project_id, &request)
+        .await
+        .map_err(publish_workflow_error)?;
+    Ok((
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(PublishWorkflowResponse { workflow }),
+    ))
+}
+
+async fn publish_workflow(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Extension(publish_workflows): Extension<Arc<crate::publish_workflow::PublishWorkflowService>>,
+    Path(workflow_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PublishWorkflowResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let workflow = publish_workflows
+        .get(&workflow_id)
+        .ok_or_else(|| not_found(format!("publish workflow not found: {workflow_id}")))?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &workflow.project_id,
+        PUBLICATION_READ_OPERATION,
+    )
+    .await?;
+    Ok(Json(PublishWorkflowResponse { workflow }))
+}
+
+async fn project_publish_workflows(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Extension(publish_workflows): Extension<Arc<crate::publish_workflow::PublishWorkflowService>>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PublishWorkflowListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &project_id,
+        PUBLICATION_READ_OPERATION,
+    )
+    .await?;
+    Ok(Json(PublishWorkflowListResponse {
+        workflows: publish_workflows.list_for_project(&project_id),
+    }))
+}
+
+async fn cancel_publish_workflow(
+    State(state): State<AppState>,
+    Extension(authorization): Extension<ApplicationAuthorizationPolicy>,
+    Extension(publish_workflows): Extension<Arc<crate::publish_workflow::PublishWorkflowService>>,
+    Path(workflow_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PublishWorkflowResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let current = publish_workflows
+        .get(&workflow_id)
+        .ok_or_else(|| not_found(format!("publish workflow not found: {workflow_id}")))?;
+    authorize_publication(
+        &state,
+        &authorization,
+        &headers,
+        &current.project_id,
+        PUBLICATION_WRITE_OPERATION,
+    )
+    .await?;
+    let workflow = publish_workflows
+        .cancel(&workflow_id)
+        .map_err(publish_workflow_error)?;
+    Ok(Json(PublishWorkflowResponse { workflow }))
+}
+
+fn publish_workflow_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    if let Some(store_error) = error.downcast_ref::<PublishWorkflowStoreError>() {
+        return match store_error {
+            PublishWorkflowStoreError::InvalidInput(message) => bad_request(message.clone()),
+            PublishWorkflowStoreError::NotFound(message) => not_found(message.clone()),
+            PublishWorkflowStoreError::Conflict(message)
+            | PublishWorkflowStoreError::InvalidTransition(message) => {
+                conflict_error(anyhow::anyhow!(message.clone()))
+            }
+            PublishWorkflowStoreError::Storage(_) => internal_error(error),
+        };
+    }
+    if error.to_string().contains("not configured") {
+        conflict_error(error)
+    } else if error.to_string().contains("not found") {
+        not_found(error.to_string())
+    } else if error.to_string().contains("source_identity_stale")
+        || error.to_string().contains("visual review")
+        || error.to_string().contains("pending deletion")
+    {
+        conflict_error(error)
+    } else {
+        bad_request(error.to_string())
+    }
 }
 
 async fn create_release(

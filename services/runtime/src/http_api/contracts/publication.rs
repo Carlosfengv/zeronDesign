@@ -57,6 +57,18 @@ pub struct ReleasePackagingResponse {
     pub packaging: crate::release::ReleasePackagingRecord,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishWorkflowResponse {
+    pub workflow: crate::visual_contracts::PublishWorkflow,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishWorkflowListResponse {
+    pub workflows: Vec<crate::visual_contracts::PublishWorkflow>,
+}
+
 fn default_static_web_profile() -> String {
     crate::release::STATIC_WEB_PROFILE_ID.to_string()
 }
