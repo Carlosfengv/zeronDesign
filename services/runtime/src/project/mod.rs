@@ -2,7 +2,10 @@ mod mutation_policy;
 mod template_availability;
 mod workspace_transaction;
 
-pub use mutation_policy::{check_project_write_path, ProjectMutationViolation};
+pub use mutation_policy::{
+    check_project_write_content, check_project_write_path, ProjectMutationViolation,
+    ProjectSourceViolation,
+};
 pub use workspace_transaction::{
     ProjectInitRecoveryOutcome, ProjectInitWorkspaceTransaction, WorkspaceTransactionError,
 };

@@ -1,4 +1,4 @@
-use crate::templates::TemplateId;
+use crate::{templates::TemplateId, visual_contracts::EditBase};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -275,6 +275,10 @@ pub struct AgentRun {
     #[serde(default)]
     pub design_context_artifacts: BTreeMap<String, String>,
     pub base_version_id: Option<String>,
+    #[serde(default)]
+    pub edit_base: Option<EditBase>,
+    #[serde(default)]
+    pub edit_impact_plan_hash: Option<String>,
     pub output_version_id: Option<String>,
     pub finding_ids: Option<Vec<String>>,
     pub input_message_ids: Vec<String>,
@@ -425,9 +429,25 @@ pub struct PreviewLeaseRecord {
     pub pod_uid: String,
     pub build_id: String,
     pub candidate_manifest_hash: String,
+    #[serde(default)]
+    pub mode: PreviewLeaseMode,
+    #[serde(default = "default_preview_target_port")]
+    pub target_port: u16,
     pub status: PreviewLeaseStatus,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewLeaseMode {
+    #[default]
+    Static,
+    Dev,
+}
+
+fn default_preview_target_port() -> u16 {
+    4321
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1960,7 +1980,7 @@ mod design_profile_effective_tests {
             "components": {},
             "content": {},
             "accessibility": {},
-            "technical": { "allowedTemplates": ["astro-website", "fumadocs-docs"] },
+            "technical": { "allowedTemplates": ["next-app", "fumadocs-docs"] },
             "governance": {},
             "signatureRules": [{
                 "id": "primary",
@@ -1979,7 +1999,7 @@ mod design_profile_effective_tests {
                     }
                 },
                 "templates": {
-                    "astro-website": {
+                    "next-app": {
                         "tokens": { "color": { "surface": "#05060f" } }
                     }
                 }
@@ -1993,7 +2013,7 @@ mod design_profile_effective_tests {
     #[test]
     fn effective_profile_merges_surface_then_template_and_hashes_canonically() {
         let profile = profile_with_overrides();
-        let effective = profile.effective_for("website", "astro-website").unwrap();
+        let effective = profile.effective_for("website", "next-app").unwrap();
         assert_eq!(effective.profile["tokens"]["color"]["primary"], "#663af3");
         assert_eq!(effective.profile["tokens"]["color"]["surface"], "#05060f");
         assert_eq!(
@@ -2005,7 +2025,7 @@ mod design_profile_effective_tests {
         assert_eq!(
             effective.effective_profile_hash,
             profile
-                .effective_for("website", "astro-website")
+                .effective_for("website", "next-app")
                 .unwrap()
                 .effective_profile_hash
         );
@@ -2017,7 +2037,7 @@ mod design_profile_effective_tests {
         profile.overrides["surfaces"]["website"]["signatureRules"][0]["priority"] =
             json!("preferred");
         assert!(profile
-            .effective_for("website", "astro-website")
+            .effective_for("website", "next-app")
             .unwrap_err()
             .contains("cannot downgrade required rule"));
     }
@@ -2042,7 +2062,7 @@ mod design_profile_effective_tests {
                     .count()
                     >= 8
             );
-            assert!(profile.effective_for("website", "astro-website").is_ok());
+            assert!(profile.effective_for("website", "next-app").is_ok());
         }
     }
 

@@ -24,6 +24,29 @@ pub struct ArtifactFile {
     pub bytes: Vec<u8>,
 }
 
+pub fn source_snapshot_fingerprint(files: &[ArtifactFile]) -> Result<String> {
+    let mut framed = Vec::new();
+    for file in files {
+        validate_relative_path(&file.path)?;
+        let path = normalized_relative_path(&file.path)?;
+        if path == ".snapshot.json" {
+            continue;
+        }
+        let content = std::str::from_utf8(&file.bytes)
+            .map_err(|_| anyhow!("source snapshot contains a non-UTF-8 file: {path}"))?;
+        framed.push((path, content));
+    }
+    framed.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = sha2::Sha256::new();
+    for (path, content) in framed {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update((content.len() as u64).to_be_bytes());
+        digest.update(content.as_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StagedArtifact {
@@ -560,6 +583,31 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn source_snapshot_fingerprint_uses_frozen_utf8_files_and_ignores_snapshot_metadata() {
+        let files = vec![
+            ArtifactFile {
+                path: PathBuf::from("app/page.tsx"),
+                bytes: b"export default function Page() {}".to_vec(),
+            },
+            ArtifactFile {
+                path: PathBuf::from(".snapshot.json"),
+                bytes: b"{\"createdAt\":\"first\"}".to_vec(),
+            },
+            ArtifactFile {
+                path: PathBuf::from("app/icon.svg"),
+                bytes: b"<svg/>".to_vec(),
+            },
+        ];
+        let expected = source_snapshot_fingerprint(&files).unwrap();
+        let mut reordered = files.into_iter().rev().collect::<Vec<_>>();
+        reordered[1].bytes = b"{\"createdAt\":\"second\"}".to_vec();
+
+        assert_eq!(source_snapshot_fingerprint(&reordered).unwrap(), expected);
+        reordered[0].bytes = b"<svg><path/></svg>".to_vec();
+        assert_ne!(source_snapshot_fingerprint(&reordered).unwrap(), expected);
     }
 
     #[tokio::test]

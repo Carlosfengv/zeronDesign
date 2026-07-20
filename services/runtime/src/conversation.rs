@@ -6,6 +6,8 @@ use crate::{
         CompiledDesignContext, ProfileCompatibilityMode, ProfileEnforcementMode,
         VerificationEnvironmentBinding,
     },
+    draft_preview::DraftPreviewStore,
+    edit_guard::EditGuardStore,
     profile_token_sync::{
         resolve as resolve_profile_token_sync_plan,
         resolved_target_tokens as resolved_profile_token_sync_targets, snapshot as token_snapshot,
@@ -13,6 +15,7 @@ use crate::{
     },
     profiles::policy,
     publication::PublicationStore,
+    publish_workflow::PublishWorkflowStore,
     release::ReleaseStore,
     repair_loop::RepairAttempt,
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
@@ -22,11 +25,16 @@ use crate::{
         BriefStatus, ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
         DesignContextEnforcementBinding, DesignContextEnforcementPolicy, DesignProfile,
         DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
-        OutboxDeliveryStatus, PendingPermission, PreviewLeaseRecord, PreviewLeaseStatus,
-        ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
-        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
-        ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding, SandboxBindingStatus,
-        SandboxChannelProtocol, ToolExecutionRecord, ToolExecutionStatus, MAX_DESIGN_SOURCE_BYTES,
+        OutboxDeliveryStatus, PendingPermission, PreviewLeaseMode, PreviewLeaseRecord,
+        PreviewLeaseStatus, ProjectAccessRecord, ProjectRuntimeState, ProjectVersion,
+        ProjectVersionStatus, ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence,
+        ReviewFindingSeverity, ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding,
+        SandboxBindingStatus, SandboxChannelProtocol, ToolExecutionRecord, ToolExecutionStatus,
+        MAX_DESIGN_SOURCE_BYTES,
+    },
+    visual_contracts::{
+        DraftSnapshot, DraftSnapshotRetentionState, RunVisualBinding, RunVisualBindingRole,
+        DRAFT_SNAPSHOT_SCHEMA,
     },
 };
 use anyhow::{anyhow, Result};
@@ -65,6 +73,8 @@ pub struct RuntimeStore {
     conversation_log_dir: Arc<PathBuf>,
     content_source_log_path: Arc<PathBuf>,
     project_version_log_path: Arc<PathBuf>,
+    draft_snapshot_log_path: Arc<PathBuf>,
+    run_visual_binding_log_path: Arc<PathBuf>,
     project_runtime_state_log_path: Arc<PathBuf>,
     project_access_log_path: Arc<PathBuf>,
     design_context_enforcement_policy_log_path: Arc<PathBuf>,
@@ -87,6 +97,9 @@ pub struct RuntimeStore {
     tool_execution_log_path: Arc<PathBuf>,
     publication_store: Arc<PublicationStore>,
     release_store: Arc<ReleaseStore>,
+    publish_workflow_store: Arc<PublishWorkflowStore>,
+    draft_preview_store: Arc<DraftPreviewStore>,
+    edit_guard_store: Arc<EditGuardStore>,
     control_plane_mirror: Option<Arc<PostgresControlPlaneMirror>>,
 }
 
@@ -114,6 +127,8 @@ struct RuntimeStoreInner {
     run_checkpoints: HashMap<String, Vec<String>>,
     project_versions: HashMap<String, ProjectVersion>,
     project_current_versions: HashMap<String, String>,
+    draft_snapshots: HashMap<String, DraftSnapshot>,
+    run_visual_bindings: HashMap<(String, RunVisualBindingRole, u32), RunVisualBinding>,
     project_runtime_states: HashMap<String, ProjectRuntimeState>,
     project_access_records: HashMap<String, ProjectAccessRecord>,
     design_context_enforcement_policies: HashMap<String, DesignContextEnforcementPolicy>,
@@ -335,6 +350,14 @@ impl Default for RuntimeStore {
             ReleaseStore::open(storage_root.join("work-releases"))
                 .expect("release store should open"),
         );
+        let publish_workflow_store = Arc::new(
+            PublishWorkflowStore::open(&storage_root).expect("publish workflow store should open"),
+        );
+        let draft_preview_store = Arc::new(
+            DraftPreviewStore::open(&storage_root).expect("draft preview store should open"),
+        );
+        let edit_guard_store =
+            Arc::new(EditGuardStore::open(&storage_root).expect("edit guard store should open"));
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -345,6 +368,8 @@ impl Default for RuntimeStore {
             conversation_log_dir: Arc::new(storage_root.join("conversation-items")),
             content_source_log_path: Arc::new(storage_root.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(storage_root.join("project-versions.jsonl")),
+            draft_snapshot_log_path: Arc::new(storage_root.join("draft-snapshots.jsonl")),
+            run_visual_binding_log_path: Arc::new(storage_root.join("run-visual-bindings.jsonl")),
             project_runtime_state_log_path: Arc::new(
                 storage_root.join("project-runtime-states.jsonl"),
             ),
@@ -379,6 +404,9 @@ impl Default for RuntimeStore {
             tool_execution_log_path: Arc::new(storage_root.join("tool-executions.jsonl")),
             publication_store,
             release_store,
+            publish_workflow_store,
+            draft_preview_store,
+            edit_guard_store,
             control_plane_mirror: None,
         }
     }
@@ -400,6 +428,15 @@ impl RuntimeStore {
             ReleaseStore::open(checkpoint_dir.join("work-releases"))
                 .expect("release store should open"),
         );
+        let publish_workflow_store = Arc::new(
+            PublishWorkflowStore::open(&checkpoint_dir)
+                .expect("publish workflow store should open"),
+        );
+        let draft_preview_store = Arc::new(
+            DraftPreviewStore::open(&checkpoint_dir).expect("draft preview store should open"),
+        );
+        let edit_guard_store =
+            Arc::new(EditGuardStore::open(&checkpoint_dir).expect("edit guard store should open"));
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -409,6 +446,8 @@ impl RuntimeStore {
             conversation_log_dir: Arc::new(checkpoint_dir.join("conversation-items")),
             content_source_log_path: Arc::new(checkpoint_dir.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(checkpoint_dir.join("project-versions.jsonl")),
+            draft_snapshot_log_path: Arc::new(checkpoint_dir.join("draft-snapshots.jsonl")),
+            run_visual_binding_log_path: Arc::new(checkpoint_dir.join("run-visual-bindings.jsonl")),
             project_runtime_state_log_path: Arc::new(
                 checkpoint_dir.join("project-runtime-states.jsonl"),
             ),
@@ -444,6 +483,9 @@ impl RuntimeStore {
             checkpoint_dir: Arc::new(checkpoint_dir),
             publication_store,
             release_store,
+            publish_workflow_store,
+            draft_preview_store,
+            edit_guard_store,
             control_plane_mirror: None,
         }
     }
@@ -482,6 +524,15 @@ impl RuntimeStore {
             ReleaseStore::open(checkpoint_dir.join("work-releases"))
                 .expect("release store should open"),
         );
+        let publish_workflow_store = Arc::new(
+            PublishWorkflowStore::open(&checkpoint_dir)
+                .expect("publish workflow store should open"),
+        );
+        let draft_preview_store = Arc::new(
+            DraftPreviewStore::open(&checkpoint_dir).expect("draft preview store should open"),
+        );
+        let edit_guard_store =
+            Arc::new(EditGuardStore::open(&checkpoint_dir).expect("edit guard store should open"));
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -493,6 +544,8 @@ impl RuntimeStore {
             conversation_log_dir: Arc::new(run_log_dir.join("conversation-items")),
             content_source_log_path: Arc::new(run_log_dir.join("content-sources.jsonl")),
             project_version_log_path: Arc::new(run_log_dir.join("project-versions.jsonl")),
+            draft_snapshot_log_path: Arc::new(run_log_dir.join("draft-snapshots.jsonl")),
+            run_visual_binding_log_path: Arc::new(run_log_dir.join("run-visual-bindings.jsonl")),
             project_runtime_state_log_path: Arc::new(
                 run_log_dir.join("project-runtime-states.jsonl"),
             ),
@@ -526,6 +579,9 @@ impl RuntimeStore {
             run_log_dir: Arc::new(run_log_dir),
             publication_store,
             release_store,
+            publish_workflow_store,
+            draft_preview_store,
+            edit_guard_store,
             control_plane_mirror: None,
         }
     }
@@ -536,6 +592,18 @@ impl RuntimeStore {
 
     pub fn release_store(&self) -> Arc<ReleaseStore> {
         Arc::clone(&self.release_store)
+    }
+
+    pub fn publish_workflow_store(&self) -> Arc<PublishWorkflowStore> {
+        Arc::clone(&self.publish_workflow_store)
+    }
+
+    pub fn draft_preview_store(&self) -> Arc<DraftPreviewStore> {
+        Arc::clone(&self.draft_preview_store)
+    }
+
+    pub fn edit_guard_store(&self) -> Arc<EditGuardStore> {
+        Arc::clone(&self.edit_guard_store)
     }
 
     fn append_control_plane_jsonl<T: Serialize>(
@@ -655,6 +723,8 @@ impl RuntimeStore {
             design_context_manifest: None,
             design_context_artifacts: BTreeMap::new(),
             base_version_id,
+            edit_base: None,
+            edit_impact_plan_hash: None,
             output_version_id: None,
             finding_ids: None,
             input_message_ids: vec![self.next_id("message")],
@@ -791,6 +861,8 @@ impl RuntimeStore {
                 .output_version_id
                 .clone()
                 .or(parent.base_version_id.clone()),
+            edit_base: parent.edit_base.clone(),
+            edit_impact_plan_hash: parent.edit_impact_plan_hash.clone(),
             output_version_id: None,
             finding_ids: if finding_ids.is_empty() {
                 None
@@ -808,6 +880,72 @@ impl RuntimeStore {
 
         inner.runs.insert(run_id.clone(), run.clone());
         inner.events.insert(run_id, Vec::new());
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn set_run_edit_context(
+        &self,
+        run_id: &str,
+        edit_base: crate::visual_contracts::EditBase,
+        plan_hash: String,
+    ) -> Result<AgentRun> {
+        edit_base.validate().map_err(|error| anyhow!(error))?;
+        if plan_hash.len() != 64 || !plan_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!("edit impact plan hash is invalid"));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.phase != crate::types::AgentPhase::Edit {
+            return Err(anyhow!("edit context can only be attached to Edit runs"));
+        }
+        run.edit_base = Some(edit_base);
+        run.edit_impact_plan_hash = Some(plan_hash);
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn advance_run_draft_edit_base(
+        &self,
+        run_id: &str,
+        expected_session_epoch: u64,
+        expected_workspace_revision: u64,
+        snapshot_id: String,
+        workspace_revision: u64,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        let Some(crate::visual_contracts::EditBase::Draft {
+            snapshot_id: current_snapshot_id,
+            expected_session_epoch: current_epoch,
+            expected_workspace_revision: current_revision,
+            ..
+        }) = run.edit_base.as_mut()
+        else {
+            return Err(anyhow!("run has no Draft EditBase"));
+        };
+        if *current_epoch != expected_session_epoch
+            || *current_revision != expected_workspace_revision
+            || workspace_revision != expected_workspace_revision.saturating_add(1)
+        {
+            return Err(anyhow!("edit.base_stale"));
+        }
+        *current_snapshot_id = snapshot_id;
+        *current_revision = workspace_revision;
+        run.updated_at = Utc::now();
+        let run = run.clone();
         drop(inner);
         self.append_run_snapshot(&run)?;
         Ok(run)
@@ -4611,6 +4749,14 @@ impl RuntimeStore {
         (*self.project_version_log_path).clone()
     }
 
+    pub fn draft_snapshot_log_path(&self) -> PathBuf {
+        (*self.draft_snapshot_log_path).clone()
+    }
+
+    pub fn run_visual_binding_log_path(&self) -> PathBuf {
+        (*self.run_visual_binding_log_path).clone()
+    }
+
     fn append_project_version_snapshot(&self, version: &ProjectVersion) -> Result<()> {
         let path = self.project_version_log_path();
         if let Some(parent) = path.parent() {
@@ -5064,6 +5210,29 @@ impl RuntimeStore {
         candidate_manifest_hash: String,
         ttl_seconds: u64,
     ) -> Result<PreviewLeaseRecord> {
+        self.create_preview_lease_with_mode(
+            run_id,
+            build_id,
+            candidate_manifest_hash,
+            PreviewLeaseMode::Static,
+            4321,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    pub async fn create_preview_lease_with_mode(
+        &self,
+        run_id: &str,
+        build_id: String,
+        candidate_manifest_hash: String,
+        mode: PreviewLeaseMode,
+        target_port: u16,
+        ttl_seconds: u64,
+    ) -> Result<PreviewLeaseRecord> {
+        if target_port == 0 {
+            return Err(anyhow!("preview lease target port must be positive"));
+        }
         let run = self
             .get_run(run_id)
             .await
@@ -5090,6 +5259,8 @@ impl RuntimeStore {
             pod_uid,
             build_id,
             candidate_manifest_hash,
+            mode,
+            target_port,
             status: PreviewLeaseStatus::Active,
             created_at: now,
             expires_at: now + Duration::seconds(ttl_seconds.clamp(30, 3600) as i64),
@@ -5938,6 +6109,340 @@ impl RuntimeStore {
         Ok(delivered)
     }
 
+    fn append_draft_snapshot(&self, snapshot: &DraftSnapshot) -> Result<()> {
+        let path = self.draft_snapshot_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.append_control_plane_jsonl(&path, snapshot, true)
+    }
+
+    fn read_draft_snapshots(&self) -> Result<Vec<DraftSnapshot>> {
+        let file = match fs::File::open(self.draft_snapshot_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut snapshots_by_id = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let snapshot: DraftSnapshot = serde_json::from_str(&line)?;
+            snapshot
+                .validate()
+                .map_err(|error| anyhow!("invalid persisted DraftSnapshot: {error}"))?;
+            snapshots_by_id.insert(snapshot.snapshot_id.clone(), snapshot);
+        }
+        Ok(snapshots_by_id.into_values().collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_draft_snapshot(
+        &self,
+        project_id: &str,
+        source_snapshot_uri: String,
+        source_hash: String,
+        template_id: String,
+        template_version: String,
+        dependency_policy_version: String,
+        design_context_hash: String,
+        created_by_run_id: &str,
+        based_on_snapshot_id: Option<String>,
+        restored_from_version_id: Option<String>,
+    ) -> Result<DraftSnapshot> {
+        self.create_draft_snapshot_internal(
+            project_id,
+            source_snapshot_uri,
+            source_hash,
+            template_id,
+            template_version,
+            dependency_policy_version,
+            design_context_hash,
+            created_by_run_id,
+            based_on_snapshot_id,
+            restored_from_version_id,
+            false,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_draft_revision_snapshot(
+        &self,
+        project_id: &str,
+        source_snapshot_uri: String,
+        source_hash: String,
+        template_id: String,
+        template_version: String,
+        dependency_policy_version: String,
+        design_context_hash: String,
+        created_by_run_id: &str,
+        based_on_snapshot_id: Option<String>,
+        restored_from_version_id: Option<String>,
+    ) -> Result<DraftSnapshot> {
+        self.create_draft_snapshot_internal(
+            project_id,
+            source_snapshot_uri,
+            source_hash,
+            template_id,
+            template_version,
+            dependency_policy_version,
+            design_context_hash,
+            created_by_run_id,
+            based_on_snapshot_id,
+            restored_from_version_id,
+            true,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_restored_draft_snapshot(
+        &self,
+        project_id: &str,
+        source_snapshot_uri: String,
+        source_hash: String,
+        template_id: String,
+        template_version: String,
+        dependency_policy_version: String,
+        design_context_hash: String,
+        created_by_run_id: &str,
+        based_on_snapshot_id: Option<String>,
+        restored_from_version_id: Option<String>,
+    ) -> Result<DraftSnapshot> {
+        self.create_draft_snapshot_internal(
+            project_id,
+            source_snapshot_uri,
+            source_hash,
+            template_id,
+            template_version,
+            dependency_policy_version,
+            design_context_hash,
+            created_by_run_id,
+            based_on_snapshot_id,
+            restored_from_version_id,
+            true,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_draft_snapshot_internal(
+        &self,
+        project_id: &str,
+        source_snapshot_uri: String,
+        source_hash: String,
+        template_id: String,
+        template_version: String,
+        dependency_policy_version: String,
+        design_context_hash: String,
+        created_by_run_id: &str,
+        based_on_snapshot_id: Option<String>,
+        restored_from_version_id: Option<String>,
+        allow_multiple_per_run: bool,
+        force_new: bool,
+    ) -> Result<DraftSnapshot> {
+        let persisted = self.read_draft_snapshots()?;
+        let mut inner = self.inner.write().await;
+        for snapshot in persisted {
+            inner
+                .draft_snapshots
+                .entry(snapshot.snapshot_id.clone())
+                .or_insert(snapshot);
+        }
+        let run_snapshots = inner.draft_snapshots.values().filter(|snapshot| {
+            snapshot.project_id == project_id && snapshot.created_by_run_id == created_by_run_id
+        });
+        if !force_new {
+            if let Some(existing) = run_snapshots.clone().find(|snapshot| {
+                snapshot.source_hash == source_hash
+                    && snapshot.source_snapshot_uri == source_snapshot_uri
+            }) {
+                return Ok(existing.clone());
+            }
+        }
+        if !allow_multiple_per_run && run_snapshots.count() > 0 {
+            return Err(anyhow!(
+                "DraftSnapshot conflict: run {created_by_run_id} already persisted a different source"
+            ));
+        }
+
+        if let Some(parent_id) = based_on_snapshot_id.as_deref() {
+            let Some(parent) = inner.draft_snapshots.get(parent_id) else {
+                return Err(anyhow!("base DraftSnapshot not found: {parent_id}"));
+            };
+            if parent.project_id != project_id {
+                return Err(anyhow!("base DraftSnapshot belongs to a different project"));
+            }
+        }
+
+        let snapshot = DraftSnapshot {
+            schema_version: DRAFT_SNAPSHOT_SCHEMA.to_string(),
+            snapshot_id: self.next_id("draft-snapshot"),
+            project_id: project_id.to_string(),
+            source_snapshot_uri,
+            source_hash,
+            template_id,
+            template_version,
+            dependency_policy_version,
+            design_context_hash,
+            created_by_run_id: created_by_run_id.to_string(),
+            based_on_snapshot_id,
+            restored_from_version_id,
+            created_at: Utc::now(),
+            retention_state: DraftSnapshotRetentionState::Active,
+            delete_after: None,
+        };
+        snapshot
+            .validate()
+            .map_err(|error| anyhow!("invalid DraftSnapshot: {error}"))?;
+        self.append_draft_snapshot(&snapshot)?;
+        inner
+            .draft_snapshots
+            .insert(snapshot.snapshot_id.clone(), snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub async fn get_draft_snapshot(&self, snapshot_id: &str) -> Option<DraftSnapshot> {
+        if let Some(snapshot) = self
+            .inner
+            .read()
+            .await
+            .draft_snapshots
+            .get(snapshot_id)
+            .cloned()
+        {
+            return Some(snapshot);
+        }
+        let snapshot = self
+            .read_draft_snapshots()
+            .ok()?
+            .into_iter()
+            .find(|snapshot| snapshot.snapshot_id == snapshot_id)?;
+        self.inner
+            .write()
+            .await
+            .draft_snapshots
+            .insert(snapshot.snapshot_id.clone(), snapshot.clone());
+        Some(snapshot)
+    }
+
+    pub async fn list_project_draft_snapshots(&self, project_id: &str) -> Vec<DraftSnapshot> {
+        let persisted = self.read_draft_snapshots().unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        for snapshot in persisted {
+            inner
+                .draft_snapshots
+                .entry(snapshot.snapshot_id.clone())
+                .or_insert(snapshot);
+        }
+        let mut snapshots = inner
+            .draft_snapshots
+            .values()
+            .filter(|snapshot| snapshot.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.created_at);
+        snapshots
+    }
+
+    fn append_run_visual_binding(&self, binding: &RunVisualBinding) -> Result<()> {
+        let path = self.run_visual_binding_log_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.append_control_plane_jsonl(&path, binding, true)
+    }
+
+    fn read_run_visual_bindings(&self) -> Result<Vec<RunVisualBinding>> {
+        let file = match fs::File::open(self.run_visual_binding_log_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bindings = HashMap::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let binding: RunVisualBinding = serde_json::from_str(&line)?;
+            binding
+                .validate()
+                .map_err(|error| anyhow!("invalid persisted RunVisualBinding: {error}"))?;
+            bindings.insert(
+                (binding.run_id.clone(), binding.role, binding.order),
+                binding,
+            );
+        }
+        Ok(bindings.into_values().collect())
+    }
+
+    pub async fn upsert_run_visual_binding(
+        &self,
+        binding: RunVisualBinding,
+    ) -> Result<RunVisualBinding> {
+        binding
+            .validate()
+            .map_err(|error| anyhow!("invalid RunVisualBinding: {error}"))?;
+        self.get_run(&binding.run_id)
+            .await
+            .ok_or_else(|| anyhow!("RunVisualBinding run not found: {}", binding.run_id))?;
+        let key = (binding.run_id.clone(), binding.role, binding.order);
+        let persisted = self.read_run_visual_bindings()?;
+        let mut inner = self.inner.write().await;
+        for candidate in persisted {
+            inner.run_visual_bindings.insert(
+                (candidate.run_id.clone(), candidate.role, candidate.order),
+                candidate,
+            );
+        }
+        if let Some(existing) = inner.run_visual_bindings.get(&key) {
+            if existing == &binding {
+                return Ok(existing.clone());
+            }
+            return Err(anyhow!(
+                "RunVisualBinding conflict for run {} role {:?} order {}",
+                binding.run_id,
+                binding.role,
+                binding.order
+            ));
+        }
+        self.append_run_visual_binding(&binding)?;
+        inner.run_visual_bindings.insert(key, binding.clone());
+        Ok(binding)
+    }
+
+    pub async fn run_visual_bindings(&self, run_id: &str) -> Result<Vec<RunVisualBinding>> {
+        let persisted = self.read_run_visual_bindings()?;
+        let mut inner = self.inner.write().await;
+        for binding in persisted {
+            inner.run_visual_bindings.insert(
+                (binding.run_id.clone(), binding.role, binding.order),
+                binding,
+            );
+        }
+        let mut bindings = inner
+            .run_visual_bindings
+            .values()
+            .filter(|binding| binding.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        bindings.sort_by_key(|binding| {
+            let role = match binding.role {
+                RunVisualBindingRole::Reference => 0_u8,
+                RunVisualBindingRole::Candidate => 1_u8,
+            };
+            (role, binding.order)
+        });
+        Ok(bindings)
+    }
+
     fn read_project_version(&self, version_id: &str) -> Result<Option<ProjectVersion>> {
         Ok(self
             .read_project_versions()?
@@ -5981,8 +6486,49 @@ impl RuntimeStore {
         screenshot_id: Option<String>,
         source_snapshot_uri: Option<String>,
     ) -> ProjectVersion {
+        let version_id = self.next_id("version");
+        self.create_project_version_candidate_with_id(
+            &version_id,
+            project_id,
+            run_id,
+            preview_url,
+            screenshot_id,
+            source_snapshot_uri,
+        )
+        .await
+        .expect("fresh project version identity must not conflict")
+    }
+
+    /// Creates an immutable candidate identity or returns the byte-for-byte equivalent
+    /// persisted candidate. PublishWorkflow uses this to recover across process crashes
+    /// without creating a second WorkVersion for the same production build.
+    pub async fn create_project_version_candidate_with_id(
+        &self,
+        version_id: &str,
+        project_id: &str,
+        run_id: &str,
+        preview_url: String,
+        screenshot_id: Option<String>,
+        source_snapshot_uri: Option<String>,
+    ) -> Result<ProjectVersion> {
+        if version_id.trim().is_empty() {
+            return Err(anyhow!("project version id must not be empty"));
+        }
+        if let Some(existing) = self.get_project_version(version_id).await {
+            if existing.project_id == project_id
+                && existing.created_by_run_id == run_id
+                && existing.preview_url == preview_url
+                && existing.screenshot_id == screenshot_id
+                && existing.source_snapshot_uri == source_snapshot_uri
+            {
+                return Ok(existing);
+            }
+            return Err(anyhow!(
+                "project version identity already belongs to different content: {version_id}"
+            ));
+        }
         let version = ProjectVersion {
-            id: self.next_id("version"),
+            id: version_id.to_string(),
             project_id: project_id.to_string(),
             source_snapshot_uri,
             preview_url,
@@ -6006,7 +6552,7 @@ impl RuntimeStore {
                 version.id
             );
         }
-        version
+        Ok(version)
     }
 
     pub async fn get_project_version(&self, version_id: &str) -> Option<ProjectVersion> {
@@ -6024,6 +6570,26 @@ impl RuntimeStore {
             .project_versions
             .insert(version.id.clone(), version.clone());
         Some(version)
+    }
+
+    pub async fn list_project_versions(&self, project_id: &str) -> Vec<ProjectVersion> {
+        let persisted = self.read_project_versions().unwrap_or_default();
+        let mut inner = self.inner.write().await;
+        let _ = self.hydrate_artifact_transactions(&mut inner);
+        for version in persisted {
+            inner
+                .project_versions
+                .entry(version.id.clone())
+                .or_insert(version);
+        }
+        let mut versions = inner
+            .project_versions
+            .values()
+            .filter(|version| version.project_id == project_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        versions.sort_by_key(|version| version.created_at);
+        versions
     }
 
     pub async fn promote_project_version(
