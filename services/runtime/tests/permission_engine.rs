@@ -709,7 +709,7 @@ fn command_policy_denies_shell_wrappers_and_install_bypass() {
         }
         other => panic!("expected pnpm install deny, got {other:?}"),
     }
-    match check_command_policy(&["yarn".to_string(), "add".to_string(), "astro".to_string()]) {
+    match check_command_policy(&["yarn".to_string(), "add".to_string(), "next".to_string()]) {
         PermissionResult::Deny { message, .. } => {
             assert!(message.contains("package.install"));
         }
@@ -725,7 +725,7 @@ fn command_policy_denies_shell_wrappers_and_install_bypass() {
         check_command_policy(&[
             "npm".to_string(),
             "create".to_string(),
-            "astro@latest".to_string()
+            "next-app@latest".to_string()
         ]),
         PermissionResult::Deny { .. }
     ));

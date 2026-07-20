@@ -9,11 +9,13 @@ use crate::{
         VerificationEnvironmentBinding, VerifierCapability, VerifierRegistry,
         VERIFIER_REGISTRY_VERSION,
     },
+    draft_preview::StartDraftPreview,
     templates::{BuiltInTemplateRegistry, TemplateId, TemplateRegistry},
     types::{
         AgentEvent, AgentPhase, AgentRunStatus, Brief, DesignProfile, EffectiveDesignProfile,
         SandboxBindingStatus, SandboxChannelProtocol,
     },
+    visual_contracts::{EditBase, EditImpactOperation, EditImpactRisk, EditImpactScope},
 };
 use chrono::Utc;
 use std::{
@@ -196,7 +198,7 @@ async fn start_build_cancels_created_run_when_sandbox_provisioning_fails() {
                 content_hierarchy: vec!["hero".to_string()],
                 page_structure: serde_json::json!([]),
                 visual_direction: "clear".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -256,7 +258,7 @@ async fn start_edit_rehydrates_a_released_project_before_restoring_workspace() {
                 content_hierarchy: vec!["hero".to_string()],
                 page_structure: serde_json::json!([]),
                 visual_direction: "clear".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -344,7 +346,7 @@ async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
                 content_hierarchy: vec!["hero".to_string()],
                 page_structure: serde_json::json!([]),
                 visual_direction: "clear".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -433,6 +435,102 @@ async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
 }
 
 #[tokio::test]
+async fn start_draft_edit_freezes_revision_and_consumes_confirmation_without_restoring_workspace() {
+    let store = RuntimeStore::new();
+    let binding = store
+        .create_sandbox_binding(
+            "project-draft-edit",
+            "sandbox-draft-edit".to_string(),
+            "claim-draft-edit".to_string(),
+            "workspace-draft-edit".to_string(),
+            "pool-draft-edit".to_string(),
+            "anydesign-sandboxes".to_string(),
+            SandboxChannelProtocol::Websocket,
+        )
+        .await
+        .unwrap();
+    store
+        .update_sandbox_binding_status(&binding.id, SandboxBindingStatus::Ready)
+        .await
+        .unwrap();
+    let session = store
+        .draft_preview_store()
+        .start(StartDraftPreview {
+            project_id: "project-draft-edit".to_string(),
+            sandbox_binding_id: binding.id.clone(),
+            template_id: "next-app".to_string(),
+            base_snapshot_id: "snapshot-draft-edit".to_string(),
+            base_version_id: None,
+            proxy_url: "https://runtime.test/previews/draft-edit/".to_string(),
+            writer_ttl_seconds: 120,
+        })
+        .unwrap();
+    let edit_base = EditBase::Draft {
+        snapshot_id: session.durable_snapshot_id.clone(),
+        session_id: session.session_id.clone(),
+        expected_session_epoch: session.session_epoch,
+        expected_workspace_revision: session.workspace_revision,
+        writer_lease_id: session.writer_lease_id.clone(),
+    };
+    let plan = store
+        .edit_guard_store()
+        .create_plan(
+            &store.draft_preview_store(),
+            crate::edit_guard::CreateEditImpactPlan {
+                observation_id: None,
+                scope: EditImpactScope::Global,
+                targets: vec!["app/layout.tsx".to_string()],
+                operations: vec![EditImpactOperation::Navigation],
+                risk: EditImpactRisk::Medium,
+                edit_base: edit_base.clone(),
+            },
+        )
+        .unwrap();
+    assert!(plan.requires_confirmation);
+    store
+        .edit_guard_store()
+        .confirm(&store.draft_preview_store(), &plan.plan_hash)
+        .unwrap();
+    let launcher = Arc::new(RecordingSessionLauncher::default());
+    let service = RunLifecycleService::new(
+        RuntimeConfig::from_env(),
+        store.clone(),
+        launcher.clone(),
+        Arc::new(UnusedSandboxProvisioner),
+        Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
+    );
+
+    let outcome = service
+        .start(super::StartRunCommand {
+            project_id: "project-draft-edit".to_string(),
+            phase: AgentPhase::Edit,
+            agent_profile: "edit".to_string(),
+            input_context: super::StartRunContext {
+                edit_base: Some(edit_base.clone()),
+                edit_impact_plan_hash: Some(plan.plan_hash.clone()),
+                sandbox_binding_id: Some(binding.id),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, "queued");
+    let run = store.get_run(&outcome.run_id).await.unwrap();
+    assert_eq!(run.edit_base, Some(edit_base));
+    assert_eq!(
+        run.edit_impact_plan_hash.as_deref(),
+        Some(plan.plan_hash.as_str())
+    );
+    assert!(launcher.launched.lock().unwrap().is_empty());
+    assert!(store
+        .edit_guard_store()
+        .validate_executable(&store.draft_preview_store(), &plan.plan_hash)
+        .is_err());
+}
+
+#[tokio::test]
 async fn start_keeps_queued_run_recoverable_when_session_registration_fails() {
     let store = RuntimeStore::new();
     let launcher = Arc::new(FailingSessionLauncher::default());
@@ -475,13 +573,13 @@ async fn start_keeps_queued_run_recoverable_when_session_registration_fails() {
 #[test]
 fn enforced_dcp_rejects_an_unavailable_verifier_before_session_launch() {
     let template = BuiltInTemplateRegistry::built_in()
-        .current(&TemplateId::parse("astro-website").unwrap())
+        .current(&TemplateId::parse("next-app").unwrap())
         .unwrap();
     let profile = EffectiveDesignProfile {
         design_profile_id: "profile-enforced".to_string(),
         version: 1,
         surface: "website".to_string(),
-        template: "astro-website".to_string(),
+        template: "next-app".to_string(),
         base_profile_hash: "a".repeat(64),
         surface_override_hash: None,
         template_override_hash: None,
@@ -497,7 +595,7 @@ fn enforced_dcp_rejects_an_unavailable_verifier_before_session_launch() {
         content_hierarchy: vec!["hero".to_string()],
         page_structure: serde_json::json!(["hero"]),
         visual_direction: "clear".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: Vec::new(),
         missing_information: Vec::new(),
     };
@@ -567,7 +665,7 @@ async fn edit_inherits_frozen_dcp_from_its_base_version_creator() {
         content_hierarchy: vec!["hero".to_string()],
         page_structure: serde_json::json!(["hero"]),
         visual_direction: "clear".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: Vec::new(),
         missing_information: Vec::new(),
     };
@@ -578,15 +676,15 @@ async fn edit_inherits_frozen_dcp_from_its_base_version_creator() {
             &source.id,
             &profile,
             Some("website"),
-            Some("astro-website"),
+            Some("next-app"),
         )
         .await
         .unwrap();
     let template = BuiltInTemplateRegistry::built_in()
-        .current(&TemplateId::parse("astro-website").unwrap())
+        .current(&TemplateId::parse("next-app").unwrap())
         .unwrap();
     let dcp = compile_website_design_context(
-        &profile.effective_for("website", "astro-website").unwrap(),
+        &profile.effective_for("website", "next-app").unwrap(),
         &brief,
         &template,
         &DesignContextCompileOptions::default(),
@@ -714,7 +812,7 @@ async fn persistent_disabled_policy_overrides_matching_config_allowlist_and_reco
                 content_hierarchy: vec!["hero".to_string()],
                 page_structure: serde_json::json!(["hero"]),
                 visual_direction: "clear".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: Vec::new(),
                 missing_information: Vec::new(),
             },
@@ -735,7 +833,7 @@ async fn persistent_disabled_policy_overrides_matching_config_allowlist_and_reco
             "sandbox-enforcement-observe".to_string(),
             "sandbox-claim-enforcement-observe".to_string(),
             "workspace-sandbox-claim-enforcement-observe".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -862,7 +960,7 @@ fn dcp_profile(project_id: &str) -> DesignProfile {
         website_context: serde_json::json!({ "enforcementMode": "observe" }),
         content: serde_json::json!({}),
         accessibility: serde_json::json!({}),
-        technical: serde_json::json!({ "allowedTemplates": ["astro-website"] }),
+        technical: serde_json::json!({ "allowedTemplates": ["next-app"] }),
         governance: serde_json::json!({ "conflictBehavior": "ask" }),
         signature_rules: Vec::new(),
         overrides: serde_json::json!({}),

@@ -41,6 +41,7 @@ impl Tool for FsDeleteTool {
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
         let path = checked_delete_path(&input, &ctx).map_err(ToolError::PermissionDenied)?;
+        preview_dev::validate_dev_mutation(&ctx)?;
         match self
             .workspace
             .path_kind(&ctx, &path)
@@ -58,8 +59,11 @@ impl Tool for FsDeleteTool {
                 .await
                 .map_err(|error| ToolError::Recoverable(error.to_string()))?,
         }
-        Ok(ToolResult::ok(
-            json!({ "path": display_workspace_path(&path, &ctx), "deleted": true }),
-        ))
+        let draft_preview = preview_dev::record_dev_mutation(&*self.workspace, &ctx).await;
+        Ok(ToolResult::ok(json!({
+            "path": display_workspace_path(&path, &ctx),
+            "deleted": true,
+            "draftPreview": draft_preview,
+        })))
     }
 }

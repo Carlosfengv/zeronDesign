@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SNAPSHOT_SKIP_DIRS: &[&str] = &["node_modules", "dist", "out", ".next", ".astro", ".source"];
+const SNAPSHOT_SKIP_DIRS: &[&str] = &["node_modules", "dist", "out", ".next", ".source"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -687,7 +687,7 @@ mod tests {
         .unwrap();
 
         let transaction =
-            ProjectInitWorkspaceTransaction::begin(&workspace, &ctx, &app_root, "astro-website")
+            ProjectInitWorkspaceTransaction::begin(&workspace, &ctx, &app_root, "next-app")
                 .await
                 .unwrap();
 
@@ -727,7 +727,7 @@ mod tests {
         let workspace = LocalWorkspaceBackend;
         let app_root = ctx.workspace_root.join("project");
         let mut transaction =
-            ProjectInitWorkspaceTransaction::begin(&workspace, &ctx, &app_root, "astro-website")
+            ProjectInitWorkspaceTransaction::begin(&workspace, &ctx, &app_root, "next-app")
                 .await
                 .unwrap();
         transaction
@@ -735,11 +735,11 @@ mod tests {
                 "projectId": ctx.project_id,
                 "runId": ctx.run.id,
                 "appRoot": "project",
-                "templateKey": "astro-website",
-                "templateVersion": "astro-website@runtime-p3",
-                "templateManifestSha256": "7374f4f493c49752bbcbdad49992b02d089f79c1f01784c42fa7224668136e3f",
-                "framework": "astro",
-                "sandboxExecutionProfileId": "astro-website",
+                "templateKey": "next-app",
+                "templateVersion": "next-app@1",
+                "templateManifestSha256": "919771231a9745aee050a3280518189d4b8d9f106d6ba334a896f41eac253067",
+                "framework": "nextjs",
+                "sandboxExecutionProfileId": "next-app",
                 "sandboxExecutionProfileVersion": "0.1.0",
                 "packageManager": "npm",
                 "lockfile": "package-lock.json",
@@ -757,7 +757,7 @@ mod tests {
             .get_project_runtime_state(&ctx.project_id)
             .await
             .unwrap();
-        assert_eq!(state.template_key, "astro-website");
+        assert_eq!(state.template_key, "next-app");
         assert_eq!(state.revision, 1);
         assert!(!ProjectInitWorkspaceTransaction::journal_path_for(&ctx).exists());
         assert_eq!(

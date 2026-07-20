@@ -40,7 +40,7 @@ fn website_brief() -> Brief {
             }
         ]),
         visual_direction: "quiet technical confidence".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: vec![],
         missing_information: vec![],
     }

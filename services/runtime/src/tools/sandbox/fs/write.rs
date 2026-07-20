@@ -65,15 +65,20 @@ impl Tool for FsWriteTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_write_path(&input, &ctx)?;
         let text = required_str(&input, "text")?;
+        ensure_project_mutation_content(&path, text, &ctx)?;
+        preview_dev::validate_dev_file_mutation(&ctx, &path)?;
         self.workspace
             .write_string(&ctx, &path, text)
             .await
             .map_err(|error| {
                 ToolError::Recoverable(format!("failed to write {}: {error}", path.display()))
             })?;
+        let draft_preview =
+            preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),
             "bytes": text.len(),
+            "draftPreview": draft_preview,
         })))
     }
 }
@@ -311,6 +316,8 @@ impl Tool for FsCommitChunksTool {
         } else {
             content
         };
+        ensure_project_mutation_content(&final_path, &final_content, &ctx)?;
+        preview_dev::validate_dev_file_mutation(&ctx, &final_path)?;
         let actual_sha256 = sha256_hex(final_content.as_bytes());
         if let Some(expected) = input.get("sha256").and_then(Value::as_str) {
             if expected != actual_sha256 {
@@ -387,6 +394,8 @@ impl Tool for FsCommitChunksTool {
             }),
         )
         .await?;
+        let draft_preview =
+            preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &final_path).await;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&final_path, &ctx),
             "sessionId": session_id,
@@ -395,6 +404,7 @@ impl Tool for FsCommitChunksTool {
             "bytes": final_content.len(),
             "chars": final_content.chars().count(),
             "sha256": actual_sha256,
+            "draftPreview": draft_preview,
         })))
     }
 }
@@ -430,6 +440,7 @@ impl Tool for FsPatchTool {
         require_string(&input, "oldStr", self.name())?;
         require_string(&input, "newStr", self.name())?;
         validate_workspace_path_input(&input, ctx, self.name())?;
+        validate_project_mutation_write_path(&input, ctx, self.name())?;
         if input.get("replaceAll").is_some()
             && !input.get("replaceAll").is_some_and(Value::is_boolean)
         {
@@ -450,6 +461,7 @@ impl Tool for FsPatchTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_existing_path(&input, &ctx)?;
         ensure_not_nested_package_root(&path, &ctx)?;
+        ensure_project_mutation_write_path(&path, &ctx)?;
         let old_str = required_str(&input, "oldStr")?;
         let new_str = required_str(&input, "newStr")?;
         let replace_all = input
@@ -509,16 +521,21 @@ impl Tool for FsPatchTool {
         } else {
             content.replacen(old_str, new_str, 1)
         };
+        ensure_project_mutation_content(&path, &new_content, &ctx)?;
+        preview_dev::validate_dev_file_mutation(&ctx, &path)?;
         self.workspace
             .write_string(&ctx, &path, &new_content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         record_read_path(&*self.workspace, &ctx, &path, &new_content).await?;
+        let draft_preview =
+            preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),
             "patched": true,
             "replaceAll": replace_all,
             "replacements": if replace_all { count } else { 1 },
+            "draftPreview": draft_preview,
         })))
     }
 }
@@ -561,6 +578,7 @@ impl Tool for FsMultiPatchTool {
     ) -> Result<Value, ValidationError> {
         require_string(&input, "path", self.name())?;
         validate_workspace_path_input(&input, ctx, self.name())?;
+        validate_project_mutation_write_path(&input, ctx, self.name())?;
         let edits = input
             .get("edits")
             .and_then(Value::as_array)
@@ -596,6 +614,7 @@ impl Tool for FsMultiPatchTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_existing_path(&input, &ctx)?;
         ensure_not_nested_package_root(&path, &ctx)?;
+        ensure_project_mutation_write_path(&path, &ctx)?;
         let read_entry = read_tracking_entry(&*self.workspace, &ctx, &path).await;
         if read_entry.is_none() {
             return Err(typed_recoverable(
@@ -680,16 +699,21 @@ impl Tool for FsMultiPatchTool {
                 "replacements": replacements,
             }));
         }
+        ensure_project_mutation_content(&path, &content, &ctx)?;
+        preview_dev::validate_dev_file_mutation(&ctx, &path)?;
         self.workspace
             .write_string(&ctx, &path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
         record_read_path(&*self.workspace, &ctx, &path, &content).await?;
+        let draft_preview =
+            preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),
             "patched": true,
             "edits": applied,
             "replacements": total_replacements,
+            "draftPreview": draft_preview,
         })))
     }
 }

@@ -14,6 +14,13 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
         command.input_context.base_version_id.as_deref(),
     )?;
     optional(
+        "editImpactPlanHash",
+        command.input_context.edit_impact_plan_hash.as_deref(),
+    )?;
+    if let Some(edit_base) = command.input_context.edit_base.as_ref() {
+        edit_base.validate().map_err(invalid_request)?;
+    }
+    optional(
         "sandboxBindingId",
         command.input_context.sandbox_binding_id.as_deref(),
     )?;

@@ -121,6 +121,21 @@ pub(super) fn design_source_error(error: anyhow::Error) -> (StatusCode, Json<Err
     }
 }
 
+pub(super) fn visual_artifact_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let message = error.to_string();
+    if message.contains("not found") {
+        not_found(message)
+    } else if message.contains("visual image")
+        || message.contains("VisualArtifact")
+        || message.contains("RunVisualBinding")
+        || message.contains("projectId is required")
+    {
+        bad_request(message)
+    } else {
+        internal_error(anyhow::anyhow!(message))
+    }
+}
+
 pub(super) fn conflict_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::CONFLICT,

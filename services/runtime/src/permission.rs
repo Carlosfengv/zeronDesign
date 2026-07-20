@@ -537,16 +537,16 @@ fn is_preview_server_command(argv: &[String]) -> bool {
         ("npx", _) => argv
             .iter()
             .skip(1)
-            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "next")),
         ("npm" | "pnpm" | "yarn", Some("run")) => argv
             .get(2)
             .is_some_and(|script| matches!(script.as_str(), "preview" | "dev" | "start")),
         ("npm", Some("exec")) => argv
             .iter()
             .skip(2)
-            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "astro")),
+            .any(|arg| matches!(arg.as_str(), "serve" | "vite" | "next")),
         ("pnpm" | "yarn", Some("preview" | "dev" | "start")) => true,
-        ("astro", Some("preview" | "dev")) | ("vite", Some("--host" | "--port")) => true,
+        ("next", Some("dev" | "start")) | ("vite", Some("--host" | "--port")) => true,
         ("serve", _) => true,
         _ => false,
     }
@@ -555,17 +555,6 @@ fn is_preview_server_command(argv: &[String]) -> bool {
 fn is_interactive_project_scaffold(argv: &[String]) -> bool {
     let cmd = argv.first().map(String::as_str).unwrap_or("");
     if cmd == "npm" && argv.get(1).map(String::as_str) == Some("create") {
-        return true;
-    }
-    if cmd == "npx" && argv.iter().any(|arg| arg == "astro") && argv.iter().any(|arg| arg == "add")
-    {
-        return true;
-    }
-    if cmd == "npm"
-        && argv.get(1).map(String::as_str) == Some("exec")
-        && argv.iter().any(|arg| arg == "astro")
-        && argv.iter().any(|arg| arg == "add")
-    {
         return true;
     }
     false

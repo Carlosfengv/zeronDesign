@@ -1897,7 +1897,7 @@ mod design_context_gate_tests {
             brief_hash: "brief-hash".to_string(),
             brief_schema_version: "brief@1".to_string(),
             surface: "website".to_string(),
-            template: "astro-website".to_string(),
+            template: "next-app".to_string(),
             template_manifest_sha256: "template-hash".to_string(),
             expected_app_root: "project".to_string(),
             compiler_version: "design-context-compiler@1".to_string(),
@@ -1989,12 +1989,9 @@ mod design_context_gate_tests {
     #[tokio::test]
     async fn frozen_dcp_requires_bootstrap_reads_and_post_init_style_contract() {
         let mut run = frozen_build_run().await;
-        let blocked = design_context_read_gate(
-            &run,
-            "project.init",
-            &json!({ "template": "astro-website" }),
-        )
-        .expect("bootstrap reads must be required");
+        let blocked =
+            design_context_read_gate(&run, "project.init", &json!({ "template": "next-app" }))
+                .expect("bootstrap reads must be required");
         assert_eq!(blocked.1, "design_context.read_required");
         assert!(blocked.2["missingFiles"]
             .as_array()
@@ -2008,28 +2005,20 @@ mod design_context_gate_tests {
             .into_iter()
             .map(|requirement| requirement.path)
             .collect();
-        assert!(design_context_read_gate(
-            &run,
-            "project.init",
-            &json!({ "template": "astro-website" }),
-        )
-        .is_none());
+        assert!(
+            design_context_read_gate(&run, "project.init", &json!({ "template": "next-app" }),)
+                .is_none()
+        );
 
-        let blocked = design_context_read_gate(
-            &run,
-            "fs.patch",
-            &json!({ "path": "project/src/pages/index.astro" }),
-        )
-        .expect("post-init style contract must be verified first");
+        let blocked =
+            design_context_read_gate(&run, "fs.patch", &json!({ "path": "project/app/page.tsx" }))
+                .expect("post-init style contract must be verified first");
         assert_eq!(blocked.1, "design_context.style_contract_unverified");
 
         run.design_context_style_contract_verified = Some(true);
-        let blocked = design_context_read_gate(
-            &run,
-            "fs.patch",
-            &json!({ "path": "project/src/pages/index.astro" }),
-        )
-        .expect("post-init style contract read must be required");
+        let blocked =
+            design_context_read_gate(&run, "fs.patch", &json!({ "path": "project/app/page.tsx" }))
+                .expect("post-init style contract read must be required");
         assert_eq!(blocked.1, "design_context.read_required");
         assert_eq!(
             blocked.2["missingFiles"],
@@ -2045,12 +2034,9 @@ mod design_context_gate_tests {
             "{\"id\":\"tampered\",\"version\":1}".to_string(),
         );
 
-        let blocked = design_context_read_gate(
-            &run,
-            "fs.patch",
-            &json!({ "path": "project/src/pages/index.astro" }),
-        )
-        .expect("tampered frozen DCP must fail closed before mutation");
+        let blocked =
+            design_context_read_gate(&run, "fs.patch", &json!({ "path": "project/app/page.tsx" }))
+                .expect("tampered frozen DCP must fail closed before mutation");
         assert_eq!(blocked.1, "design_context.integrity_failed");
         assert_eq!(blocked.2["runId"], run.id);
     }
@@ -2068,7 +2054,7 @@ mod design_context_gate_tests {
             design_context_read_gate(
                 &run,
                 "project.init",
-                &json!({ "template": "astro-website", "path": "site" }),
+                &json!({ "template": "next-app", "path": "site" }),
             )
             .unwrap()
             .1,
@@ -2098,19 +2084,16 @@ mod design_context_gate_tests {
             .chain(std::iter::once("state/style-contract.json".to_string()))
             .collect();
 
-        let blocked = design_context_read_gate(
-            &run,
-            "fs.patch",
-            &json!({ "path": "project/src/pages/index.astro" }),
-        )
-        .expect("Edit mutations must fail closed before contract verification");
+        let blocked =
+            design_context_read_gate(&run, "fs.patch", &json!({ "path": "project/app/page.tsx" }))
+                .expect("Edit mutations must fail closed before contract verification");
         assert_eq!(blocked.1, "design_context.style_contract_unverified");
 
         run.design_context_style_contract_verified = Some(true);
         assert!(design_context_read_gate(
             &run,
             "fs.patch",
-            &json!({ "path": "project/src/pages/index.astro" }),
+            &json!({ "path": "project/app/page.tsx" }),
         )
         .is_none());
     }
@@ -2120,7 +2103,7 @@ mod design_context_gate_tests {
         let mut run = frozen_build_run().await;
         let expected = json!({
             "version": 1,
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project",
             "tokens": { "color.primary": "--color-primary" },
         });
@@ -2142,7 +2125,7 @@ mod design_context_gate_tests {
             "inputs/template-style-contract.json".to_string(),
             json!({
                 "version": 1,
-                "template": "astro-website",
+                "template": "next-app",
                 "appRoot": "project",
                 "tokens": { "color.primary": "--color-primary" },
             })
@@ -2152,7 +2135,7 @@ mod design_context_gate_tests {
             "path": "/workspace/state/style-contract.json",
             "text": json!({
                 "version": 1,
-                "template": "astro-website",
+                "template": "next-app",
                 "appRoot": "project",
                 "tokens": { "color.primary": "--wrong" },
             }).to_string(),

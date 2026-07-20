@@ -124,7 +124,11 @@ impl StreamingToolExecutor {
     fn deadline_for_tool(&self, tool_name: &str) -> Duration {
         if matches!(
             tool_name,
-            "preview.publish" | "project.build" | "project.ensure_dependencies" | "package.install"
+            "preview.publish"
+                | "project.build"
+                | "project.ensure_dependencies"
+                | "package.install"
+                | "draft.snapshot_create"
         ) {
             self.build_tool_call_deadline
         } else {

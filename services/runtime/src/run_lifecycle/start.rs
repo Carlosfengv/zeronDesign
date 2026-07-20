@@ -33,6 +33,8 @@ pub struct StartRunContext {
     pub content_sources: Vec<ContentSource>,
     pub brief_id: Option<String>,
     pub base_version_id: Option<String>,
+    pub edit_base: Option<crate::visual_contracts::EditBase>,
+    pub edit_impact_plan_hash: Option<String>,
     pub sandbox_binding_id: Option<String>,
     pub parent_run_id: Option<String>,
     pub design_profile_id: Option<String>,
@@ -72,6 +74,21 @@ impl RunLifecycleService {
             &self.config.agent_model,
             request.input_context.model_resource_id.as_deref(),
         );
+        if request.phase == AgentPhase::Edit && request.input_context.edit_base.is_some() {
+            let plan_hash = request
+                .input_context
+                .edit_impact_plan_hash
+                .as_deref()
+                .ok_or_else(|| {
+                    conflict_error(anyhow::anyhow!("edit impact plan hash is required"))
+                })?;
+            self.store
+                .edit_guard_store()
+                .consume(&self.store.draft_preview_store(), plan_hash)
+                .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
+        }
+        let edit_base = request.input_context.edit_base.clone();
+        let edit_impact_plan_hash = request.input_context.edit_impact_plan_hash.clone();
         let run = if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
             if request.phase == AgentPhase::Repair {
                 self.store
@@ -109,6 +126,14 @@ impl RunLifecycleService {
                     request.input_context.base_version_id,
                 )
                 .await
+        };
+        let run = if let (Some(edit_base), Some(plan_hash)) = (edit_base, edit_impact_plan_hash) {
+            self.store
+                .set_run_edit_context(&run.id, edit_base, plan_hash)
+                .await
+                .map_err(conflict_error)?
+        } else {
+            run
         };
         let inherited_frozen_dcp = run.design_context_manifest.is_some();
         let run = if inherited_frozen_dcp {
@@ -179,7 +204,14 @@ impl RunLifecycleService {
         } else {
             run
         };
-        let run = if self.config.enable_design_context_package && run.phase == AgentPhase::Edit {
+        let draft_edit = matches!(
+            run.edit_base.as_ref(),
+            Some(crate::visual_contracts::EditBase::Draft { .. })
+        );
+        let run = if self.config.enable_design_context_package
+            && run.phase == AgentPhase::Edit
+            && !draft_edit
+        {
             match inherit_edit_design_context_from_base_version(self, &run).await {
                 Ok(inherited) => inherited,
                 Err(error) if is_verification_unavailable(&error) => {
@@ -445,6 +477,12 @@ async fn inherit_edit_brief_from_base_version(
     request: &mut StartRunCommand,
 ) -> Result<(), RunLifecycleError> {
     if request.phase != AgentPhase::Edit {
+        return Ok(());
+    }
+    if matches!(
+        request.input_context.edit_base.as_ref(),
+        Some(crate::visual_contracts::EditBase::Draft { .. })
+    ) {
         return Ok(());
     }
     let base_version_id = request
@@ -848,6 +886,12 @@ async fn restore_edit_workspace_from_base_version(
     service: &RunLifecycleService,
     run: &AgentRun,
 ) -> anyhow::Result<()> {
+    if matches!(
+        run.edit_base.as_ref(),
+        Some(crate::visual_contracts::EditBase::Draft { .. })
+    ) {
+        return Ok(());
+    }
     let base_version_id = run
         .base_version_id
         .as_deref()
@@ -1001,6 +1045,46 @@ async fn validate_project_lifecycle_context(
     }
 
     if request.phase == AgentPhase::Edit {
+        if let Some(crate::visual_contracts::EditBase::Draft {
+            snapshot_id,
+            session_id,
+            expected_session_epoch,
+            expected_workspace_revision,
+            writer_lease_id,
+        }) = request.input_context.edit_base.as_ref()
+        {
+            if request.input_context.base_version_id.is_some() {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "Draft EditBase cannot be combined with baseVersionId"
+                )));
+            }
+            let session = store
+                .draft_preview_store()
+                .get(session_id)
+                .ok_or_else(|| conflict_error(anyhow::anyhow!("edit.base_stale")))?;
+            if session.project_id != request.project_id
+                || session.session_epoch != *expected_session_epoch
+                || session.workspace_revision != *expected_workspace_revision
+                || session.durable_snapshot_id != *snapshot_id
+                || session.writer_lease_id != *writer_lease_id
+                || session.writer_lease_expires_at <= chrono::Utc::now()
+            {
+                return Err(conflict_error(anyhow::anyhow!("edit.base_stale")));
+            }
+            let plan_hash = request
+                .input_context
+                .edit_impact_plan_hash
+                .as_deref()
+                .ok_or_else(|| conflict_error(anyhow::anyhow!("edit plan is required")))?;
+            let plan = store
+                .edit_guard_store()
+                .validate_executable(&store.draft_preview_store(), plan_hash)
+                .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
+            if plan.edit_base != *request.input_context.edit_base.as_ref().unwrap() {
+                return Err(conflict_error(anyhow::anyhow!("edit.plan_stale")));
+            }
+            return Ok(());
+        }
         let base_version_id = request
             .input_context
             .base_version_id
