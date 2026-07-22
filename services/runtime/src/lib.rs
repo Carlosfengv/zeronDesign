@@ -8,6 +8,7 @@ pub mod authorization;
 pub mod channel_manager;
 pub mod component_registry;
 pub mod config;
+pub mod content_plan_approval;
 pub mod control_plane_persistence;
 pub mod conversation;
 pub mod design_context;

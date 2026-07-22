@@ -33,6 +33,7 @@ pub(super) fn router_with_services(state: AppState) -> Router {
     Router::new()
         .merge(routes::system::router())
         .merge(routes::briefs::router())
+        .merge(routes::content_plan_approvals::router())
         .merge(routes::runs::router())
         .merge(routes::run_events::router())
         .merge(routes::design_sources::router())

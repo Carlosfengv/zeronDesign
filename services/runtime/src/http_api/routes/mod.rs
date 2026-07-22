@@ -1,6 +1,7 @@
 pub(super) mod artifacts;
 pub(super) mod briefs;
 pub(super) mod capture;
+pub(super) mod content_plan_approvals;
 pub(super) mod design_profiles;
 pub(super) mod design_sources;
 pub(super) mod draft_preview_events;

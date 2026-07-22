@@ -1,5 +1,6 @@
 use crate::{
     acceptance_contract::{AcceptanceContract, AcceptanceContractDraft},
+    content_plan_approval::ContentPlanApprovalStore,
     control_plane_persistence::PostgresControlPlaneMirror,
     design_context::{
         frozen_run_design_context_manifest, validate_run_design_context_identity,
@@ -100,6 +101,7 @@ pub struct RuntimeStore {
     publish_workflow_store: Arc<PublishWorkflowStore>,
     draft_preview_store: Arc<DraftPreviewStore>,
     edit_guard_store: Arc<EditGuardStore>,
+    content_plan_approval_store: Arc<ContentPlanApprovalStore>,
     control_plane_mirror: Option<Arc<PostgresControlPlaneMirror>>,
 }
 
@@ -358,6 +360,10 @@ impl Default for RuntimeStore {
         );
         let edit_guard_store =
             Arc::new(EditGuardStore::open(&storage_root).expect("edit guard store should open"));
+        let content_plan_approval_store = Arc::new(
+            ContentPlanApprovalStore::open(&storage_root)
+                .expect("content plan approval store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -407,6 +413,7 @@ impl Default for RuntimeStore {
             publish_workflow_store,
             draft_preview_store,
             edit_guard_store,
+            content_plan_approval_store,
             control_plane_mirror: None,
         }
     }
@@ -437,6 +444,10 @@ impl RuntimeStore {
         );
         let edit_guard_store =
             Arc::new(EditGuardStore::open(&checkpoint_dir).expect("edit guard store should open"));
+        let content_plan_approval_store = Arc::new(
+            ContentPlanApprovalStore::open(&checkpoint_dir)
+                .expect("content plan approval store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -486,6 +497,7 @@ impl RuntimeStore {
             publish_workflow_store,
             draft_preview_store,
             edit_guard_store,
+            content_plan_approval_store,
             control_plane_mirror: None,
         }
     }
@@ -533,6 +545,10 @@ impl RuntimeStore {
         );
         let edit_guard_store =
             Arc::new(EditGuardStore::open(&checkpoint_dir).expect("edit guard store should open"));
+        let content_plan_approval_store = Arc::new(
+            ContentPlanApprovalStore::open(&checkpoint_dir)
+                .expect("content plan approval store should open"),
+        );
         Self {
             inner: Arc::new(RwLock::new(RuntimeStoreInner::default())),
             ids: Arc::new(AtomicU64::new(next_id)),
@@ -582,6 +598,7 @@ impl RuntimeStore {
             publish_workflow_store,
             draft_preview_store,
             edit_guard_store,
+            content_plan_approval_store,
             control_plane_mirror: None,
         }
     }
@@ -604,6 +621,10 @@ impl RuntimeStore {
 
     pub fn edit_guard_store(&self) -> Arc<EditGuardStore> {
         Arc::clone(&self.edit_guard_store)
+    }
+
+    pub fn content_plan_approval_store(&self) -> Arc<ContentPlanApprovalStore> {
+        Arc::clone(&self.content_plan_approval_store)
     }
 
     fn append_control_plane_jsonl<T: Serialize>(

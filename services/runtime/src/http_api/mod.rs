@@ -115,6 +115,19 @@ pub fn try_app_state_with_supervisor(
         config.runtime_storage_dir.clone(),
         &config.database_url,
     )?;
+    if config.content_plan_approval_producer_required {
+        let producer = store.content_plan_approval_store().producer_status();
+        if !producer.ready
+            || producer.schema_version
+                != crate::content_plan_approval::CONTENT_PLAN_APPROVAL_PRODUCER_SCHEMA
+            || producer.transaction_schema_version
+                != crate::content_plan_approval::CONTENT_PLAN_APPROVAL_TRANSACTION_SCHEMA
+        {
+            return Err(anyhow::anyhow!(
+                "Content Plan Approval producer readiness/schema probe failed"
+            ));
+        }
+    }
     Ok(AppState {
         model,
         store,

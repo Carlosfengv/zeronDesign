@@ -97,6 +97,40 @@ pub enum PublicPrincipalAuthMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationContextMode {
+    Off,
+    Shadow,
+    Enabled,
+}
+
+impl GenerationContextMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "shadow" => Self::Shadow,
+            "enabled" | "on" => Self::Enabled,
+            _ => Self::Off,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPlanAttestationMode {
+    Shadow,
+    Enforce,
+}
+
+impl ContentPlanAttestationMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "enforce" | "enforced" => Self::Enforce,
+            _ => Self::Shadow,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceChannelTlsMode {
     Required,
@@ -187,6 +221,10 @@ pub struct RuntimeConfig {
     pub model_strict_tools: bool,
     pub enable_design_context_package: bool,
     pub enable_design_context_enforcement: bool,
+    pub generation_context_mode: GenerationContextMode,
+    pub content_plan_attestation_mode: ContentPlanAttestationMode,
+    pub content_plan_approval_producer_required: bool,
+    pub observation_receipts_enabled: bool,
     /// Runtime-owned browser worker bound into an enforced DCP Run.  This
     /// deliberately lives on the config instance so isolated Runtime hosts and
     /// tests do not have to mutate process-global environment after startup.
@@ -361,6 +399,18 @@ impl RuntimeConfig {
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
             enable_design_context_package: truthy_env("RUNTIME_DESIGN_CONTEXT_PACKAGE_V1"),
             enable_design_context_enforcement: truthy_env("RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1"),
+            generation_context_mode: env::var("RUNTIME_GENERATION_CONTEXT_MODE")
+                .ok()
+                .map(|value| GenerationContextMode::from_env_value(&value))
+                .unwrap_or(GenerationContextMode::Off),
+            content_plan_attestation_mode: env::var("RUNTIME_CONTENT_PLAN_ATTESTATION_MODE")
+                .ok()
+                .map(|value| ContentPlanAttestationMode::from_env_value(&value))
+                .unwrap_or(ContentPlanAttestationMode::Shadow),
+            content_plan_approval_producer_required: truthy_env(
+                "RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED",
+            ),
+            observation_receipts_enabled: truthy_env("RUNTIME_OBSERVATION_RECEIPTS_ENABLED"),
             design_context_browser_executable: optional_path_env("RUNTIME_BROWSER_EXECUTABLE"),
             design_context_browser_collector_executable: optional_path_env(
                 "RUNTIME_BROWSER_COLLECTOR_EXECUTABLE",
@@ -403,6 +453,15 @@ impl RuntimeConfig {
     }
 
     pub fn validate_startup(&self) -> Result<(), String> {
+        if (self.generation_context_mode == GenerationContextMode::Enabled
+            || self.content_plan_attestation_mode == ContentPlanAttestationMode::Enforce)
+            && !self.content_plan_approval_producer_required
+        {
+            return Err(
+                "RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED must be true when Generation Context is enabled or Content Plan attestation is enforced"
+                    .to_string(),
+            );
+        }
         if self.enable_design_context_enforcement && !self.enable_design_context_package {
             return Err(
                 "RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1 requires RUNTIME_DESIGN_CONTEXT_PACKAGE_V1"
@@ -709,6 +768,9 @@ mod tests {
         config.object_storage_endpoint = "https://object-store.example".to_string();
         config.object_storage_access_key = Some("test-access-key".to_string());
         config.object_storage_secret_key = Some("test-secret-key".to_string());
+        config.generation_context_mode = GenerationContextMode::Off;
+        config.content_plan_attestation_mode = ContentPlanAttestationMode::Shadow;
+        config.content_plan_approval_producer_required = false;
         config
     }
 
@@ -740,6 +802,32 @@ mod tests {
         config.policy_profile = RuntimePolicyProfile::LocalE2e;
         config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
         config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn enabled_context_requires_content_plan_approval_producer() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.generation_context_mode = GenerationContextMode::Enabled;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED"));
+        config.content_plan_approval_producer_required = true;
+        config.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn enforced_content_plan_attestation_requires_producer() {
+        let mut config = phase_a_config();
+        config.policy_profile = RuntimePolicyProfile::LocalE2e;
+        config.public_principal_auth_mode = PublicPrincipalAuthMode::Disabled;
+        config.content_plan_attestation_mode = ContentPlanAttestationMode::Enforce;
+        assert!(config
+            .validate_startup()
+            .unwrap_err()
+            .contains("RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED"));
     }
 
     #[test]
