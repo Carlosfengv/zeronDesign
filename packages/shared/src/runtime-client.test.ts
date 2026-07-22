@@ -277,6 +277,72 @@ describe("runtime client", () => {
     ]);
   });
 
+  it("reads exact Content Plan approval identity and producer state", async () => {
+    const calls: Array<{ url: string; init?: Parameters<RuntimeFetch>[1] }> = [];
+    const contentHash = "a".repeat(64);
+    const approval = {
+      schemaVersion: "content-plan-approval@1",
+      approvalId: "approval-1",
+      projectId: "project/1",
+      planId: "plan/1",
+      revision: 2,
+      contentHash,
+      decision: "approved",
+      confirmationEventId: "confirmation-2",
+      approvedAt: timestamp,
+      invalidatedAt: null,
+      invalidationReason: null,
+    } as const;
+    const fetchImpl: RuntimeFetch = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      const target = url.toString();
+      if (target.endsWith("content-plan-approval-producer")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              ready: true,
+              schemaVersion: "content-plan-approval-producer@1",
+              transactionSchemaVersion: "content-plan-approval-transaction@1",
+              lastSequence: 2,
+            };
+          },
+        };
+      }
+      if (target.includes("/verify?")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { state: "verified", approval, reason: null };
+          },
+        };
+      }
+      return { ok: true, status: 200, async json() { return approval; } };
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: fetchImpl,
+      publicPrincipalToken: "principal-token",
+    });
+
+    await client.verifyContentPlanApproval("project/1", {
+      planId: "plan/1",
+      revision: 2,
+      contentHash,
+    });
+    await client.getContentPlanApprovalProducerStatus("project/1");
+
+    expect(calls.map((call) => call.url)).toEqual([
+      `http://runtime.local/projects/project%2F1/content-plan-approvals/verify?planId=plan%2F1&revision=2&contentHash=${contentHash}`,
+      "http://runtime.local/projects/project%2F1/content-plan-approval-producer",
+    ]);
+    for (const call of calls) {
+      expect(call.init?.headers).toMatchObject({ authorization: "Bearer principal-token" });
+    }
+  });
+
   it("builds BFF preview proxy requests with only the minted principal token", () => {
     expect(runtimePreviewPath("lease/1", "assets/app.js")).toBe(
       "/previews/lease%2F1/assets/app.js",
@@ -382,6 +448,110 @@ describe("runtime client", () => {
           }),
         },
       },
+    ]);
+  });
+
+  it("reads versioned run efficiency metrics", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      publicPrincipalToken: "principal-token",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "run-efficiency-metrics@1",
+              calculatorVersion: "run-efficiency-calculator@1",
+              runId: "run/1",
+              projectId: "project-1",
+              phase: "build",
+              model: "fixture",
+              template: "next-app",
+              status: "running",
+              totalDurationMs: null,
+              timeToFirstModelTurnMs: 5,
+              timeToFirstSourceMutationMs: 20,
+              modelTurnAtFirstSourceMutation: 1,
+              timeToFirstGreenfieldStaticBuildMs: 100,
+              coldDevReadyMs: null,
+              timeToIframeAppliedMs: null,
+              timeToDurableSnapshotMs: null,
+              timeToDraftReadyMs: null,
+              prebuildFsReadCount: 2,
+              prebuildFsListCount: 1,
+              prebuildFsSearchCount: 0,
+              inputTokens: 500,
+              outputTokens: 50,
+              cachedInputTokens: 0,
+              contextReadDeliveries: 1,
+              sourceReadDeliveries: 2,
+              diagnosticReadDeliveries: 0,
+              verificationReadDeliveries: 0,
+              fullReadDeliveries: 3,
+              duplicateFullReadDeliveries: 1,
+              duplicateFullReadRateBasisPoints: 3334,
+              duplicateReadEstimatedTokens: 25,
+              outOfScopeMutationCount: 0,
+              firstBuildSucceeded: true,
+              requiredFidelityPassed: null,
+            };
+          },
+        };
+      },
+    });
+
+    expect((await client.getRunEfficiencyMetrics("run/1")).inputTokens).toBe(500);
+    expect(calls).toEqual(["http://runtime.local/runs/run%2F1/efficiency-metrics"]);
+  });
+
+  it("reads hash-only GenerationContext status", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "generation-context-status@1",
+              runId: "run/1",
+              runContractVersion: "generation-context@1",
+              status: "compiled",
+              runtimeMode: "enabled",
+              compilerVersion: "generation-context-compiler@1",
+              contextContentHash: "a".repeat(64),
+              runContextBindingHash: "b".repeat(64),
+              runtimeAttestationHash: "d".repeat(64),
+              visualBindingSetHash: "e".repeat(64),
+              visualDeliveryState: "not_applicable",
+              executionProfile: "greenfield_static",
+              workflowState: "context_ready",
+              contextWindowEpoch: 0,
+              contextInjectedTurn: null,
+              predecessorRunId: null,
+              successorRunId: null,
+              contentPlan: {
+                planId: "plan-1",
+                revision: 2,
+                contentHash: "c".repeat(64),
+              },
+              approvalId: "approval-1",
+              approvalState: "verified",
+              designSourceKind: "template_default",
+            };
+          },
+        };
+      },
+    });
+
+    expect((await client.getRunGenerationContextStatus("run/1")).status).toBe("compiled");
+    expect(calls).toEqual([
+      "http://runtime.local/runs/run%2F1/generation-context-status",
     ]);
   });
 

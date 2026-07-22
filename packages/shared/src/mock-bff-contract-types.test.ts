@@ -131,6 +131,24 @@ describe("mock BFF shared runtime contract types", () => {
         findingIds: ["finding-1"],
       },
     } satisfies StartRunRequest;
+    const startReplanSuccessor = {
+      projectId: "project-1",
+      phase: "repair",
+      agentProfile: "repair",
+      inputContext: {
+        predecessorRunId: "run-replan-1",
+        editBase: {
+          kind: "draft",
+          snapshotId: "draft-snapshot-1",
+          sessionId: "draft-session-1",
+          expectedSessionEpoch: 1,
+          expectedWorkspaceRevision: 2,
+          writerLeaseId: "writer-lease-1",
+        },
+        editImpactPlanHash: "a".repeat(64),
+        sandboxBindingId: "sandbox-binding-1",
+      },
+    } satisfies StartRunRequest;
     const startRunResponse = { runId: "run-1", status: "queued" } satisfies StartRunResponse;
 
     const continueRun = {
@@ -269,6 +287,9 @@ describe("mock BFF shared runtime contract types", () => {
     expect(StartRunRequestSchema.parse(startRepairRun).inputContext.findingIds).toEqual([
       "finding-1",
     ]);
+    expect(
+      StartRunRequestSchema.parse(startReplanSuccessor).inputContext.predecessorRunId,
+    ).toBe("run-replan-1");
     expect(StartRunResponseSchema.parse(startRunResponse).status).toBe("queued");
     expect(ContinueRunRequestSchema.parse(continueRun).userMessage).toContain("hero");
     expect(ContinueRunResponseSchema.parse(continueRunResponse).status).toBe("running");

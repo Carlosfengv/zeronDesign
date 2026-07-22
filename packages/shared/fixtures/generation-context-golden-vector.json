@@ -1,0 +1,86 @@
+{
+  "compilerVersion": "generation-context-compiler@1",
+  "payload": {
+    "phase": "build",
+    "executionProfile": "greenfield_static",
+    "change": null,
+    "identity": {
+      "briefHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "baseRevision": null,
+      "designSource": {
+        "kind": "template_default",
+        "templateDefaultContractHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "templateId": "next-app",
+      "templateVersion": "next-app@2",
+      "templateManifestHash": "8e83fe7389916e38cc7b17f51d87766d642a2813b21134865091026c5017a48e",
+      "surface": "website",
+      "appRoot": "project"
+    },
+    "contentPlan": {
+      "planId": "plan-1",
+      "revision": 1,
+      "contentHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "approval": {
+        "state": "verified",
+        "approvalId": "approval-1",
+        "approvedRevision": 1
+      }
+    },
+    "acceptance": {
+      "requiredRoutes": ["/"],
+      "requiredText": ["Hello"],
+      "forbiddenText": [],
+      "responsiveViewports": [375, 1440]
+    },
+    "design": {
+      "visualDirection": "calm",
+      "requiredRules": [],
+      "runtimeTokens": {},
+      "componentRecipes": [],
+      "layoutGuidance": [],
+      "fidelityMode": "template_default",
+      "compatibilityMode": "observe"
+    },
+    "content": {
+      "inlineSources": [],
+      "indexedSources": [],
+      "requiredSourceSections": []
+    },
+    "visuals": {
+      "bindings": [],
+      "deliveryMode": "provider_image_content_blocks",
+      "reviewMode": "advisory"
+    },
+    "project": {
+      "editableSurface": {
+        "primaryRoutes": [{ "route": "/", "source": "project/app/page.tsx" }],
+        "globalStyleFiles": ["project/app/globals.css"],
+        "componentRoots": ["project/components", "project/components/ui"],
+        "contentRoots": [],
+        "tokenFile": "project/app/tokens.css",
+        "protectedPaths": [
+          "project/components.json",
+          "project/next.config.mjs",
+          "project/package-lock.json",
+          "project/package.json"
+        ],
+        "inspectionHints": [
+          "project/app/page.tsx",
+          "project/app/layout.tsx",
+          "project/app/globals.css",
+          "project/app/tokens.css"
+        ]
+      }
+    }
+  },
+  "contextContentHash": "3ced29833f2f9c8b6c16961236f5f5fd98812c004177114d411f0af95bc10d3d",
+  "runBindingInput": {
+    "runId": "run-1",
+    "projectId": "project-1",
+    "workspaceNamespace": "ws-golden",
+    "frozenResourcesHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "runtimeAttestationHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "runContextBindingHash": "1920a33b4f38f645c0225e1411b6bc779deee4914ed066d103dcff68e922a2fa"
+}

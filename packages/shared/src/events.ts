@@ -8,6 +8,25 @@ const BaseEventSchema = z.object({
   timestamp: z.string().datetime(),
 });
 
+export const ObservationReceiptSchema = z
+  .object({
+    schemaVersion: z.literal("observation-receipt@1"),
+    runId: z.string().min(1),
+    normalizedPath: z.string().min(1),
+    contentSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    contextWindowEpoch: z.number().int().nonnegative(),
+    view: z.enum(["full", "partial", "injected"]),
+    lastOutcome: z.enum(["content_returned", "unchanged"]),
+    firstReadTurn: z.number().int().nonnegative(),
+    lastReadTurn: z.number().int().nonnegative(),
+    readCount: z.number().int().positive(),
+    purpose: z.enum(["context", "source", "diagnostic", "verification", "runtime_internal"]),
+    deliveredBytes: z.number().int().nonnegative(),
+    estimatedTokens: z.number().int().nonnegative(),
+    duplicateDelivery: z.boolean(),
+  })
+  .strict();
+
 const AgentEventBaseSchema = z.discriminatedUnion("type", [
   BaseEventSchema.extend({
     type: z.literal("run.started"),
@@ -77,6 +96,34 @@ const AgentEventBaseSchema = z.discriminatedUnion("type", [
     name: z.string().min(1),
     value: z.number().int().nonnegative(),
     metadata: z.unknown().nullish(),
+  }),
+  BaseEventSchema.extend({
+    type: z.literal("model.turn_started"),
+    turn: z.number().int().nonnegative(),
+  }),
+  BaseEventSchema.extend({
+    type: z.literal("observation.receipt"),
+    receipt: ObservationReceiptSchema,
+  }),
+  BaseEventSchema.extend({
+    type: z.literal("generation_context.compiled"),
+    contextContentHash: z.string().regex(/^[0-9a-f]{64}$/),
+    runContextBindingHash: z.string().regex(/^[0-9a-f]{64}$/),
+    serializedBytes: z.number().int().nonnegative(),
+    sections: z.array(z.string().min(1)),
+  }),
+  BaseEventSchema.extend({
+    type: z.literal("generation_context.fallback"),
+    reason: z.string().min(1),
+    designSourceKind: z.enum(["design_profile", "template_default"]),
+  }),
+  BaseEventSchema.extend({
+    type: z.literal("content_plan.approval_rejected"),
+    planId: z.string().min(1).nullable(),
+    revision: z.number().int().positive().nullable(),
+    contentHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    state: z.enum(["verified", "missing", "invalidated", "identity_mismatch"]),
+    reason: z.string().min(1),
   }),
   BaseEventSchema.extend({
     type: z.literal("permission.requested"),

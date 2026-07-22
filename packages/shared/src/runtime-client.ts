@@ -9,6 +9,9 @@ import {
   BriefResponseSchema,
   ContinueRunRequest,
   ContinueRunResponseSchema,
+  ContentPlanIdentitySchema,
+  ContentPlanApprovalProducerStatusSchema,
+  ContentPlanApprovalVerificationSchema,
   DesignContextDiagnosticsResponseSchema,
   DesignContextManifestResponseSchema,
   ConversationListResponseSchema,
@@ -36,6 +39,7 @@ import {
   EditImpactPlanResponseSchema,
   ElementObservationResponseSchema,
   HealthResponseSchema,
+  GenerationContextStatusSchema,
   ImportDesignProfileRequest,
   ImportDesignProfileResponseSchema,
   ListDesignProfilesResponseSchema,
@@ -61,6 +65,7 @@ import {
   ReleasePackagingResponseSchema,
   RunVisualBindingListResponseSchema,
   RunVisualBindingResponseSchema,
+  RunEfficiencyMetricsSchema,
   ScheduleVisualReviewRequest,
   StartRunRequest,
   StartRunResponseSchema,
@@ -154,6 +159,12 @@ export type RuntimeClient = {
   getRunDesignContextDiagnostics(
     runId: string,
   ): Promise<z.output<typeof DesignContextDiagnosticsResponseSchema>>;
+  getRunEfficiencyMetrics(
+    runId: string,
+  ): Promise<z.output<typeof RunEfficiencyMetricsSchema>>;
+  getRunGenerationContextStatus(
+    runId: string,
+  ): Promise<z.output<typeof GenerationContextStatusSchema>>;
   planDesignProfileSync(
     runId: string,
     request: PlanDesignProfileSyncRequest,
@@ -243,6 +254,13 @@ export type RuntimeClient = {
     projectId: string,
     planHash: string,
   ): Promise<z.output<typeof EditImpactPlanResponseSchema>>;
+  verifyContentPlanApproval(
+    projectId: string,
+    identity: { planId: string; revision: number; contentHash: string },
+  ): Promise<z.output<typeof ContentPlanApprovalVerificationSchema>>;
+  getContentPlanApprovalProducerStatus(
+    projectId: string,
+  ): Promise<z.output<typeof ContentPlanApprovalProducerStatusSchema>>;
   listProjectAssets(
     projectId: string,
   ): Promise<z.output<typeof ProjectAssetListResponseSchema>>;
@@ -414,6 +432,16 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         `/runs/${encodePathSegment(runId)}/design-context-diagnostics`,
         DesignContextDiagnosticsResponseSchema,
       ),
+    getRunEfficiencyMetrics: (runId) =>
+      get(
+        `/runs/${encodePathSegment(runId)}/efficiency-metrics`,
+        RunEfficiencyMetricsSchema,
+      ),
+    getRunGenerationContextStatus: (runId) =>
+      get(
+        `/runs/${encodePathSegment(runId)}/generation-context-status`,
+        GenerationContextStatusSchema,
+      ),
     planDesignProfileSync: (runId, request) =>
       post(
         `/runs/${encodePathSegment(runId)}/design-profile-sync-plan`,
@@ -551,6 +579,16 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
         `/projects/${encodePathSegment(projectId)}/edit-impact-plans/${encodePathSegment(planHash)}/confirm`,
         {},
         EditImpactPlanResponseSchema,
+      ),
+    verifyContentPlanApproval: (projectId, identity) =>
+      get(
+        contentPlanApprovalVerificationPath(projectId, identity),
+        ContentPlanApprovalVerificationSchema,
+      ),
+    getContentPlanApprovalProducerStatus: (projectId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/content-plan-approval-producer`,
+        ContentPlanApprovalProducerStatusSchema,
       ),
     listProjectAssets: (projectId) =>
       get(
@@ -944,6 +982,19 @@ function normalizeBaseUrl(baseUrl: string): string {
 
 function encodePathSegment(value: string): string {
   return encodeURIComponent(value);
+}
+
+function contentPlanApprovalVerificationPath(
+  projectId: string,
+  identity: { planId: string; revision: number; contentHash: string },
+): string {
+  const parsed = ContentPlanIdentitySchema.parse(identity);
+  const params = new URLSearchParams({
+    planId: parsed.planId,
+    revision: String(parsed.revision),
+    contentHash: parsed.contentHash,
+  });
+  return `/projects/${encodePathSegment(projectId)}/content-plan-approvals/verify?${params.toString()}`;
 }
 
 function designProfilesPath(query?: {

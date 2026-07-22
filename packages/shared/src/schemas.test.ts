@@ -867,12 +867,49 @@ describe("shared schemas", () => {
         inputContext: {
           briefId: "brief-1",
           designProfileId: "design-profile-1",
+          modelResourceId: "deepseek-v4-pro",
+          visualBindings: [{
+            artifactId: "visual-reference-1",
+            role: "reference",
+            route: "/",
+            viewport: { width: 1440, height: 900, deviceScaleFactor: 1 },
+            target: {
+              kind: "static-snapshot",
+              snapshotId: "draft-snapshot-1",
+              sourceHash: "a".repeat(64),
+            },
+            order: 0,
+          }],
         },
       }).inputContext,
     ).toMatchObject({
       briefId: "brief-1",
       designProfileId: "design-profile-1",
+      modelResourceId: "deepseek-v4-pro",
+      visualBindings: [{ role: "reference", artifactId: "visual-reference-1" }],
     });
+    expect(() =>
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "build",
+        agentProfile: "build",
+        inputContext: {
+          briefId: "brief-1",
+          visualBindings: [{
+            artifactId: "visual-candidate-1",
+            role: "candidate",
+            route: "/",
+            viewport: { width: 1440, height: 900, deviceScaleFactor: 1 },
+            target: {
+              kind: "static-snapshot",
+              snapshotId: "draft-snapshot-1",
+              sourceHash: "a".repeat(64),
+            },
+            order: 0,
+          }],
+        },
+      }),
+    ).toThrow();
     expect(() =>
       StartRunRequestSchema.parse({
         projectId: "project-1",
@@ -890,6 +927,37 @@ describe("shared schemas", () => {
         },
       }).inputContext.parentRunId,
     ).toBe("run-parent-1");
+    expect(
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "repair",
+        agentProfile: "repair",
+        inputContext: {
+          predecessorRunId: "run-replan-1",
+          editBase: {
+            kind: "draft",
+            snapshotId: "draft-snapshot-1",
+            sessionId: "draft-session-1",
+            expectedSessionEpoch: 1,
+            expectedWorkspaceRevision: 2,
+            writerLeaseId: "writer-lease-1",
+          },
+          editImpactPlanHash: "a".repeat(64),
+          sandboxBindingId: "sandbox-binding-1",
+        },
+      }).inputContext.predecessorRunId,
+    ).toBe("run-replan-1");
+    expect(() =>
+      StartRunRequestSchema.parse({
+        projectId: "project-1",
+        phase: "repair",
+        agentProfile: "repair",
+        inputContext: {
+          parentRunId: "run-parent-1",
+          predecessorRunId: "run-replan-1",
+        },
+      }),
+    ).toThrow();
     expect(
       StartRunRequestSchema.parse({
         projectId: "project-1",

@@ -34,6 +34,147 @@ import {
   VisualViewportSchema,
 } from "./schemas.js";
 
+const LowercaseSha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+
+export const ContentPlanIdentitySchema = z
+  .object({
+    planId: z.string().min(1),
+    revision: z.number().int().positive(),
+    contentHash: LowercaseSha256Schema,
+  })
+  .strict();
+
+export const ContentPlanApprovalSchema = z
+  .object({
+    schemaVersion: z.literal("content-plan-approval@1"),
+    approvalId: z.string().min(1),
+    projectId: z.string().min(1),
+    planId: z.string().min(1),
+    revision: z.number().int().positive(),
+    contentHash: LowercaseSha256Schema,
+    decision: z.literal("approved"),
+    confirmationEventId: z.string().min(1),
+    approvedAt: z.string().datetime(),
+    invalidatedAt: z.string().datetime().nullable(),
+    invalidationReason: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const RecordContentPlanApprovalRequestSchema = z
+  .object({
+    planId: z.string().min(1),
+    revision: z.number().int().positive(),
+    contentHash: LowercaseSha256Schema,
+    confirmationEventId: z.string().min(1),
+  })
+  .strict();
+
+export const RecordContentPlanChangeRequestSchema = z
+  .object({
+    planId: z.string().min(1),
+    revision: z.number().int().positive(),
+    contentHash: LowercaseSha256Schema,
+    changeEventId: z.string().min(1),
+  })
+  .strict();
+
+export const ContentPlanChangeResultSchema = z
+  .object({
+    projectId: z.string().min(1),
+    planId: z.string().min(1),
+    revision: z.number().int().positive(),
+    contentHash: LowercaseSha256Schema,
+    invalidatedApprovalIds: z.array(z.string().min(1)),
+    sequence: z.number().int().positive(),
+  })
+  .strict();
+
+export const ContentPlanApprovalVerificationSchema = z
+  .object({
+    state: z.enum(["verified", "missing", "invalidated", "identity_mismatch"]),
+    approval: ContentPlanApprovalSchema.nullable(),
+    reason: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const ContentPlanApprovalProducerStatusSchema = z
+  .object({
+    ready: z.boolean(),
+    schemaVersion: z.literal("content-plan-approval-producer@1"),
+    transactionSchemaVersion: z.literal("content-plan-approval-transaction@1"),
+    lastSequence: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const GenerationContextStatusSchema = z
+  .object({
+    schemaVersion: z.literal("generation-context-status@1"),
+    runId: z.string().min(1),
+    runContractVersion: z.string().min(1),
+    status: z.string().min(1),
+    runtimeMode: z.enum(["shadow", "enabled"]).nullable(),
+    compilerVersion: z.string().min(1).nullable(),
+    contextContentHash: LowercaseSha256Schema.nullable(),
+    runContextBindingHash: LowercaseSha256Schema.nullable(),
+    runtimeAttestationHash: LowercaseSha256Schema.nullable(),
+    visualBindingSetHash: LowercaseSha256Schema.nullable(),
+    visualDeliveryState: z
+      .enum(["pending", "delivered", "unavailable", "not_applicable"])
+      .nullable(),
+    executionProfile: z
+      .enum(["greenfield_static", "cold_dev", "warm_hmr", "repair_cold_dev", "repair_warm"])
+      .nullable(),
+    workflowState: z.string().min(1).nullable(),
+    contextWindowEpoch: z.number().int().nonnegative(),
+    contextInjectedTurn: z.number().int().nonnegative().nullable(),
+    predecessorRunId: z.string().min(1).nullable(),
+    successorRunId: z.string().min(1).nullable(),
+    contentPlan: ContentPlanIdentitySchema.nullable(),
+    approvalId: z.string().min(1).nullable(),
+    approvalState: z.string().min(1).nullable(),
+    designSourceKind: z.enum(["design_profile", "template_default"]).nullable(),
+  })
+  .strict();
+
+export const RunEfficiencyMetricsSchema = z
+  .object({
+    schemaVersion: z.literal("run-efficiency-metrics@1"),
+    calculatorVersion: z.literal("run-efficiency-calculator@1"),
+    runId: z.string().min(1),
+    projectId: z.string().min(1),
+    phase: AgentPhaseSchema,
+    model: z.string().min(1),
+    template: z.string().min(1).nullable(),
+    status: AgentRunStatusSchema,
+    totalDurationMs: z.number().int().nonnegative().nullable(),
+    timeToFirstModelTurnMs: z.number().int().nonnegative().nullable(),
+    timeToFirstSourceMutationMs: z.number().int().nonnegative().nullable(),
+    modelTurnAtFirstSourceMutation: z.number().int().nonnegative().nullable(),
+    timeToFirstGreenfieldStaticBuildMs: z.number().int().nonnegative().nullable(),
+    coldDevReadyMs: z.number().int().nonnegative().nullable(),
+    timeToIframeAppliedMs: z.number().int().nonnegative().nullable(),
+    timeToDurableSnapshotMs: z.number().int().nonnegative().nullable(),
+    timeToDraftReadyMs: z.number().int().nonnegative().nullable(),
+    prebuildFsReadCount: z.number().int().nonnegative(),
+    prebuildFsListCount: z.number().int().nonnegative(),
+    prebuildFsSearchCount: z.number().int().nonnegative(),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    contextReadDeliveries: z.number().int().nonnegative(),
+    sourceReadDeliveries: z.number().int().nonnegative(),
+    diagnosticReadDeliveries: z.number().int().nonnegative(),
+    verificationReadDeliveries: z.number().int().nonnegative(),
+    fullReadDeliveries: z.number().int().nonnegative(),
+    duplicateFullReadDeliveries: z.number().int().nonnegative(),
+    duplicateFullReadRateBasisPoints: z.number().int().min(0).max(10_000),
+    duplicateReadEstimatedTokens: z.number().int().nonnegative(),
+    outOfScopeMutationCount: z.number().int().nonnegative(),
+    firstBuildSucceeded: z.boolean(),
+    requiredFidelityPassed: z.boolean().nullable(),
+  })
+  .strict();
+
 export const DraftPreviewHeartbeatRequestSchema = z
   .object({
     writerLeaseId: z.string().min(1),
@@ -69,6 +210,7 @@ export const CreateElementObservationRequestSchema = z
 export const CreateEditImpactPlanRequestSchema = z
   .object({
     observationId: z.string().min(1).nullish(),
+    predecessorRunId: z.string().min(1).optional(),
     scope: z.enum(["local", "page", "global"]),
     targets: z.array(z.string().min(1)).min(1),
     operations: z.array(EditImpactOperationSchema).min(1),
@@ -141,13 +283,54 @@ export const StartRunRequestSchema = z
         editImpactPlanHash: z.string().regex(/^[a-fA-F0-9]{64}$/).optional(),
         sandboxBindingId: z.string().min(1).optional(),
         parentRunId: z.string().min(1).optional(),
+        predecessorRunId: z.string().min(1).optional(),
         designProfileId: z.string().min(1).optional(),
         designFidelityMode: z.enum(["profile_only", "source_fallback"]).optional(),
+        modelResourceId: z.string().min(1).max(128).optional(),
+        contentPlan: ContentPlanIdentitySchema.optional(),
+        visualBindings: z
+          .array(
+            CreateRunVisualBindingRequestSchema.refine(
+              (binding) => binding.role === "reference",
+              "StartRun visual bindings must use the reference role",
+            ),
+          )
+          .max(16)
+          .optional(),
         findingIds: z.array(z.string().min(1)).optional(),
       })
       .default({}),
   })
   .superRefine((request, ctx) => {
+    if (request.inputContext.parentRunId && request.inputContext.predecessorRunId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["inputContext", "predecessorRunId"],
+        message: "parentRunId and predecessorRunId are mutually exclusive",
+      });
+    }
+    if (request.inputContext.predecessorRunId) {
+      if (request.phase !== "edit" && request.phase !== "repair") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["phase"],
+          message: "replan successors must use edit or repair phase",
+        });
+      }
+      for (const [field, present] of [
+        ["editBase", Boolean(request.inputContext.editBase)],
+        ["editImpactPlanHash", Boolean(request.inputContext.editImpactPlanHash)],
+        ["sandboxBindingId", Boolean(request.inputContext.sandboxBindingId)],
+      ] as const) {
+        if (!present) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["inputContext", field],
+            message: `replan successors require ${field}`,
+          });
+        }
+      }
+    }
     if (
       request.phase === "build" &&
       !request.inputContext.parentRunId &&
@@ -873,6 +1056,23 @@ export const ErrorResponseSchema = z.object({
 });
 
 export type ContentSource = z.infer<typeof ContentSourceSchema>;
+export type ContentPlanIdentity = z.infer<typeof ContentPlanIdentitySchema>;
+export type ContentPlanApproval = z.infer<typeof ContentPlanApprovalSchema>;
+export type RecordContentPlanApprovalRequest = z.input<
+  typeof RecordContentPlanApprovalRequestSchema
+>;
+export type RecordContentPlanChangeRequest = z.input<
+  typeof RecordContentPlanChangeRequestSchema
+>;
+export type ContentPlanChangeResult = z.infer<typeof ContentPlanChangeResultSchema>;
+export type ContentPlanApprovalVerification = z.infer<
+  typeof ContentPlanApprovalVerificationSchema
+>;
+export type ContentPlanApprovalProducerStatus = z.infer<
+  typeof ContentPlanApprovalProducerStatusSchema
+>;
+export type GenerationContextStatus = z.infer<typeof GenerationContextStatusSchema>;
+export type RunEfficiencyMetrics = z.infer<typeof RunEfficiencyMetricsSchema>;
 export type StartRunRequest = z.infer<typeof StartRunRequestSchema>;
 export type StartRunResponse = z.infer<typeof StartRunResponseSchema>;
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;
