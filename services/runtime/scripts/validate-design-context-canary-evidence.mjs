@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { validateDualReadRunEvidence } from "./generation-context-evidence.mjs";
 
 function fail(errors, message) {
   errors.push(message);
@@ -303,9 +304,10 @@ function passRun(run, mode, cohort, errors) {
   for (const field of ["runId", "candidateVersionId", "workerProvider", "workerVersion", "verificationPolicyId", "artifactUri", "evidenceUri"]) {
     if (!hasText(run[field])) fail(errors, `${mode}.${field} is required`);
   }
-  for (const field of ["candidateManifestHash", "designContextContentHash", "artifactManifestHash", "materializationHash", "verifierCapabilitySnapshotHash"]) {
+  for (const field of ["candidateManifestHash", "artifactManifestHash", "materializationHash", "verifierCapabilitySnapshotHash"]) {
     if (!sha256(run[field])) fail(errors, `${mode}.${field} must be sha256`);
   }
+  errors.push(...validateDualReadRunEvidence(run, mode));
   if (run.artifactManifestHash !== run.materializationHash) {
     fail(errors, `${mode} DCP materialization hash must match its artifact manifest hash`);
   }
@@ -317,13 +319,8 @@ function passRun(run, mode, cohort, errors) {
     || policy?.policyRevision !== expectedRevision || !hasText(policy?.policyUpdatedBy)) {
     fail(errors, `${mode} Website run must carry its frozen persistent enforcement policy binding`);
   }
-  const requiredReads = Array.isArray(run.requiredReadPaths) ? run.requiredReadPaths : [];
-  const readFiles = Array.isArray(run.readFiles) ? run.readFiles : [];
-  if (!requiredReads.length || requiredReads.some(path => !hasText(path) || !readFiles.includes(path))) {
-    fail(errors, `${mode} Website run must list every required DCP read and its recorded read evidence`);
-  }
-  if (run.status !== "completed" || run.publishVerdict !== "pass" || run.requiredReadsPassed !== true) {
-    fail(errors, `${mode} Website run must complete with all required reads and a passing publish verdict`);
+  if (run.status !== "completed" || run.publishVerdict !== "pass") {
+    fail(errors, `${mode} Website run must complete with a passing publish verdict`);
   }
 }
 

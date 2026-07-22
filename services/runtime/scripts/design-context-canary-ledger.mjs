@@ -8,6 +8,7 @@ import {
   validateCanaryLedgerChain,
   validateDesignContextCanaryEvidence,
 } from "./validate-design-context-canary-evidence.mjs";
+import { validateDualReadRunEvidence } from "./generation-context-evidence.mjs";
 
 const EVENT_TYPES = new Set([
   "website.run",
@@ -90,19 +91,19 @@ function validateEventPayload(type, payload, session) {
   const cohort = session.cohort;
   if (type === "website.run") {
     requireFields(payload, ["runId", "candidateVersionId", "workerProvider", "workerVersion", "verificationPolicyId", "artifactUri", "evidenceUri"], type);
-    for (const field of ["candidateManifestHash", "designContextContentHash", "artifactManifestHash", "materializationHash", "verifierCapabilitySnapshotHash"]) {
+    for (const field of ["candidateManifestHash", "artifactManifestHash", "materializationHash", "verifierCapabilitySnapshotHash"]) {
       if (!sha256(payload[field])) throw new Error(`${type}.${field} must be sha256`);
     }
+    const protocolErrors = validateDualReadRunEvidence(payload, type);
+    if (protocolErrors.length) throw new Error(protocolErrors.join("; "));
     const policy = payload.enforcementPolicy;
     const expectedRevision = payload.mode === "observe" ? cohort.observePolicyRevision : cohort.policyRevision;
     if (!["observe", "enforced"].includes(payload.mode) || !sameWebsiteCohort(payload, cohort, payload.mode)
       || payload.artifactManifestHash !== payload.materializationHash
-      || payload.status !== "completed" || payload.publishVerdict !== "pass" || payload.requiredReadsPassed !== true
-      || !Array.isArray(payload.requiredReadPaths) || payload.requiredReadPaths.length === 0
-      || payload.requiredReadPaths.some(path => !payload.readFiles?.includes(path))
+      || payload.status !== "completed" || payload.publishVerdict !== "pass"
       || policy?.source !== "persistent" || policy?.enabled !== (payload.mode === "enforced")
       || policy?.policyRevision !== expectedRevision || !hasText(policy?.policyUpdatedBy)) {
-      throw new Error("website.run must be a passing same-cohort DCP run with complete reads");
+      throw new Error("website.run must be a passing same-cohort DCP run with valid protocol evidence");
     }
     return;
   }

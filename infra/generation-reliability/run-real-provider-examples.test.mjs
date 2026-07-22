@@ -41,6 +41,60 @@ try {
     manifestFile,
   });
   await runScenario({
+    name: "keep-sandbox-accepted",
+    artifactText: "Fixture Expected Text",
+    keepSandbox: true,
+    expectedExitCode: 0,
+    expectedStatus: "accepted",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
+    name: "sandbox-release-transient-retry",
+    artifactText: "Fixture Expected Text",
+    releaseFailuresBeforeSuccess: 1,
+    expectedReleaseRequestCount: 3,
+    expectedExitCode: 0,
+    expectedStatus: "accepted",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
+    name: "sandbox-release-failure",
+    artifactText: "Fixture Expected Text",
+    releaseFailuresBeforeSuccess: 3,
+    expectedReleaseRequestCount: 3,
+    expectedExitCode: 1,
+    expectedStatus: "failed",
+    expectedClassification: "sandbox_release_failed",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
+    name: "static-draft-preview-accepted",
+    artifactText: "Fixture Expected Text",
+    draftPreviewAcceptance: true,
+    expectedExitCode: 0,
+    expectedStatus: "accepted",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
+    name: "dev-draft-preview-accepted",
+    artifactText: "Fixture Expected Text",
+    draftPreviewAcceptance: true,
+    devDraftPreviewAcceptance: true,
+    expectedExitCode: 0,
+    expectedStatus: "accepted",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
     name: "rejected",
     artifactText: "Wrong generated content",
     expectedExitCode: 1,
@@ -58,6 +112,19 @@ try {
     expectedExitCode: 1,
     expectedStatus: "failed",
     expectedClassification: "no_progress",
+    privateKeyFile,
+    adminTokenFile,
+    manifestFile,
+  });
+  await runScenario({
+    name: "no-progress-retry",
+    artifactText: "Fixture Expected Text",
+    buildFailuresBeforeSuccess: 1,
+    maxCaseAttempts: 2,
+    expectedExitCode: 0,
+    expectedStatus: "accepted",
+    expectedRunCount: 4,
+    expectedAttemptCount: 2,
     privateKeyFile,
     adminTokenFile,
     manifestFile,
@@ -172,15 +239,25 @@ async function runScenario({
   expectedMaxDurationMs = null,
   includeModelExecution = true,
   briefFailuresBeforeSuccess = 0,
+  buildFailuresBeforeSuccess = 0,
   maxCaseAttempts = 1,
+  draftPreviewAcceptance = false,
+  devDraftPreviewAcceptance = false,
+  keepSandbox = false,
+  releaseFailuresBeforeSuccess = 0,
+  expectedReleaseRequestCount = null,
   privateKeyFile,
   adminTokenFile,
   manifestFile,
 }) {
   let runCounter = 0;
   let briefEventRequests = 0;
+  let buildEventRequests = 0;
+  let releaseSandboxRequests = 0;
+  const runs = new Map();
   const receivedBriefPrompts = [];
   const receivedWorkspaceNamespaces = [];
+  const receivedContentPlans = [];
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     if (request.method === "PUT" && url.pathname.endsWith("/access")) {
@@ -190,14 +267,40 @@ async function runScenario({
       });
       return;
     }
+    if (request.method === "POST" && url.pathname.endsWith("/content-plan-changes")) {
+      collectJson(request).then((body) => {
+        receivedContentPlans.push({
+          kind: "change",
+          body,
+          internal: request.headers["x-anydesign-internal"] === "true",
+          hasAdminToken: typeof request.headers["x-runtime-admin-token"] === "string",
+          hasPrincipalToken: typeof request.headers.authorization === "string",
+        });
+        json(response, 200, { recorded: true });
+      });
+      return;
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/content-plan-approvals")) {
+      collectJson(request).then((body) => {
+        receivedContentPlans.push({
+          kind: "approval",
+          body,
+          internal: request.headers["x-anydesign-internal"] === "true",
+          hasAdminToken: typeof request.headers["x-runtime-admin-token"] === "string",
+          hasPrincipalToken: typeof request.headers.authorization === "string",
+        });
+        json(response, 200, { state: "verified" });
+      });
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/runs") {
       collectJson(request).then((body) => {
         if (body.phase === "brief") {
           receivedBriefPrompts.push(body.inputContext?.contentSources?.[0]?.text);
         }
-        json(response, 200, {
-          runId: `${body.phase}-run-${++runCounter}`,
-        });
+        const runId = `${body.phase}-run-${++runCounter}`;
+        runs.set(runId, { projectId: body.projectId, phase: body.phase });
+        json(response, 200, { runId });
       });
       return;
     }
@@ -211,14 +314,81 @@ async function runScenario({
         items: visibleBriefId ? [{ metadata: { briefId: visibleBriefId } }] : [],
       });
     }
+    if (
+      request.method === "GET" &&
+      devDraftPreviewAcceptance &&
+      url.pathname.endsWith("/draft-preview")
+    ) {
+      return json(response, 200, {
+        sessionId: "draft-session-fixture",
+        sessionEpoch: 1,
+        templateId: "next-app",
+        status: "ready",
+        workspaceRevision: 1,
+        lastReadyRevision: 1,
+        durableRevision: 1,
+        durableSnapshotId: "draft-snapshot-fixture",
+        proxyUrl: `http://${request.headers.host}/previews/fixture-dev-lease/`,
+      });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/continue")) {
       return json(response, 200, { continued: true });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.endsWith("/efficiency-metrics")
+    ) {
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run not found" });
+      const terminalStatus = run.terminalStatus ||
+        (run.phase === "build" ? buildStatus : briefStatus);
+      return json(response, 200, {
+        schemaVersion: "run-efficiency-metrics@1",
+        calculatorVersion: "run-efficiency-calculator@1",
+        runId,
+        projectId: run.projectId,
+        phase: run.phase,
+        model: "deepseek-v4-pro",
+        template: run.phase === "build" ? "next-app@2" : null,
+        status: terminalStatus,
+        inputTokens: usageInputTokens,
+        outputTokens: usageOutputTokens,
+        cachedInputTokens: 2,
+        prebuildFsReadCount: 0,
+        prebuildFsListCount: 0,
+        prebuildFsSearchCount: 0,
+        contextReadDeliveries: 0,
+        sourceReadDeliveries: 0,
+        diagnosticReadDeliveries: 0,
+        verificationReadDeliveries: 0,
+        fullReadDeliveries: 0,
+        duplicateFullReadDeliveries: 0,
+        duplicateFullReadRateBasisPoints: 0,
+        duplicateReadEstimatedTokens: 0,
+        outOfScopeMutationCount: 0,
+        firstBuildSucceeded: run.phase === "build" && terminalStatus === "completed",
+        requiredFidelityPassed: run.phase === "build" ? terminalStatus === "completed" : null,
+      });
     }
     if (request.method === "GET" && url.pathname.endsWith("/events")) {
       response.writeHead(200, { "content-type": "text/event-stream" });
       const phase = url.pathname.includes("brief-run") ? "brief" : "build";
       const transientBriefFailure =
         phase === "brief" && briefEventRequests++ < briefFailuresBeforeSuccess;
+      const transientBuildFailure =
+        phase === "build" && buildEventRequests++ < buildFailuresBeforeSuccess;
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (run) {
+        run.terminalStatus = transientBuildFailure
+          ? "partial"
+          : phase === "build"
+            ? buildStatus
+            : transientBriefFailure
+              ? "blocked"
+              : briefStatus;
+      }
       const events = [
         ...(includeModelExecution
           ? [{
@@ -236,17 +406,49 @@ async function runScenario({
           cachedInputTokens: 2,
         },
         { type: "tool.started", toolName: "fixture.tool" },
+        ...(phase === "build" && draftPreviewAcceptance
+          ? [
+              {
+                type: "tool.completed",
+                tool: devDraftPreviewAcceptance ? "preview.dev_start" : "preview.start",
+                metadata: {
+                  postToolUseSuccess: {
+                    url: `http://${request.headers.host}/previews/${devDraftPreviewAcceptance ? "fixture-dev-lease" : "fixture-lease"}/`,
+                  },
+                },
+              },
+              ...(devDraftPreviewAcceptance ? [{
+                type: "tool.completed",
+                tool: "preview.dev_status",
+                metadata: { postToolUseSuccess: { status: "ready", revision: 1 } },
+              }] : []),
+              {
+                type: "tool.completed",
+                tool: "draft.snapshot_create",
+                metadata: {
+                  postToolUseSuccess: {
+                    previewUrl: `http://${request.headers.host}/previews/${devDraftPreviewAcceptance ? "fixture-dev-lease" : "fixture-lease"}/`,
+                    snapshotId: "draft-snapshot-fixture",
+                  },
+                },
+              },
+            ]
+          : []),
         {
           type: "run.completed",
           status:
             phase === "build"
-              ? buildStatus
+              ? transientBuildFailure
+                ? "partial"
+                : buildStatus
               : transientBriefFailure
                 ? "blocked"
                 : briefStatus,
           summary:
             phase === "build"
-              ? buildSummary
+              ? transientBuildFailure
+                ? "Run stopped for no_progress: consecutive_turns=5, limit=5, fingerprint=fixture-retry"
+                : buildSummary
               : transientBriefFailure
                 ? "model gateway request failed: status=503 Service Unavailable code=provider_unavailable retryable=true"
                 : briefSummary,
@@ -261,17 +463,33 @@ async function runScenario({
     }
     if (
       request.method === "GET" &&
+      (url.pathname.startsWith("/previews/fixture-lease/") ||
+        url.pathname.startsWith("/previews/fixture-dev-lease/"))
+    ) {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      return response.end(`<main>${artifactText}</main>`);
+    }
+    if (
+      request.method === "GET" &&
       url.pathname.endsWith("/release-evidence")
     ) {
-      response.writeHead(409, { "content-type": "text/plain" });
+      response.writeHead(draftPreviewAcceptance ? 404 : 409, {
+        "content-type": "text/plain",
+      });
       return response.end(
-        "release evidence requires an Edit promotion with a base version",
+        draftPreviewAcceptance
+          ? "current version not found: fixture-project"
+          : "release evidence requires an Edit promotion with a base version",
       );
     }
     if (
       request.method === "POST" &&
       url.pathname.endsWith("/release-sandbox")
     ) {
+      releaseSandboxRequests += 1;
+      if (releaseSandboxRequests <= releaseFailuresBeforeSuccess) {
+        return json(response, 503, { released: false });
+      }
       return json(response, 200, { released: true });
     }
     response.writeHead(404);
@@ -293,7 +511,12 @@ async function runScenario({
         GENERATION_REAL_RUN_IDLE_TIMEOUT_MS: "30000",
         GENERATION_REAL_MAX_CASE_ATTEMPTS: String(maxCaseAttempts),
         GENERATION_REAL_CASE_RETRY_COOLDOWN_MS: "0",
+        GENERATION_REAL_SANDBOX_RELEASE_RETRY_COOLDOWN_MS: "0",
         GENERATION_REAL_WORKSPACE_NAMESPACE: "ws-real-provider-test",
+        ...(draftPreviewAcceptance
+          ? { GENERATION_REAL_DRAFT_PREVIEW_ACCEPTANCE: "1" }
+          : {}),
+        ...(keepSandbox ? { GENERATION_REAL_KEEP_SANDBOX: "true" } : {}),
         GENERATION_SOURCE_COMMIT: "fixture-commit",
         GENERATION_SOURCE_DIRTY: "false",
         GENERATION_PROVIDER_CONFIG_DIGEST: "a".repeat(64),
@@ -331,6 +554,8 @@ async function runScenario({
     assert.equal(summary.provenance.providerResourceRevision, 2);
     assert.equal(summary.cases[0].status, expectedCaseStatus);
     assert.equal(summary.provider.realProviderVerified, expectedProviderVerified);
+    assert.equal(summary.approval.contentPlanApprovalMode, "automated_fixture_exact_identity");
+    assert.equal(summary.approval.verifiedContentPlanCount, 1);
     if (expectedClassification !== null) {
       assert.equal(
         summary.cases[0].error?.classification || null,
@@ -338,6 +563,8 @@ async function runScenario({
       );
     }
     assert.equal(summary.cases[0].acceptanceContractSha256.length, 64);
+    assert.equal(summary.cases[0].contentPlan.state, "verified");
+    assert.equal(summary.cases[0].contentPlan.intentSha256.length, 64);
     if (expectedRemainingTokens !== null) {
       assert.equal(summary.budget.configuredTotalTokens, totalTokenCeiling);
       assert.equal(summary.budget.remainingTokens, expectedRemainingTokens);
@@ -352,8 +579,38 @@ async function runScenario({
     assert.equal(caseEvidence.schemaVersion, "generation-real-provider-case-evidence@2");
     assert.equal(caseEvidence.runs.length, expectedRunCount);
     assert.equal(caseEvidence.attempts.length, expectedAttemptCount);
+    assert.equal(caseEvidence.sandboxRelease.required, !keepSandbox);
+    assert.equal(
+      caseEvidence.sandboxRelease.released,
+      keepSandbox ? false : expectedClassification !== "sandbox_release_failed",
+    );
+    if (draftPreviewAcceptance) {
+      if (devDraftPreviewAcceptance) {
+        assert.equal(caseEvidence.draftPreview.durableSnapshotId, "draft-snapshot-fixture");
+        assert.equal(caseEvidence.draftPreview.hmr, true);
+      } else {
+        assert.equal(caseEvidence.draftPreview.snapshotId, "draft-snapshot-fixture");
+        assert.equal(caseEvidence.draftPreview.hmr, false);
+      }
+      assert.equal(caseEvidence.draftPreview.expectedTextFound, true);
+      assert.equal(
+        caseEvidence.releaseEvidence.reason,
+        "draft-only-suite-does-not-create-current-version",
+      );
+    }
     assert.ok(receivedBriefPrompts.length >= 1);
     assert.ok(receivedWorkspaceNamespaces.length >= 1);
+    assert.equal(receivedContentPlans.length, expectedAttemptCount * 2);
+    assert.ok(receivedContentPlans.every(({ body }) => body.contentHash.length === 64));
+    assert.ok(receivedContentPlans.every(({ internal, hasAdminToken }) => internal && hasAdminToken));
+    assert.ok(receivedContentPlans.every(({ hasPrincipalToken }) => !hasPrincipalToken));
+    assert.equal(
+      releaseSandboxRequests,
+      expectedReleaseRequestCount ?? (keepSandbox ? 0 : expectedAttemptCount * 2),
+      keepSandbox
+        ? "keep-sandbox mode must defer release to the Runtime Restart probe"
+        : "the ordinary runner must release every attempted Sandbox",
+    );
     assert.ok(
       receivedWorkspaceNamespaces.every(
         (namespace) => namespace === "ws-real-provider-test",
@@ -367,8 +624,22 @@ async function runScenario({
     for (const run of caseEvidence.runs) {
       assert.equal(run.eventStream.incremental, true);
       assert.equal(run.eventStream.format, "ndjson");
-      assert.equal(run.eventStream.eventCount, includeModelExecution ? 4 : 3);
+      assert.equal(
+        run.eventStream.eventCount,
+        (includeModelExecution ? 4 : 3) +
+          (draftPreviewAcceptance && run.phase === "build"
+            ? devDraftPreviewAcceptance ? 3 : 2
+            : 0),
+      );
       assert.equal(run.toolCalls, 1);
+      if (run.status === "completed") {
+        const owningAttempt = caseEvidence.attempts.find((attempt) =>
+          attempt.runIds.includes(run.runId),
+        );
+        assert.ok(owningAttempt, `missing owning attempt for ${run.runId}`);
+        assert.equal(run.efficiency.runId, run.runId);
+        assert.equal(run.efficiency.projectId, owningAttempt.projectId);
+      }
       assert.ok(fs.existsSync(path.join(suiteDirectory, run.eventStream.path)));
       for (const execution of run.modelExecutions) {
         assert.equal(execution.providerRequestId, undefined);

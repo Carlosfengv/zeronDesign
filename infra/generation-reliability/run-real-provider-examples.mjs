@@ -67,11 +67,30 @@ const caseRetryCooldownMs = Number.parseInt(
   process.env.GENERATION_REAL_CASE_RETRY_COOLDOWN_MS || "45000",
   10,
 );
+const sandboxReleaseMaxAttempts = Number.parseInt(
+  process.env.GENERATION_REAL_SANDBOX_RELEASE_MAX_ATTEMPTS || "3",
+  10,
+);
+const sandboxReleaseRetryCooldownMs = Number.parseInt(
+  process.env.GENERATION_REAL_SANDBOX_RELEASE_RETRY_COOLDOWN_MS || "1000",
+  10,
+);
 const designProfileFixture = (
   process.env.GENERATION_REAL_DESIGN_PROFILE_FIXTURE || ""
 ).trim();
 const draftPreviewAcceptance =
   process.env.GENERATION_REAL_DRAFT_PREVIEW_ACCEPTANCE === "1";
+const draftWarmEditCanary =
+  process.env.GENERATION_REAL_DRAFT_WARM_EDIT_CANARY === "1";
+const draftColdDevEditCanary =
+  process.env.GENERATION_REAL_DRAFT_COLD_DEV_EDIT_CANARY === "1";
+const repairCanary = process.env.GENERATION_REAL_REPAIR_CANARY === "1";
+const keepSandbox = process.env.GENERATION_REAL_KEEP_SANDBOX === "true";
+if ([draftWarmEditCanary, draftColdDevEditCanary, repairCanary].filter(Boolean).length > 1) {
+  throw new Error("Warm Edit, Cold Dev Edit, and Repair canaries are mutually exclusive");
+}
+const draftLifecycleEditCanary =
+  draftWarmEditCanary || draftColdDevEditCanary;
 
 fs.mkdirSync(suiteDirectory, { recursive: true });
 
@@ -130,6 +149,24 @@ if (
     "GENERATION_REAL_CASE_RETRY_COOLDOWN_MS must be between 0 and 300000",
   );
 }
+if (
+  !Number.isSafeInteger(sandboxReleaseMaxAttempts) ||
+  sandboxReleaseMaxAttempts < 1 ||
+  sandboxReleaseMaxAttempts > 3
+) {
+  throw new Error(
+    "GENERATION_REAL_SANDBOX_RELEASE_MAX_ATTEMPTS must be between 1 and 3",
+  );
+}
+if (
+  !Number.isSafeInteger(sandboxReleaseRetryCooldownMs) ||
+  sandboxReleaseRetryCooldownMs < 0 ||
+  sandboxReleaseRetryCooldownMs > 30_000
+) {
+  throw new Error(
+    "GENERATION_REAL_SANDBOX_RELEASE_RETRY_COOLDOWN_MS must be between 0 and 30000",
+  );
+}
 const selectedCases =
   requestedCaseIds.length > 0
     ? requestedCaseIds.map((id) => {
@@ -138,6 +175,9 @@ const selectedCases =
         return testCase;
       })
     : manifest.cases.slice(0, requestedCaseLimit);
+if (repairCanary && selectedCases.some((testCase) => testCase.kind !== "docs")) {
+  throw new Error("Repair canary currently requires docs fixtures with a Version lifecycle");
+}
 if (new Set(selectedCases.map((testCase) => testCase.id)).size !== selectedCases.length) {
   throw new Error("GENERATION_REAL_CASE_IDS must not contain duplicates");
 }
@@ -174,9 +214,15 @@ for (const [index, testCase] of selectedCases.entries()) {
     runs: [],
     attempts: [],
     artifact: null,
+    contentPlan: null,
     designProfile: null,
     draftPreview: null,
+    warmEdit: null,
+    coldDevEdit: null,
+    repair: null,
     releaseEvidence: null,
+    sandboxRelease: null,
+    cleanupError: null,
     error: null,
   };
 
@@ -188,11 +234,29 @@ for (const [index, testCase] of selectedCases.entries()) {
     result.projectId = projectId;
     result.status = "failed";
     result.artifact = null;
+    result.warmEdit = null;
+    result.coldDevEdit = null;
+    result.repair = null;
     result.releaseEvidence = null;
+    result.sandboxRelease = null;
+    result.cleanupError = null;
     result.error = null;
 
     try {
       await grantProjectAccess(projectId);
+      const executionPrompt =
+        draftLifecycleEditCanary && caseNumber === 1
+          ? [
+              testCase.prompt,
+              "完成 Build 时必须使用 preview.dev_start 和 preview.dev_status 建立 ready 且 durable 的 DraftPreviewSession；不要使用 preview.start 静态候选预览。",
+            ].join(" ")
+          : testCase.prompt;
+      const contentPlan = await prepareApprovedContentPlan(
+        projectId,
+        testCase,
+        executionPrompt,
+      );
+      result.contentPlan = contentPlan.evidence;
       if (designProfileFixture) {
         result.designProfile = configureAndBindDesignProfile(projectId);
       }
@@ -200,7 +264,7 @@ for (const [index, testCase] of selectedCases.entries()) {
       let brief;
       try {
         assertRunReservation("brief", testCase.id);
-        brief = await runBrief(projectId, testCase.prompt);
+        brief = await runBrief(projectId, executionPrompt);
         result.runs.push(brief.evidence);
         addUsage(brief.evidence.usage);
         assertActualBudget();
@@ -213,11 +277,12 @@ for (const [index, testCase] of selectedCases.entries()) {
         throw error;
       }
 
+      let buildResult;
       try {
         assertRunReservation("build", testCase.id);
-        const build = await runBuild(projectId, brief.briefId);
-        result.runs.push(...build.evidence);
-        for (const run of build.evidence) addUsage(run.usage);
+        buildResult = await runBuild(projectId, brief.briefId, contentPlan.identity);
+        result.runs.push(...buildResult.evidence);
+        for (const run of buildResult.evidence) addUsage(run.usage);
         assertActualBudget();
       } catch (error) {
         for (const run of error.runEvidence || []) {
@@ -228,8 +293,63 @@ for (const [index, testCase] of selectedCases.entries()) {
         throw error;
       }
 
+      if (draftLifecycleEditCanary && caseNumber === 1) {
+        const lifecycleEdit = runDraftLifecycleEditCanary(
+          projectId,
+          brief.briefId,
+          contentPlan.identity,
+        );
+        if (draftColdDevEditCanary) {
+          result.coldDevEdit = lifecycleEdit;
+        } else {
+          result.warmEdit = lifecycleEdit;
+        }
+        if (lifecycleEdit.status !== "accepted") {
+          throw classifiedError(
+            draftColdDevEditCanary
+              ? "cold_dev_edit_canary_failed"
+              : "warm_edit_canary_failed",
+            `Draft lifecycle Edit canary failed: ${lifecycleEdit.error?.message || lifecycleEdit.status}`,
+          );
+        }
+      }
+
+      if (repairCanary && caseNumber === 1) {
+        const buildRunId = buildResult.evidence.at(-1)?.runId;
+        if (!buildRunId) throw new Error("Repair canary base Build omitted its run id");
+        const repair = await runRepairCanary(
+          projectId,
+          buildRunId,
+          buildResult.candidateVersionId,
+          contentPlan.identity,
+          testCase,
+        );
+        result.repair = repair;
+        for (const run of [repair.setupEdit?.run, repair.reviewRun, repair.run].filter(Boolean)) {
+          result.runs.push(run);
+        }
+        assertActualBudget();
+        if (repair.status !== "accepted") {
+          throw classifiedError(
+            "repair_canary_failed",
+            `Repair canary failed: ${repair.error?.message || repair.status}`,
+          );
+        }
+      }
+
+      if (buildResult.canaryRecoveredFromTerminalFailure) {
+        throw classifiedError(
+          "warm_edit_canary_base_build_terminal_failure",
+          "Warm Edit canary completed from a ready durable Draft, but its base Build retained the original terminal failure",
+        );
+      }
+
       if (draftPreviewAcceptance) {
-        result.draftPreview = await verifyDraftPreview(projectId, testCase);
+        result.draftPreview = await verifyDraftPreview(
+          projectId,
+          testCase,
+          buildResult.staticPreview,
+        );
       } else {
         const principalToken = issuePrincipalToken(projectId);
         const artifactUrl = new URL(
@@ -282,6 +402,15 @@ for (const [index, testCase] of selectedCases.entries()) {
       );
       const releaseEvidenceBody = await releaseEvidenceResponse.text();
       if (
+        draftPreviewAcceptance &&
+        releaseEvidenceResponse.status === 404 &&
+        releaseEvidenceBody.includes("current version not found")
+      ) {
+        result.releaseEvidence = {
+          available: false,
+          reason: "draft-only-suite-does-not-create-current-version",
+        };
+      } else if (
         releaseEvidenceResponse.status === 409 &&
         releaseEvidenceBody.includes(
           "release evidence requires an Edit promotion with a base version",
@@ -313,7 +442,27 @@ for (const [index, testCase] of selectedCases.entries()) {
         message: String(error?.message || error),
       };
     } finally {
-      await releaseSandbox(projectId);
+      result.sandboxRelease = keepSandbox
+        ? {
+            required: false,
+            released: false,
+            attempts: [],
+            maxAttempts: sandboxReleaseMaxAttempts,
+            requiredSuccessfulResponses: 2,
+          }
+        : await releaseSandboxWithRetry(projectId);
+      if (!keepSandbox && !result.sandboxRelease.released) {
+        const cleanupError = {
+          name: "Error",
+          classification: "sandbox_release_failed",
+          message: `sandbox release failed after ${result.sandboxRelease.attempts.length} attempts`,
+        };
+        result.cleanupError = cleanupError;
+        if (result.status === "accepted") {
+          result.status = "failed";
+          result.error = cleanupError;
+        }
+      }
       const attemptRuns = result.runs.slice(attemptRunStart);
       result.attempts.push({
         attempt,
@@ -326,16 +475,18 @@ for (const [index, testCase] of selectedCases.entries()) {
           (total, run) => total + run.usage.totalTokens,
           0,
         ),
+        sandboxRelease: result.sandboxRelease,
+        cleanupError: result.cleanupError,
         error: result.error,
       });
     }
 
     if (result.status === "accepted") break;
-    if (!isRetryableProviderFailure(result.error) || attempt >= maxCaseAttempts) {
+    if (!isRetryableCaseFailure(result.error) || attempt >= maxCaseAttempts) {
       break;
     }
     process.stdout.write(
-      `[${caseNumber}/${selectedCases.length}] ${testCase.id}: transient Provider failure; retrying attempt ${attempt + 1}/${maxCaseAttempts} after ${caseRetryCooldownMs}ms\n`,
+      `[${caseNumber}/${selectedCases.length}] ${testCase.id}: retryable case failure (${result.error.classification}); retrying attempt ${attempt + 1}/${maxCaseAttempts} after ${caseRetryCooldownMs}ms\n`,
     );
     await delay(caseRetryCooldownMs);
   }
@@ -403,6 +554,10 @@ const summary = {
     required: false,
     manualApprovalCount: 0,
     briefProtocolConfirmation: "automated",
+    contentPlanApprovalMode: "automated_fixture_exact_identity",
+    verifiedContentPlanCount: caseResults.filter(
+      (result) => result.contentPlan?.state === "verified",
+    ).length,
   },
   budget: {
     configuredTotalTokens: suiteTokenCeiling,
@@ -425,6 +580,7 @@ const summary = {
     expectedRoute: result.expectedRoute,
     expectedText: result.expectedText,
     acceptanceContractSha256: result.acceptance.sha256,
+    contentPlan: result.contentPlan,
     attemptCount: result.attempts.length,
     attempts: result.attempts,
     runIds: result.runs.map((run) => run.runId),
@@ -433,6 +589,44 @@ const summary = {
       0,
     ),
     artifact: result.artifact,
+    warmEdit: result.warmEdit
+      ? {
+          status: result.warmEdit.status,
+          runId: result.warmEdit.run?.runId || null,
+          totalTokens: result.warmEdit.run?.usage?.totalTokens || 0,
+          providerVerified: result.warmEdit.providerVerified === true,
+          hmrMetricRecorded: result.warmEdit.hmrMetricRecorded === true,
+          evidencePath: result.warmEdit.evidencePath,
+      }
+      : null,
+    coldDevEdit: result.coldDevEdit
+      ? {
+          status: result.coldDevEdit.status,
+          runId: result.coldDevEdit.run?.runId || null,
+          totalTokens: result.coldDevEdit.run?.usage?.totalTokens || 0,
+          providerVerified: result.coldDevEdit.providerVerified === true,
+          coldDevMetricRecorded:
+            result.coldDevEdit.coldDevMetricRecorded === true,
+          durableSnapshotMetricRecorded:
+            result.coldDevEdit.durableSnapshotMetricRecorded === true,
+          evidencePath: result.coldDevEdit.evidencePath,
+      }
+      : null,
+    repair: result.repair
+      ? {
+          status: result.repair.status,
+          reviewRunId: result.repair.reviewRun?.runId || null,
+          repairRunId: result.repair.run?.runId || null,
+          findingId: result.repair.reviewFinding?.findingId || null,
+          totalTokens:
+            (result.repair.reviewRun?.usage?.totalTokens || 0) +
+            (result.repair.run?.usage?.totalTokens || 0),
+          providerVerified: result.repair.providerVerified === true,
+          repairVerification: result.repair.repairVerification,
+      }
+      : null,
+    sandboxRelease: result.sandboxRelease,
+    cleanupError: result.cleanupError,
     error: result.error,
   })),
 };
@@ -457,8 +651,8 @@ function validateManifest(value) {
   if (value.provider?.gatewayMode !== "internal_gateway") {
     throw new Error("real-provider suite must use the governed internal Gateway");
   }
-  if (value.provider?.modelResourceId !== "deepseek-v4-pro") {
-    throw new Error("real-provider suite must target deepseek-v4-pro");
+  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(value.provider?.modelResourceId || "")) {
+    throw new Error("real-provider suite must target a valid frozen model resource id");
   }
   if (value.approval?.required !== false) {
     throw new Error("real-provider suite must not require human approval");
@@ -560,7 +754,443 @@ function configureAndBindDesignProfile(projectId) {
   };
 }
 
-async function verifyDraftPreview(projectId, testCase) {
+function repairMarker() {
+  const marker = (
+    process.env.GENERATION_REAL_REPAIR_MARKER ||
+    `REPAIR_CANARY_${suiteId.slice(-12)}`
+  ).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{7,80}$/.test(marker)) {
+    throw new Error("GENERATION_REAL_REPAIR_MARKER has an invalid format");
+  }
+  return marker;
+}
+
+async function runRepairCanary(
+  projectId,
+  buildRunId,
+  baseVersionId,
+  contentPlan,
+  testCase,
+) {
+  const marker = repairMarker();
+  const startedAt = new Date().toISOString();
+  const evidence = {
+    schemaVersion: "generation-real-provider-repair-evidence@1",
+    startedAt,
+    finishedAt: null,
+    status: "failed",
+    projectId,
+    prompt: [
+      `Review the deliberate inaccessible contrast defect on ${marker}.`,
+      "Create a repairable blocking finding through the read-only Review run, then repair only that scoped finding and publish a fresh validated Version.",
+    ].join(" "),
+    lifecycleProfile: "repair_warm",
+    repairMarker: marker,
+    initialBuildRunId: buildRunId,
+    initialBuildVersionId: baseVersionId,
+    baseVersionId: null,
+    setupEdit: null,
+    reviewRun: null,
+    reviewFinding: null,
+    run: null,
+    generationContextStatus: null,
+    repairedVersionId: null,
+    repairVerification: null,
+    providerVerified: false,
+    secretMaterialPersisted: false,
+    error: null,
+  };
+  let reviewEvents = [];
+  let repairEvents = [];
+  try {
+    if (!baseVersionId) {
+      throw new Error("Repair canary base Build did not produce a candidate Version");
+    }
+    assertRunReservation("repair_fixture_edit", testCase.id);
+    evidence.setupEdit = runRepairFixtureEdit(projectId, marker, contentPlan);
+    if (evidence.setupEdit.run?.usage) {
+      addUsage(evidence.setupEdit.run.usage);
+      assertActualBudget();
+    }
+    if (
+      evidence.setupEdit.status !== "accepted" ||
+      !evidence.setupEdit.versionId ||
+      evidence.setupEdit.versionId === baseVersionId ||
+      evidence.setupEdit.run?.status !== "completed"
+    ) {
+      throw new Error(
+        `Repair fixture Edit failed: ${evidence.setupEdit.error?.message || evidence.setupEdit.status}`,
+      );
+    }
+    evidence.baseVersionId = evidence.setupEdit.versionId;
+    assertRunReservation("review", testCase.id);
+    const reviewStarted = await startRun(projectId, "review", "visual-review", {
+      parentRunId: evidence.setupEdit.run.runId,
+    });
+    const reviewStream = await readRunEvents(projectId, reviewStarted.runId, "review");
+    reviewEvents = reviewStream.events;
+    evidence.reviewRun = summarizeRun(
+      "review",
+      reviewStarted.runId,
+      reviewEvents,
+      reviewStream.evidence,
+    );
+    evidence.reviewRun.efficiency = await fetchRunEfficiencyMetrics(
+      projectId,
+      reviewStarted.runId,
+    );
+    addUsage(evidence.reviewRun.usage);
+    assertActualBudget();
+    if (evidence.reviewRun.status !== "completed") {
+      throw new Error(
+        `Review did not complete: ${evidence.reviewRun.summary || evidence.reviewRun.status}`,
+      );
+    }
+    const findings = reviewEvents
+      .filter(
+        (event) =>
+          event.type === "review.finding" &&
+          typeof event.findingId === "string" &&
+          event.findingId.length > 0,
+      )
+      .sort((left, right) => {
+        const matchesTarget = (event) => {
+          const summary = String(event.summary || "").toLowerCase();
+          return summary.includes(marker.toLowerCase()) || summary.includes("contrast");
+        };
+        return Number(matchesTarget(right)) - Number(matchesTarget(left));
+      });
+    if (findings.length === 0) {
+      throw new Error("read-only Review completed without recording a scoped finding");
+    }
+
+    assertRunReservation("repair", testCase.id);
+    let repairStarted = null;
+    let finding = null;
+    let lastStartError = null;
+    for (const candidateFinding of findings) {
+      try {
+        repairStarted = await startRun(projectId, "repair", "repair", {
+          parentRunId: reviewStarted.runId,
+          findingIds: [candidateFinding.findingId],
+          contentPlan,
+        });
+        finding = candidateFinding;
+        break;
+      } catch (error) {
+        lastStartError = error;
+      }
+    }
+    if (!repairStarted || !finding) {
+      throw lastStartError || new Error("Review produced no repairable finding");
+    }
+    evidence.reviewFinding = {
+      findingId: finding.findingId,
+      severity: finding.severity || null,
+      summary: finding.summary || null,
+      source: "real-provider-review.report_finding",
+    };
+    evidence.generationContextStatus = await fetchGenerationContextStatus(
+      projectId,
+      repairStarted.runId,
+    );
+    if (evidence.generationContextStatus.executionProfile !== "repair_warm") {
+      throw new Error(
+        `Repair run used unexpected execution profile: ${evidence.generationContextStatus.executionProfile || "missing"}`,
+      );
+    }
+    const repairStream = await readRunEvents(projectId, repairStarted.runId, "repair");
+    repairEvents = repairStream.events;
+    evidence.run = summarizeRun(
+      "repair",
+      repairStarted.runId,
+      repairEvents,
+      repairStream.evidence,
+    );
+    evidence.run.efficiency = await fetchRunEfficiencyMetrics(
+      projectId,
+      repairStarted.runId,
+    );
+    addUsage(evidence.run.usage);
+    assertActualBudget();
+    if (evidence.run.status !== "completed") {
+      throw new Error(
+        `Repair did not complete: ${evidence.run.summary || evidence.run.status}`,
+      );
+    }
+    evidence.repairedVersionId = extractCandidateVersionId(repairEvents);
+    const artifactBody = await readCurrentArtifactBody(projectId, testCase.expectedRoute);
+    evidence.repairVerification = {
+      reviewFindingRecorded: true,
+      findingFixedByCompletedRepair: true,
+      freshVersionCreated:
+        Boolean(evidence.repairedVersionId) &&
+        evidence.repairedVersionId !== evidence.baseVersionId,
+      sourceMutationRecorded:
+        Number.isFinite(evidence.run.efficiency.timeToFirstSourceMutationMs) ||
+        Number.isFinite(evidence.run.efficiency.modelTurnAtFirstSourceMutation),
+      previewPublishRecorded: repairEvents.some(
+        (event) => event.type === "tool.completed" && event.tool === "preview.publish",
+      ),
+      markerPreserved: artifactBody.includes(marker),
+      artifactBodySha256: sha256(artifactBody),
+    };
+    evidence.providerVerified = [evidence.reviewRun, evidence.run].every(
+      (run) =>
+        run.modelExecutions.length > 0 &&
+        run.modelExecutions.every(
+          (execution) =>
+            execution.modelResourceId === manifest.provider.modelResourceId &&
+            execution.providerRequestIdPresent === true,
+        ),
+    );
+    if (
+      !evidence.providerVerified ||
+      Object.entries(evidence.repairVerification)
+        .filter(([key]) => key !== "artifactBodySha256")
+        .some(([, value]) => value !== true)
+    ) {
+      throw new Error("Repair lifecycle evidence did not satisfy its acceptance contract");
+    }
+    evidence.status = "accepted";
+  } catch (error) {
+    if (!evidence.reviewRun && reviewEvents.length > 0) {
+      evidence.reviewRun = summarizeRun("review", "unknown", reviewEvents);
+    }
+    if (!evidence.run && repairEvents.length > 0) {
+      evidence.run = summarizeRun("repair", "unknown", repairEvents);
+    }
+    evidence.error = {
+      name: error?.name || "Error",
+      message: String(error?.message || error),
+    };
+  }
+  evidence.finishedAt = new Date().toISOString();
+  return evidence;
+}
+
+function runRepairFixtureEdit(projectId, marker, contentPlan) {
+  const evidenceRoot = path.join(suiteDirectory, `repair-fixture-edit-${projectId}`);
+  const prompt = [
+    "Make one isolated setup change for a later accessibility Review/Repair canary.",
+    `Add the exact visible text ${marker} to the main documentation content in a small span.`,
+    "Use valid JSX with a React style object whose color is #ffffff and backgroundColor is #ffffff, intentionally making only that marker unreadable due to zero contrast.",
+    "Preserve every existing route and required text, publish the updated candidate, and do not fix the deliberate marker contrast in this setup Edit.",
+  ].join(" ");
+  let executionError = null;
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.resolve("infra/generation-reliability/run-real-provider-edit.mjs"),
+        baseUrl,
+        principalPrivateKeyFile,
+        adminTokenFile,
+        projectId,
+        prompt,
+        evidenceRoot,
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          GENERATION_REAL_MODEL_RESOURCE_ID: manifest.provider.modelResourceId,
+          GENERATION_REAL_DRAFT_WARM_EDIT: "false",
+          GENERATION_REAL_DRAFT_COLD_DEV_EDIT: "false",
+          GENERATION_REAL_KEEP_SANDBOX: "true",
+          GENERATION_REAL_CONTENT_PLAN_JSON: JSON.stringify(contentPlan),
+          GENERATION_REAL_ARTIFACT_KIND: "docs",
+          GENERATION_REAL_EXPECTED_ARTIFACT_TEXT: marker,
+        },
+        stdio: "inherit",
+      },
+    );
+  } catch (error) {
+    executionError = error;
+  }
+  const evidenceDirectory = fs
+    .readdirSync(evidenceRoot, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        (entry.name.endsWith("-accepted") || entry.name.endsWith("-failed")),
+    )
+    .map((entry) => path.join(evidenceRoot, entry.name))
+    .sort()
+    .at(-1);
+  if (!evidenceDirectory) {
+    throw executionError || new Error("Repair fixture Edit did not produce evidence");
+  }
+  const evidenceFile = path.join(
+    evidenceDirectory,
+    "real-provider-edit-summary.json",
+  );
+  const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+  return {
+    ...evidence,
+    evidencePath: path.relative(suiteDirectory, evidenceFile),
+  };
+}
+
+async function fetchGenerationContextStatus(projectId, runId) {
+  const response = await fetchWithTimeout(
+    new URL(
+      `/runs/${encodeURIComponent(runId)}/generation-context-status`,
+      baseUrl,
+    ),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `generation context status returned ${response.status}: ${body.slice(0, 500)}`,
+    );
+  }
+  return JSON.parse(body);
+}
+
+async function readCurrentArtifactBody(projectId, route) {
+  const response = await fetchWithTimeout(
+    new URL(
+      `/artifacts/${encodeURIComponent(projectId)}/current${route}`,
+      baseUrl,
+    ),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `repaired artifact route returned ${response.status}: ${body.slice(0, 500)}`,
+    );
+  }
+  return body;
+}
+
+function runDraftLifecycleEditCanary(projectId, briefId, contentPlan) {
+  const lifecycleKind = draftColdDevEditCanary
+    ? "cold_dev"
+    : (process.env.GENERATION_REAL_DRAFT_WARM_EDIT_KIND || "copy_css").trim();
+  if (!new Set(["copy_css", "structural", "cold_dev"]).has(lifecycleKind)) {
+    throw new Error("Draft lifecycle Edit kind is invalid");
+  }
+  const marker = (
+    process.env.GENERATION_REAL_WARM_EDIT_MARKER ||
+    `WARM-HMR-VERIFIED-${suiteId.slice(-8)}`
+  ).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{7,80}$/.test(marker)) {
+    throw new Error("GENERATION_REAL_WARM_EDIT_MARKER has an invalid format");
+  }
+  const evidenceRoot = path.join(
+    suiteDirectory,
+    `${draftColdDevEditCanary ? "cold-dev-edit" : "warm-edit"}-${projectId}`,
+  );
+  const prompt = lifecycleKind === "cold_dev"
+    ? [
+        "Update only project/app/page.tsx.",
+        `Add the exact visible text ${marker} near the existing page heading without removing existing content.`,
+        "Do not modify package.json or any Runtime-owned contract file. Restore the existing dependency graph with project.ensure_dependencies mode restore.",
+        "Follow Runtime Workflow Progress exactly: stop the prior managed Dev process once, restart Dev once, wait for the current revision to become ready and durable, then complete the run. Do not inspect ports or processes with shell.run.",
+        "Do not run a Production Build.",
+      ].join(" ")
+    : lifecycleKind === "structural"
+    ? [
+        "Update only project/app/page.tsx.",
+        `Add a new visible section headed by the exact text ${marker} without removing existing content.`,
+        "Change the page structure with a semantic section and reuse the existing visual language.",
+        "Keep the current managed Dev session, wait for preview.dev_status to report the current revision as ready and durable, create the durable DraftSnapshot, then complete the run.",
+      ].join(" ")
+    : [
+        "Update only project/app/page.tsx.",
+        `Add the exact visible text ${marker} near the existing page heading without removing existing content, and make only a small CSS presentation adjustment to that text.`,
+        "Keep the current managed Dev session, wait for preview.dev_status to report the current revision as ready and durable, create the durable DraftSnapshot, then complete the run.",
+      ].join(" ");
+  let executionError = null;
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        path.resolve("infra/generation-reliability/run-real-provider-edit.mjs"),
+        baseUrl,
+        principalPrivateKeyFile,
+        adminTokenFile,
+        projectId,
+        prompt,
+        evidenceRoot,
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          GENERATION_REAL_MODEL_RESOURCE_ID: manifest.provider.modelResourceId,
+          GENERATION_REAL_DRAFT_WARM_EDIT: draftColdDevEditCanary ? "false" : "true",
+          GENERATION_REAL_DRAFT_COLD_DEV_EDIT: draftColdDevEditCanary ? "true" : "false",
+          GENERATION_REAL_DRAFT_WARM_EDIT_KIND:
+            lifecycleKind === "cold_dev" ? "copy_css" : lifecycleKind,
+          GENERATION_REAL_KEEP_SANDBOX: "true",
+          GENERATION_REAL_EXPECTED_DRAFT_TEXT: marker,
+          GENERATION_REAL_BRIEF_ID: briefId,
+          GENERATION_REAL_CONTENT_PLAN_JSON: JSON.stringify(contentPlan),
+        },
+        stdio: "inherit",
+      },
+    );
+  } catch (error) {
+    executionError = error;
+  }
+  const evidenceDirectories = fs
+    .readdirSync(evidenceRoot, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        (entry.name.endsWith("-accepted") || entry.name.endsWith("-failed")),
+    )
+    .map((entry) => path.join(evidenceRoot, entry.name))
+    .sort();
+  const evidenceDirectory = evidenceDirectories.at(-1);
+  if (!evidenceDirectory) {
+    throw executionError || new Error("Draft lifecycle Edit canary did not produce evidence");
+  }
+  const evidenceFile = path.join(
+    evidenceDirectory,
+    "real-provider-edit-summary.json",
+  );
+  const evidence = JSON.parse(fs.readFileSync(evidenceFile, "utf8"));
+  if (
+    evidence.status === "accepted" &&
+    (evidence.providerVerified !== true ||
+      (!draftColdDevEditCanary && evidence.hmrMetricRecorded !== true) ||
+      (draftColdDevEditCanary &&
+        (evidence.coldDevMetricRecorded !== true ||
+          evidence.durableSnapshotMetricRecorded !== true)))
+  ) {
+    throw new Error(
+      `Draft lifecycle Edit canary evidence is incomplete: ${JSON.stringify({
+        status: evidence.status,
+        providerVerified: evidence.providerVerified,
+        hmrMetricRecorded: evidence.hmrMetricRecorded,
+        coldDevMetricRecorded: evidence.coldDevMetricRecorded,
+        durableSnapshotMetricRecorded: evidence.durableSnapshotMetricRecorded,
+      })}`,
+    );
+  }
+  return {
+    ...evidence,
+    lifecycleProfile: draftColdDevEditCanary ? "cold_dev" : "warm_hmr",
+    warmEditKind: draftColdDevEditCanary ? null : lifecycleKind,
+    evidencePath: path.relative(suiteDirectory, evidenceFile),
+  };
+}
+
+async function verifyDraftPreview(projectId, testCase, staticPreview) {
+  if (staticPreview) {
+    return verifyStaticDraftPreview(projectId, testCase, staticPreview);
+  }
   const deadline = Date.now() + 180_000;
   let session;
   while (Date.now() < deadline) {
@@ -645,6 +1275,48 @@ async function verifyDraftPreview(projectId, testCase) {
   };
 }
 
+async function verifyStaticDraftPreview(projectId, testCase, staticPreview) {
+  const prefix = `/projects/${projectId}/previews/${staticPreview.leaseId}`;
+  const previewUrl = new URL(
+    `/previews/${encodeURIComponent(staticPreview.leaseId)}${testCase.expectedRoute}`,
+    baseUrl,
+  );
+  const previewResponse = await fetchWithTimeout(
+    previewUrl,
+    {
+      headers: {
+        authorization: `Bearer ${issuePrincipalToken(projectId)}`,
+        "x-anydesign-preview-prefix": prefix,
+      },
+    },
+    120_000,
+  );
+  const previewBody = await previewResponse.text();
+  if (!previewResponse.ok) {
+    throw new Error(
+      `Static Draft Preview route returned ${previewResponse.status}: ${previewBody.slice(0, 500)}`,
+    );
+  }
+  if (!previewBody.includes(testCase.expectedText)) {
+    throw classifiedError(
+      "acceptance_rejected",
+      `Static Draft Preview does not contain expected text: ${testCase.expectedText}`,
+      "rejected",
+    );
+  }
+  return {
+    snapshotId: staticPreview.snapshotId,
+    leaseId: staticPreview.leaseId,
+    hmr: false,
+    route: testCase.expectedRoute,
+    httpStatus: previewResponse.status,
+    expectedText: testCase.expectedText,
+    expectedTextFound: true,
+    bodySha256: sha256(previewBody),
+    bodyBytes: Buffer.byteLength(previewBody),
+  };
+}
+
 async function grantProjectAccess(projectId) {
   const response = await fetchWithTimeout(
     new URL(`/internal/projects/${encodeURIComponent(projectId)}/access`, baseUrl),
@@ -669,6 +1341,74 @@ async function grantProjectAccess(projectId) {
   }
 }
 
+async function prepareApprovedContentPlan(projectId, testCase, executionPrompt = testCase.prompt) {
+  const eventIdentity = sha256(projectId).slice(0, 16);
+  const planPayload = {
+    schemaVersion: "generation-real-provider-content-plan@1",
+    fixtureId: testCase.id,
+    intentSha256: sha256(executionPrompt),
+    expectedRoute: testCase.expectedRoute,
+    expectedTextSha256: sha256(testCase.expectedText),
+    kind: testCase.kind,
+    locale: testCase.locale,
+  };
+  const identity = {
+    planId: `real-provider-${testCase.id}-plan`,
+    revision: 1,
+    contentHash: sha256(JSON.stringify(planPayload)),
+  };
+  const changeRequest = {
+    ...identity,
+    changeEventId: `real-provider-${testCase.id}-${eventIdentity}-plan-created`,
+  };
+  const changeResponse = await fetchWithTimeout(
+    new URL(`/projects/${encodeURIComponent(projectId)}/content-plan-changes`, baseUrl),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-anydesign-internal": "true",
+        "x-runtime-admin-token": adminToken,
+      },
+      body: JSON.stringify(changeRequest),
+    },
+    120_000,
+  );
+  if (!changeResponse.ok) {
+    throw new Error(`content plan change failed ${changeResponse.status}: ${(await changeResponse.text()).slice(0, 500)}`);
+  }
+  const approvalRequest = {
+    ...identity,
+    confirmationEventId: `real-provider-${testCase.id}-${eventIdentity}-plan-approved`,
+  };
+  const approvalResponse = await fetchWithTimeout(
+    new URL(`/projects/${encodeURIComponent(projectId)}/content-plan-approvals`, baseUrl),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-anydesign-internal": "true",
+        "x-runtime-admin-token": adminToken,
+      },
+      body: JSON.stringify(approvalRequest),
+    },
+    120_000,
+  );
+  if (!approvalResponse.ok) {
+    throw new Error(`content plan approval failed ${approvalResponse.status}: ${(await approvalResponse.text()).slice(0, 500)}`);
+  }
+  return {
+    identity,
+    evidence: {
+      ...identity,
+      fixtureId: testCase.id,
+      intentSha256: planPayload.intentSha256,
+      approvalEvidenceSha256: sha256(JSON.stringify(approvalRequest)),
+      state: "verified",
+    },
+  };
+}
+
 async function runBrief(projectId, prompt) {
   const started = await startRun(projectId, "brief", "brief", {
     contentSources: [
@@ -679,6 +1419,7 @@ async function runBrief(projectId, prompt) {
         readable: true,
       },
     ],
+    modelResourceId: manifest.provider.modelResourceId,
   });
   const eventStreamOutcome = readRunEvents(
     projectId,
@@ -794,6 +1535,7 @@ async function runBrief(projectId, prompt) {
     eventStream.events,
     eventStream.evidence,
   );
+  evidence.efficiency = await fetchRunEfficiencyMetrics(projectId, started.runId);
   if (evidence.status !== "completed") {
     const error = new Error(
       `brief run ${started.runId} ended with status ${evidence.status}`,
@@ -807,8 +1549,12 @@ async function runBrief(projectId, prompt) {
   };
 }
 
-async function runBuild(projectId, briefId) {
-  const started = await startRun(projectId, "build", "build", { briefId });
+async function runBuild(projectId, briefId, contentPlan) {
+  const started = await startRun(projectId, "build", "build", {
+    briefId,
+    contentPlan,
+    modelResourceId: manifest.provider.modelResourceId,
+  });
   let eventStream;
   try {
     eventStream = await readRunEvents(projectId, started.runId, "build");
@@ -822,8 +1568,35 @@ async function runBuild(projectId, briefId) {
     eventStream.events,
     eventStream.evidence,
   );
+  run.efficiency = await fetchRunEfficiencyMetrics(projectId, started.runId);
   run.attempt = 1;
-  if (run.status === "completed") return { evidence: [run] };
+  if (run.status === "completed") {
+    return {
+      evidence: [run],
+      staticPreview: extractStaticDraftPreview(eventStream.events),
+      candidateVersionId: extractCandidateVersionId(eventStream.events),
+    };
+  }
+  const readyDurableDraft =
+    eventStream.events.some(
+      (event) =>
+        event.type === "tool.completed" && event.tool === "preview.dev_status",
+    ) &&
+    eventStream.events.some(
+      (event) =>
+        event.type === "tool.completed" && event.tool === "draft.snapshot_create",
+    );
+  if (
+    draftLifecycleEditCanary &&
+    readyDurableDraft &&
+    String(run.summary || "").includes("DraftSnapshot conflict")
+  ) {
+    return {
+      evidence: [run],
+      staticPreview: extractStaticDraftPreview(eventStream.events),
+      canaryRecoveredFromTerminalFailure: true,
+    };
+  }
   const failure = classifyTerminalRunFailure(run);
   const error = classifiedError(
     failure.classification,
@@ -832,6 +1605,38 @@ async function runBuild(projectId, briefId) {
   );
   error.runEvidence = [run];
   throw error;
+}
+
+function extractStaticDraftPreview(events) {
+  const completed = events.filter((event) => event.type === "tool.completed");
+  const preview = completed.findLast((event) => event.tool === "preview.start");
+  const snapshot = completed.findLast(
+    (event) => event.tool === "draft.snapshot_create",
+  );
+  // A Dev Preview snapshot also carries previewUrl/snapshotId metadata. It is
+  // not a static preview and must be verified through the authoritative
+  // DraftPreviewSession so the current ready/durable revision is selected.
+  if (!preview || !snapshot) return null;
+  const previewUrl =
+    snapshot?.metadata?.postToolUseSuccess?.previewUrl ||
+    preview?.metadata?.postToolUseSuccess?.url;
+  const snapshotId = snapshot?.metadata?.postToolUseSuccess?.snapshotId;
+  if (!previewUrl || !snapshotId) return null;
+  let leaseId;
+  try {
+    leaseId = new URL(previewUrl).pathname.split("/").filter(Boolean).at(-1);
+  } catch {
+    return null;
+  }
+  if (!leaseId) return null;
+  return { leaseId, snapshotId };
+}
+
+function extractCandidateVersionId(events) {
+  return [...events]
+    .reverse()
+    .find((event) => event.type === "preview.candidate" && event.versionId)
+    ?.versionId || null;
 }
 
 function classifyTerminalRunFailure(run) {
@@ -860,8 +1665,10 @@ function classifyTerminalRunFailure(run) {
   return { classification: "run_incomplete", resultStatus: "failed" };
 }
 
-function isRetryableProviderFailure(error) {
-  if (!error || error.classification !== "run_incomplete") return false;
+function isRetryableCaseFailure(error) {
+  if (!error) return false;
+  if (error.classification === "no_progress") return true;
+  if (error.classification !== "run_incomplete") return false;
   const message = String(error.message || "");
   return [
     "code=provider_unavailable",
@@ -889,7 +1696,15 @@ async function startRun(projectId, phase, agentProfile, inputContext) {
         "content-type": "application/json",
         authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ projectId, phase, agentProfile, inputContext }),
+      body: JSON.stringify({
+        projectId,
+        phase,
+        agentProfile,
+        inputContext: {
+          ...inputContext,
+          modelResourceId: manifest.provider.modelResourceId,
+        },
+      }),
     },
     120_000,
   );
@@ -1040,6 +1855,32 @@ async function cancelTimedOutRun(projectId, runId) {
   }
 }
 
+async function fetchRunEfficiencyMetrics(projectId, runId) {
+  const response = await fetchWithTimeout(
+    new URL(`/runs/${encodeURIComponent(runId)}/efficiency-metrics`, baseUrl),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `run efficiency metrics returned ${response.status}: ${body.slice(0, 500)}`,
+    );
+  }
+  const metrics = JSON.parse(body);
+  if (
+    metrics.schemaVersion !== "run-efficiency-metrics@1" ||
+    metrics.calculatorVersion !== "run-efficiency-calculator@1" ||
+    metrics.runId !== runId ||
+    metrics.projectId !== projectId
+  ) {
+    throw new Error("run efficiency metrics identity or schema mismatch");
+  }
+  return metrics;
+}
+
 function summarizeRun(phase, runId, events, eventEvidence = null) {
   const terminal = [...events]
     .reverse()
@@ -1153,7 +1994,7 @@ function issuePrincipalToken(projectId) {
   return `${input}.${crypto.sign(null, Buffer.from(input), privateKey).toString("base64url")}`;
 }
 
-async function releaseSandbox(projectId, strict = false) {
+async function releaseSandboxOnce(projectId) {
   try {
     const response = await fetchWithTimeout(
       new URL(
@@ -1169,17 +2010,50 @@ async function releaseSandbox(projectId, strict = false) {
       },
       120_000,
     );
-    if (!response.ok && strict) {
-      throw new Error(
-        `release sandbox failed ${response.status}: ${await response.text()}`,
-      );
-    }
-    return response.ok;
+    await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      error: response.ok ? null : `http_${response.status}`,
+    };
   } catch (error) {
-    if (strict) throw error;
-    // Best-effort cleanup. The failure is captured by cluster diagnostics.
-    return false;
+    return {
+      ok: false,
+      status: null,
+      error: error?.name || "release_request_failed",
+    };
   }
+}
+
+async function releaseSandboxWithRetry(projectId) {
+  const attempts = [];
+  let successfulResponses = 0;
+  for (let attempt = 1; attempt <= sandboxReleaseMaxAttempts; attempt += 1) {
+    const release = await releaseSandboxOnce(projectId);
+    attempts.push({ attempt, ...release });
+    if (release.ok) {
+      successfulResponses += 1;
+      if (successfulResponses >= 2) {
+        return {
+          required: true,
+          released: true,
+          attempts,
+          maxAttempts: sandboxReleaseMaxAttempts,
+          requiredSuccessfulResponses: 2,
+        };
+      }
+    }
+    if (attempt < sandboxReleaseMaxAttempts) {
+      await delay(sandboxReleaseRetryCooldownMs);
+    }
+  }
+  return {
+    required: true,
+    released: false,
+    attempts,
+    maxAttempts: sandboxReleaseMaxAttempts,
+    requiredSuccessfulResponses: 2,
+  };
 }
 
 function sanitizeReleaseEvidence(evidence) {

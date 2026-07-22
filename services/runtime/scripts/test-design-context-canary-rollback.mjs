@@ -11,6 +11,7 @@ import {
 } from "./validate-design-context-canary-evidence.mjs";
 import {
   disableCanaryPolicy,
+  rollbackDiagnosticsReady,
   verifyCanaryRollback,
 } from "./run-design-context-canary-rollback.mjs";
 
@@ -24,6 +25,22 @@ const cohort = {
   policyUpdatedBy: "operator-1",
   thresholdVersion: "website-dcp-canary-thresholds@1",
 };
+assert.equal(rollbackDiagnosticsReady({ gate: "ready", missingRequiredReads: [] }), true);
+assert.equal(rollbackDiagnosticsReady({ gate: "ready", missingRequiredReads: ["inputs/design-profile.json"] }), false);
+assert.equal(rollbackDiagnosticsReady({
+  gate: "ready",
+  missingRequiredReads: ["inputs/design-profile.json"],
+  generationContext: {
+    status: "compiled",
+    contextContentHash: sha,
+    runContextBindingHash: "b".repeat(64),
+    runtimeAttestationHash: "c".repeat(64),
+  },
+}), true);
+assert.equal(rollbackDiagnosticsReady({
+  gate: "ready",
+  generationContext: { status: "compiled", contextContentHash: sha },
+}), false);
 let runStartedAt = "2026-07-15T01:01:00Z";
 const requests = [];
 const server = createServer(async (request, response) => {

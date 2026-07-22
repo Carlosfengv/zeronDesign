@@ -71,6 +71,34 @@ const websiteRun = mode => ({
   },
 });
 
+const generationContextWebsiteRun = mode => {
+  const value = websiteRun(mode);
+  delete value.designContextContentHash;
+  delete value.requiredReadPaths;
+  delete value.readFiles;
+  delete value.requiredReadsPassed;
+  value.templateVersion = "next-app@2";
+  value.generationContext = {
+    schemaVersion: "generation-context@1",
+    status: "compiled",
+    contextContentHash: "b".repeat(64),
+    runContextBindingHash: "c".repeat(64),
+    runtimeAttestationHash: "d".repeat(64),
+  };
+  value.attestation = { state: "verified", runtimeAttestationHash: "d".repeat(64) };
+  value.efficiency = {
+    schemaVersion: "run-efficiency-metrics@1",
+    uniqueContextReads: 0,
+    uniqueSourceReads: 2,
+    duplicateReads: 0,
+    duplicateReadTokens: 0,
+    unchangedReadStubs: 0,
+    postCompactSourceRestores: 0,
+    prebuildLists: 0,
+  };
+  return value;
+};
+
 const requiredFindingRepair = {
   ...cohort,
   ruleId: "a11y.button-name",
@@ -181,7 +209,7 @@ try {
       attemptCount: 1,
     }],
     ["website.run", "2026-07-08T00:05:00Z", websiteRun("observe")],
-    ["website.run", "2026-07-08T00:06:00Z", websiteRun("enforced")],
+    ["website.run", "2026-07-08T00:06:00Z", generationContextWebsiteRun("enforced")],
     ["required-finding.repair", "2026-07-08T01:00:00Z", requiredFindingRepair],
     ["profile-sync.clean-apply", "2026-07-08T02:00:00Z", profileSync.cleanApply],
     ["profile-sync.conflict-apply", "2026-07-08T03:00:00Z", profileSync.conflictApply],

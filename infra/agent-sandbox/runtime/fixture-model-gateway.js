@@ -12,6 +12,18 @@ function staticWebsiteBuildScript(title, fontSize) {
   return `const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true});fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html',${JSON.stringify(html)});`;
 }
 
+function nextAppPageSource(title) {
+  return `export default function Home() {
+  return (
+    <main style={{ minHeight: "100vh", padding: "4rem 2rem", fontFamily: "system-ui, sans-serif" }}>
+      <nav aria-label="Primary"><a href="#overview">Overview</a></nav>
+      <section id="overview"><h1>${title}</h1></section>
+    </main>
+  );
+}
+`;
+}
+
 function projectId(body) {
   return String(
     body.projectId
@@ -104,39 +116,70 @@ function buildResponse(body, state) {
   const buildScript = docs
     ? "const fs=require('fs');fs.rmSync('out',{recursive:true,force:true});fs.mkdirSync('out',{recursive:true});const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>RC Docs</title><style>*,*::before,*::after{box-sizing:border-box}body{margin:0;font:16px sans-serif;background:#fff;color:#111;max-width:100%;overflow-x:hidden}h1{font-size:40px;overflow-wrap:anywhere}</style>';const shell='<nav><a href=\"/docs/#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>';fs.writeFileSync('out/index.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1>RC Docs</h1></body></html>');fs.writeFileSync('out/docs.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1 id=\"overview\">RC Docs Overview</h1></body></html>');"
     : staticWebsiteBuildScript("RC Website", 48);
-  const calls = [
-    tool("fixture-package", "fs.write", {
-      path: "project/package.json",
-      text: '{"scripts":{"build":"node build.cjs"}}',
-    }),
-    tool("fixture-build-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
-  ];
+  if (turn === 1) {
+    const paths = docs
+      ? ["project/package.json", "project/content/docs/index.mdx"]
+      : ["project/app/page.tsx"];
+    return {
+      type: "tool_calls",
+      toolCalls: paths.map((path, index) =>
+        tool(`fixture-observe-existing-${index}`, "fs.read", { path })),
+    };
+  }
+  const calls = docs
+    ? [
+      tool("fixture-package", "fs.write", {
+        path: "project/package.json",
+        text: '{"scripts":{"build":"node build.cjs"}}',
+      }),
+      tool("fixture-build-script", "fs.write", { path: "project/build.cjs", text: buildScript }),
+    ]
+    : [];
+  if (!docs) {
+    calls.push(tool("fixture-next-page", "fs.write", {
+      path: "project/app/page.tsx",
+      text: nextAppPageSource("RC Website Built"),
+    }));
+  }
   if (docs) {
     calls.push(tool("fixture-docs-source", "fs.write", {
       path: "project/content/docs/index.mdx",
       text: "---\ntitle: Overview\n---\n\n# RC Docs Overview",
     }));
   }
-  if (turn === 1) {
+  if (turn === 2) {
     return { type: "tool_calls", toolCalls: calls };
   }
-  if (turn === 2) {
+  if (turn === 3) {
     return {
       type: "tool_calls",
       toolCalls: [
         tool("fixture-dependency", "project.ensure_dependencies", {
-          mode: "add",
-          packages: ["is-number@7.0.0"],
+          ...(docs
+            ? { mode: "add", packages: ["is-number@7.0.0"] }
+            : { mode: "restore" }),
           cwd: "project",
         }),
       ],
     };
   }
-  if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-build", "project.build", { cwd: "project" })] };
-  if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-preview", "preview.start")] };
-  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
-  if (turn === 6) return { type: "tool_calls", toolCalls: [tool("fixture-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
-  if (turn === 7) return { type: "tool_calls", toolCalls: [tool("fixture-promote", "preview.publish", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
+  if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-build", "project.build", { cwd: "project" })] };
+  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-preview", "preview.start")] };
+  if (!docs && turn === 6) {
+    return {
+      type: "tool_calls",
+      toolCalls: [tool("fixture-draft-snapshot", "draft.snapshot_create")],
+    };
+  }
+  if (!docs) {
+    return { type: "tool_calls", toolCalls: [tool("fixture-complete", "run.complete", {
+      status: "completed",
+      summary: "Website deployed Runtime RC Draft gate complete",
+    })] };
+  }
+  if (turn === 6) return { type: "tool_calls", toolCalls: [tool("fixture-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
+  if (turn === 7) return { type: "tool_calls", toolCalls: [tool("fixture-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
+  if (turn === 8) return { type: "tool_calls", toolCalls: [tool("fixture-promote", "preview.publish", { screenshotId: docs ? "rc-docs" : "rc-website" })] };
   return { type: "tool_calls", toolCalls: [tool("fixture-complete", "run.complete", {
     status: "completed",
     summary: `${docs ? "Docs" : "Website"} deployed Runtime RC gate complete`,
@@ -154,6 +197,7 @@ function enforcedDcpBuildResponse(state) {
         "inputs/design-profile-usage.md",
         "inputs/component-recipes.json",
         "inputs/template-style-contract.json",
+        "project/package.json",
       ].map((path, index) => tool(`fixture-dcp-build-read-${index}`, "fs.read", { path })),
     };
   }
@@ -203,12 +247,44 @@ function editResponse(body, state) {
   const buildScript = docs
     ? "const fs=require('fs');fs.rmSync('out',{recursive:true,force:true});fs.mkdirSync('out',{recursive:true});const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>RC Docs Edited</title><style>*,*::before,*::after{box-sizing:border-box}body{margin:0;font:16px sans-serif;background:#fff;color:#111;max-width:100%;overflow-x:hidden}h1{font-size:40px;overflow-wrap:anywhere}</style>';const shell='<nav><a href=\"/docs/#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>';fs.writeFileSync('out/index.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1>RC Docs Edited</h1></body></html>');fs.writeFileSync('out/docs.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1 id=\"overview\">RC Docs Overview Edited</h1></body></html>');"
     : staticWebsiteBuildScript("RC Website Edited", 48);
-  if (turn === 0) return { type: "tool_calls", toolCalls: [tool("fixture-edit-script", "fs.write", { path: "project/build.cjs", text: buildScript })] };
-  if (turn === 1) return { type: "tool_calls", toolCalls: [tool("fixture-edit-build", "project.build", { cwd: "project" })] };
-  if (turn === 2) return { type: "tool_calls", toolCalls: [tool("fixture-edit-preview", "preview.start")] };
-  if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-edit-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
-  if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-edit-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
-  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-edit-promote", "preview.publish", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
+  if (turn === 0) {
+    const paths = docs ? ["project/build.cjs"] : ["project/app/page.tsx"];
+    return {
+      type: "tool_calls",
+      toolCalls: paths.map((path, index) =>
+        tool(`fixture-edit-observe-${index}`, "fs.read", { path })),
+    };
+  }
+  if (turn === 1) {
+    const calls = docs ? [tool("fixture-edit-script", "fs.write", {
+      path: "project/build.cjs",
+      text: buildScript,
+    })] : [];
+    if (!docs) {
+      calls.push(tool("fixture-edit-next-page", "fs.write", {
+        path: "project/app/page.tsx",
+        text: nextAppPageSource("RC Website Edited"),
+      }));
+    }
+    return { type: "tool_calls", toolCalls: calls };
+  }
+  if (turn === 2) return { type: "tool_calls", toolCalls: [tool("fixture-edit-build", "project.build", { cwd: "project" })] };
+  if (turn === 3) return { type: "tool_calls", toolCalls: [tool("fixture-edit-preview", "preview.start")] };
+  if (!docs && turn === 4) {
+    return {
+      type: "tool_calls",
+      toolCalls: [tool("fixture-edit-draft-snapshot", "draft.snapshot_create")],
+    };
+  }
+  if (!docs) {
+    return { type: "tool_calls", toolCalls: [tool("fixture-edit-complete", "run.complete", {
+      status: "completed",
+      summary: "Website deployed Runtime RC Draft edit complete",
+    })] };
+  }
+  if (turn === 4) return { type: "tool_calls", toolCalls: [tool("fixture-edit-open", "browser.open", { url: "http://127.0.0.1:3000" })] };
+  if (turn === 5) return { type: "tool_calls", toolCalls: [tool("fixture-edit-shot", "browser.screenshot", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
+  if (turn === 6) return { type: "tool_calls", toolCalls: [tool("fixture-edit-promote", "preview.publish", { screenshotId: docs ? "rc-docs-edit" : "rc-website-edit" })] };
   return { type: "tool_calls", toolCalls: [tool("fixture-edit-complete", "run.complete", {
     status: "completed",
     summary: `${docs ? "Docs" : "Website"} deployed Runtime RC edit complete`,
@@ -224,6 +300,7 @@ function enforcedDcpEditResponse(state) {
         "inputs/design-profile.json",
         "inputs/design-profile-usage.md",
         "inputs/component-recipes.json",
+        "project/build.cjs",
       ].map((path, index) => tool(`fixture-dcp-edit-read-${index}`, "fs.read", { path })),
     };
   }
@@ -270,6 +347,7 @@ function repairResponse(body, state) {
         "inputs/design-profile-usage.md",
         "inputs/component-recipes.json",
         "state/style-contract.json",
+        "project/build.cjs",
       ].map((path, index) => tool(`fixture-dcp-repair-read-${index}`, "fs.read", { path })),
     };
   }
@@ -299,9 +377,18 @@ function responseForBody(body) {
         : requestPhase === "edit"
           ? editResponse(body, state)
           : buildResponse(body, state);
+  const scopedPayload = payload.toolCalls
+    ? {
+        ...payload,
+        toolCalls: payload.toolCalls.map(call => ({
+          ...call,
+          id: `${requestRunId}:${call.id}`,
+        })),
+      }
+    : payload;
   runs.set(requestRunId, state);
-  responses.set(responseKey, payload);
-  return payload;
+  responses.set(responseKey, scopedPayload);
+  return scopedPayload;
 }
 
 function resetFixtureState() {

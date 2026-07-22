@@ -11,6 +11,23 @@ function positiveInteger(value) {
   return Number.isInteger(value) && value > 0;
 }
 
+function sha256(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+export function rollbackDiagnosticsReady(diagnostics) {
+  if (diagnostics?.gate !== "ready") return false;
+  const context = diagnostics?.generationContext;
+  if (context) {
+    return context.status === "compiled"
+      && sha256(context.contextContentHash)
+      && sha256(context.runContextBindingHash)
+      && sha256(context.runtimeAttestationHash);
+  }
+  return Array.isArray(diagnostics?.missingRequiredReads)
+    && diagnostics.missingRequiredReads.length === 0;
+}
+
 function parsePositiveInteger(value, label) {
   const parsed = Number(value);
   if (!positiveInteger(parsed)) throw new Error(`${label} must be a positive integer`);
@@ -147,9 +164,9 @@ export async function verifyCanaryRollback({
     || policy?.source !== "persistent" || policy?.enabled !== false
     || policy?.policyRevision !== state.policyRevisionAfterRollback
     || policy?.policyUpdatedBy !== state.updatedBy
-    || diagnostics?.gate !== "ready" || diagnostics?.missingRequiredReads?.length !== 0
+    || !rollbackDiagnosticsReady(diagnostics)
     || !started || Date.parse(started.timestamp) < Date.parse(state.recordedAt) || !completed) {
-    throw new Error("post-rollback Run does not prove a new observe Run with a clean read gate and frozen disabled policy");
+    throw new Error("post-rollback Run does not prove a new observe Run with ready legacy or runtime-attested protocol evidence and frozen disabled policy");
   }
   const ledger = await readCanaryLedger(ledgerPath);
   const recovery = ledger.find(record => record.type === "profile-sync.recovery")?.payload;

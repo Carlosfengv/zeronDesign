@@ -7,8 +7,7 @@ REQUIRE_COMPUTED_STYLE="${RUNTIME_E2E_REQUIRE_COMPUTED_STYLE:-0}"
 SUMMARY_WRITTEN=0
 APPROVAL_REFERENCE="${RUNTIME_PROVIDER_APPROVAL_ID:-}"
 
-export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
-export DEEPSEEK_E2E_MODEL="${DEEPSEEK_E2E_MODEL:-deepseek-chat}"
+export DEEPSEEK_E2E_MODEL="${DEEPSEEK_E2E_MODEL:-deepseek-v4-pro}"
 export RUNTIME_E2E_NPM_REGISTRY="${RUNTIME_E2E_NPM_REGISTRY:-https://registry.npmjs.org/}"
 export RUNTIME_BROWSER_EXECUTABLE="${RUNTIME_BROWSER_EXECUTABLE:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 export RUNTIME_BROWSER_COLLECTOR_EXECUTABLE="${RUNTIME_BROWSER_COLLECTOR_EXECUTABLE:-$(command -v node || true)}"
@@ -22,9 +21,9 @@ write_metadata() {
   {
     echo "timestampUtc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "styleOnly=$STYLE_ONLY"
-    echo "deepseekBaseUrl=$DEEPSEEK_BASE_URL"
-    echo "deepseekModel=$DEEPSEEK_E2E_MODEL"
-    echo "deepseekApiKeyPresent=$([[ -n "${DEEPSEEK_API_KEY:-}" ]] && echo true || echo false)"
+    echo "modelGatewayUrl=${MODEL_GATEWAY_URL:-}"
+    echo "modelResourceId=$DEEPSEEK_E2E_MODEL"
+    echo "modelGatewayAuthTokenPresent=$([[ -n "${MODEL_GATEWAY_AUTH_TOKEN:-}" ]] && echo true || echo false)"
     echo "providerApprovalReference=$APPROVAL_REFERENCE"
     echo "npmRegistry=$RUNTIME_E2E_NPM_REGISTRY"
     echo "artifactUrl=${RUNTIME_E2E_ARTIFACT_URL:-}"
@@ -150,8 +149,8 @@ trap finish EXIT
 write_metadata
 
 if [[ "$STYLE_ONLY" != "1" ]]; then
-  if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
-    echo "DEEPSEEK_API_KEY is required" >&2
+  if [[ -z "${MODEL_GATEWAY_URL:-}" ]]; then
+    echo "MODEL_GATEWAY_URL is required; Provider credentials belong to the Gateway Model Resource" >&2
     exit 1
   fi
   if [[ -z "$APPROVAL_REFERENCE" ]]; then

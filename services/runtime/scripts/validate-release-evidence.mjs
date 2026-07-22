@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
+import { generationContextProtocol, validateGenerationContextRunEvidence } from "./generation-context-evidence.mjs";
 
 function fail(errors, message) {
   errors.push(message);
@@ -14,12 +15,49 @@ function artifactAvailableAfterRelease(project) {
     && project?.artifactAccessAfterRelease?.httpStatus === 200;
 }
 
+function cancelCleanupPassed(cleanup) {
+  const legacyPreviewCleanup = cleanup?.previewHttpStatusAfterCancel === 404;
+  const snapshotOnlyCleanup = cleanup?.previewLeaseStatus === "not_applicable"
+    && cleanup?.durableDraftCreated === false;
+  return cleanup?.passed === true
+    && cleanup?.runStatus === "cancelled"
+    && hasText(cleanup?.runId)
+    && (legacyPreviewCleanup || snapshotOnlyCleanup);
+}
+
 function hasText(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
 function sha256(value) {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function validateDcpStage(errors, stage, label) {
+  const generationContext = generationContextProtocol(stage) === "generation-context";
+  if (generationContext) {
+    const protocolErrors = validateGenerationContextRunEvidence(stage, label);
+    errors.push(...protocolErrors);
+    if (protocolErrors.length) return false;
+  } else if (stage?.package?.effectiveCompatibilityMode !== "enforced"
+    || !sha256(stage?.package?.contentHash)
+    || !Array.isArray(stage?.missingRequiredReads)
+    || stage.missingRequiredReads.length !== 0) {
+    return false;
+  }
+  return stage?.gate === "ready"
+    && stage?.materialization?.ready === true
+    && sha256(stage?.materialization?.hash)
+    && stage?.styleContract?.verified === true
+    && ["computed-style", "a11y", "viewport"].every(
+      capability => stage?.verification?.capabilities?.[capability]?.available === true,
+    );
+}
+
+function stageContextHash(stage) {
+  return generationContextProtocol(stage) === "generation-context"
+    ? stage?.generationContext?.contextContentHash
+    : stage?.package?.contentHash;
 }
 
 function validateEnforcedDcpFixture(errors, fixture, label = "enforced DCP") {
@@ -39,21 +77,23 @@ function validateEnforcedDcpFixture(errors, fixture, label = "enforced DCP") {
     ["repair", dcp?.repair, lifecycle.repairRunId],
   ];
   for (const [name, stage, runId] of stages) {
-    if (stage?.runId !== runId
-      || stage?.package?.effectiveCompatibilityMode !== "enforced"
-      || !sha256(stage?.package?.contentHash)
-      || stage?.gate !== "ready"
-      || stage?.materialization?.ready !== true
-      || !sha256(stage?.materialization?.hash)
-      || stage?.styleContract?.verified !== true
-      || !Array.isArray(stage?.missingRequiredReads)
-      || stage.missingRequiredReads.length !== 0
-      || ["computed-style", "a11y", "viewport"].some(capability => stage?.verification?.capabilities?.[capability]?.available !== true)) {
+    if (stage?.runId !== runId || !validateDcpStage(errors, stage, `${label}.${name}`)) {
       fail(errors, `${label} ${name} diagnostics are missing or failed`);
     }
   }
-  if (new Set(stages.map(([, stage]) => stage?.package?.contentHash)).size !== 1) {
-    fail(errors, `${label} content hash changed across Build/Edit/Repair`);
+  const protocols = stages.map(([, stage]) => generationContextProtocol(stage));
+  if (new Set(protocols).size !== 1) {
+    fail(errors, `${label} mixes legacy and generation-context stage evidence`);
+  } else if (protocols[0] === "legacy"
+    && new Set(stages.map(([, stage]) => stageContextHash(stage))).size !== 1) {
+    fail(errors, `${label} legacy content hash changed across Build/Edit/Repair`);
+  } else if (protocols[0] === "generation-context") {
+    if (new Set(stages.map(([, stage]) => stage?.templateVersion)).size !== 1) {
+      fail(errors, `${label} template version changed across Build/Edit/Repair`);
+    }
+    if (new Set(stages.map(([, stage]) => stage?.generationContext?.runContextBindingHash)).size !== stages.length) {
+      fail(errors, `${label} Generation Context binding hashes must be distinct per Run`);
+    }
   }
   if (new Set(stages.map(([, stage]) => stage?.materialization?.hash)).size !== 1) {
     fail(errors, `${label} materialization hash changed across Build/Edit/Repair`);
@@ -167,11 +207,25 @@ export function validateReleaseEvidence(evidence) {
       fail(errors, `${kind} project evidence is missing`);
       continue;
     }
-    for (const field of ["projectId", "buildRunId", "editRunId", "bindingId", "podUid", "buildId", "candidateManifestHash", "sourceSnapshotUri", "previewLeaseId", "screenshotId", "versionAfterCas", "artifactManifestHash", "artifactUrl", "sandboxReleasedAt"]) {
+    for (const field of ["projectId", "buildRunId", "editRunId", "bindingId", "podUid", "buildId", "candidateManifestHash", "sourceSnapshotUri", "previewLeaseId", "versionAfterCas", "artifactManifestHash", "artifactUrl", "sandboxReleasedAt"]) {
       if (!hasText(project[field])) fail(errors, `${kind}.${field} is required`);
     }
     if (project.buildRunId === project.editRunId) fail(errors, `${kind} Build and Edit run IDs must differ`);
-    if (!(project.nonblankPixelRatio > 0)) fail(errors, `${kind} screenshot is blank`);
+    const screenshotPassed = hasText(project.screenshotId) && project.nonblankPixelRatio > 0;
+    const publication = project.publication;
+    const publishWorkflowPassed = hasText(publication?.workflowId)
+      && publication?.status === "completed"
+      && publication?.checkpoint === "completed"
+      && publication?.versionId === project.versionAfterCas
+      && hasText(publication?.releaseId)
+      && hasText(publication?.publicationOperationId)
+      && /^https:\/\//.test(publication?.publicUrl ?? "")
+      && publication?.externalProbePassed === true
+      && project?.visualReview?.mode === "advisory"
+      && project?.visualReview?.status === "not_requested";
+    if (!screenshotPassed && !publishWorkflowPassed) {
+      fail(errors, `${kind} requires a nonblank screenshot or completed advisory PublishWorkflow evidence`);
+    }
     if (project.artifactAssertions?.content?.matched !== true || !sha256(project.artifactAssertions?.content?.expectedTextSha256) || !sha256(project.artifactAssertions?.content?.documentSha256)) {
       fail(errors, `${kind} artifact content assertion is missing or failed`);
     }
@@ -183,13 +237,18 @@ export function validateReleaseEvidence(evidence) {
     if (computed?.passed !== true || computed?.selector !== "body" || !hasText(computed?.display) || computed.display === "none" || !hasText(computed?.color) || !hasText(computed?.fontFamily)) {
       fail(errors, `${kind} artifact computed-style assertion is missing or failed`);
     }
-    if (project.cancelCleanup?.passed !== true || project.cancelCleanup?.runStatus !== "cancelled" || project.cancelCleanup?.previewHttpStatusAfterCancel !== 404 || !hasText(project.cancelCleanup?.runId)) {
-      fail(errors, `${kind} run cancellation did not clean Preview resources`);
+    if (!cancelCleanupPassed(project.cancelCleanup)) {
+      fail(errors, `${kind} run cancellation did not clean generation resources`);
     }
     if (project.dependencyEvidence?.passed !== true || project.dependencyEvidence?.nodeModulesPresent !== true || !sha256(project.dependencyEvidence?.lockfileSha256) || !(project.dependencyEvidence?.tarballRequestCount > 0)) {
       fail(errors, `${kind} Runtime dependency installation evidence is missing or failed`);
     }
-    if (project.events?.sequenceValid !== true || !hasText(project.events?.previewUpdated) || !hasText(project.events?.runCompleted)) fail(errors, `${kind} event sequence is invalid`);
+    const legacyEventSequencePassed = project.events?.sequenceValid === true
+      && hasText(project.events?.previewUpdated)
+      && hasText(project.events?.runCompleted);
+    if (!legacyEventSequencePassed && !publishWorkflowPassed) {
+      fail(errors, `${kind} event sequence is invalid and has no completed PublishWorkflow replacement`);
+    }
     if (project.terminalToolFailureCount !== 0) fail(errors, `${kind} has terminal tool failures`);
     if (!artifactAvailableAfterRelease(project)) fail(errors, `${kind} artifact is unavailable to its project principal after Sandbox release`);
   }

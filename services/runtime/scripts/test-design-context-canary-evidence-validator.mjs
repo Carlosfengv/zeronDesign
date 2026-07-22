@@ -57,6 +57,38 @@ const run = mode => ({
   },
 });
 
+const generationContextRun = (mode, index) => {
+  const value = run(mode);
+  delete value.designContextContentHash;
+  delete value.requiredReadPaths;
+  delete value.readFiles;
+  delete value.requiredReadsPassed;
+  value.templateVersion = "next-app@2";
+  value.generationContext = {
+    schemaVersion: "generation-context-status@1",
+    runContractVersion: "generation-context@1",
+    status: "compiled",
+    contextContentHash: String(index + 1).repeat(64),
+    runContextBindingHash: String(index + 3).repeat(64),
+    runtimeAttestationHash: String(index + 5).repeat(64),
+  };
+  value.attestation = {
+    state: "verified",
+    runtimeAttestationHash: value.generationContext.runtimeAttestationHash,
+  };
+  value.efficiency = {
+    schemaVersion: "run-efficiency-metrics@1",
+    uniqueContextReads: 0,
+    uniqueSourceReads: 3,
+    duplicateReads: 0,
+    duplicateReadTokens: 0,
+    unchangedReadStubs: 0,
+    postCompactSourceRestores: 0,
+    prebuildLists: 1,
+  };
+  return value;
+};
+
 const fixture = {
   schemaVersion: "design-context-canary-evidence@1",
   result: "pass",
@@ -229,6 +261,16 @@ function attachSourceLedger(evidence) {
 attachSourceLedger(fixture);
 
 assert.deepEqual(validateDesignContextCanaryEvidence(fixture), []);
+const generationContextFixture = structuredClone(fixture);
+generationContextFixture.websiteRuns = [generationContextRun("observe", 0), generationContextRun("enforced", 1)];
+attachSourceLedger(generationContextFixture);
+assert.deepEqual(validateDesignContextCanaryEvidence(generationContextFixture), []);
+const missingBindingHash = structuredClone(generationContextFixture);
+delete missingBindingHash.websiteRuns[1].generationContext.runContextBindingHash;
+assert(validateDesignContextCanaryEvidence(missingBindingHash).some(error => error.includes("runContextBindingHash")));
+const missingEfficiency = structuredClone(generationContextFixture);
+delete missingEfficiency.websiteRuns[0].efficiency;
+assert(validateDesignContextCanaryEvidence(missingEfficiency).some(error => error.includes("efficiency")));
 const noProvider = structuredClone(fixture);
 noProvider.provider.mode = "fixture";
 assert(validateDesignContextCanaryEvidence(noProvider).some(error => error.includes("approved real provider")));

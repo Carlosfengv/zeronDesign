@@ -16,7 +16,71 @@ const principalId = "generation-real-provider-suite";
 const workspaceNamespace = (process.env.GENERATION_REAL_WORKSPACE_NAMESPACE || "").trim();
 const configuredBaseVersionId = (process.env.GENERATION_REAL_BASE_VERSION_ID || "").trim();
 const nextAppDraftMode = process.env.GENERATION_REAL_NEXT_APP_DRAFT === "true";
+const draftWarmEditMode = process.env.GENERATION_REAL_DRAFT_WARM_EDIT === "true";
+const draftColdDevEditMode =
+  process.env.GENERATION_REAL_DRAFT_COLD_DEV_EDIT === "true";
+if (draftWarmEditMode && draftColdDevEditMode) {
+  throw new Error("Draft Warm Edit and Cold Dev Edit modes are mutually exclusive");
+}
+const draftLifecycleEditMode = draftWarmEditMode || draftColdDevEditMode;
+const draftWarmEditKind = (
+  process.env.GENERATION_REAL_DRAFT_WARM_EDIT_KIND || "copy_css"
+).trim();
+const expectedDraftText = (
+  process.env.GENERATION_REAL_EXPECTED_DRAFT_TEXT || "WARM-HMR-VERIFIED"
+).trim();
+const artifactKind = (process.env.GENERATION_REAL_ARTIFACT_KIND || "website").trim();
+const expectedArtifactText = (
+  process.env.GENERATION_REAL_EXPECTED_ARTIFACT_TEXT || ""
+).trim();
+if (!new Set(["website", "docs"]).has(artifactKind)) {
+  throw new Error("GENERATION_REAL_ARTIFACT_KIND must be website or docs");
+}
+if (artifactKind === "docs" && !expectedArtifactText) {
+  throw new Error("Docs Edit requires GENERATION_REAL_EXPECTED_ARTIFACT_TEXT");
+}
+if (
+  draftWarmEditMode &&
+  !new Set(["copy_css", "structural"]).has(draftWarmEditKind)
+) {
+  throw new Error(
+    "GENERATION_REAL_DRAFT_WARM_EDIT_KIND must be copy_css or structural",
+  );
+}
+const contentPlan = process.env.GENERATION_REAL_CONTENT_PLAN_JSON
+  ? JSON.parse(process.env.GENERATION_REAL_CONTENT_PLAN_JSON)
+  : null;
+const draftBriefId = (process.env.GENERATION_REAL_BRIEF_ID || "").trim();
+const keepSandbox = process.env.GENERATION_REAL_KEEP_SANDBOX === "true";
 const existingRunId = (process.env.GENERATION_REAL_EXISTING_RUN_ID || "").trim();
+const modelResourceId = (
+  process.env.GENERATION_REAL_MODEL_RESOURCE_ID || "deepseek-v4-pro"
+).trim();
+if (!/^[a-z0-9][a-z0-9._-]{0,127}$/.test(modelResourceId)) {
+  throw new Error("GENERATION_REAL_MODEL_RESOURCE_ID is invalid");
+}
+const nonVisualReferenceMode =
+  process.env.GENERATION_REAL_NONVISUAL_REFERENCE === "true";
+const multimodalReferenceMode =
+  process.env.GENERATION_REAL_MULTIMODAL_REFERENCE === "true";
+const expectNonVisualUnavailable =
+  process.env.GENERATION_REAL_EXPECT_NONVISUAL_UNAVAILABLE === "true";
+const expectMultimodalDelivered =
+  process.env.GENERATION_REAL_EXPECT_MULTIMODAL_DELIVERED === "true";
+if (nonVisualReferenceMode && multimodalReferenceMode) {
+  throw new Error("Non-visual and multimodal reference modes are mutually exclusive");
+}
+if (expectNonVisualUnavailable && !nonVisualReferenceMode) {
+  throw new Error(
+    "GENERATION_REAL_EXPECT_NONVISUAL_UNAVAILABLE requires GENERATION_REAL_NONVISUAL_REFERENCE",
+  );
+}
+if (expectMultimodalDelivered && !multimodalReferenceMode) {
+  throw new Error(
+    "GENERATION_REAL_EXPECT_MULTIMODAL_DELIVERED requires GENERATION_REAL_MULTIMODAL_REFERENCE",
+  );
+}
+const visualReferenceMode = nonVisualReferenceMode || multimodalReferenceMode;
 if (!/^ws-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(workspaceNamespace)) {
   throw new Error("GENERATION_REAL_WORKSPACE_NAMESPACE must be a valid ws-* namespace");
 }
@@ -30,22 +94,81 @@ fs.mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
 
 let runId = null;
 let result = null;
+let editRunEvidence = null;
 try {
+  const draftSession = draftLifecycleEditMode ? await getDraftPreview() : null;
   let before;
-  try {
-    before = await getRuntimeState();
-  } catch (error) {
-    if (!configuredBaseVersionId) throw error;
-    before = { currentVersionId: configuredBaseVersionId, sandboxBindingId: null };
-  }
-  if (!before.currentVersionId) {
-    throw new Error("existing project has no editable currentVersionId");
-  }
+  let inputContext;
+  let editImpactPlan = null;
+  if (draftSession) {
+    if (!contentPlan) {
+      throw new Error("Draft lifecycle Edit requires GENERATION_REAL_CONTENT_PLAN_JSON");
+    }
+    if (!draftBriefId) {
+      throw new Error("Draft lifecycle Edit requires GENERATION_REAL_BRIEF_ID");
+    }
+    if (
+      draftSession.status !== "ready" ||
+      draftSession.lastReadyRevision < draftSession.workspaceRevision ||
+      draftSession.durableRevision < draftSession.workspaceRevision
+    ) {
+      throw new Error(
+        `Draft lifecycle Edit requires a ready durable session: ${JSON.stringify(draftSession)}`,
+      );
+    }
+    const editBase = {
+      kind: "draft",
+      snapshotId: draftSession.durableSnapshotId,
+      sessionId: draftSession.sessionId,
+      expectedSessionEpoch: draftSession.sessionEpoch,
+      expectedWorkspaceRevision: draftSession.workspaceRevision,
+      writerLeaseId: draftSession.writerLeaseId,
+    };
+    editImpactPlan = await createDraftEditImpactPlan(editBase);
+    inputContext = {
+      editBase,
+      editImpactPlanHash: editImpactPlan.planHash,
+      sandboxBindingId: draftSession.sandboxBindingId,
+      modelResourceId,
+      briefId: draftBriefId,
+      contentPlan,
+    };
+    before = {
+      currentVersionId: null,
+      sandboxBindingId: draftSession.sandboxBindingId,
+      draftSnapshotId: draftSession.durableSnapshotId,
+      workspaceRevision: draftSession.workspaceRevision,
+    };
+    if (visualReferenceMode) {
+      const reference = await createVisualReference(
+        draftSession.durableSnapshotId,
+        nonVisualReferenceMode ? "nonvisual-provider-canary" : "multimodal-provider-canary",
+      );
+      inputContext.visualBindings = [reference.binding];
+      before.visualReferenceArtifactId = reference.artifactId;
+      before.visualReferenceSha256 = reference.sha256;
+      before.visualReferenceMediaType = reference.mediaType;
+    }
+  } else {
+    try {
+      before = await getRuntimeState();
+    } catch (error) {
+      if (!configuredBaseVersionId) throw error;
+      before = { currentVersionId: configuredBaseVersionId, sandboxBindingId: null };
+    }
+    if (!before.currentVersionId) {
+      throw new Error("existing project has no editable currentVersionId");
+    }
 
-  // A published project may retain the identity of a released binding in its
-  // runtime-state snapshot. Omit it so StartRun provisions a fresh Sandbox and
-  // restores the immutable base Version into that workspace.
-  const inputContext = { baseVersionId: before.currentVersionId };
+    // A published project may retain the identity of a released binding in its
+    // runtime-state snapshot. Omit it so StartRun provisions a fresh Sandbox and
+    // restores the immutable base Version into that workspace.
+    inputContext = {
+      baseVersionId: before.currentVersionId,
+      modelResourceId,
+      ...(contentPlan ? { contentPlan } : {}),
+    };
+  }
 
   if (existingRunId) {
     runId = existingRunId;
@@ -68,12 +191,71 @@ try {
     });
   }
   const stream = await readRunEvents(runId, eventFile);
-  const run = summarizeRun(runId, stream.events, stream.evidence);
-  if (run.status !== "completed") {
-    throw new Error(`Edit did not complete: ${run.summary || run.status}`);
+  editRunEvidence = summarizeRun(runId, stream.events, stream.evidence);
+  editRunEvidence.efficiency = await fetchRunEfficiencyMetrics(runId);
+  if (editRunEvidence.status !== "completed") {
+    throw new Error(
+      `Edit did not complete: ${editRunEvidence.summary || editRunEvidence.status}`,
+    );
+  }
+  const generationContextStatus = visualReferenceMode
+    ? await signedJson(`/runs/${encodeURIComponent(runId)}/generation-context-status`)
+    : null;
+  const visualUnavailableMetricRecorded = stream.events.some(
+    (event) =>
+      event.type === "metric.recorded" &&
+      event.name === "generation_context_visual_delivery_unavailable_total" &&
+      Number(event.value) === 1,
+  );
+  const visualBindingsVerified =
+    /^[a-f0-9]{64}$/.test(generationContextStatus?.visualBindingSetHash || "") &&
+    /^[a-f0-9]{64}$/.test(generationContextStatus?.runtimeAttestationHash || "");
+  const acceptedVisualExecution = editRunEvidence.modelExecutions.find(
+    (execution) =>
+      execution.modelResourceId === modelResourceId &&
+      execution.visualInput?.state === "verified_and_provider_accepted" &&
+      Number(execution.visualInput?.imageCount) >= 1 &&
+      execution.visualInput?.artifactSha256s?.includes(before.visualReferenceSha256) &&
+      execution.visualInput?.mediaTypes?.includes(before.visualReferenceMediaType),
+  );
+  if (
+    expectNonVisualUnavailable &&
+    (!visualBindingsVerified ||
+      generationContextStatus?.visualDeliveryState !== "unavailable" ||
+      !visualUnavailableMetricRecorded)
+  ) {
+    throw new Error(
+      `non-visual fallback evidence is incomplete: ${JSON.stringify({
+        visualBindingSetHash: generationContextStatus?.visualBindingSetHash,
+        runtimeAttestationHash: generationContextStatus?.runtimeAttestationHash,
+        visualBindingsVerified,
+        visualDeliveryState: generationContextStatus?.visualDeliveryState,
+        visualUnavailableMetricRecorded,
+      })}`,
+    );
+  }
+  if (
+    expectMultimodalDelivered &&
+    (!visualBindingsVerified ||
+      generationContextStatus?.visualDeliveryState !== "delivered" ||
+      visualUnavailableMetricRecorded ||
+      !acceptedVisualExecution)
+  ) {
+    throw new Error(
+      `multimodal delivery evidence is incomplete: ${JSON.stringify({
+        visualBindingSetHash: generationContextStatus?.visualBindingSetHash,
+        runtimeAttestationHash: generationContextStatus?.runtimeAttestationHash,
+        visualBindingsVerified,
+        visualDeliveryState: generationContextStatus?.visualDeliveryState,
+        visualUnavailableMetricRecorded,
+        gatewayVisualInputAttested: Boolean(acceptedVisualExecution),
+      })}`,
+    );
   }
 
-  const draftPreview = nextAppDraftMode
+  const draftPreview = draftLifecycleEditMode
+    ? await verifyDraftPreview(runId)
+    : nextAppDraftMode
     ? existingRunId
       ? {
           status: "previously_verified",
@@ -82,18 +264,28 @@ try {
         }
       : await verifyDraftPreview(runId)
     : null;
-  const publishWorkflow = nextAppDraftMode
+  const publishWorkflow = !draftLifecycleEditMode && nextAppDraftMode
     ? await publishLatestDraft(runId)
     : null;
 
-  const after = nextAppDraftMode
+  const after = draftLifecycleEditMode
+    ? { currentVersionId: null }
+    : nextAppDraftMode
     ? { currentVersionId: publishWorkflow.versionId }
     : await getRuntimeState();
-  if (!after.currentVersionId || after.currentVersionId === before.currentVersionId) {
+  if (
+    !draftLifecycleEditMode &&
+    (!after.currentVersionId || after.currentVersionId === before.currentVersionId)
+  ) {
     throw new Error("Edit completed without promoting a new Version");
   }
-  const artifact = await readArtifact(after.currentVersionId);
-  const releaseEvidence = nextAppDraftMode
+  const artifact = draftLifecycleEditMode ? null : await readArtifact(after.currentVersionId);
+  const releaseEvidence = draftLifecycleEditMode
+    ? {
+        available: false,
+        reason: "draft-lifecycle-edit-does-not-promote-current-version",
+      }
+    : nextAppDraftMode
     ? {
         available: true,
         source: "publish-workflow",
@@ -113,22 +305,74 @@ try {
     prompt,
     baseVersionId: before.currentVersionId,
     versionId: after.currentVersionId,
-    run,
+    baseDraftSnapshotId: before.draftSnapshotId || null,
+    editImpactPlanHash: editImpactPlan?.planHash || null,
+    warmEditKind: draftWarmEditMode ? draftWarmEditKind : null,
+    lifecycleProfile: draftColdDevEditMode ? "cold_dev" : draftWarmEditMode ? "warm_hmr" : null,
+    run: editRunEvidence,
     draftPreview,
     publishWorkflow,
     artifact,
     releaseEvidence,
+    visualDelivery: visualReferenceMode
+      ? {
+          state: generationContextStatus.visualDeliveryState,
+          visualBindingsVerified,
+          visualBindingSetHash: generationContextStatus.visualBindingSetHash,
+          runtimeAttestationHash: generationContextStatus.runtimeAttestationHash,
+          bindingVerificationSource:
+            nonVisualReferenceMode
+              ? "frozen-runtime-attestation-plus-unavailable-delivery-metric"
+              : "frozen-runtime-attestation-plus-gateway-visual-input-attestation",
+          unavailableMetricRecorded: visualUnavailableMetricRecorded,
+          gatewayVisualInputAttested: Boolean(acceptedVisualExecution),
+          gatewayAcceptedImageCount:
+            acceptedVisualExecution?.visualInput?.imageCount || 0,
+          referenceArtifactSha256: before.visualReferenceSha256,
+          referenceMediaType: before.visualReferenceMediaType,
+          mainTaskCompleted: editRunEvidence.status === "completed",
+          providerModelResourceId: modelResourceId,
+          providerVisionCapable: multimodalReferenceMode,
+          referenceArtifactId: before.visualReferenceArtifactId,
+        }
+      : null,
+    hmrMetricRecorded: stream.events.some(
+      (event) =>
+        event.type === "metric.recorded" &&
+        event.name === "efficiency.time_to_iframe_applied_ms",
+    ),
+    coldDevMetricRecorded: stream.events.some(
+      (event) =>
+        event.type === "metric.recorded" &&
+        event.name === "efficiency.cold_dev_ready_ms",
+    ),
+    durableSnapshotMetricRecorded: stream.events.some(
+      (event) =>
+        event.type === "metric.recorded" &&
+        event.name === "efficiency.time_to_durable_snapshot_ms",
+    ),
     providerVerified:
-      run.modelExecutions.length > 0 &&
-      run.modelExecutions.every(
+      editRunEvidence.modelExecutions.length > 0 &&
+      editRunEvidence.modelExecutions.every(
         (execution) =>
-          execution.modelResourceId === "deepseek-v4-pro" &&
+          execution.modelResourceId === modelResourceId &&
           execution.providerRequestIdPresent === true,
       ),
     secretMaterialPersisted: false,
   };
   if (!result.providerVerified) {
-    throw new Error("Edit evidence does not prove real deepseek-v4-pro execution");
+    throw new Error(`Edit evidence does not prove real ${modelResourceId} execution`);
+  }
+  if (draftWarmEditMode && !result.hmrMetricRecorded) {
+    throw new Error("Draft Warm Edit completed without recording the HMR iframe metric");
+  }
+  if (
+    draftColdDevEditMode &&
+    (!result.coldDevMetricRecorded || !result.durableSnapshotMetricRecorded)
+  ) {
+    throw new Error(
+      "Draft Cold Dev Edit completed without recording Cold Dev ready and durable snapshot metrics",
+    );
   }
 } catch (error) {
   result = {
@@ -139,11 +383,14 @@ try {
     projectId,
     prompt,
     runId,
+    warmEditKind: draftWarmEditMode ? draftWarmEditKind : null,
+    lifecycleProfile: draftColdDevEditMode ? "cold_dev" : draftWarmEditMode ? "warm_hmr" : null,
+    run: editRunEvidence,
     error: { name: error?.name || "Error", message: String(error?.message || error) },
     secretMaterialPersisted: false,
   };
 } finally {
-  if (!existingRunId) await releaseSandbox();
+  if (!existingRunId && !keepSandbox) await releaseSandbox();
 }
 
 const finalDirectory = evidenceDirectory.replace(
@@ -163,13 +410,132 @@ async function getRuntimeState() {
   return signedJson(`/projects/${encodeURIComponent(projectId)}/runtime-state`);
 }
 
+async function fetchRunEfficiencyMetrics(editRunId) {
+  const metrics = await signedJson(
+    `/runs/${encodeURIComponent(editRunId)}/efficiency-metrics`,
+  );
+  if (
+    metrics.schemaVersion !== "run-efficiency-metrics@1" ||
+    metrics.calculatorVersion !== "run-efficiency-calculator@1" ||
+    metrics.runId !== editRunId ||
+    metrics.projectId !== projectId
+  ) {
+    throw new Error("run efficiency metrics identity or schema mismatch");
+  }
+  return metrics;
+}
+
+async function getDraftPreview() {
+  return signedJson(`/projects/${encodeURIComponent(projectId)}/draft-preview`);
+}
+
+async function createVisualReference(snapshotId, purpose) {
+  const history = await signedJson(`/projects/${encodeURIComponent(projectId)}/history`);
+  const snapshot = (history.items || [])
+    .filter((item) => item.kind === "draft_snapshot")
+    .map((item) => item.snapshot)
+    .find((candidate) => candidate.snapshotId === snapshotId);
+  if (!snapshot?.sourceHash) {
+    throw new Error(`project history has no durable base snapshot: ${snapshotId}`);
+  }
+  // Opaque 1x1 PNG; evidence stores only the Runtime artifact identity and hash.
+  const contentBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const bytes = Buffer.from(contentBase64, "base64");
+  const contentSha256 = sha256(bytes);
+  const response = await signedJson(
+    `/projects/${encodeURIComponent(projectId)}/visual-artifacts`,
+    {
+      method: "POST",
+      body: {
+        contentBase64,
+        clientSha256: contentSha256,
+        originMetadata: {
+          purpose: `generation-context-${purpose}`,
+          source: "real-provider-suite",
+        },
+      },
+    },
+  );
+  if (!response.artifact?.id) {
+    throw new Error("visual artifact response omitted artifact.id");
+  }
+  return {
+    artifactId: response.artifact.id,
+    sha256: contentSha256,
+    mediaType: "image/png",
+    binding: {
+      artifactId: response.artifact.id,
+      role: "reference",
+      route: "/",
+      viewport: { width: 1440, height: 900, deviceScaleFactor: 1 },
+      target: {
+        kind: "static-snapshot",
+        snapshotId,
+        sourceHash: snapshot.sourceHash,
+      },
+      order: 0,
+    },
+  };
+}
+
+async function createDraftEditImpactPlan(editBase) {
+  const operations = draftColdDevEditMode
+    ? ["dependency", "copy"]
+    : draftWarmEditKind === "structural"
+      ? ["layout", "component"]
+      : ["copy", "style"];
+  const targets = draftColdDevEditMode
+    ? ["project/app/page.tsx"]
+    : ["project/app/page.tsx"];
+  let plan = await signedJson(
+    `/projects/${encodeURIComponent(projectId)}/edit-impact-plans`,
+    {
+      method: "POST",
+      body: {
+        scope: "page",
+        targets,
+        operations,
+        risk:
+          draftColdDevEditMode || draftWarmEditKind === "structural"
+            ? "medium"
+            : "low",
+        editBase,
+      },
+    },
+  );
+  if (plan.requiresConfirmation) {
+    plan = await signedJson(
+      `/projects/${encodeURIComponent(projectId)}/edit-impact-plans/${encodeURIComponent(plan.planHash)}/confirm`,
+      { method: "POST", body: {} },
+    );
+  }
+  if (!plan.planHash) throw new Error("Draft EditImpactPlan response omitted planHash");
+  return plan;
+}
+
 async function readArtifact(versionId) {
+  const route = artifactKind === "docs" ? "/docs/" : "/";
   const response = await signedFetch(
-    `/artifacts/${encodeURIComponent(projectId)}/current/`,
+    `/artifacts/${encodeURIComponent(projectId)}/current${route}`,
   );
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`current Artifact returned ${response.status}: ${body.slice(0, 500)}`);
+  }
+  if (artifactKind === "docs") {
+    if (!body.includes(expectedArtifactText)) {
+      throw new Error(`edited Docs Artifact does not contain expected text: ${expectedArtifactText}`);
+    }
+    return {
+      versionId,
+      route,
+      httpStatus: response.status,
+      expectedText: expectedArtifactText,
+      expectedTextFound: true,
+      bodySha256: sha256(body),
+      bodyBytes: Buffer.byteLength(body),
+    };
   }
   const navPattern = /<nav(?:\s|>)/i;
   if (!navPattern.test(body)) {
@@ -198,7 +564,7 @@ async function readArtifact(versionId) {
   }
   return {
     versionId,
-    route: "/",
+    route,
     httpStatus: response.status,
     semanticNavFound: true,
     originalHeadlineFound: true,
@@ -274,8 +640,27 @@ async function verifyDraftPreview(editRunId) {
       `Draft Preview route returned ${response.status}: ${html.slice(0, 500)}`,
     );
   }
-  if (!html.includes("让 AI 成为可治理的企业生产力")) {
-    throw new Error("Draft Preview lost the original required headline");
+  const expectedText = draftLifecycleEditMode
+    ? expectedDraftText
+    : "让 AI 成为可治理的企业生产力";
+  if (!html.includes(expectedText)) {
+    throw new Error(`Draft Preview does not contain expected text: ${expectedText}`);
+  }
+  if (draftLifecycleEditMode) {
+    return {
+      sessionId: session.sessionId,
+      sessionEpoch: session.sessionEpoch,
+      leaseId,
+      runId: editRunId,
+      status: session.status,
+      workspaceRevision: session.workspaceRevision,
+      lastReadyRevision: session.lastReadyRevision,
+      durableRevision: session.durableRevision,
+      durableSnapshotId: session.durableSnapshotId,
+      httpStatus: response.status,
+      expectedText,
+      expectedTextFound: true,
+    };
   }
   const iconHref = declaredIconHref(html);
   if (!iconHref) {
@@ -314,7 +699,8 @@ async function verifyDraftPreview(editRunId) {
     durableRevision: session.durableRevision,
     durableSnapshotId: session.durableSnapshotId,
     httpStatus: response.status,
-    originalHeadlineFound: true,
+    expectedText,
+    expectedTextFound: true,
     declaredIconHref: iconHref,
     declaredIconHttpStatus: iconStatus,
   };

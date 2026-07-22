@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zerondesign.local/schemas/generation-context-run-evidence.schema.json",
+  "title": "Generation Context dual-read Run evidence",
+  "description": "Compatibility contract for legacy DCP read evidence and GenerationContext@1 runtime-attested evidence.",
+  "type": "object",
+  "required": ["runId"],
+  "properties": {
+    "runId": { "$ref": "#/$defs/nonEmpty" },
+    "templateVersion": { "$ref": "#/$defs/nonEmpty" },
+    "generationContext": { "$ref": "#/$defs/generationContext" },
+    "attestation": { "$ref": "#/$defs/attestation" },
+    "efficiency": { "$ref": "#/$defs/efficiency" },
+    "designContextContentHash": { "$ref": "#/$defs/sha256" },
+    "requiredReadPaths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    },
+    "readFiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonEmpty" }
+    },
+    "requiredReadsPassed": { "type": "boolean" }
+  },
+  "oneOf": [
+    {
+      "title": "GenerationContext@1",
+      "required": ["templateVersion", "generationContext", "efficiency"],
+      "not": { "required": ["requiredReadsPassed"] }
+    },
+    {
+      "title": "Legacy DCP read protocol",
+      "required": ["designContextContentHash", "requiredReadPaths", "readFiles", "requiredReadsPassed"],
+      "properties": { "requiredReadsPassed": { "const": true } },
+      "not": { "required": ["generationContext"] }
+    }
+  ],
+  "$defs": {
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "generationContext": {
+      "type": "object",
+      "required": ["schemaVersion", "status", "contextContentHash", "runContextBindingHash", "runtimeAttestationHash"],
+      "properties": {
+        "schemaVersion": { "enum": ["generation-context@1", "generation-context-status@1"] },
+        "runContractVersion": { "const": "generation-context@1" },
+        "status": { "const": "compiled" },
+        "contextContentHash": { "$ref": "#/$defs/sha256" },
+        "runContextBindingHash": { "$ref": "#/$defs/sha256" },
+        "runtimeAttestationHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "required": ["state", "runtimeAttestationHash"],
+      "properties": {
+        "state": { "const": "verified" },
+        "runtimeAttestationHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "efficiency": {
+      "type": "object",
+      "required": ["schemaVersion"],
+      "properties": {
+        "schemaVersion": { "const": "run-efficiency-metrics@1" },
+        "calculatorVersion": { "const": "run-efficiency-calculator@1" },
+        "uniqueContextReads": { "$ref": "#/$defs/count" },
+        "uniqueSourceReads": { "$ref": "#/$defs/count" },
+        "duplicateReads": { "$ref": "#/$defs/count" },
+        "duplicateReadTokens": { "$ref": "#/$defs/count" },
+        "unchangedReadStubs": { "$ref": "#/$defs/count" },
+        "postCompactSourceRestores": { "$ref": "#/$defs/count" },
+        "prebuildLists": { "$ref": "#/$defs/count" },
+        "prebuildFsReadCount": { "$ref": "#/$defs/count" },
+        "prebuildFsListCount": { "$ref": "#/$defs/count" },
+        "prebuildFsSearchCount": { "$ref": "#/$defs/count" },
+        "contextReadDeliveries": { "$ref": "#/$defs/count" },
+        "sourceReadDeliveries": { "$ref": "#/$defs/count" },
+        "fullReadDeliveries": { "$ref": "#/$defs/count" },
+        "duplicateFullReadDeliveries": { "$ref": "#/$defs/count" },
+        "duplicateFullReadRateBasisPoints": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "duplicateReadEstimatedTokens": { "$ref": "#/$defs/count" }
+      },
+      "oneOf": [
+        {
+          "title": "Evidence summary counters",
+          "required": [
+            "uniqueContextReads", "uniqueSourceReads", "duplicateReads", "duplicateReadTokens",
+            "unchangedReadStubs", "postCompactSourceRestores", "prebuildLists"
+          ],
+          "not": { "required": ["calculatorVersion"] }
+        },
+        {
+          "title": "Runtime calculator output",
+          "required": [
+            "calculatorVersion", "prebuildFsReadCount", "prebuildFsListCount", "prebuildFsSearchCount",
+            "contextReadDeliveries", "sourceReadDeliveries", "fullReadDeliveries",
+            "duplicateFullReadDeliveries", "duplicateFullReadRateBasisPoints", "duplicateReadEstimatedTokens"
+          ]
+        }
+      ]
+    },
+    "count": { "type": "integer", "minimum": 0 }
+  }
+}

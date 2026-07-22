@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anydesign-runtime
+  namespace: anydesign-runtime
+spec:
+  template:
+    spec:
+      containers:
+        - name: runtime
+          volumeMounts:
+            - name: works-probe-ca
+              mountPath: /etc/anydesign/works-probe
+              readOnly: true
+      volumes:
+        - name: works-probe-ca
+          configMap:
+            name: anydesign-runtime-works-probe-ca

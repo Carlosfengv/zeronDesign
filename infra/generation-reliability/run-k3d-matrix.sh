@@ -45,8 +45,8 @@ case "${rc_mode}" in
     exit 2
     ;;
 esac
-if [[ "${matrix_mode}" == "fixture" && "${rc_mode}" == "release" ]]; then
-  printf 'release mode requires GENERATION_MATRIX_MODE=real\n' >&2
+if [[ "${rc_mode}" == "release" ]]; then
+  printf 'GENERATION_MATRIX_RC_MODE=release is retired because this matrix uses a direct Provider diagnostic. Use run-real-provider-examples.sh with the governed Provider Gateway.\n' >&2
   exit 2
 fi
 

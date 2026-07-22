@@ -1,0 +1,25 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: anydesign-runtime-generation-context
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - anydesign-runtime
+  selector:
+    matchLabels:
+      app: anydesign-runtime
+      anydesign.io/runtime-role: primary
+  endpoints:
+    - port: http
+      path: /internal/metrics/generation-context
+      interval: 30s
+      scrapeTimeout: 10s
+      authorization:
+        type: Bearer
+        credentials:
+          name: anydesign-runtime-internal-admin
+          key: token

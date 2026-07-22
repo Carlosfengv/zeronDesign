@@ -38,6 +38,13 @@ assert.deepEqual(
   docsBriefOne.toolCalls.map((call) => call.name),
   ["content.list_sources", "content.read_source"],
 );
+assert.ok(websiteBriefOne.toolCalls.every((call) => call.id.startsWith("run-website-brief:")));
+assert.ok(docsBriefOne.toolCalls.every((call) => call.id.startsWith("run-docs-brief:")));
+assert.equal(
+  new Set([...websiteBriefOne.toolCalls, ...docsBriefOne.toolCalls].map((call) => call.id)).size,
+  4,
+  "fixture tool-call ids must be unique across concurrent Runs",
+);
 
 const websiteBriefTwo = responseForBody(
   request("run-website-brief", "rc-website-fixture", "brief", 2),
@@ -64,7 +71,17 @@ assert.equal(docsBuildOne.toolCalls[0].input.template, "fumadocs-docs");
 const docsBuildTwo = responseForBody(
   request("run-docs-build", "rc-docs-fixture", "build", 2),
 );
-const docsBuildScript = docsBuildTwo.toolCalls.find(
+assert.deepEqual(
+  docsBuildTwo.toolCalls.map((call) => [call.name, call.input.path]),
+  [
+    ["fs.read", "project/package.json"],
+    ["fs.read", "project/content/docs/index.mdx"],
+  ],
+);
+const docsBuildThree = responseForBody(
+  request("run-docs-build", "rc-docs-fixture", "build", 3),
+);
+const docsBuildScript = docsBuildThree.toolCalls.find(
   (call) => call.name === "fs.write" && call.input.path === "project/build.cjs",
 )?.input.text;
 assert.match(
@@ -92,16 +109,28 @@ responseForBody(request("run-website-css", "rc-website-css", "build", 1));
 const websiteBuildTwo = responseForBody(
   request("run-website-css", "rc-website-css", "build", 2),
 );
-const websiteBuildScript = websiteBuildTwo.toolCalls.find(
+assert.deepEqual(
+  websiteBuildTwo.toolCalls.map((call) => [call.name, call.input.path]),
+  [["fs.read", "project/app/page.tsx"]],
+);
+const websiteBuildThree = responseForBody(
+  request("run-website-css", "rc-website-css", "build", 3),
+);
+const websiteBuildScript = websiteBuildThree.toolCalls.find(
   (call) => call.name === "fs.write" && call.input.path === "project/build.cjs",
 )?.input.text;
-assert.match(
-  websiteBuildScript,
-  /rmSync\('dist',\{recursive:true,force:true\}\)/,
-  "the Website fixture must remove stale output inherited from a reused warm-pool workspace",
+assert.equal(websiteBuildScript, undefined, "next-app must retain its Runtime-owned build contract");
+assert.ok(
+  !websiteBuildThree.toolCalls.some(
+    (call) => call.name === "fs.write" && call.input.path === "project/package.json",
+  ),
+  "next-app must not mutate its protected package contract",
 );
-assert.match(websiteBuildScript, /<meta name=\\"viewport\\"/);
-assert.match(websiteBuildScript, /html,body\{margin:0;max-width:100%;overflow-x:hidden\}/);
+const websitePageSource = websiteBuildThree.toolCalls.find(
+  (call) => call.name === "fs.write" && call.input.path === "project/app/page.tsx",
+)?.input.text;
+assert.match(websitePageSource, /RC Website Built/);
+assert.match(websitePageSource, /<nav aria-label="Primary">/);
 
 function collectToolNames(runId, projectId, phase, turns) {
   return Array.from({ length: turns }, (_, index) =>
@@ -113,6 +142,7 @@ function assertDependentToolsAreSerialized(runId, projectId, phase, turns) {
   const dependentTools = new Set([
     "project.build",
     "preview.start",
+    "draft.snapshot_create",
     "browser.open",
     "browser.screenshot",
     "preview.publish",
@@ -128,38 +158,66 @@ function assertDependentToolsAreSerialized(runId, projectId, phase, turns) {
   }
 }
 
-for (const [surface, projectId] of [
-  ["website", "rc-website-publish-contract"],
-  ["docs", "rc-docs-publish-contract"],
-]) {
-  const buildTools = collectToolNames(
-    `run-${surface}-publish-contract`,
-    projectId,
-    "build",
-    9,
-  );
-  const editTools = collectToolNames(
-    `run-${surface}-edit-publish-contract`,
-    projectId,
-    "edit",
-    7,
-  );
-  assert.ok(buildTools.includes("preview.publish"));
-  assert.ok(editTools.includes("preview.publish"));
-  assert.ok(!buildTools.includes("preview.report_candidate"));
-  assert.ok(!editTools.includes("preview.report_candidate"));
-  assertDependentToolsAreSerialized(
-    `run-${surface}-serialized-build`,
-    `${projectId}-serialized`,
-    "build",
-    9,
-  );
-  assertDependentToolsAreSerialized(
-    `run-${surface}-serialized-edit`,
-    `${projectId}-serialized`,
-    "edit",
-    7,
-  );
+const websiteBuildTools = collectToolNames(
+  "run-website-draft-contract",
+  "rc-website-draft-contract",
+  "build",
+  8,
+);
+const websiteEditTools = collectToolNames(
+  "run-website-edit-draft-contract",
+  "rc-website-edit-draft-contract",
+  "edit",
+  6,
+);
+for (const tools of [websiteBuildTools, websiteEditTools]) {
+  assert.ok(tools.includes("draft.snapshot_create"));
+  assert.ok(tools.includes("run.complete"));
+  assert.ok(!tools.includes("preview.publish"));
+  assert.ok(!tools.includes("browser.open"));
+  assert.ok(!tools.includes("browser.screenshot"));
 }
+assertDependentToolsAreSerialized(
+  "run-website-serialized-build",
+  "rc-website-serialized-build",
+  "build",
+  8,
+);
+assertDependentToolsAreSerialized(
+  "run-website-serialized-edit",
+  "rc-website-serialized-edit",
+  "edit",
+  6,
+);
+
+const docsBuildTools = collectToolNames(
+  "run-docs-publish-contract",
+  "rc-docs-publish-contract",
+  "build",
+  9,
+);
+const docsEditTools = collectToolNames(
+  "run-docs-edit-publish-contract",
+  "rc-docs-edit-publish-contract",
+  "edit",
+  7,
+);
+for (const tools of [docsBuildTools, docsEditTools]) {
+  assert.ok(tools.includes("preview.publish"));
+  assert.ok(!tools.includes("draft.snapshot_create"));
+  assert.ok(!tools.includes("preview.report_candidate"));
+}
+assertDependentToolsAreSerialized(
+  "run-docs-serialized-build",
+  "rc-docs-serialized-build",
+  "build",
+  9,
+);
+assertDependentToolsAreSerialized(
+  "run-docs-serialized-edit",
+  "rc-docs-serialized-edit",
+  "edit",
+  7,
+);
 
 process.stdout.write("Fixture model gateway contract passed\n");

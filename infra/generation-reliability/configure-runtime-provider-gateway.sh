@@ -8,6 +8,7 @@ KUBECTL="${KUBECTL:-kubectl}"
 context="${RUNTIME_PROVIDER_GATEWAY_CONTEXT:-k3d-${GENERATION_REAL_CLUSTER:-zerondesign-e2e}}"
 namespace="${RUNTIME_PROVIDER_GATEWAY_NAMESPACE:-anydesign-runtime}"
 deployment="${RUNTIME_PROVIDER_GATEWAY_DEPLOYMENT:-anydesign-runtime}"
+pod_selector="${RUNTIME_PROVIDER_GATEWAY_POD_SELECTOR:-app=anydesign-runtime,anydesign.io/runtime-role=primary}"
 expected_url="${RUNTIME_PROVIDER_GATEWAY_URL:-http://provider-gateway.provider-system.svc.cluster.local:9000}"
 patch_file="${RUNTIME_PROVIDER_GATEWAY_PATCH_FILE:-${ROOT_DIR}/infra/agent-sandbox/runtime/provider-gateway-env-patch.yaml}"
 evidence_file="${RUNTIME_PROVIDER_GATEWAY_EVIDENCE_FILE:-${ROOT_DIR}/services/runtime/target/e2e-evidence/${GENERATION_REAL_CLUSTER:-zerondesign-e2e}/real-provider-runs/runtime-provider-gateway-mode.json}"
@@ -41,7 +42,7 @@ previous_deployment="$(${KUBECTL} --context "${context}" -n "${namespace}" \
 current_deployment="$(${KUBECTL} --context "${context}" -n "${namespace}" \
   get deployment "${deployment}" -o json)"
 ready_pods="$(${KUBECTL} --context "${context}" -n "${namespace}" \
-  get pods -l app=anydesign-runtime -o json)"
+  get pods -l "${pod_selector}" -o json)"
 
 node - "${previous_deployment}" "${current_deployment}" "${ready_pods}" \
   "${expected_url}" "${context}" "${namespace}" "${deployment}" \

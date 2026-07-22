@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { generationContextProtocol, validateGenerationContextRunEvidence } from "./generation-context-evidence.mjs";
 
 function parseArgs(argv) {
   const args = {};
@@ -30,23 +31,44 @@ function digestRef(image) {
   return `${image.ref}@${image.digest}`;
 }
 
-function enforcedDcpLifecyclePassed(fixture) {
+function dcpStagePassed(stage, label) {
+  if (generationContextProtocol(stage) === "generation-context") {
+    if (validateGenerationContextRunEvidence(stage, label).length > 0) return false;
+  } else if (stage?.package?.effectiveCompatibilityMode !== "enforced"
+    || !Array.isArray(stage?.missingRequiredReads)
+    || stage.missingRequiredReads.length !== 0) {
+    return false;
+  }
+  return stage?.gate === "ready"
+    && stage?.materialization?.ready === true
+    && stage?.styleContract?.verified === true
+    && ["computed-style", "a11y", "viewport"].every(
+      capability => stage?.verification?.capabilities?.[capability]?.available === true,
+    );
+}
+
+function stageContextHash(stage) {
+  return generationContextProtocol(stage) === "generation-context"
+    ? stage?.generationContext?.contextContentHash
+    : stage?.package?.contentHash;
+}
+
+export function enforcedDcpLifecyclePassed(fixture) {
   const dcp = fixture?.designContextEnforced;
   const lifecycle = dcp?.lifecycle;
   const stages = [dcp?.build, dcp?.edit, dcp?.repair];
   const runIds = [lifecycle?.buildRunId, lifecycle?.editRunId, lifecycle?.reviewRunId, lifecycle?.repairRunId];
   if (runIds.some(value => typeof value !== "string" || value.length === 0) || new Set(runIds).size !== 4) return false;
   if (lifecycle?.findingStatus !== "fixed" || !lifecycle?.findingId || !lifecycle?.candidateVersionId) return false;
-  if (stages.some(stage => stage?.package?.effectiveCompatibilityMode !== "enforced"
-    || stage?.gate !== "ready"
-    || stage?.materialization?.ready !== true
-    || stage?.styleContract?.verified !== true
-    || !Array.isArray(stage?.missingRequiredReads)
-    || stage.missingRequiredReads.length !== 0
-    || ["computed-style", "a11y", "viewport"].some(capability => stage?.verification?.capabilities?.[capability]?.available !== true))) return false;
+  if (stages.some((stage, index) => !dcpStagePassed(stage, `designContextEnforced.stage${index + 1}`))) return false;
   if (dcp.build.runId !== lifecycle.buildRunId || dcp.edit.runId !== lifecycle.editRunId || dcp.repair.runId !== lifecycle.repairRunId) return false;
-  if (new Set(stages.map(stage => stage.package.contentHash)).size !== 1
-    || new Set(stages.map(stage => stage.materialization.hash)).size !== 1) return false;
+  const protocols = stages.map(generationContextProtocol);
+  if (new Set(protocols).size !== 1) return false;
+  if (protocols[0] === "legacy" && new Set(stages.map(stageContextHash)).size !== 1) return false;
+  if (protocols[0] === "generation-context"
+    && (new Set(stages.map(stage => stage.templateVersion)).size !== 1
+      || new Set(stages.map(stage => stage.generationContext.runContextBindingHash)).size !== stages.length)) return false;
+  if (new Set(stages.map(stage => stage.materialization.hash)).size !== 1) return false;
   const repairFinding = fixture?.reviewRepair?.findings?.find(item => item?.findingId === lifecycle.findingId);
   return fixture?.reviewRepair?.reviewRunId === lifecycle.reviewRunId
     && fixture?.reviewRepair?.repairRunId === lifecycle.repairRunId
@@ -71,6 +93,8 @@ function normalizeProject(project) {
     previewLeaseId: project.previewLeaseId,
     screenshotId: project.screenshotId ?? screenshot.screenshotId,
     nonblankPixelRatio: project.nonblankPixelRatio ?? screenshot.nonblankPixelRatio,
+    visualReview: project.visualReview,
+    publication: project.publication,
     versionBeforeCas: project.versionBeforeCas ?? project.currentVersionBeforeCas ?? null,
     versionAfterCas: project.versionAfterCas ?? project.currentVersionAfterCas,
     artifactManifestHash: project.artifactManifestHash,
@@ -265,4 +289,6 @@ async function main() {
   process.stdout.write(`Release evidence aggregated: ${args.out} (eligible=${releaseEligible})\n`);
 }
 
-await main();
+if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  await main();
+}

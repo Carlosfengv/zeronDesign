@@ -31,14 +31,6 @@ name: Generation Reliability
         options:
           - fixture
           - real
-      rc_mode:
-        description: Audit accepts a dirty/local build; release requires clean real-provider evidence
-        required: true
-        default: audit
-        type: choice
-        options:
-          - audit
-          - release
 
 permissions:
   contents: read
@@ -148,17 +140,49 @@ jobs:
           browser="$(command -v google-chrome || command -v chromium || command -v chromium-browser)"
           test -x "${browser}"
           printf 'RUNTIME_BROWSER_EXECUTABLE=%s\n' "${browser}" >>"${GITHUB_ENV}"
-      - name: Run real-provider Website and Docs matrix
+      - name: Bootstrap governed Runtime cluster with fixture matrix
+        env:
+          GENERATION_MATRIX_MODE: fixture
+          GENERATION_MATRIX_BOOTSTRAP: always
+          GENERATION_MATRIX_SKIP_PREFLIGHT: "1"
+          GENERATION_MATRIX_EVIDENCE_DIR: services/runtime/target/e2e-evidence/ci-real/bootstrap
+        run: bash infra/generation-reliability/run-k3d-matrix.sh
+      - name: Build and import Provider Gateway image
+        run: |
+          gateway_image="zerondesign/provider-gateway:ci-${GITHUB_RUN_ID}"
+          docker build --tag "${gateway_image}" services/provider-gateway
+          k3d image import --cluster zerondesign-e2e "${gateway_image}"
+          printf 'PROVIDER_GATEWAY_IMAGE=%s\n' "${gateway_image}" >>"${GITHUB_ENV}"
+      - name: Install credential-backed Provider Gateway
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
-          DEEPSEEK_E2E_MODEL: ${{ vars.DEEPSEEK_E2E_MODEL }}
-          GENERATION_MATRIX_MODE: real
-          GENERATION_MATRIX_RC_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.rc_mode || 'audit' }}
-          GENERATION_MATRIX_BOOTSTRAP: always
-          GENERATION_MATRIX_EVIDENCE_DIR: services/runtime/target/e2e-evidence/ci-real
-          RUNTIME_RC_REAL_TOTAL_TOKEN_CEILING: ${{ vars.REAL_PROVIDER_TOTAL_TOKEN_CEILING || '5000000' }}
-        run: bash infra/generation-reliability/run-k3d-matrix.sh
+        run: |
+          test -n "${DEEPSEEK_API_KEY}"
+          kubectl create namespace provider-system --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f infra/provider-gateway/service-account.yaml
+          kubectl apply -f infra/provider-gateway/service.yaml
+          secret_dir="$(mktemp -d)"
+          trap 'rm -rf "${secret_dir}"' EXIT
+          umask 077
+          printf '%s' "${DEEPSEEK_API_KEY}" >"${secret_dir}/api-key"
+          openssl rand -hex 32 >"${secret_dir}/runtime-token"
+          kubectl create secret generic deepseek-v4-pro-api -n provider-system \
+            --from-file="api-key=${secret_dir}/api-key" --dry-run=client -o yaml | kubectl apply -f -
+          for namespace in provider-system anydesign-runtime; do
+            kubectl create secret generic provider-gateway-runtime-auth -n "${namespace}" \
+              --from-file="MODEL_GATEWAY_AUTH_TOKEN=${secret_dir}/runtime-token" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          done
+          PROVIDER_GATEWAY_IMAGE="${PROVIDER_GATEWAY_IMAGE}" \
+            bash infra/provider-gateway/apply-k3d-persistent-sqlite.sh
+      - name: Run governed real-provider Website and Docs suite
+        env:
+          DEEPSEEK_E2E_MODEL: ${{ vars.DEEPSEEK_E2E_MODEL || 'deepseek-v4-pro' }}
+          GENERATION_REAL_CLUSTER: zerondesign-e2e
+          GENERATION_REAL_WORKSPACE_NAMESPACE: ws-runtime-rc
+          GENERATION_REAL_EVIDENCE_DIR: services/runtime/target/e2e-evidence/ci-real/real-provider-runs
+          GENERATION_REAL_PROVIDER_READINESS_PROBE: "1"
+        run: bash infra/generation-reliability/run-real-provider-examples.sh
       - name: Upload generation evidence
         if: always()
         uses: actions/upload-artifact@v4

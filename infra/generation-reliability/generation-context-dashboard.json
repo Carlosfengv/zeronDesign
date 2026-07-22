@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 39,
+  "title": "Generation Context Runtime",
+  "tags": ["runtime", "generation-context"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "template", "type": "query", "query": "label_values(generation_context_compile_total, template)" },
+      { "name": "phase", "type": "query", "query": "label_values(agent_time_to_first_mutation_seconds, phase)" }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Compile outcomes",
+      "type": "timeseries",
+      "targets": [{ "expr": "sum by (status) (rate(generation_context_compile_total[5m]))", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 2,
+      "title": "Time to first mutation P50/P95",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, phase) (rate(agent_time_to_first_mutation_seconds_bucket{template=~\"$template\"}[10m])))", "legendFormat": "P50 {{phase}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(agent_time_to_first_mutation_seconds_bucket{template=~\"$template\"}[10m])))", "legendFormat": "P95 {{phase}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Cold Dev ready P50/P95",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, template) (rate(cold_dev_ready_seconds_bucket[10m])))", "legendFormat": "P50 {{template}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, template) (rate(cold_dev_ready_seconds_bucket[10m])))", "legendFormat": "P95 {{template}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Time to first Greenfield Build P50/P95",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, template) (rate(agent_time_to_first_greenfield_build_seconds_bucket[10m])))", "legendFormat": "P50 {{template}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, template) (rate(agent_time_to_first_greenfield_build_seconds_bucket[10m])))", "legendFormat": "P95 {{template}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Warm iframe applied P50/P95",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, template) (rate(draft_hmr_iframe_applied_seconds_bucket[10m])))", "legendFormat": "P50 {{template}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, template) (rate(draft_hmr_iframe_applied_seconds_bucket[10m])))", "legendFormat": "P95 {{template}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Durable snapshot P95",
+      "type": "timeseries",
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, template) (rate(draft_snapshot_durable_seconds_bucket[10m])))", "legendFormat": "P95 {{template}}" }]
+    },
+    {
+      "id": 7,
+      "title": "Duplicate read ratio",
+      "type": "timeseries",
+      "targets": [{ "expr": "sum(rate(agent_duplicate_read_total[10m])) / clamp_min(sum(rate(agent_unique_read_total[10m]) + rate(agent_duplicate_read_total[10m])), 1)", "legendFormat": "duplicate ratio" }]
+    },
+    {
+      "id": 8,
+      "title": "Integrity and boundary violations",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "sum by (status) (rate(generation_context_compile_total{status!=\"compiled\"}[5m]))", "legendFormat": "compile {{status}}" },
+        { "expr": "sum(rate(agent_out_of_scope_mutation_total[5m]))", "legendFormat": "out of scope" },
+        { "expr": "sum(rate(run_completion_boundary_violation_total[5m]))", "legendFormat": "completion boundary" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Replan and successor Runs",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "sum by (reason) (rate(edit_impact_plan_replaced_total[10m]))", "legendFormat": "replan {{reason}}" },
+        { "expr": "sum by (reason) (rate(agent_successor_run_created_total[10m]))", "legendFormat": "successor {{reason}}" }
+      ]
+    }
+  ]
+}

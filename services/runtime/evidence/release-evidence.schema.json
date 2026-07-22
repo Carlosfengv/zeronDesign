@@ -220,11 +220,17 @@
         },
         "cancelCleanup": {
           "type": "object",
-          "required": ["runId", "runStatus", "previewHttpStatusAfterCancel", "passed"],
+          "required": ["runId", "runStatus", "passed"],
+          "oneOf": [
+            { "required": ["previewHttpStatusAfterCancel"] },
+            { "required": ["previewLeaseStatus", "durableDraftCreated"] }
+          ],
           "properties": {
             "runId": { "$ref": "#/$defs/nonEmpty" },
             "runStatus": { "const": "cancelled" },
             "previewHttpStatusAfterCancel": { "const": 404 },
+            "previewLeaseStatus": { "const": "not_applicable" },
+            "durableDraftCreated": { "const": false },
             "passed": { "const": true }
           }
         },

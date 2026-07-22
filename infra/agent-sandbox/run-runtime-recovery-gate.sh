@@ -73,7 +73,10 @@ const fs=require("fs");
 const projects=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).projects;
 if(!Array.isArray(projects)||projects.length<2)process.exit(2);
 for(const project of projects){
-  if(project.cancelCleanup?.passed!==true||project.cancelCleanup?.runStatus!=="cancelled"||project.cancelCleanup?.previewHttpStatusAfterCancel!==404)process.exit(2);
+  const cleanup=project.cancelCleanup;
+  const legacy=cleanup?.previewHttpStatusAfterCancel===404;
+  const snapshotOnly=cleanup?.previewLeaseStatus==="not_applicable"&&cleanup?.durableDraftCreated===false;
+  if(cleanup?.passed!==true||cleanup?.runStatus!=="cancelled"||(!legacy&&!snapshotOnly))process.exit(2);
 }
 ' "${runtime_evidence_file}"
 

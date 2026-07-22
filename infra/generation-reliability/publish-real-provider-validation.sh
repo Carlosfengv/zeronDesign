@@ -63,7 +63,7 @@ trap cleanup EXIT
 mkdir -p "${work_dir}/context/public" "${work_dir}/context/metadata"
 
 runtime_pod="$(${KUBECTL} --context "${context}" -n "${runtime_namespace}" \
-  get pod -l app=anydesign-runtime -o json | jq -r '
+  get pod -l 'app=anydesign-runtime,anydesign.io/runtime-role=primary' -o json | jq -r '
     [.items[] | select(
       .metadata.deletionTimestamp == null and
       any(.status.conditions[]?; .type == "Ready" and .status == "True")

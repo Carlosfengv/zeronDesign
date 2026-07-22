@@ -1,0 +1,83 @@
+{
+  "schemaVersion": "baseline-evidence@1",
+  "calculatorVersion": "generation-context-baseline-calculator@1",
+  "recordedAt": "2026-07-20T00:00:00Z",
+  "sourceWindow": {
+    "startedAt": "2026-07-19T00:00:00Z",
+    "endedAt": "2026-07-20T00:00:00Z"
+  },
+  "samples": [
+    {
+      "id": "greenfield-build-run-69962",
+      "source": {
+        "storageRef": "unavailable://target/e2e-evidence/zerondesign-greenfield/real-provider-runs/suite-20260719131101003-failed/run-build-run-69962.events.ndjson",
+        "contentSha256": null,
+        "availability": "unavailable"
+      },
+      "identity": {
+        "runId": "build-run-69962",
+        "modelResource": "unknown-real-provider-resource",
+        "template": "next-app@1",
+        "phase": "build",
+        "fixtureIdentity": null
+      },
+      "outcome": {
+        "status": "failed",
+        "accepted": false
+      },
+      "metrics": {
+        "prebuildFsReadCount": 13,
+        "prebuildFsListCount": 3,
+        "timeToFirstBuildMs": 141000,
+        "initialContextReadCount": 7,
+        "inputTokens": null,
+        "duplicateReadTokens": null
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": false,
+        "exclusionReasons": [
+          "source_evidence_unavailable_after_local_target_cleanup",
+          "model_resource_identity_not_recoverable",
+          "replay_fixture_identity_not_recoverable"
+        ]
+      }
+    },
+    {
+      "id": "accepted-edit-20260719153832095",
+      "source": {
+        "storageRef": "unavailable://target/e2e-evidence/zerondesign-greenfield/real-provider-edits/edit-20260719153832095-accepted/real-provider-edit-summary.json",
+        "contentSha256": null,
+        "availability": "unavailable"
+      },
+      "identity": {
+        "runId": "unknown",
+        "modelResource": "unknown-real-provider-resource",
+        "template": "next-app@1",
+        "phase": "edit",
+        "fixtureIdentity": null
+      },
+      "outcome": {
+        "status": "completed",
+        "accepted": true
+      },
+      "metrics": {
+        "modelTurns": 30,
+        "toolCalls": 74,
+        "inputTokens": 483148,
+        "fsReadCount": 17,
+        "fsListCount": 3,
+        "projectInspectCount": 2,
+        "timeToFirstBuildMs": null,
+        "duplicateReadTokens": null
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": false,
+        "exclusionReasons": [
+          "source_evidence_unavailable_after_local_target_cleanup",
+          "run_and_model_resource_identity_not_recoverable",
+          "replay_fixture_identity_not_recoverable"
+        ]
+      }
+    }
+  ]
+}

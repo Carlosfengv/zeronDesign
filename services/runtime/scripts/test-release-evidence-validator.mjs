@@ -74,6 +74,35 @@ const dcpStage = runId => ({
     "computed-style": { available: true }, a11y: { available: true }, viewport: { available: true },
   } },
 });
+const generationDcpStage = (runId, index) => {
+  const stage = dcpStage(runId);
+  delete stage.package;
+  delete stage.missingRequiredReads;
+  stage.templateVersion = "next-app@2";
+  stage.generationContext = {
+    schemaVersion: "generation-context-status@1",
+    runContractVersion: "generation-context@1",
+    status: "compiled",
+    contextContentHash: String(index + 1).repeat(64),
+    runContextBindingHash: String(index + 4).repeat(64),
+    runtimeAttestationHash: String(index + 7).repeat(64),
+  };
+  stage.attestation = {
+    state: "verified",
+    runtimeAttestationHash: stage.generationContext.runtimeAttestationHash,
+  };
+  stage.efficiency = {
+    schemaVersion: "run-efficiency-metrics@1",
+    uniqueContextReads: 0,
+    uniqueSourceReads: 3,
+    duplicateReads: 0,
+    duplicateReadTokens: 0,
+    unchangedReadStubs: 0,
+    postCompactSourceRestores: 0,
+    prebuildLists: 1,
+  };
+  return stage;
+};
 fixture.enforcedDcpFixture = {
   reviewRepair: {
     editRunId: "dcp-edit",
@@ -122,6 +151,55 @@ fixture.providerDcpProject = {
 };
 
 assert.deepEqual(validateReleaseEvidence(fixture), []);
+
+const publishWorkflowFixture = structuredClone(fixture);
+const website = publishWorkflowFixture.projects.find(project => project.kind === "website");
+delete website.screenshotId;
+delete website.nonblankPixelRatio;
+website.visualReview = { mode: "advisory", status: "not_requested" };
+website.publication = {
+  workflowId: "publish-workflow-website",
+  status: "completed",
+  checkpoint: "completed",
+  versionId: website.versionAfterCas,
+  releaseId: "release-website",
+  publicationOperationId: "operation-website",
+  publicUrl: "https://website.works.example.test",
+  externalProbePassed: true,
+};
+website.events.sequenceValid = false;
+assert.deepEqual(validateReleaseEvidence(publishWorkflowFixture), []);
+
+publishWorkflowFixture.projects[0].publication.externalProbePassed = false;
+assert.ok(
+  validateReleaseEvidence(publishWorkflowFixture).some(error =>
+    error.includes("nonblank screenshot or completed advisory PublishWorkflow")),
+);
+const generationContextFixture = structuredClone(fixture);
+for (const target of [generationContextFixture.enforcedDcpFixture, generationContextFixture.providerDcpProject]) {
+  const lifecycle = target.designContextEnforced.lifecycle;
+  target.designContextEnforced.build = generationDcpStage(lifecycle.buildRunId, 0);
+  target.designContextEnforced.edit = generationDcpStage(lifecycle.editRunId, 1);
+  target.designContextEnforced.repair = generationDcpStage(lifecycle.repairRunId, 2);
+  target.designContextEnforced.edit.efficiency = {
+    schemaVersion: "run-efficiency-metrics@1",
+    calculatorVersion: "run-efficiency-calculator@1",
+    prebuildFsReadCount: 1,
+    prebuildFsListCount: 0,
+    prebuildFsSearchCount: 0,
+    contextReadDeliveries: 0,
+    sourceReadDeliveries: 2,
+    fullReadDeliveries: 2,
+    duplicateFullReadDeliveries: 0,
+    duplicateFullReadRateBasisPoints: 0,
+    duplicateReadEstimatedTokens: 0,
+  };
+}
+assert.deepEqual(validateReleaseEvidence(generationContextFixture), []);
+const reusedGenerationBinding = structuredClone(generationContextFixture);
+reusedGenerationBinding.enforcedDcpFixture.designContextEnforced.edit.generationContext.runContextBindingHash =
+  reusedGenerationBinding.enforcedDcpFixture.designContextEnforced.build.generationContext.runContextBindingHash;
+assert(validateReleaseEvidence(reusedGenerationBinding).some(error => error.includes("binding hashes")));
 const dirty = structuredClone(fixture);
 dirty.repository.dirty = true;
 assert(validateReleaseEvidence(dirty).some(error => error.includes("clean")));
@@ -149,6 +227,17 @@ assert(validateReleaseEvidence(mismatchedPreflightLock).some(error => error.incl
 const leakedPreview = structuredClone(fixture);
 leakedPreview.projects[0].cancelCleanup.previewHttpStatusAfterCancel = 200;
 assert(validateReleaseEvidence(leakedPreview).some(error => error.includes("cancellation")));
+const snapshotOnlyCancellation = structuredClone(fixture);
+snapshotOnlyCancellation.projects[0].cancelCleanup = {
+  runId: "website-cancel",
+  runStatus: "cancelled",
+  previewLeaseStatus: "not_applicable",
+  durableDraftCreated: false,
+  passed: true,
+};
+assert(!validateReleaseEvidence(snapshotOnlyCancellation).some(error => error.includes("cancellation")));
+snapshotOnlyCancellation.projects[0].cancelCleanup.durableDraftCreated = true;
+assert(validateReleaseEvidence(snapshotOnlyCancellation).some(error => error.includes("cancellation")));
 const anonymousArtifactProbe = structuredClone(fixture);
 anonymousArtifactProbe.projects[0].artifactAccessAfterRelease.authentication = "anonymous";
 assert(validateReleaseEvidence(anonymousArtifactProbe).some(error => error.includes("project principal")));

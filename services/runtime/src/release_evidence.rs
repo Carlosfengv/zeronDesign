@@ -2,6 +2,7 @@ use crate::{
     conversation::RuntimeStore,
     runtime_storage::RuntimeEvidenceStore,
     types::{AgentEvent, AgentPhase, ReviewFindingStatus},
+    visual_contracts::{PublishWorkflowCheckpoint, PublishWorkflowStatus, VisualReviewMode},
 };
 use serde_json::{json, Value};
 use std::{error::Error, fmt, sync::Arc};
@@ -152,6 +153,16 @@ impl ReleaseEvidenceService {
             })?;
         let events = self.store.events(&edit_run_id).await;
         let build_events = self.store.events(&base_version.created_by_run_id).await;
+        let publish_workflow = self
+            .store
+            .publish_workflow_store()
+            .list_for_project(project_id)
+            .into_iter()
+            .find(|workflow| {
+                workflow.version_id.as_deref() == Some(current.id.as_str())
+                    && workflow.status == PublishWorkflowStatus::Completed
+                    && workflow.checkpoint == PublishWorkflowCheckpoint::Completed
+            });
         let failure_counts = build_events.iter().chain(events.iter()).fold(
             (0_u64, 0_u64),
             |(recoverable, terminal), event| match event {
@@ -166,24 +177,54 @@ impl ReleaseEvidenceService {
         );
         let preview_index = events
             .iter()
-            .position(|event| matches!(event, AgentEvent::PreviewUpdated { .. }))
-            .ok_or_else(|| {
-                ReleaseEvidenceError::Conflict("preview.updated event missing".to_string())
-            })?;
+            .position(|event| matches!(event, AgentEvent::PreviewUpdated { .. }));
+        if preview_index.is_none() && publish_workflow.is_none() {
+            return Err(ReleaseEvidenceError::Conflict(
+                "preview.updated event or completed PublishWorkflow evidence is required"
+                    .to_string(),
+            ));
+        }
         let completed_index = events
             .iter()
             .position(|event| matches!(event, AgentEvent::RunCompleted { .. }))
             .ok_or_else(|| {
                 ReleaseEvidenceError::Conflict("run.completed event missing".to_string())
             })?;
-        let screenshot_id = current
-            .screenshot_id
-            .clone()
-            .ok_or_else(|| ReleaseEvidenceError::Conflict("screenshot ID missing".to_string()))?;
-        let screenshot = self
-            .evidence
-            .read_screenshot(project_id, &edit_run_id, &screenshot_id)
-            .map_err(|error| ReleaseEvidenceError::Internal(error.to_string()))?;
+        let screenshot_id = current.screenshot_id.clone();
+        if screenshot_id.is_none() && publish_workflow.is_none() {
+            return Err(ReleaseEvidenceError::Conflict(
+                "screenshot ID or completed PublishWorkflow evidence is required".to_string(),
+            ));
+        }
+        let screenshot = screenshot_id
+            .as_deref()
+            .map(|screenshot_id| {
+                self.evidence
+                    .read_screenshot(project_id, &edit_run_id, screenshot_id)
+                    .map_err(|error| ReleaseEvidenceError::Internal(error.to_string()))
+            })
+            .transpose()?;
+        let publication = publish_workflow.as_ref().map(|workflow| {
+            json!({
+                "schemaVersion": workflow.schema_version,
+                "workflowId": workflow.id,
+                "status": workflow.status,
+                "checkpoint": workflow.checkpoint,
+                "versionId": workflow.version_id,
+                "releaseId": workflow.release_id,
+                "publicationOperationId": workflow.publication_operation_id,
+                "publicUrl": workflow.public_url,
+                "externalProbePassed": workflow.evidence.iter().any(|evidence| {
+                    evidence.stage == PublishWorkflowCheckpoint::ExternalProbePassed
+                }),
+            })
+        });
+        let visual_review = json!({
+            "mode": publish_workflow.as_ref().map_or(VisualReviewMode::Required, |workflow| {
+                workflow.visual_review_mode
+            }),
+            "status": if screenshot_id.is_some() { "captured" } else { "not_requested" },
+        });
         Ok(json!({
             "projectId": project_id,
             "buildRunId": base_version.created_by_run_id,
@@ -197,17 +238,22 @@ impl ReleaseEvidenceService {
             "previewLeaseId": lease.id,
             "previewLeaseStatus": lease.status,
             "screenshotId": screenshot_id,
-            "nonblankPixelRatio": screenshot["nonblankPixelRatio"],
-            "screenshotPngSha256": screenshot["pngSha256"],
-            "screenshotDocumentSha256": screenshot["documentSha256"],
+            "nonblankPixelRatio": screenshot.as_ref().map(|value| &value["nonblankPixelRatio"]),
+            "screenshotPngSha256": screenshot.as_ref().map(|value| &value["pngSha256"]),
+            "screenshotDocumentSha256": screenshot.as_ref().map(|value| &value["documentSha256"]),
+            "visualReview": visual_review,
+            "publication": publication,
             "versionBeforeCas": base_version_id,
             "versionAfterCas": current.id,
             "artifactManifestHash": publish.artifact_manifest_hash,
             "artifactUrl": format!("/artifacts/{project_id}/current/"),
             "events": {
-                "previewUpdated": format!("{}/{}", current.created_by_run_id, preview_index),
+                "previewUpdated": preview_index.map(|index| {
+                    format!("{}/{}", current.created_by_run_id, index)
+                }),
                 "runCompleted": format!("{}/{}", current.created_by_run_id, completed_index),
-                "sequenceValid": preview_index < completed_index,
+                "sequenceValid": preview_index.is_some_and(|index| index < completed_index),
+                "publishWorkflowCompleted": publish_workflow.as_ref().map(|workflow| &workflow.id),
             },
             "recoverableToolFailureCount": failure_counts.0,
             "terminalToolFailureCount": failure_counts.1,

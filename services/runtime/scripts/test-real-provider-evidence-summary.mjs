@@ -80,6 +80,35 @@ function websiteDcpEvidence(readFiles = ["inputs/design-profile.json"]) {
   };
 }
 
+function websiteGenerationContextEvidence(stage) {
+  const index = { build: 0, edit: 1, repair: 2 }[stage];
+  return {
+    templateVersion: "next-app@2",
+    generationContext: {
+      schemaVersion: "generation-context-status@1",
+      runContractVersion: "generation-context@1",
+      status: "compiled",
+      contextContentHash: String(index + 1).repeat(64),
+      runContextBindingHash: String(index + 4).repeat(64),
+      runtimeAttestationHash: String(index + 7).repeat(64),
+    },
+    attestation: {
+      state: "verified",
+      runtimeAttestationHash: String(index + 7).repeat(64),
+    },
+    efficiency: {
+      schemaVersion: "run-efficiency-metrics@1",
+      uniqueContextReads: 0,
+      uniqueSourceReads: 3,
+      duplicateReads: 0,
+      duplicateReadTokens: 0,
+      unchangedReadStubs: 0,
+      postCompactSourceRestores: 0,
+      prebuildLists: 1,
+    },
+  };
+}
+
 function completeProviderLog(overrides = {}) {
   const projects = ["real-http-website", "real-http-docs"];
   const lines = [];
@@ -417,6 +446,40 @@ function main() {
     ["--require-dcp-project", "real-http-website"],
   );
   assert.deepEqual(dcpPayload.requiredDcpProjects, ["real-http-website"]);
+  const generationContextProviderEvidence = writeCase(
+    root,
+    "website-generation-context-provider-evidence",
+    completeProviderLog({
+      evidence: {
+        "real-http-website:build": websiteGenerationContextEvidence("build"),
+        "real-http-website:edit": websiteGenerationContextEvidence("edit"),
+        "real-http-website:repair": websiteGenerationContextEvidence("repair"),
+      },
+    }),
+  );
+  assertPass(
+    "website Generation Context provider evidence",
+    generationContextProviderEvidence,
+    ["--require-dcp-project", "real-http-website"],
+  );
+  const missingGenerationBinding = websiteGenerationContextEvidence("edit");
+  delete missingGenerationBinding.generationContext.runContextBindingHash;
+  assertFail(
+    "missing Generation Context binding hash",
+    writeCase(
+      root,
+      "missing-generation-context-binding",
+      completeProviderLog({
+        evidence: {
+          "real-http-website:build": websiteGenerationContextEvidence("build"),
+          "real-http-website:edit": missingGenerationBinding,
+          "real-http-website:repair": websiteGenerationContextEvidence("repair"),
+        },
+      }),
+    ),
+    "runContextBindingHash must be sha256",
+    ["--require-dcp-project", "real-http-website"],
+  );
   const providerRepairPayload = assertPass(
     "enforced Website provider Repair evidence",
     dcpProviderEvidence,

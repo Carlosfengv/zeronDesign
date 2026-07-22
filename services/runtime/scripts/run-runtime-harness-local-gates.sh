@@ -45,7 +45,7 @@ run_step "runtime http api" \
   cargo test --manifest-path services/runtime/Cargo.toml --test http_api -- --nocapture
 
 run_step "runtime template build agent" \
-  cargo test --manifest-path services/runtime/Cargo.toml --test next_build_agent -- --nocapture
+  cargo test --manifest-path services/runtime/Cargo.toml --test template_build_agent -- --nocapture
 
 run_step "shared package tests" \
   npm test --prefix packages/shared
@@ -82,6 +82,30 @@ run_step "design-context canary evidence validator syntax" \
   node --check services/runtime/scripts/validate-design-context-canary-evidence.mjs
 run_step "design-context canary evidence validator tests" \
   node services/runtime/scripts/test-design-context-canary-evidence-validator.mjs
+run_step "release evidence validator syntax" \
+  node --check services/runtime/scripts/validate-release-evidence.mjs
+run_step "release evidence validator tests" \
+  node services/runtime/scripts/test-release-evidence-validator.mjs
+run_step "release evidence aggregator syntax" \
+  node --check services/runtime/scripts/aggregate-release-evidence.mjs
+run_step "release evidence aggregator tests" \
+  node services/runtime/scripts/test-aggregate-release-evidence.mjs
+run_step "generation-context operations artifacts" \
+  node services/runtime/scripts/test-generation-context-ops-artifacts.mjs
+run_step "generation-context monitoring proof" \
+  node infra/generation-reliability/verify-generation-context-monitoring.test.mjs
+run_step "generation-context rollout evaluator" \
+  node services/runtime/scripts/test-generation-context-rollout.mjs
+run_step "generation-context paired sample creator" \
+  node services/runtime/scripts/test-create-generation-context-paired-sample.mjs
+run_step "generation-context real-provider paired sample collector" \
+  node services/runtime/scripts/test-collect-generation-context-paired-sample.mjs
+run_step "generation-context paired-cohort ledger" \
+  node services/runtime/scripts/test-generation-context-paired-cohort-ledger.mjs
+run_step "generation-context paired-pair runner" \
+  node services/runtime/scripts/test-run-generation-context-paired-pair.mjs
+run_step "generation-context baseline calculator" \
+  node services/runtime/scripts/test-generation-context-baseline.mjs
 run_step "design-context canary ledger syntax" \
   node --check services/runtime/scripts/design-context-canary-ledger.mjs
 run_step "design-context canary ledger tests syntax" \
@@ -113,20 +137,20 @@ run_step "design-context canary rollback tests syntax" \
 run_step "design-context canary rollback tests" \
   node services/runtime/scripts/test-design-context-canary-rollback.mjs
 
-run_step "provider gate no-key failure" \
-  bash -c 'set +e; RUNTIME_E2E_RUN_LOCAL_GATES=0 DEEPSEEK_API_KEY= RUNTIME_E2E_ENV_FILE= DEEPSEEK_API_KEY_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-no-key.out 2>/tmp/runtime-provider-no-key.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "DEEPSEEK_API_KEY is required" /tmp/runtime-provider-no-key.err'
+run_step "provider gate no-gateway failure" \
+  bash -c 'set +e; RUNTIME_E2E_RUN_LOCAL_GATES=0 MODEL_GATEWAY_URL= RUNTIME_E2E_ENV_FILE= MODEL_GATEWAY_AUTH_TOKEN_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-no-gateway.out 2>/tmp/runtime-provider-no-gateway.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "MODEL_GATEWAY_URL is required" /tmp/runtime-provider-no-gateway.err'
 
-run_step "provider gate default no-key fails before local gates" \
-  bash -c 'set +e; DEEPSEEK_API_KEY= RUNTIME_E2E_ENV_FILE= DEEPSEEK_API_KEY_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-default-no-key.out 2>/tmp/runtime-provider-default-no-key.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "DEEPSEEK_API_KEY is required" /tmp/runtime-provider-default-no-key.err; ! grep -q "== cargo fmt ==" /tmp/runtime-provider-default-no-key.out'
+run_step "provider gate default no-gateway fails before local gates" \
+  bash -c 'set +e; MODEL_GATEWAY_URL= RUNTIME_E2E_ENV_FILE= MODEL_GATEWAY_AUTH_TOKEN_FILE= bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-default-no-gateway.out 2>/tmp/runtime-provider-default-no-gateway.err; rc=$?; set -e; test "$rc" -eq 1; grep -q "MODEL_GATEWAY_URL is required" /tmp/runtime-provider-default-no-gateway.err; ! grep -q "== cargo fmt ==" /tmp/runtime-provider-default-no-gateway.out'
 
-run_step "provider gate key-file dry run" \
-  bash -c 'tmpkey="$(mktemp)"; tmpdir="$(mktemp -d)"; artifact_url="http://127.0.0.1:18082/artifacts/real-http-website/current"; trap "rm -f \"$tmpkey\"" EXIT; printf "dummy-key\n" > "$tmpkey"; RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_RUN_LOCAL_GATES=0 RUNTIME_E2E_DRY_RUN=1 RUNTIME_E2E_ARTIFACT_URL="$artifact_url" DEEPSEEK_API_KEY= DEEPSEEK_API_KEY_FILE="$tmpkey" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-key-file-dry-run.out; grep -q "DEEPSEEK_API_KEY_PRESENT=true" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_ARTIFACT_URL=$artifact_url" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_PROJECT=real-http-website" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_STAGE=edit" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_SELECTOR=:root" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_PROPERTY=--runtime-primary" /tmp/runtime-provider-key-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_EXPECTED=#f97316" /tmp/runtime-provider-key-file-dry-run.out; grep -q "providerGateDryRun=1" "$tmpdir/run-metadata.env"; grep -q "deepseekApiKeyPresent=true" "$tmpdir/run-metadata.env"; grep -q "artifactUrl=$artifact_url" "$tmpdir/run-metadata.env"; grep -q "styleProperty=--runtime-primary" "$tmpdir/run-metadata.env"; ! grep -q "dummy-key" "$tmpdir/run-metadata.env"'
+run_step "provider gate workload-token-file dry run" \
+  bash -c 'tmptoken="$(mktemp)"; tmpdir="$(mktemp -d)"; artifact_url="http://127.0.0.1:18082/artifacts/real-http-website/current"; trap "rm -f \"$tmptoken\"" EXIT; printf "dummy-workload-token\n" > "$tmptoken"; RUNTIME_E2E_LOG_DIR="$tmpdir" RUNTIME_E2E_RUN_LOCAL_GATES=0 RUNTIME_E2E_DRY_RUN=1 RUNTIME_E2E_ARTIFACT_URL="$artifact_url" MODEL_GATEWAY_URL="http://127.0.0.1:19000" MODEL_GATEWAY_AUTH_TOKEN= MODEL_GATEWAY_AUTH_TOKEN_FILE="$tmptoken" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-token-file-dry-run.out; grep -q "MODEL_GATEWAY_URL=http://127.0.0.1:19000" /tmp/runtime-provider-token-file-dry-run.out; grep -q "MODEL_RESOURCE_ID=deepseek-v4-pro" /tmp/runtime-provider-token-file-dry-run.out; grep -q "MODEL_GATEWAY_AUTH_TOKEN_PRESENT=true" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_ARTIFACT_URL=$artifact_url" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_PROJECT=real-http-website" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_STAGE=edit" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_SELECTOR=:root" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_PROPERTY=--runtime-primary" /tmp/runtime-provider-token-file-dry-run.out; grep -q "RUNTIME_E2E_STYLE_EXPECTED=#f97316" /tmp/runtime-provider-token-file-dry-run.out; grep -q "providerGateDryRun=1" "$tmpdir/run-metadata.env"; grep -q "modelGatewayUrl=http://127.0.0.1:19000" "$tmpdir/run-metadata.env"; grep -q "modelResourceId=deepseek-v4-pro" "$tmpdir/run-metadata.env"; grep -q "modelGatewayAuthTokenPresent=true" "$tmpdir/run-metadata.env"; grep -q "artifactUrl=$artifact_url" "$tmpdir/run-metadata.env"; grep -q "styleProperty=--runtime-primary" "$tmpdir/run-metadata.env"; ! grep -q "dummy-workload-token" "$tmpdir/run-metadata.env"'
 
 run_step "provider gate env-file dry run" \
-  bash -c 'tmpenv="$(mktemp)"; trap "rm -f \"$tmpenv\"" EXIT; printf "DEEPSEEK_API_KEY=dummy-env-key\n" > "$tmpenv"; RUNTIME_E2E_RUN_LOCAL_GATES=0 RUNTIME_E2E_DRY_RUN=1 DEEPSEEK_API_KEY= RUNTIME_E2E_ENV_FILE="$tmpenv" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh | grep -q "DEEPSEEK_API_KEY_PRESENT=true"'
+  bash -c 'tmpenv="$(mktemp)"; trap "rm -f \"$tmpenv\"" EXIT; printf "MODEL_GATEWAY_URL=http://127.0.0.1:19000\nMODEL_GATEWAY_AUTH_TOKEN=dummy-workload-token\nDEEPSEEK_E2E_MODEL=deepseek-v4-pro\n" > "$tmpenv"; RUNTIME_E2E_RUN_LOCAL_GATES=0 RUNTIME_E2E_DRY_RUN=1 MODEL_GATEWAY_URL= RUNTIME_E2E_ENV_FILE="$tmpenv" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh | grep -q "MODEL_GATEWAY_AUTH_TOKEN_PRESENT=true"'
 
 run_step "provider gate dry run skips local gates by default" \
-  bash -c 'tmpkey="$(mktemp)"; trap "rm -f \"$tmpkey\"" EXIT; printf "dummy-key\n" > "$tmpkey"; RUNTIME_E2E_DRY_RUN=1 RUNTIME_E2E_STYLE_PROJECT=real-http-docs RUNTIME_E2E_STYLE_STAGE=edit DEEPSEEK_API_KEY= DEEPSEEK_API_KEY_FILE="$tmpkey" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-dry-run-default.out; grep -q "PROVIDER_GATE_DRY_RUN=1" /tmp/runtime-provider-dry-run-default.out; grep -q "RUNTIME_E2E_STYLE_PROJECT=real-http-docs" /tmp/runtime-provider-dry-run-default.out; grep -q "RUNTIME_E2E_STYLE_STAGE=edit" /tmp/runtime-provider-dry-run-default.out; ! grep -q "== cargo fmt ==" /tmp/runtime-provider-dry-run-default.out'
+  bash -c 'RUNTIME_E2E_DRY_RUN=1 RUNTIME_E2E_STYLE_PROJECT=real-http-docs RUNTIME_E2E_STYLE_STAGE=edit MODEL_GATEWAY_URL="http://127.0.0.1:19000" bash services/runtime/scripts/run-runtime-harness-provider-gates.sh >/tmp/runtime-provider-dry-run-default.out; grep -q "PROVIDER_GATE_DRY_RUN=1" /tmp/runtime-provider-dry-run-default.out; grep -q "RUNTIME_E2E_STYLE_PROJECT=real-http-docs" /tmp/runtime-provider-dry-run-default.out; grep -q "RUNTIME_E2E_STYLE_STAGE=edit" /tmp/runtime-provider-dry-run-default.out; ! grep -q "== cargo fmt ==" /tmp/runtime-provider-dry-run-default.out'
 
 run_step "fumadocs real build smoke" \
   bash services/runtime/scripts/smoke-fumadocs-docs-build.sh

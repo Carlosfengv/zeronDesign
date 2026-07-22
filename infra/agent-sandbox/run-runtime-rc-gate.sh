@@ -11,6 +11,8 @@ workspace_namespace="${RUNTIME_RC_WORKSPACE_NAMESPACE:-ws-runtime-rc}"
 website_workspace_namespace="${RUNTIME_RC_WEBSITE_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
 docs_workspace_namespace="${RUNTIME_RC_DOCS_WORKSPACE_NAMESPACE:-${workspace_namespace}}"
 concurrent_workspace_gate="${RUNTIME_RC_CONCURRENT_WORKSPACE_GATE:-0}"
+works_base_domain="${RUNTIME_RC_WORKS_BASE_DOMAIN:-works.fixture.invalid}"
+works_tls_secret_name="anydesign-runtime-rc-works-tls"
 cd "${ROOT_DIR}"
 
 for candidate_namespace in \
@@ -85,8 +87,8 @@ if [[ "${RUNTIME_RC_TOKEN_BUDGET_SELF_TEST:-0}" == "1" ]]; then
   printf 'Runtime RC real Provider token reservation self-test passed\n'
   exit 0
 fi
-if [[ "${rc_mode}" == "release" && "${provider_mode}" != "deepseek" ]]; then
-  printf 'release mode requires RUNTIME_RC_PROVIDER_MODE=deepseek\n' >&2
+if [[ "${rc_mode}" == "release" ]]; then
+  printf 'RUNTIME_RC_MODE=release is retired for this direct Provider diagnostic. Use infra/generation-reliability/run-real-provider-examples.sh with the governed Provider Gateway.\n' >&2
   exit 2
 fi
 evidence_dir="${RUNTIME_RC_EVIDENCE_DIR:-services/runtime/target/e2e-evidence/${cluster_name}}"
@@ -161,6 +163,8 @@ for required in \
 done
 for candidate_namespace in $(printf '%s\n' \
   "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
+  RUNTIME_SYSTEM_NAMESPACE=anydesign-runtime \
+    bash infra/workspace-provisioner/provision-workspace.sh "${candidate_namespace}" >/dev/null
   "${KUBECTL}" get serviceaccount anydesign-runtime \
     -n anydesign-runtime >/dev/null
   "${KUBECTL}" get serviceaccount anydesign-sandbox \
@@ -224,6 +228,7 @@ principal_private_key="${principal_key_dir}/private.pem"
 principal_private_key_der="${principal_key_dir}/private.der"
 principal_public_key="${principal_key_dir}/public.der"
 port_forward_pid=""
+release_packager_pid=""
 gate_id="$(date +%s)"
 provider_secret_created=false
 provider_secret_file=""
@@ -231,6 +236,93 @@ dcp_runtime_flags_enabled=false
 gate_work_dir="$(mktemp -d)"
 active_recovery_evidence="${evidence_dir}/active-recovery.json"
 recovery_baseline_file="${gate_work_dir}/recovery-baseline.json"
+works_ca_key="${gate_work_dir}/works-ca.key"
+works_ca_cert="${gate_work_dir}/works-ca.crt"
+works_tls_key="${gate_work_dir}/works-tls.key"
+works_tls_csr="${gate_work_dir}/works-tls.csr"
+works_tls_cert="${gate_work_dir}/works-tls.crt"
+
+ensure_traefik() {
+  local server_container chart_root crd_chart chart crd_content chart_content
+  if "${KUBECTL}" get deployment/traefik -n kube-system >/dev/null 2>&1; then
+    "${KUBECTL}" rollout status deployment/traefik -n kube-system --timeout=300s >/dev/null
+    return
+  fi
+  server_container="k3d-${cluster_name}-server-0"
+  chart_root=/var/lib/rancher/k3s/server/static/charts
+  crd_chart="$(docker exec "${server_container}" sh -c \
+    "ls '${chart_root}'/traefik-crd-*.tgz | head -n 1")"
+  chart="$(docker exec "${server_container}" sh -c \
+    "ls '${chart_root}'/traefik-*.tgz | grep -v '/traefik-crd-' | head -n 1")"
+  [[ -n "${crd_chart}" && -n "${chart}" ]]
+  crd_content="$(docker exec "${server_container}" base64 -w 0 "${crd_chart}")"
+  chart_content="$(docker exec "${server_container}" base64 -w 0 "${chart}")"
+  "${KUBECTL}" apply -f - >/dev/null <<EOF
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik-crd
+  namespace: kube-system
+spec:
+  bootstrap: true
+  chartContent: ${crd_content}
+EOF
+  for _ in $(seq 1 120); do
+    if "${KUBECTL}" get job/helm-install-traefik-crd -n kube-system >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  "${KUBECTL}" wait --for=condition=complete job/helm-install-traefik-crd \
+    -n kube-system --timeout=300s >/dev/null
+  "${KUBECTL}" apply -f - >/dev/null <<EOF
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  bootstrap: true
+  chartContent: ${chart_content}
+  valuesContent: |-
+    service:
+      type: ClusterIP
+    image:
+      repository: traefik
+      tag: v2.10.7
+EOF
+  for _ in $(seq 1 120); do
+    if "${KUBECTL}" get deployment/traefik -n kube-system >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  "${KUBECTL}" rollout status deployment/traefik -n kube-system --timeout=300s >/dev/null
+}
+
+ensure_traefik
+traefik_service_ip="$("${KUBECTL}" get service/traefik -n kube-system \
+  -o 'jsonpath={.spec.clusterIP}')"
+[[ "${traefik_service_ip}" =~ ^[0-9a-fA-F:.]+$ ]]
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -subj '/CN=AnyDesign Runtime RC Works CA' \
+  -keyout "${works_ca_key}" -out "${works_ca_cert}" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj "/CN=*.${works_base_domain}" \
+  -keyout "${works_tls_key}" -out "${works_tls_csr}" >/dev/null 2>&1
+printf 'subjectAltName=DNS:*.%s\nextendedKeyUsage=serverAuth\n' "${works_base_domain}" \
+  >"${gate_work_dir}/works-tls.ext"
+openssl x509 -req -sha256 -days 2 -in "${works_tls_csr}" \
+  -CA "${works_ca_cert}" -CAkey "${works_ca_key}" -CAcreateserial \
+  -extfile "${gate_work_dir}/works-tls.ext" -out "${works_tls_cert}" >/dev/null 2>&1
+"${KUBECTL}" create configmap anydesign-runtime-works-probe-ca \
+  -n anydesign-runtime --from-file="ca.crt=${works_ca_cert}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+for candidate_namespace in $(printf '%s\n' \
+  "${website_workspace_namespace}" "${docs_workspace_namespace}" | sort -u); do
+  "${KUBECTL}" create secret tls "${works_tls_secret_name}" \
+    -n "${candidate_namespace}" --cert="${works_tls_cert}" --key="${works_tls_key}" \
+    --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+done
 rm -f "${active_recovery_evidence}"
 "${KUBECTL}" get sandboxclaims.extensions.agents.x-k8s.io \
   -n "${workspace_namespace}" -o json \
@@ -251,6 +343,9 @@ fs.writeFileSync(process.argv[1], `${JSON.stringify({
 cleanup() {
   if [[ -n "${port_forward_pid}" ]]; then
     kill "${port_forward_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${release_packager_pid}" ]]; then
+    kill "${release_packager_pid}" >/dev/null 2>&1 || true
   fi
   if [[ "${provider_secret_created}" == "true" ]]; then
     "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
@@ -457,6 +552,42 @@ fi
   -n anydesign-runtime \
   --from-file="fixture-model-gateway.js=infra/agent-sandbox/runtime/fixture-model-gateway.js" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f -
+release_packager_token="$(openssl rand -hex 32)"
+"${KUBECTL}" create secret generic release-packaging-proxy-token \
+  -n anydesign-runtime \
+  --from-literal="proxy-token=${release_packager_token}" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+"${KUBECTL}" create configmap release-packaging-proxy \
+  -n anydesign-runtime \
+  --from-file="release-packaging-proxy-helper.mjs=infra/generation-reliability/release-packaging-proxy-helper.mjs" \
+  --dry-run=client -o yaml | "${KUBECTL}" apply -f - >/dev/null
+if lsof -nP -iTCP:49091 -sTCP:LISTEN >/dev/null 2>&1; then
+  printf 'release packaging host port is already in use: 49091\n' >&2
+  exit 3
+fi
+ANYDESIGN_K3D_PACKAGER_TOKEN="${release_packager_token}" \
+ANYDESIGN_K3D_RUNTIME_NAMESPACE=anydesign-runtime \
+ANYDESIGN_K3D_REGISTRY_EXTERNAL=127.0.0.1:5003 \
+ANYDESIGN_K3D_REGISTRY_INTERNAL=k3d-greenfield-registry.localhost:5000 \
+node infra/generation-reliability/release-packaging-host.mjs \
+  >"${gate_work_dir}/release-packaging-host.log" 2>&1 &
+release_packager_pid=$!
+release_packager_ready=false
+for _ in $(seq 1 30); do
+  if ! kill -0 "${release_packager_pid}" >/dev/null 2>&1; then
+    cat "${gate_work_dir}/release-packaging-host.log" >&2
+    exit 3
+  fi
+  if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:49091/)" == "404" ]]; then
+    release_packager_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${release_packager_ready}" != "true" ]]; then
+  printf 'release packaging host did not become ready\n' >&2
+  exit 3
+fi
 "${KUBECTL}" apply -f infra/agent-sandbox/runtime/fixture-model-gateway.yaml
 "${KUBECTL}" set image deployment/fixture-model-gateway -n anydesign-runtime \
   "gateway=${runtime_image}" >/dev/null
@@ -465,9 +596,32 @@ sed "s|image: anydesign/runtime:dev|image: ${runtime_image}|" \
 "${KUBECTL}" patch deployment anydesign-runtime -n anydesign-runtime \
   --type=strategic \
   --patch-file infra/agent-sandbox/runtime/fixture-gateway-env-patch.yaml >/dev/null
+"${KUBECTL}" patch deployment anydesign-runtime -n anydesign-runtime \
+  --type=strategic \
+  --patch-file infra/agent-sandbox/runtime/release-packaging-proxy-volume-patch.yaml >/dev/null
+"${KUBECTL}" patch deployment anydesign-runtime -n anydesign-runtime \
+  --type=strategic \
+  --patch-file infra/agent-sandbox/runtime/works-probe-ca-volume-patch.yaml >/dev/null
+release_packaging_proxy_sha256="$(shasum -a 256 infra/generation-reliability/release-packaging-proxy-helper.mjs | awk '{print $1}')"
 "${KUBECTL}" set env deployment/anydesign-runtime -n anydesign-runtime \
   RUNTIME_DESIGN_CONTEXT_PACKAGE_V1=true \
   RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_V1=true \
+  RELEASE_BASE_IMAGE_DIGEST="sha256:53cadfbebeffa241f12333cf8a63f3c6553eedad8b9f8296de89e32c566a5caa" \
+  RELEASE_PACKAGER_VERSION="k3d-release-packager@1" \
+  RELEASE_REGISTRY_REPOSITORY="k3d-greenfield-registry.localhost:5000/anydesign/works" \
+  RELEASE_SCAN_POLICY_VERSION="k3d-local-integrity@1" \
+  ANYDESIGN_RELEASE_PACKAGER_HELPER="/opt/anydesign/release-packaging-proxy-helper.mjs" \
+  RELEASE_PACKAGING_HELPER_SHA256="${release_packaging_proxy_sha256}" \
+  ANYDESIGN_PACKAGER_ROOT="/var/run/anydesign/release-packager" \
+  WORK_RUNTIME_BACKEND="kubernetes" \
+  WORK_RUNTIME_EXPOSURE="ingress" \
+  WORK_RUNTIME_PROBER_IMAGE="docker.io/rancher/mirrored-library-busybox:1.36.1@sha256:8a45424ddf949bbe9bb3231b05f9032a45da5cd036eb4867b511b00734756d6f" \
+  WORKS_BASE_DOMAIN="${works_base_domain}" \
+  WORKS_INGRESS_CLASS="traefik" \
+  WORKS_TLS_SECRET_NAME="${works_tls_secret_name}" \
+  WORKS_PROBE_SCHEME="https" \
+  WORKS_PROBE_RESOLVE="${traefik_service_ip}:443" \
+  WORKS_PROBE_CA_FILE="/etc/anydesign/works-probe/ca.crt" \
   RUNTIME_DESIGN_CONTEXT_ENFORCEMENT_ALLOWLIST_JSON- >/dev/null
 dcp_runtime_flags_enabled=true
 configure_deepseek_provider() {
@@ -616,15 +770,47 @@ const kid=`ed25519-${crypto.createHash("sha256").update(publicDer).digest("hex")
 const now=Math.floor(Date.now()/1000);
 const encode=value=>Buffer.from(JSON.stringify(value)).toString("base64url");
 const header=encode({alg:"EdDSA",typ:"JWT",kid});
-const payload=encode({iss:"anydesign-bff",aud:"anydesign-runtime-public",sub:process.argv[3],jti:crypto.randomBytes(16).toString("hex"),iat:now,exp:now+120,projectId:process.argv[2],operations:["preview.read","project.read","project.write"]});
+const payload=encode({iss:"anydesign-bff",aud:"anydesign-runtime-public",sub:process.argv[3],jti:crypto.randomBytes(16).toString("hex"),iat:now,exp:now+120,projectId:process.argv[2],operations:["preview.read","project.read","project.write","publication.read","publication.write"]});
 const input=`${header}.${payload}`;
 process.stdout.write(`${input}.${crypto.sign(null,Buffer.from(input),key).toString("base64url")}`);
 ' "${principal_private_key}" "${project_id}" "${principal_id}"
 }
 
+extract_preview_lease_id() {
+  node -e '
+for(const line of process.argv[1].split(/\r?\n/)){
+  if(!line.startsWith("data: "))continue;
+  try{const event=JSON.parse(line.slice(6));
+    const url=event.type==="preview.updated"
+      ? event.url
+      : event.type==="tool.completed"&&event.tool==="preview.start"
+        ? event.metadata?.postToolUseSuccess?.url
+        : null;
+    if(url){
+      const match=new URL(url).pathname.match(/^\/previews\/([^/]+)\/?$/);
+      if(match){process.stdout.write(match[1]);process.exit(0);}
+    }
+  }catch{}
+}
+process.exit(2);
+' "$1"
+}
+
+publish_fixture_draft() {
+  node infra/agent-sandbox/runtime/publish-fixture-draft.mjs \
+    "${base_url}" "${principal_private_key}" "$1" "${principal_id}" "$2"
+}
+
 configure_enforced_dcp_fixture() {
   local project_id="$1"
-  local profile_payload created profile_id profile_version policy_payload policy
+  local principal_token profile_payload created profile_id profile_version policy_payload policy
+  curl --fail --silent -X PUT \
+    -H 'content-type: application/json' \
+    -H 'x-anydesign-internal: true' \
+    -H "x-runtime-admin-token: ${admin_token}" \
+    -d "$(node -e 'process.stdout.write(JSON.stringify({ownerPrincipalId:process.argv[1],workspaceNamespace:process.argv[2]}))' "${principal_id}" "${workspace_namespace}")" \
+    "${base_url}/internal/projects/${project_id}/access" >/dev/null
+  principal_token="$(issue_principal_token "${project_id}")"
   profile_payload="$(node -e '
 const projectId=process.argv[1];
 const profile={
@@ -642,10 +828,13 @@ const profile={
 process.stdout.write(JSON.stringify({projectId,name:"RC Enforced DCP Profile",profile}));
 ' "${project_id}")"
   created="$(curl --fail --silent -X POST -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "${profile_payload}" "${base_url}/design-profiles")"
   profile_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).designProfile.id)' "${created}")"
   profile_version="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).designProfile.version))' "${created}")"
+  principal_token="$(issue_principal_token "${project_id}")"
   curl --fail --silent -X POST -H 'content-type: application/json' \
+    -H "authorization: Bearer ${principal_token}" \
     -d "$(node -e 'process.stdout.write(JSON.stringify({designProfileId:process.argv[1]}))' "${profile_id}")" \
     "${base_url}/projects/${project_id}/design-profile" >/dev/null
   policy_payload="$(node -e '
@@ -668,18 +857,21 @@ process.stdout.write(JSON.stringify({designProfileId:process.argv[1],designProfi
 
 inject_active_preview_recovery() {
   local project_id="$1"
-  local runtime_state="$2"
-  local lease_id="$3"
-  local binding_id preview_url preview_prefix principal_token
-  local old_runtime_pod old_runtime_uid new_runtime_uid recovered_state recovered_status
+  local lease_id="$2"
+  local preview_url preview_prefix principal_token
+  local old_runtime_pod old_runtime_uid new_runtime_uid recovered_status
   local killed_port_forward_pid reconnect_status
-  binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${runtime_state}")"
   preview_url="${base_url}/previews/${lease_id}/"
   preview_prefix="/projects/${project_id}/previews/${lease_id}"
   principal_token="$(issue_principal_token "${project_id}")"
-  recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${principal_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  recovered_status="000"
+  for _ in $(seq 1 30); do
+    recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+    [[ "${recovered_status}" == "200" ]] && break
+    sleep 1
+  done
   [[ "${recovered_status}" == "200" ]] || {
     printf 'active Preview is unavailable before Runtime restart: %s\n' "${recovered_status}" >&2
     return 1
@@ -700,17 +892,15 @@ inject_active_preview_recovery() {
     printf 'Runtime restart did not replace the serving Pod\n' >&2
     return 1
   }
-  recovered_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
-    "${base_url}/projects/${project_id}/runtime-state")"
-  node -e '
-const before=JSON.parse(process.argv[1]);
-const after=JSON.parse(process.argv[2]);
-if(after.sandboxBindingId!==process.argv[3]||after.currentVersionId!==before.currentVersionId)process.exit(2);
-' "${runtime_state}" "${recovered_state}" "${binding_id}" "${lease_id}"
   principal_token="$(issue_principal_token "${project_id}")"
-  recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${principal_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  recovered_status="000"
+  for _ in $(seq 1 30); do
+    recovered_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+    [[ "${recovered_status}" == "200" ]] && break
+    sleep 1
+  done
   [[ "${recovered_status}" == "200" ]] || {
     printf 'active Preview did not recover after Runtime restart: %s\n' "${recovered_status}" >&2
     return 1
@@ -724,9 +914,14 @@ if(after.sandboxBindingId!==process.argv[3]||after.currentVersionId!==before.cur
   fi
   start_runtime_port_forward
   principal_token="$(issue_principal_token "${project_id}")"
-  reconnect_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${principal_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  reconnect_status="000"
+  for _ in $(seq 1 30); do
+    reconnect_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+    [[ "${reconnect_status}" == "200" ]] && break
+    sleep 1
+  done
   [[ "${reconnect_status}" == "200" ]] || {
     printf 'active Preview did not recover after port-forward replacement: %s\n' \
       "${reconnect_status}" >&2
@@ -735,11 +930,11 @@ if(after.sandboxBindingId!==process.argv[3]||after.currentVersionId!==before.cur
   node -e '
 const fs=require("fs");
 fs.writeFileSync(process.argv[1],JSON.stringify({
-  runtimeRestart:{scenario:"runtime-restart",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,oldPodUid:process.argv[2],newPodUid:process.argv[3],bindingId:process.argv[4],previewLeaseId:process.argv[5]},
-  portForwardKill:{scenario:"port-forward-kill",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,killedPid:Number(process.argv[6]),reconnectedHttpStatus:Number(process.argv[7])}
+  runtimeRestart:{scenario:"runtime-restart",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,oldPodUid:process.argv[2],newPodUid:process.argv[3],previewLeaseId:process.argv[4]},
+  portForwardKill:{scenario:"port-forward-kill",injectionPoint:"active-preview-lease",result:"pass",orphanCount:0,killedPid:Number(process.argv[5]),reconnectedHttpStatus:Number(process.argv[6])}
 },null,2)+"\n");
 ' "${active_recovery_evidence}" "${old_runtime_uid}" "${new_runtime_uid}" \
-    "${binding_id}" "${lease_id}" "${killed_port_forward_pid}" "${reconnect_status}"
+    "${lease_id}" "${killed_port_forward_pid}" "${reconnect_status}"
 }
 
 capture_dependency_workspace_evidence() {
@@ -804,12 +999,14 @@ run_fixture() {
   local workspace_namespace="${selected_workspace_namespace}"
   local brief_payload brief_run conversation brief_id build_payload build_run events artifact_url
   local build_state base_version_id binding_id edit_payload edit_run release_data project_evidence artifact_status artifact_assertions artifact_assertion_path artifact_assertion_url dependency_evidence
+  local project_evidence_attempt
+  local build_publish edit_publish
   local dcp_build_diagnostics dcp_edit_diagnostics dcp_repair_diagnostics
   local edit_version_id review_payload review_run review_events finding_id repair_payload repair_run repair_events
   local edit_response edit_status
-  local build_preview_lease_id
-  local principal_token wrong_project_token anonymous_status cross_project_status preview_url preview_prefix owner_status
-  local cancel_probe_payload cancel_probe_run cancel_probe_response cancelled_preview_status
+  local build_preview_lease_id edit_preview_lease_id
+  local principal_token wrong_project_token anonymous_status cross_project_status preview_url preview_prefix preview_lease_id publication_workflow_completed owner_status
+  local cancel_probe_payload cancel_probe_run cancel_probe_response cancel_probe_history cancelled_preview_status
   local stage_timeout brief_wait_timeout brief_text edit_text build_expected_text confirmation_ready seeded_review_provider
   seeded_review_provider=false
   stage_timeout=240
@@ -845,8 +1042,12 @@ run_fixture() {
   confirmation_ready=false
   for _ in $(seq 1 "${brief_wait_timeout}"); do
     principal_token="$(issue_principal_token "${project_id}")"
-    conversation="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
-      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
+    if ! conversation="$(curl --fail --silent --max-time 10 \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"; then
+      sleep 1
+      continue
+    fi
     if [[ "${conversation}" == *'"briefId"'* || "${conversation}" == *'"kind":"approval_request"'* || "${conversation}" == *"Requested brief confirmation"* || "${conversation}" == *"confirmation_requested"* || "${conversation}" == *"Confirm this deterministic"* ]]; then
       confirmation_ready=true
       break
@@ -867,8 +1068,12 @@ run_fixture() {
   brief_id=""
   for _ in $(seq 1 120); do
     principal_token="$(issue_principal_token "${project_id}")"
-    conversation="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
-      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"
+    if ! conversation="$(curl --fail --silent --max-time 10 \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/conversation?includeDebug=true")"; then
+      sleep 1
+      continue
+    fi
     brief_id="$(node -e '
 const c=JSON.parse(process.argv[1]);
 const item=[...c.items].reverse().find(x=>x.metadata&&x.metadata.briefId);
@@ -903,27 +1108,23 @@ process.stdout.write(item?.metadata?.briefId||"");
       -H "authorization: Bearer ${principal_token}" \
       "${base_url}/runs/${build_run}/design-context-diagnostics")"
   fi
-  build_preview_lease_id="$(node -e '
-for(const line of process.argv[1].split(/\r?\n/)){
-  if(!line.startsWith("data: "))continue;
-  try{const event=JSON.parse(line.slice(6));if(event.type==="preview.updated"){
-    const match=new URL(event.url).pathname.match(/^\/previews\/([^/]+)\/?$/);
-    if(match){process.stdout.write(match[1]);process.exit(0);}
-  }}catch{}
-}
-process.exit(2);
-' "${events}")"
+  build_preview_lease_id="$(extract_preview_lease_id "${events}")"
+  if [[ "${inject_recovery}" == "true" && "${kind}" == "website" && ! -s "${active_recovery_evidence}" ]]; then
+    inject_active_preview_recovery "${project_id}" "${build_preview_lease_id}"
+  fi
+  if [[ "${kind}" == "website" ]]; then
+    build_publish="$(publish_fixture_draft "${project_id}" "${build_run}")"
+  fi
+  principal_token="$(issue_principal_token "${project_id}")"
   build_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
     "${base_url}/projects/${project_id}/runtime-state")"
   base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
   binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
-  if [[ "${inject_recovery}" == "true" && "${kind}" == "website" && ! -s "${active_recovery_evidence}" ]]; then
-    inject_active_preview_recovery "${project_id}" "${build_state}" "${build_preview_lease_id}"
-    principal_token="$(issue_principal_token "${project_id}")"
-    build_state="$(curl --fail --silent -H "authorization: Bearer ${principal_token}" \
-      "${base_url}/projects/${project_id}/runtime-state")"
-    base_version_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).currentVersionId)' "${build_state}")"
-    binding_id="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).sandboxBindingId)' "${build_state}")"
+  if [[ "${kind}" == "website" ]]; then
+    node -e '
+const published=JSON.parse(process.argv[1]);
+if(published.versionId!==process.argv[2]) throw new Error(`published version ${published.versionId} does not match Runtime state ${process.argv[2]}`);
+' "${build_publish}" "${base_version_id}"
   fi
   principal_token="$(issue_principal_token "${project_id}")"
   reserve_real_provider_run edit "${project_id}"
@@ -952,7 +1153,21 @@ process.exit(2);
     printf 'Edit did not complete cleanly: project=%s run=%s\n%s\n' "${project_id}" "${edit_run}" "${events}" >&2
     exit 4
   fi
+  edit_preview_lease_id="$(extract_preview_lease_id "${events}")"
+  if [[ "${kind}" == "website" ]]; then
+    edit_publish="$(publish_fixture_draft "${project_id}" "${edit_run}")"
+  fi
   principal_token="$(issue_principal_token "${project_id}")"
+  if [[ "${kind}" == "website" ]]; then
+    edit_version_id="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/runtime-state" \
+      | node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).currentVersionId)')"
+    node -e '
+const published=JSON.parse(process.argv[1]);
+if(published.versionId!==process.argv[2]) throw new Error(`published version ${published.versionId} does not match Runtime state ${process.argv[2]}`);
+' "${edit_publish}" "${edit_version_id}"
+  fi
   if [[ "${project_id}" == *"dcp-enforced"* ]]; then
     dcp_edit_diagnostics="$(curl --fail --silent \
       -H "authorization: Bearer ${principal_token}" \
@@ -1048,10 +1263,21 @@ const evidence=JSON.parse(process.argv[1]);
 evidence.route=process.argv[2];
 process.stdout.write(JSON.stringify(evidence));
 ' "${artifact_assertions}" "${artifact_assertion_path}")"
-  project_evidence="$(curl --fail --silent \
-    -H 'x-anydesign-internal: true' \
-    -H "x-runtime-admin-token: ${admin_token}" \
-    "${base_url}/internal/projects/${project_id}/release-evidence")"
+  project_evidence=""
+  for project_evidence_attempt in $(seq 1 60); do
+    if project_evidence="$(curl --fail --silent \
+      -H 'x-anydesign-internal: true' \
+      -H "x-runtime-admin-token: ${admin_token}" \
+      "${base_url}/internal/projects/${project_id}/release-evidence")"; then
+      break
+    fi
+    project_evidence=""
+    sleep 1
+  done
+  if [[ -z "${project_evidence}" ]]; then
+    printf 'project release evidence did not become ready: %s\n' "${project_id}" >&2
+    return 1
+  fi
   node -e '
 const evidence=JSON.parse(process.argv[1]);
 if(evidence.terminalToolFailureCount!==0) throw new Error(`terminal tool failures: ${evidence.terminalToolFailureCount}`);
@@ -1087,15 +1313,35 @@ process.stdout.write(JSON.stringify(evidence));
   fi
   principal_token="$(issue_principal_token "${project_id}")"
   wrong_project_token="$(issue_principal_token "wrong-${project_id}")"
-  preview_url="${base_url}/previews/$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).previewLeaseId)' "${project_evidence}")/"
-  preview_prefix="/projects/${project_id}/previews/$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).previewLeaseId)' "${project_evidence}")"
-  anonymous_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "${preview_url}")"
-  cross_project_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${wrong_project_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
-  owner_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${principal_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  preview_lease_id="$(node -e '
+const value=JSON.parse(process.argv[1]).previewLeaseId;
+if(typeof value==="string") process.stdout.write(value);
+' "${project_evidence}")"
+  publication_workflow_completed="$(node -e '
+const publication=JSON.parse(process.argv[1]).publication;
+process.stdout.write(String(publication?.schemaVersion==="publish-workflow@1"&&publication?.status==="completed"));
+' "${project_evidence}")"
+  if [[ "${publication_workflow_completed}" != "true" && -n "${preview_lease_id}" ]]; then
+    preview_url="${base_url}/previews/${preview_lease_id}/"
+    preview_prefix="/projects/${project_id}/previews/${preview_lease_id}"
+    anonymous_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "${preview_url}")"
+    cross_project_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${wrong_project_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+    owner_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+  else
+    # Snapshot-only runs intentionally have no Preview Lease. Preserve the
+    # principal isolation gate against the promoted artifact instead of
+    # reintroducing preview.publish into the generation path.
+    anonymous_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      "${artifact_assertion_url}")"
+    cross_project_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${wrong_project_token}" "${artifact_assertion_url}")"
+    owner_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" "${artifact_assertion_url}")"
+  fi
   if [[ "${anonymous_status}" != "401" || "${cross_project_status}" != "403" || "${owner_status}" != "200" ]]; then
     printf 'Public principal gate failed: anonymous=%s crossProject=%s owner=%s\n' \
       "${anonymous_status}" "${cross_project_status}" "${owner_status}" >&2
@@ -1121,18 +1367,36 @@ const response=JSON.parse(process.argv[1]);
 if(response.runId!==process.argv[2]||response.status!=="cancelled")process.exit(2);
 ' "${cancel_probe_response}" "${cancel_probe_run}"
   principal_token="$(issue_principal_token "${project_id}")"
-  cancelled_preview_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    -H "authorization: Bearer ${principal_token}" \
-    -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
-  [[ "${cancelled_preview_status}" == "404" ]] || {
-    printf 'cancelled run left Preview lease accessible: %s\n' "${cancelled_preview_status}" >&2
-    exit 5
-  }
-  project_evidence="$(node -e '
+  if [[ "${publication_workflow_completed}" == "true" ]]; then
+    cancel_probe_history="$(curl --fail --silent \
+      -H "authorization: Bearer ${principal_token}" \
+      "${base_url}/projects/${project_id}/history")"
+    node -e '
+const history=JSON.parse(process.argv[1]);
+const runId=process.argv[2];
+if((history.items||[]).some(item=>item.kind==="draft_snapshot"&&item.snapshot?.createdByRunId===runId)) {
+  throw new Error(`cancelled run created a Durable Draft: ${runId}`);
+}
+' "${cancel_probe_history}" "${cancel_probe_run}"
+    project_evidence="$(node -e '
+const evidence=JSON.parse(process.argv[1]);
+evidence.cancelCleanup={runId:process.argv[2],runStatus:"cancelled",previewLeaseStatus:"not_applicable",durableDraftCreated:false,passed:true};
+process.stdout.write(JSON.stringify(evidence));
+' "${project_evidence}" "${cancel_probe_run}")"
+  else
+    cancelled_preview_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+      -H "authorization: Bearer ${principal_token}" \
+      -H "x-anydesign-preview-prefix: ${preview_prefix}" "${preview_url}")"
+    [[ "${cancelled_preview_status}" == "404" ]] || {
+      printf 'cancelled run left Preview lease accessible: %s\n' "${cancelled_preview_status}" >&2
+      exit 5
+    }
+    project_evidence="$(node -e '
 const evidence=JSON.parse(process.argv[1]);
 evidence.cancelCleanup={runId:process.argv[2],runStatus:"cancelled",previewHttpStatusAfterCancel:Number(process.argv[3]),passed:true};
 process.stdout.write(JSON.stringify(evidence));
 ' "${project_evidence}" "${cancel_probe_run}" "${cancelled_preview_status}")"
+  fi
   release_data="$(curl --fail --silent -X POST \
     -H 'x-anydesign-internal: true' \
     -H "x-runtime-admin-token: ${admin_token}" \

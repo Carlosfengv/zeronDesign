@@ -1,0 +1,259 @@
+{
+  "schemaVersion": "baseline-evidence@1",
+  "calculatorVersion": "generation-context-baseline-calculator@1",
+  "recordedAt": "2026-07-21T07:47:59.440Z",
+  "sourceWindow": {
+    "startedAt": "2026-07-21T07:28:56.858Z",
+    "endedAt": "2026-07-21T07:47:59.440Z"
+  },
+  "cohort": {
+    "suiteId": "20260721072856857",
+    "status": "failed",
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "realProviderVerified": true,
+    "budgetExceeded": false
+  },
+  "samples": [
+    {
+      "id": "20260721072856857-agent-cloud-quickstart-build",
+      "source": {
+        "storageRef": "suite-evidence://20260721072856857/run-build-run-12725552.events.ndjson",
+        "contentSha256": "ec3a539e0e07393e7a3aa051e310298c2f5b42f57e168edc017db4d51d7b7c08",
+        "availability": "available"
+      },
+      "identity": {
+        "runId": "run-12725552",
+        "modelResource": "deepseek-v4-pro@4",
+        "template": "fumadocs-docs",
+        "phase": "build",
+        "fixtureIdentity": "agent-cloud-quickstart"
+      },
+      "outcome": {
+        "status": "partial",
+        "accepted": false,
+        "failureClassification": "no_progress"
+      },
+      "metrics": {
+        "modelTurns": 28,
+        "toolCalls": 70,
+        "totalDurationMs": 167315,
+        "timeToFirstModelTurnMs": 5878,
+        "timeToFirstSourceMutationMs": 89758,
+        "modelTurnAtFirstSourceMutation": 11,
+        "timeToFirstBuildMs": null,
+        "prebuildFsReadCount": 39,
+        "prebuildFsListCount": 10,
+        "prebuildFsSearchCount": 0,
+        "prebuildObservationCallCount": 49,
+        "inputTokens": 335290,
+        "outputTokens": 6272,
+        "cachedInputTokens": 45696,
+        "duplicateReadTokens": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "nextActionMatchCount": 4,
+        "nextActionViolationCount": 23,
+        "firstBuildSucceeded": 0,
+        "completionMissingDurableSnapshot": 0,
+        "noProgressFailure": 1,
+        "artifactAccepted": 0
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": true,
+        "exclusionReasons": []
+      }
+    },
+    {
+      "id": "20260721072856857-ai-governance-console-build",
+      "source": {
+        "storageRef": "suite-evidence://20260721072856857/run-build-run-12725258.events.ndjson",
+        "contentSha256": "2fd535f79fa1a6a714a2297ead7d1b35dd5e3f2372159f67141f142c38490363",
+        "availability": "available"
+      },
+      "identity": {
+        "runId": "run-12725258",
+        "modelResource": "deepseek-v4-pro@4",
+        "template": "next-app",
+        "phase": "build",
+        "fixtureIdentity": "ai-governance-console"
+      },
+      "outcome": {
+        "status": "partial",
+        "accepted": false,
+        "failureClassification": "no_progress"
+      },
+      "metrics": {
+        "modelTurns": 29,
+        "toolCalls": 73,
+        "totalDurationMs": 235117,
+        "timeToFirstModelTurnMs": 7921,
+        "timeToFirstSourceMutationMs": 55955,
+        "modelTurnAtFirstSourceMutation": 10,
+        "timeToFirstBuildMs": null,
+        "prebuildFsReadCount": 26,
+        "prebuildFsListCount": 11,
+        "prebuildFsSearchCount": 0,
+        "prebuildObservationCallCount": 37,
+        "inputTokens": 444861,
+        "outputTokens": 9688,
+        "cachedInputTokens": 87808,
+        "duplicateReadTokens": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "nextActionMatchCount": 4,
+        "nextActionViolationCount": 24,
+        "firstBuildSucceeded": 0,
+        "completionMissingDurableSnapshot": 0,
+        "noProgressFailure": 1,
+        "artifactAccepted": 0
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": true,
+        "exclusionReasons": []
+      }
+    },
+    {
+      "id": "20260721072856857-oilfield-operations-dashboard-build",
+      "source": {
+        "storageRef": "suite-evidence://20260721072856857/run-build-run-12725008.events.ndjson",
+        "contentSha256": "8c5fac9cc54ec3fbe972fef05f6f4b1f980b25506e1e199c1acbf2811ede5219",
+        "availability": "available"
+      },
+      "identity": {
+        "runId": "run-12725008",
+        "modelResource": "deepseek-v4-pro@4",
+        "template": "next-app",
+        "phase": "build",
+        "fixtureIdentity": "oilfield-operations-dashboard"
+      },
+      "outcome": {
+        "status": "partial",
+        "accepted": false,
+        "failureClassification": "no_progress"
+      },
+      "metrics": {
+        "modelTurns": 27,
+        "toolCalls": 57,
+        "totalDurationMs": 159071,
+        "timeToFirstModelTurnMs": 5899,
+        "timeToFirstSourceMutationMs": 57882,
+        "modelTurnAtFirstSourceMutation": 11,
+        "timeToFirstBuildMs": null,
+        "prebuildFsReadCount": 24,
+        "prebuildFsListCount": 13,
+        "prebuildFsSearchCount": 6,
+        "prebuildObservationCallCount": 43,
+        "inputTokens": 278070,
+        "outputTokens": 3924,
+        "cachedInputTokens": 58368,
+        "duplicateReadTokens": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "nextActionMatchCount": 4,
+        "nextActionViolationCount": 22,
+        "firstBuildSucceeded": 0,
+        "completionMissingDurableSnapshot": 0,
+        "noProgressFailure": 1,
+        "artifactAccepted": 0
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": true,
+        "exclusionReasons": []
+      }
+    },
+    {
+      "id": "20260721072856857-private-ai-security-runbook-build",
+      "source": {
+        "storageRef": "suite-evidence://20260721072856857/run-build-run-12725873.events.ndjson",
+        "contentSha256": "4c8460fa13869429274b82f671442e37ce11306a110203ca69e2cd210c15c46a",
+        "availability": "available"
+      },
+      "identity": {
+        "runId": "run-12725873",
+        "modelResource": "deepseek-v4-pro@4",
+        "template": "fumadocs-docs",
+        "phase": "build",
+        "fixtureIdentity": "private-ai-security-runbook"
+      },
+      "outcome": {
+        "status": "partial",
+        "accepted": false,
+        "failureClassification": "no_progress"
+      },
+      "metrics": {
+        "modelTurns": 23,
+        "toolCalls": 45,
+        "totalDurationMs": 165242,
+        "timeToFirstModelTurnMs": 7986,
+        "timeToFirstSourceMutationMs": 55323,
+        "modelTurnAtFirstSourceMutation": 9,
+        "timeToFirstBuildMs": null,
+        "prebuildFsReadCount": 21,
+        "prebuildFsListCount": 5,
+        "prebuildFsSearchCount": 5,
+        "prebuildObservationCallCount": 31,
+        "inputTokens": 276596,
+        "outputTokens": 4282,
+        "cachedInputTokens": 60160,
+        "duplicateReadTokens": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "nextActionMatchCount": 7,
+        "nextActionViolationCount": 15,
+        "firstBuildSucceeded": 0,
+        "completionMissingDurableSnapshot": 0,
+        "noProgressFailure": 1,
+        "artifactAccepted": 0
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": true,
+        "exclusionReasons": []
+      }
+    },
+    {
+      "id": "20260721072856857-zenova-agent-cloud-build",
+      "source": {
+        "storageRef": "suite-evidence://20260721072856857/run-build-run-12724815.events.ndjson",
+        "contentSha256": "ed67926d952452621909162aeb52cc3120673f72b2de6d1e52f424dde935a877",
+        "availability": "available"
+      },
+      "identity": {
+        "runId": "run-12724815",
+        "modelResource": "deepseek-v4-pro@4",
+        "template": "next-app",
+        "phase": "build",
+        "fixtureIdentity": "zenova-agent-cloud"
+      },
+      "outcome": {
+        "status": "completed",
+        "accepted": false,
+        "failureClassification": "unclassified_failure"
+      },
+      "metrics": {
+        "modelTurns": 21,
+        "toolCalls": 32,
+        "totalDurationMs": 242665,
+        "timeToFirstModelTurnMs": 7921,
+        "timeToFirstSourceMutationMs": 43442,
+        "modelTurnAtFirstSourceMutation": 7,
+        "timeToFirstBuildMs": 226049,
+        "prebuildFsReadCount": 9,
+        "prebuildFsListCount": 3,
+        "prebuildFsSearchCount": 0,
+        "prebuildObservationCallCount": 12,
+        "inputTokens": 293959,
+        "outputTokens": 7052,
+        "cachedInputTokens": 114944,
+        "duplicateReadTokens": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "nextActionMatchCount": 9,
+        "nextActionViolationCount": 11,
+        "firstBuildSucceeded": 1,
+        "completionMissingDurableSnapshot": 1,
+        "noProgressFailure": 0,
+        "artifactAccepted": 0
+      },
+      "inclusion": {
+        "includedInImprovementDenominator": true,
+        "exclusionReasons": []
+      }
+    }
+  ]
+}

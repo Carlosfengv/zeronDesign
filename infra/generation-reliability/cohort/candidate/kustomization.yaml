@@ -1,0 +1,74 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: anydesign-runtime
+resources:
+  - ../../../agent-sandbox/runtime/deployment.yaml
+nameSuffix: -generation-candidate
+labels:
+  - pairs:
+      anydesign.io/generation-context-cohort: candidate
+    includeSelectors: true
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: anydesign-runtime
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: anydesign-runtime
+        labels:
+          anydesign.io/runtime-role: generation-candidate
+      spec:
+        template:
+          metadata:
+            labels:
+              anydesign.io/runtime-role: generation-candidate
+          spec:
+            containers:
+              - name: runtime
+                env:
+                  - name: RUNTIME_PUBLIC_BASE_URL
+                    value: http://anydesign-runtime-generation-candidate.anydesign-runtime.svc.cluster.local:8080
+                  - name: RUNTIME_GENERATION_CONTEXT_MODE
+                    value: enabled
+                  - name: RUNTIME_CONTENT_PLAN_ATTESTATION_MODE
+                    value: shadow
+                  - name: RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED
+                    value: "true"
+                  - name: RUNTIME_OBSERVATION_RECEIPTS_ENABLED
+                    value: "true"
+                  - name: DATABASE_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: anydesign-runtime-postgres-generation-candidate
+                        key: url
+                  - name: OBJECT_STORAGE_URL
+                    value: s3://anydesign-runtime/generation-candidate
+                  - name: MODEL_GATEWAY_URL
+                    value: http://provider-gateway.provider-system.svc.cluster.local:9000
+                  - name: MODEL_GATEWAY_AUTH_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: provider-gateway-runtime-auth
+                        key: MODEL_GATEWAY_AUTH_TOKEN
+            volumes:
+              - name: public-principal
+                secret:
+                  secretName: anydesign-runtime-public-principal-generation-candidate
+  - target:
+      version: v1
+      kind: Service
+      name: anydesign-runtime
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: anydesign-runtime
+        labels:
+          anydesign.io/runtime-role: generation-candidate
+      spec:
+        selector:
+          anydesign.io/runtime-role: generation-candidate

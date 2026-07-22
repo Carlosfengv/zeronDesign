@@ -8,6 +8,10 @@ use anydesign_runtime::{
     },
     tools::control_plane::{sandbox_backend_for_config, SandboxBackend},
     types::{sha256_hex, AgentEvent, AgentPhase, AgentRunStatus, Brief, DesignProfile},
+    visual_contracts::{
+        DraftPreviewSession, DraftSnapshot, EditBase, EditImpactOperation, EditImpactRisk,
+        EditImpactScope,
+    },
     RuntimeConfig, RuntimeStore,
 };
 use chrono::Utc;
@@ -42,28 +46,11 @@ impl ModelClient for RoutingFixtureModel {
             *turn += 1;
             *turn
         };
-        match (run.phase, run.project_id.as_str(), turn) {
-            (AgentPhase::Build, "website-k3d", 1) => Ok(website_dcp_bootstrap_response()),
-            (AgentPhase::Build, "website-k3d", 2) => {
-                Ok(ModelResponse::ToolCalls(vec![ToolCall::new(
-                    "website-dcp-init",
-                    "project.init",
-                    json!({ "template": "next-app" }),
-                )]))
-            }
-            (AgentPhase::Build, "website-k3d", 3) => Ok(website_build_response()),
-            (AgentPhase::Build, "docs-k3d", 1) => Ok(docs_init_response()),
-            (AgentPhase::Build, "docs-k3d", 2) => Ok(docs_build_response()),
-            (AgentPhase::Edit, "website-k3d", 1) => Ok(website_edit_dcp_reads_response()),
-            (AgentPhase::Edit, "website-k3d", 2) => {
-                Ok(ModelResponse::ToolCalls(vec![ToolCall::new(
-                    "website-edit-dcp-style-contract",
-                    "fs.read",
-                    json!({ "path": "state/style-contract.json" }),
-                )]))
-            }
-            (AgentPhase::Edit, "website-k3d", 3) => Ok(website_dcp_edit_response()),
-            (AgentPhase::Edit, _, 1) => Ok(deterministic_edit_response("edit")),
+        match (run.phase, run.project_id.as_str()) {
+            (AgentPhase::Build, "website-k3d") => website_build_response(turn),
+            (AgentPhase::Build, "docs-k3d") => docs_build_response(turn),
+            (AgentPhase::Edit, "website-k3d") => website_draft_edit_response(turn),
+            (AgentPhase::Edit, "docs-k3d") => docs_edit_response(turn),
             _ => Err(anyhow::anyhow!(
                 "unexpected fixture model turn: project={} phase={:?} turn={turn}",
                 run.project_id,
@@ -131,8 +118,8 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             .await
             .unwrap();
     }
-    let website_token = principal_token(&principal_issuer, "website-k3d");
-    let docs_token = principal_token(&principal_issuer, "docs-k3d");
+    let mut website_token = principal_token(&principal_issuer, "website-k3d");
+    let mut docs_token = principal_token(&principal_issuer, "docs-k3d");
     let website_brief_id = confirmed_brief(&store, "website-k3d", website_brief()).await;
     let docs_brief_id = confirmed_brief(&store, "docs-k3d", docs_brief()).await;
     bind_observe_website_dcp_profile(&store, "website-k3d").await;
@@ -180,21 +167,54 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
             &docs_token,
         )
     );
-    let website_build_version = store
-        .current_project_version("website-k3d")
-        .await
-        .expect("website build version");
+    let website_build_snapshot = latest_draft_snapshot(&store, "website-k3d").await;
+    assert!(website_build.output_version_id.is_none());
+    assert!(store.current_project_version("website-k3d").await.is_none());
     let docs_build_version = store
         .current_project_version("docs-k3d")
         .await
         .expect("docs build version");
+    let website_session = store
+        .draft_preview_store()
+        .active_for_project("website-k3d")
+        .expect("website DraftPreviewSession");
+    let website_edit_base = EditBase::Draft {
+        snapshot_id: website_session.durable_snapshot_id.clone(),
+        session_id: website_session.session_id.clone(),
+        expected_session_epoch: website_session.session_epoch,
+        expected_workspace_revision: website_session.workspace_revision,
+        writer_lease_id: website_session.writer_lease_id.clone(),
+    };
+    let website_edit_plan = store
+        .edit_guard_store()
+        .create_plan(
+            &store.draft_preview_store(),
+            anydesign_runtime::edit_guard::CreateEditImpactPlan {
+                observation_id: None,
+                scope: EditImpactScope::Page,
+                targets: vec!["project/app/page.tsx".to_string()],
+                operations: vec![EditImpactOperation::Copy],
+                risk: EditImpactRisk::Low,
+                edit_base: website_edit_base.clone(),
+            },
+        )
+        .expect("website EditImpactPlan");
+    if website_edit_plan.requires_confirmation {
+        store
+            .edit_guard_store()
+            .confirm(&store.draft_preview_store(), &website_edit_plan.plan_hash)
+            .expect("confirm Website EditImpactPlan");
+    }
+    website_token = principal_token(&principal_issuer, "website-k3d");
+    docs_token = principal_token(&principal_issuer, "docs-k3d");
     let (website, docs) = tokio::join!(
-        run_edit(
+        run_draft_edit(
             &client,
             &config.runtime_public_base_url,
             &store,
             "website-k3d",
-            &website_build_version.id,
+            website_edit_base,
+            &website_edit_plan.plan_hash,
             website_build.sandbox_id.as_deref().unwrap(),
             &website_token,
         ),
@@ -210,21 +230,32 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
     );
     assert!(website_build.design_context_manifest.is_some());
     assert_eq!(
-        website.design_context_content_hash, website_build.design_context_content_hash,
-        "the k3d Edit Run must inherit the Website Build DCP"
+        website.design_profile_hash, website_build.design_profile_hash,
+        "the k3d Draft Edit must inherit the Website design profile"
     );
     assert!(website
         .design_context_read_files
         .iter()
         .any(|path| path == "inputs/design-profile.json"));
+    let website_edit_snapshot = latest_draft_snapshot(&store, "website-k3d").await;
+    let website_session_after_edit = store
+        .draft_preview_store()
+        .active_for_project("website-k3d")
+        .expect("updated website DraftPreviewSession");
     assert_ne!(
-        store
-            .current_project_version("website-k3d")
-            .await
-            .unwrap()
-            .id,
-        website_build_version.id
+        website_build_snapshot.snapshot_id,
+        website_edit_snapshot.snapshot_id
     );
+    assert_ne!(
+        website_build_snapshot.source_hash,
+        website_edit_snapshot.source_hash
+    );
+    assert_eq!(
+        website_build_snapshot.design_context_hash, website_edit_snapshot.design_context_hash,
+        "the warm Draft Edit must inherit the frozen Design Context hash"
+    );
+    assert!(website.output_version_id.is_none());
+    assert!(store.current_project_version("website-k3d").await.is_none());
     assert_ne!(
         store.current_project_version("docs-k3d").await.unwrap().id,
         docs_build_version.id
@@ -242,6 +273,34 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
         .await
         .expect("docs sandbox identity");
     assert_ne!(website_identity.pod_uid, docs_identity.pod_uid);
+    website_token = principal_token(&principal_issuer, "website-k3d");
+    let website_preview_lease = store
+        .preview_lease_for_run(&website_build.id)
+        .await
+        .expect("Website Dev preview lease");
+    let website_preview = client
+        .get(&website_session.proxy_url)
+        .bearer_auth(&website_token)
+        .header(
+            "x-anydesign-preview-prefix",
+            format!(
+                "/projects/website-k3d/previews/{}",
+                website_preview_lease.id
+            ),
+        )
+        .send()
+        .await
+        .expect("website Draft preview before release");
+    let website_preview_status = website_preview.status();
+    let website_html = website_preview.text().await.unwrap();
+    assert!(
+        website_preview_status.is_success(),
+        "website Draft preview returned {website_preview_status}; body={website_html}; session={website_session_after_edit:?}; lease={website_preview_lease:?}"
+    );
+    assert!(
+        website_html.contains("K3d Website Edited"),
+        "website Draft preview was: {website_html}"
+    );
     backend
         .release(&store, website_binding)
         .await
@@ -251,6 +310,8 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
         .await
         .expect("release docs sandbox");
 
+    website_token = principal_token(&principal_issuer, "website-k3d");
+    docs_token = principal_token(&principal_issuer, "docs-k3d");
     let website_artifact = client
         .get(format!(
             "{}/artifacts/website-k3d/current/",
@@ -269,28 +330,25 @@ async fn website_and_docs_public_runtime_lifecycle_on_k3d() {
         .send()
         .await
         .expect("docs artifact after release");
-    assert!(website_artifact.status().is_success());
+    assert_eq!(website_artifact.status(), reqwest::StatusCode::NOT_FOUND);
     assert!(docs_artifact.status().is_success());
-    let website_html = website_artifact.text().await.unwrap();
     let docs_html = docs_artifact.text().await.unwrap();
-    assert!(
-        website_html.contains("K3d Website Edited"),
-        "website artifact was: {website_html}"
-    );
     assert!(
         docs_html.contains("Docs Edited"),
         "docs artifact was: {docs_html}"
     );
 
-    assert_event_order(&store, &website.id).await;
+    assert_run_completed(&store, &website.id).await;
     assert_event_order(&store, &docs.id).await;
     write_evidence(
         &store,
         &storage,
         &website_build,
         &docs_build,
-        &website_build_version,
+        &website_build_snapshot,
         &docs_build_version,
+        &website_edit_snapshot,
+        &website_session_after_edit,
         &website,
         &docs,
         &website_identity,
@@ -393,18 +451,106 @@ async fn run_build(
     loop {
         let run = store.get_run(run_id).await.expect("persisted run");
         if run.status.is_terminal() {
+            let events = store.events(run_id).await;
             assert_eq!(
                 run.status,
                 AgentRunStatus::Completed,
-                "run failed: {run:?}; events={:?}",
-                store.events(run_id).await
+                "run failed: {run:?}; events={events:?}"
             );
-            assert!(run.output_version_id.is_some());
+            assert!(
+                !events.iter().any(|event| match event {
+                    AgentEvent::ToolFailed { recoverable, .. } if !recoverable => true,
+                    AgentEvent::ToolFailed { tool, .. } if tool == "project.build" => true,
+                    _ => false,
+                }),
+                "build contained an unrecoverable or failed project.build tool: {events:?}"
+            );
             return run;
         }
         assert!(time::Instant::now() < deadline, "run timed out: {run_id}");
         time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+async fn run_draft_edit(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &RuntimeStore,
+    project_id: &str,
+    edit_base: EditBase,
+    edit_impact_plan_hash: &str,
+    sandbox_binding_id: &str,
+    principal_token: &str,
+) -> anydesign_runtime::types::AgentRun {
+    let response = client
+        .post(format!("{base_url}/runs"))
+        .bearer_auth(principal_token)
+        .json(&json!({
+            "projectId": project_id,
+            "phase": "edit",
+            "agentProfile": "edit",
+            "inputContext": {
+                "editBase": edit_base,
+                "editImpactPlanHash": edit_impact_plan_hash,
+                "sandboxBindingId": sandbox_binding_id
+            }
+        }))
+        .send()
+        .await
+        .expect("start Public Runtime Draft edit");
+    let status = response.status();
+    let payload: Value = response.json().await.expect("Draft edit response JSON");
+    assert!(status.is_success(), "Draft edit start failed: {payload}");
+    let run_id = payload["runId"].as_str().expect("runId");
+    let continued = client
+        .post(format!("{base_url}/runs/{run_id}/continue"))
+        .bearer_auth(principal_token)
+        .json(&json!({ "userMessage": "Apply the deterministic warm Draft edit." }))
+        .send()
+        .await
+        .expect("continue Public Runtime Draft edit");
+    assert!(continued.status().is_success());
+    wait_for_completed_run(store, run_id, "Draft edit").await
+}
+
+async fn wait_for_completed_run(
+    store: &RuntimeStore,
+    run_id: &str,
+    label: &str,
+) -> anydesign_runtime::types::AgentRun {
+    let deadline = time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let run = store.get_run(run_id).await.expect("persisted run");
+        if run.status.is_terminal() {
+            let events = store.events(run_id).await;
+            assert_eq!(
+                run.status,
+                AgentRunStatus::Completed,
+                "{label} failed: {run:?}; events={events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolFailed { .. })),
+                "{label} contained failed tools: {events:?}"
+            );
+            return run;
+        }
+        assert!(
+            time::Instant::now() < deadline,
+            "{label} timed out: {run_id}"
+        );
+        time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn latest_draft_snapshot(store: &RuntimeStore, project_id: &str) -> DraftSnapshot {
+    store
+        .list_project_draft_snapshots(project_id)
+        .await
+        .into_iter()
+        .max_by_key(|snapshot| snapshot.created_at)
+        .expect("project DraftSnapshot")
 }
 
 async fn run_edit(
@@ -508,36 +654,63 @@ fn website_dcp_bootstrap_response() -> ModelResponse {
     )
 }
 
-fn website_build_response() -> ModelResponse {
-    let build_script = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:48px sans-serif;background:#fff;color:#111}</style><h1>K3d Website</h1>');";
-    ModelResponse::ToolCalls(vec![
-        ToolCall::new(
+fn one_tool(id: &str, name: &str, input: Value) -> ModelResponse {
+    ModelResponse::ToolCalls(vec![ToolCall::new(id, name, input)])
+}
+
+fn website_build_response(turn: u32) -> anyhow::Result<ModelResponse> {
+    let source = "export default function Page(){return <main><h1>K3d Website</h1></main>}";
+    match turn {
+        1 => Ok(website_dcp_bootstrap_response()),
+        2 => Ok(one_tool(
+            "website-dcp-init",
+            "project.init",
+            json!({ "template": "next-app" }),
+        )),
+        3 => Ok(one_tool(
             "website-dcp-style-contract",
             "fs.read",
             json!({ "path": "state/style-contract.json" }),
-        ),
-        ToolCall::new(
-            "web-package",
+        )),
+        4 => Ok(one_tool(
+            "website-source",
             "fs.write",
-            json!({ "path": "project/package.json", "text": "{\"scripts\":{\"build\":\"node build.cjs\"}}" }),
-        ),
-        ToolCall::new(
-            "web-script",
-            "fs.write",
-            json!({ "path": "project/build.cjs", "text": build_script }),
-        ),
-        ToolCall::new("web-build", "project.build", json!({ "cwd": "project" })),
-        ToolCall::new(
-            "web-publish",
-            "preview.publish",
+            json!({ "path": "project/app/page.tsx", "text": source }),
+        )),
+        5 => Ok(one_tool(
+            "website-build",
+            "project.build",
+            json!({ "cwd": "project" }),
+        )),
+        6 => Ok(one_tool(
+            "website-dev-start",
+            "preview.dev_start",
+            json!({}),
+        )),
+        7 => Ok(one_tool(
+            "website-dev-status",
+            "preview.dev_status",
+            json!({}),
+        )),
+        8 => Ok(one_tool(
+            "website-open",
+            "browser.open",
+            json!({ "url": "http://127.0.0.1:3000" }),
+        )),
+        9 => Ok(one_tool(
+            "website-shot",
+            "browser.screenshot",
             json!({ "screenshotId": "website-k3d-shot" }),
-        ),
-        ToolCall::new(
-            "web-complete",
+        )),
+        10 => Ok(one_tool(
+            "website-complete",
             "run.complete",
-            json!({ "status": "completed", "summary": "Website k3d gate complete" }),
-        ),
-    ])
+            json!({ "status": "completed", "summary": "Website k3d Draft gate complete" }),
+        )),
+        _ => Err(anyhow::anyhow!(
+            "unexpected Website Build fixture turn {turn}"
+        )),
+    }
 }
 
 fn website_edit_dcp_reads_response() -> ModelResponse {
@@ -546,6 +719,9 @@ fn website_edit_dcp_reads_response() -> ModelResponse {
             "inputs/design-profile.json",
             "inputs/design-profile-usage.md",
             "inputs/component-recipes.json",
+            "inputs/design.md",
+            "state/style-contract.json",
+            "project/app/page.tsx",
         ]
         .into_iter()
         .enumerate()
@@ -560,119 +736,139 @@ fn website_edit_dcp_reads_response() -> ModelResponse {
     )
 }
 
-fn website_dcp_edit_response() -> ModelResponse {
-    let build_script = "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/index.html','<!doctype html><style>body{font:44px sans-serif;background:#fff;color:#111}</style><h1>K3d Website Edited</h1>');";
-    ModelResponse::ToolCalls(vec![
-        ToolCall::new(
+fn website_draft_edit_response(turn: u32) -> anyhow::Result<ModelResponse> {
+    let source = "export default function Page(){return <main><h1>K3d Website Edited</h1></main>}";
+    match turn {
+        1 => Ok(website_edit_dcp_reads_response()),
+        2 => Ok(one_tool(
             "website-edit-write",
             "fs.write",
-            json!({ "path": "project/build.cjs", "text": build_script }),
-        ),
-        ToolCall::new(
-            "website-edit-build",
-            "project.build",
-            json!({ "cwd": "project" }),
-        ),
-        ToolCall::new(
-            "website-edit-publish",
-            "preview.publish",
-            json!({ "screenshotId": "k3d-edit-shot" }),
-        ),
-        ToolCall::new(
+            json!({ "path": "project/app/page.tsx", "text": source }),
+        )),
+        3 => Ok(one_tool(
+            "website-edit-dev-status",
+            "preview.dev_status",
+            json!({}),
+        )),
+        4 => Ok(one_tool(
             "website-edit-complete",
             "run.complete",
-            json!({ "status": "completed", "summary": "K3d DCP edit gate complete" }),
-        ),
-    ])
+            json!({ "status": "completed", "summary": "K3d warm Draft edit complete" }),
+        )),
+        _ => Err(anyhow::anyhow!(
+            "unexpected Website Edit fixture turn {turn}"
+        )),
+    }
 }
 
-fn docs_init_response() -> ModelResponse {
-    ModelResponse::ToolCalls(vec![ToolCall::new(
-        "docs-init",
-        "project.init",
-        json!({ "template": "fumadocs-docs" }),
-    )])
-}
-
-fn docs_build_response() -> ModelResponse {
-    let build_script = "const fs=require('fs');fs.mkdirSync('out',{recursive:true});fs.writeFileSync('out/index.html','<!doctype html><style>body{font:40px sans-serif;background:#fff;color:#111}</style><h1>Docs</h1><a href=\"/docs\">Overview</a>');fs.writeFileSync('out/docs.html','<h1>Docs Overview</h1>');";
-    ModelResponse::ToolCalls(vec![
-        ToolCall::new(
-            "docs-package",
-            "fs.write",
-            json!({ "path": "project/package.json", "text": "{\"scripts\":{\"build\":\"node build.cjs\"}}" }),
-        ),
-        ToolCall::new(
-            "docs-script",
-            "fs.write",
-            json!({ "path": "project/build.cjs", "text": build_script }),
-        ),
-        ToolCall::new(
-            "docs-source",
-            "fs.write",
-            json!({ "path": "project/content/docs/index.mdx", "text": "---\ntitle: Overview\n---\n\n# Docs Overview" }),
-        ),
-        ToolCall::new("docs-build", "project.build", json!({ "cwd": "project" })),
-        ToolCall::new("docs-preview", "preview.start", json!({})),
-        ToolCall::new(
+fn docs_build_response(turn: u32) -> anyhow::Result<ModelResponse> {
+    let build_script = "const fs=require('fs');fs.mkdirSync('out',{recursive:true});const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Docs</title><style>body{font:16px sans-serif;background:#fff;color:#111}h1{font-size:40px}</style>';const shell='<nav><a href=\"/docs/#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>';fs.writeFileSync('out/index.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1>Docs</h1></body></html>');fs.writeFileSync('out/docs.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1 id=\"overview\">Docs Overview</h1></body></html>');";
+    match turn {
+        1 => Ok(one_tool(
+            "docs-init",
+            "project.init",
+            json!({ "template": "fumadocs-docs" }),
+        )),
+        2 => Ok(ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "docs-read-package",
+                "fs.read",
+                json!({ "path": "project/package.json" }),
+            ),
+            ToolCall::new(
+                "docs-read-source",
+                "fs.read",
+                json!({ "path": "project/content/docs/index.mdx" }),
+            ),
+        ])),
+        3 => Ok(ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "docs-package",
+                "fs.write",
+                json!({ "path": "project/package.json", "text": "{\"scripts\":{\"build\":\"node build.cjs\"}}" }),
+            ),
+            ToolCall::new(
+                "docs-script",
+                "fs.write",
+                json!({ "path": "project/build.cjs", "text": build_script }),
+            ),
+            ToolCall::new(
+                "docs-source",
+                "fs.write",
+                json!({ "path": "project/content/docs/index.mdx", "text": "---\ntitle: Overview\n---\n\n# Docs Overview" }),
+            ),
+        ])),
+        4 => Ok(one_tool(
+            "docs-build",
+            "project.build",
+            json!({ "cwd": "project" }),
+        )),
+        5 => Ok(one_tool("docs-preview", "preview.start", json!({}))),
+        6 => Ok(one_tool(
             "docs-open",
             "browser.open",
             json!({ "url": "http://127.0.0.1:4321" }),
-        ),
-        ToolCall::new(
+        )),
+        7 => Ok(one_tool(
             "docs-shot",
             "browser.screenshot",
             json!({ "screenshotId": "docs-k3d-shot" }),
-        ),
-        ToolCall::new(
+        )),
+        8 => Ok(one_tool(
             "docs-promote",
             "preview.publish",
             json!({ "url": "http://127.0.0.1:4321", "screenshotId": "docs-k3d-shot" }),
-        ),
-        ToolCall::new(
+        )),
+        9 => Ok(one_tool(
             "docs-complete",
             "run.complete",
             json!({ "status": "completed", "summary": "Docs k3d gate complete" }),
-        ),
-    ])
+        )),
+        _ => Err(anyhow::anyhow!("unexpected Docs Build fixture turn {turn}")),
+    }
 }
 
-fn deterministic_edit_response(prefix: &str) -> ModelResponse {
-    let build_script = "const fs=require('fs');const docs=fs.existsSync('content/docs/index.mdx');const dir=docs?'out':'dist';fs.mkdirSync(dir,{recursive:true});const title=docs?'Docs Edited':'K3d Website Edited';fs.writeFileSync(dir+'/index.html','<!doctype html><style>body{font:44px sans-serif;background:#fff;color:#111}</style><h1>'+title+'</h1>');if(docs)fs.writeFileSync(dir+'/docs.html','<h1>Docs Overview Edited</h1>');";
-    let screenshot_id = "k3d-edit-shot";
-    ModelResponse::ToolCalls(vec![
-        ToolCall::new(
-            format!("{prefix}-write"),
+fn docs_edit_response(turn: u32) -> anyhow::Result<ModelResponse> {
+    let build_script = "const fs=require('fs');fs.mkdirSync('out',{recursive:true});const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Docs Edited</title><style>body{font:16px sans-serif;background:#fff;color:#111}h1{font-size:40px}</style>';const shell='<nav><a href=\"/docs/#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>';fs.writeFileSync('out/index.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1>Docs Edited</h1></body></html>');fs.writeFileSync('out/docs.html','<!doctype html><html lang=\"en\"><head>'+head+'</head><body>'+shell+'<h1 id=\"overview\">Docs Overview Edited</h1></body></html>');";
+    match turn {
+        1 => Ok(one_tool(
+            "docs-edit-read",
+            "fs.read",
+            json!({ "path": "project/build.cjs" }),
+        )),
+        2 => Ok(one_tool(
+            "docs-edit-write",
             "fs.write",
             json!({ "path": "project/build.cjs", "text": build_script }),
-        ),
-        ToolCall::new(
-            format!("{prefix}-build"),
+        )),
+        3 => Ok(one_tool(
+            "docs-edit-build",
             "project.build",
             json!({ "cwd": "project" }),
-        ),
-        ToolCall::new(format!("{prefix}-preview"), "preview.start", json!({})),
-        ToolCall::new(
-            format!("{prefix}-open"),
+        )),
+        4 => Ok(one_tool("docs-edit-preview", "preview.start", json!({}))),
+        5 => Ok(one_tool(
+            "docs-edit-open",
             "browser.open",
             json!({ "url": "http://127.0.0.1:4321" }),
-        ),
-        ToolCall::new(
-            format!("{prefix}-shot"),
+        )),
+        6 => Ok(one_tool(
+            "docs-edit-shot",
             "browser.screenshot",
-            json!({ "screenshotId": screenshot_id }),
-        ),
-        ToolCall::new(
-            format!("{prefix}-promote"),
+            json!({ "screenshotId": "k3d-edit-shot" }),
+        )),
+        7 => Ok(one_tool(
+            "docs-edit-promote",
             "preview.publish",
-            json!({ "url": "http://127.0.0.1:4321", "screenshotId": screenshot_id }),
-        ),
-        ToolCall::new(
-            format!("{prefix}-complete"),
+            json!({ "url": "http://127.0.0.1:4321", "screenshotId": "k3d-edit-shot" }),
+        )),
+        8 => Ok(one_tool(
+            "docs-edit-complete",
             "run.complete",
-            json!({ "status": "completed", "summary": "K3d edit gate complete" }),
-        ),
-    ])
+            json!({ "status": "completed", "summary": "K3d Docs edit gate complete" }),
+        )),
+        _ => Err(anyhow::anyhow!("unexpected Docs Edit fixture turn {turn}")),
+    }
 }
 
 async fn assert_event_order(store: &RuntimeStore, run_id: &str) {
@@ -688,14 +884,24 @@ async fn assert_event_order(store: &RuntimeStore, run_id: &str) {
     assert!(preview < completed);
 }
 
+async fn assert_run_completed(store: &RuntimeStore, run_id: &str) {
+    assert!(store
+        .events(run_id)
+        .await
+        .iter()
+        .any(|event| matches!(event, AgentEvent::RunCompleted { .. })));
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_evidence(
     store: &RuntimeStore,
     storage: &std::path::Path,
     website_build: &anydesign_runtime::types::AgentRun,
     docs_build: &anydesign_runtime::types::AgentRun,
-    website_build_version: &anydesign_runtime::types::ProjectVersion,
+    website_build_snapshot: &DraftSnapshot,
     docs_build_version: &anydesign_runtime::types::ProjectVersion,
+    website_edit_snapshot: &DraftSnapshot,
+    website_session: &DraftPreviewSession,
     website: &anydesign_runtime::types::AgentRun,
     docs: &anydesign_runtime::types::AgentRun,
     website_binding: &anydesign_runtime::types::SandboxBinding,
@@ -704,23 +910,14 @@ async fn write_evidence(
     let Ok(path) = std::env::var("PUBLIC_RUNTIME_EVIDENCE_PATH") else {
         return;
     };
-    let website_version = store
-        .current_project_version(&website.project_id)
-        .await
-        .unwrap();
     let docs_version = store
         .current_project_version(&docs.project_id)
-        .await
-        .unwrap();
-    let website_publish = store
-        .artifact_publish_for_version(&website.project_id, &website.id, &website_version.id)
         .await
         .unwrap();
     let docs_publish = store
         .artifact_publish_for_version(&docs.project_id, &docs.id, &docs_version.id)
         .await
         .unwrap();
-    let website_preview = store.preview_lease_for_run(&website.id).await.unwrap();
     let docs_preview = store.preview_lease_for_run(&docs.id).await.unwrap();
     let website_events = store.events(&website.id).await;
     let docs_events = store.events(&docs.id).await;
@@ -739,20 +936,28 @@ async fn write_evidence(
             "sequenceValid": preview < completed,
         })
     };
+    let website_completed = website_events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RunCompleted { .. }))
+        .unwrap();
     let website_released = store
         .get_sandbox_binding(&website_binding.id)
         .await
         .unwrap();
     let docs_released = store.get_sandbox_binding(&docs_binding.id).await.unwrap();
-    let website_screenshot =
-        screenshot_evidence(storage, &website.project_id, &website.id, "k3d-edit-shot");
+    let website_screenshot = screenshot_evidence(
+        storage,
+        &website.project_id,
+        &website_build.id,
+        "website-k3d-shot",
+    );
     let docs_screenshot = screenshot_evidence(storage, &docs.project_id, &docs.id, "k3d-edit-shot");
     assert_ne!(
         website_screenshot["documentSha256"], docs_screenshot["documentSha256"],
         "Website and Docs browser evidence must come from different documents"
     );
     let evidence = json!({
-        "schemaVersion": "anydesign-public-runtime-k3d-evidence@1",
+        "schemaVersion": "anydesign-public-runtime-k3d-evidence@2",
         "provider": { "mode": "fixture", "model": "deterministic-tool-sequence" },
         "repository": {
             "commit": std::env::var("E2E_REPOSITORY_COMMIT").unwrap_or_default(),
@@ -769,36 +974,39 @@ async fn write_evidence(
         "projects": [
             {
                 "kind": "website", "projectId": website.project_id,
+                "lifecycle": "draft",
                 "buildRunId": website_build.id, "editRunId": website.id,
                 "sandboxBindingId": website_binding.id, "podUid": website_binding.pod_uid,
-                "versionBeforeCas": website_build_version.id,
-                "versionAfterCas": website_version.id,
-                "buildId": website_publish.build_id,
-                "candidateManifestHash": website_publish.candidate_manifest_hash,
-                "sourceSnapshotUri": website_publish.source_snapshot_uri,
-                "previewLeaseId": website_preview.id,
-                "previewLeaseStatusAfterRelease": website_preview.status,
+                "draftSnapshotBeforeEdit": website_build_snapshot.snapshot_id,
+                "draftSnapshotAfterEdit": website_edit_snapshot.snapshot_id,
+                "sourceHashBeforeEdit": website_build_snapshot.source_hash,
+                "sourceHashAfterEdit": website_edit_snapshot.source_hash,
+                "sourceSnapshotUri": website_edit_snapshot.source_snapshot_uri,
+                "previewSessionId": website_session.session_id,
+                "sessionEpoch": website_session.session_epoch,
+                "workspaceRevision": website_session.workspace_revision,
+                "durableRevision": website_session.durable_revision,
                 "screenshot": website_screenshot,
-                "artifactManifestHash": website_publish.artifact_manifest_hash,
-                "artifactUri": website_publish.immutable_artifact_uri,
-                "artifactUrl": format!("/artifacts/{}/current/", website.project_id),
-                "artifactHttpStatusAfterRelease": 200,
-                "currentVersionBeforeCas": website_publish.expected_current_version_id,
-                "currentVersionAfterCas": website_version.id,
-                "events": event_ids(&website.id, &website_events),
+                "artifactHttpStatusAfterRelease": 404,
+                "workVersionCreated": false,
+                "events": {
+                    "runCompleted": format!("{}/{}", website.id, website_completed),
+                    "terminalSeen": true,
+                },
                 "sandboxReleasedAt": website_released.last_seen_at,
                 "designContext": {
-                    "contentHash": website.design_context_content_hash,
-                    "artifactManifestHash": website.design_context_artifact_manifest_hash,
-                    "briefHash": website.design_context_brief_hash,
-                    "verificationPolicyId": website.design_context_verification_policy_id,
-                    "effectiveCompatibilityMode": website.design_context_effective_compatibility_mode,
-                    "materializationHash": website.design_context_materialization_hash,
-                    "readFiles": website.design_context_read_files,
+                    "contentHash": website_build.design_context_content_hash,
+                    "artifactManifestHash": website_build.design_context_artifact_manifest_hash,
+                    "briefHash": website_build.design_context_brief_hash,
+                    "verificationPolicyId": website_build.design_context_verification_policy_id,
+                    "effectiveCompatibilityMode": website_build.design_context_effective_compatibility_mode,
+                    "materializationHash": website_build.design_context_materialization_hash,
+                    "readFiles": website_build.design_context_read_files,
                 },
             },
             {
                 "kind": "docs", "projectId": docs.project_id,
+                "lifecycle": "work-version",
                 "buildRunId": docs_build.id, "editRunId": docs.id,
                 "sandboxBindingId": docs_binding.id, "podUid": docs_binding.pod_uid,
                 "versionBeforeCas": docs_build_version.id,

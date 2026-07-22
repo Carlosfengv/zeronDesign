@@ -60,7 +60,7 @@ function run(program, args, options = {}) {
 function runtimePod() {
   return run("kubectl", [
     "-n", runtimeNamespace,
-    "get", "pod", "-l", "app=anydesign-runtime",
+    "get", "pod", "-l", "app=anydesign-runtime,anydesign.io/runtime-role=primary",
     "-o", "jsonpath={.items[0].metadata.name}",
   ]).trim();
 }
@@ -71,25 +71,33 @@ function internalRepositoryToExternal(repository) {
   return `${registryExternal}/${repository.slice(prefix.length)}`;
 }
 
-function registryUrl(repository, releaseId, reference = "latest") {
-  const external = internalRepositoryToExternal(repository);
-  const slash = external.indexOf("/");
-  return `http://${external.slice(0, slash)}/v2/${external.slice(slash + 1)}/${safeId(releaseId)}/manifests/${reference}`;
-}
-
 async function registryDigest({ imageRepository, releaseId }) {
-  const response = await fetch(registryUrl(imageRepository, releaseId), {
-    method: "HEAD",
-    headers: {
-      accept: [
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-      ].join(", "),
-    },
-  });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`registry inspection failed: ${response.status}`);
-  const digest = response.headers.get("docker-content-digest");
+  const prefix = `${registryInternal}/`;
+  if (!imageRepository.startsWith(prefix)) {
+    throw new Error("unexpected k3d registry repository");
+  }
+  const repositoryPath = imageRepository.slice(prefix.length);
+  const registryContainer = registryInternal.split(":", 1)[0];
+  const result = spawnSync(
+    "docker",
+    [
+      "exec",
+      registryContainer,
+      "wget",
+      "-S",
+      "--spider",
+      "--header=Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+      `http://127.0.0.1:5000/v2/${repositoryPath}/${safeId(releaseId)}/manifests/latest`,
+    ],
+    { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+  );
+  if (result.error) throw result.error;
+  const headers = `${result.stdout}\n${result.stderr}`;
+  if (result.status !== 0 && /HTTP\/1\.1 404\b/.test(headers)) return null;
+  if (result.status !== 0) {
+    throw new Error(`registry inspection failed: ${headers.trim()}`);
+  }
+  const digest = headers.match(/^\s*Docker-Content-Digest:\s*(sha256:[a-f0-9]{64})\s*$/im)?.[1];
   if (!/^sha256:[a-f0-9]{64}$/.test(digest || "")) throw new Error("registry returned an invalid digest");
   return digest;
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { generationContextProtocol, validateGenerationContextRunEvidence } from "./generation-context-evidence.mjs";
 
 function parseArgs(argv) {
   const args = {
@@ -733,31 +734,35 @@ function validateStage(record, requireDcp, requiredApprovalReference) {
   }
 
   if (requireDcp) {
-    const dcp = evidence.designContext;
-    if (!dcp || typeof dcp !== "object" || Array.isArray(dcp)) {
-      errors.push("DCP evidence missing");
+    if (generationContextProtocol(evidence) === "generation-context") {
+      errors.push(...validateGenerationContextRunEvidence(evidence, `Generation Context ${record.stage}`));
     } else {
-      for (const field of ["contentHash", "artifactManifestHash", "briefHash"]) {
-        if (!isSha256(dcp[field])) errors.push(`DCP ${field} must be sha256`);
-      }
-      if (!hasText(dcp.verificationPolicyId)) {
-        errors.push("DCP verificationPolicyId missing");
-      }
-      if (!['observe', 'enforced'].includes(dcp.effectiveCompatibilityMode)) {
-        errors.push("DCP effectiveCompatibilityMode invalid");
-      }
-      if (!Array.isArray(dcp.requiredReadPaths) || !Array.isArray(dcp.readFiles)) {
-        errors.push("DCP requiredReadPaths/readFiles missing");
+      const dcp = evidence.designContext;
+      if (!dcp || typeof dcp !== "object" || Array.isArray(dcp)) {
+      errors.push("DCP evidence missing");
       } else {
-        const stageLabel = `${record.stage.slice(0, 1).toUpperCase()}${record.stage.slice(1)}`;
-        if (dcp.requiredReadPaths.length === 0) {
-          errors.push(`DCP ${stageLabel} requiredReadPaths missing`);
+        for (const field of ["contentHash", "artifactManifestHash", "briefHash"]) {
+          if (!isSha256(dcp[field])) errors.push(`DCP ${field} must be sha256`);
         }
-        if (!dcp.requiredReadPaths.every(path => hasText(path) && dcp.readFiles.includes(path))) {
-          errors.push(`DCP ${stageLabel} required reads were not all recorded`);
+        if (!hasText(dcp.verificationPolicyId)) {
+          errors.push("DCP verificationPolicyId missing");
         }
-        if (record.stage === "repair" && dcp.effectiveCompatibilityMode !== "enforced") {
-          errors.push("DCP Repair effectiveCompatibilityMode is not enforced");
+        if (!["observe", "enforced"].includes(dcp.effectiveCompatibilityMode)) {
+          errors.push("DCP effectiveCompatibilityMode invalid");
+        }
+        if (!Array.isArray(dcp.requiredReadPaths) || !Array.isArray(dcp.readFiles)) {
+          errors.push("DCP requiredReadPaths/readFiles missing");
+        } else {
+          const stageLabel = `${record.stage.slice(0, 1).toUpperCase()}${record.stage.slice(1)}`;
+          if (dcp.requiredReadPaths.length === 0) {
+            errors.push(`DCP ${stageLabel} requiredReadPaths missing`);
+          }
+          if (!dcp.requiredReadPaths.every(path => hasText(path) && dcp.readFiles.includes(path))) {
+            errors.push(`DCP ${stageLabel} required reads were not all recorded`);
+          }
+          if (record.stage === "repair" && dcp.effectiveCompatibilityMode !== "enforced") {
+            errors.push("DCP Repair effectiveCompatibilityMode is not enforced");
+          }
         }
       }
     }
@@ -804,14 +809,27 @@ function validateSummary(summary, args) {
     }
   }
   for (const project of args.requiredDcpProjects) {
-    const build = summary.stages[stageKey(project, "build")]?.evidence.at(-1)?.evidence?.designContext;
-    const edit = summary.stages[stageKey(project, "edit")]?.evidence.at(-1)?.evidence?.designContext;
-    const repair = summary.stages[stageKey(project, "repair")]?.evidence.at(-1)?.evidence?.designContext;
-    if (build?.contentHash && edit?.contentHash && build.contentHash !== edit.contentHash) {
-      errors.push(`${project}: Edit DCP contentHash does not inherit the Build DCP`);
-    }
-    if (build?.contentHash && repair?.contentHash && build.contentHash !== repair.contentHash) {
-      errors.push(`${project}: Repair DCP contentHash does not inherit the Build DCP`);
+    const evidence = ["build", "edit", "repair"]
+      .map(stage => summary.stages[stageKey(project, stage)]?.evidence.at(-1)?.evidence)
+      .filter(Boolean);
+    const protocols = evidence.map(generationContextProtocol);
+    if (new Set(protocols).size > 1) {
+      errors.push(`${project}: lifecycle mixes legacy and generation-context evidence`);
+    } else if (protocols[0] === "generation-context") {
+      if (new Set(evidence.map(item => item.templateVersion)).size !== 1) {
+        errors.push(`${project}: Template Version changed across the Generation Context lifecycle`);
+      }
+      if (new Set(evidence.map(item => item.generationContext.runContextBindingHash)).size !== evidence.length) {
+        errors.push(`${project}: Generation Context binding hashes must be distinct per Run`);
+      }
+    } else {
+      const [build, edit, repair] = evidence.map(item => item.designContext);
+      if (build?.contentHash && edit?.contentHash && build.contentHash !== edit.contentHash) {
+        errors.push(`${project}: Edit DCP contentHash does not inherit the Build DCP`);
+      }
+      if (build?.contentHash && repair?.contentHash && build.contentHash !== repair.contentHash) {
+        errors.push(`${project}: Repair DCP contentHash does not inherit the Build DCP`);
+      }
     }
   }
   if (summary.malformedEvidenceLines > 0) {
@@ -934,7 +952,7 @@ function main() {
   }
   process.stdout.write(json);
   if (!result.ok) {
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
