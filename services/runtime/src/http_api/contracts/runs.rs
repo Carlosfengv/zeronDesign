@@ -23,10 +23,15 @@ pub struct StartRunInputContext {
     pub edit_impact_plan_hash: Option<String>,
     pub sandbox_binding_id: Option<String>,
     pub parent_run_id: Option<String>,
+    pub predecessor_run_id: Option<String>,
     pub design_profile_id: Option<String>,
     pub design_fidelity_mode: Option<String>,
     #[serde(default)]
     pub model_resource_id: Option<String>,
+    #[serde(default)]
+    pub content_plan: Option<crate::generation_context::ContentPlanIdentity>,
+    #[serde(default)]
+    pub visual_bindings: Vec<crate::visual_contracts::StartRunVisualBinding>,
     #[serde(default)]
     pub finding_ids: Vec<String>,
 }
@@ -45,9 +50,12 @@ impl From<StartRunRequest> for crate::run_lifecycle::StartRunCommand {
                 edit_impact_plan_hash: request.input_context.edit_impact_plan_hash,
                 sandbox_binding_id: request.input_context.sandbox_binding_id,
                 parent_run_id: request.input_context.parent_run_id,
+                predecessor_run_id: request.input_context.predecessor_run_id,
                 design_profile_id: request.input_context.design_profile_id,
                 design_fidelity_mode: request.input_context.design_fidelity_mode,
                 model_resource_id: request.input_context.model_resource_id,
+                content_plan: request.input_context.content_plan,
+                visual_bindings: request.input_context.visual_bindings,
                 finding_ids: request.input_context.finding_ids,
             },
         }

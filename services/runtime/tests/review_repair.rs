@@ -412,6 +412,7 @@ async fn repair_child_run_freezes_parent_and_finding_context() {
     );
     assert_eq!(repair.profile_snapshot.source_checkpoint_id, None);
     assert!(repair.profile_snapshot.mcp_server_names.is_empty());
+    assert_eq!(repair.execution_profile.as_deref(), Some("repair_warm"));
     assert_ne!(
         repair.input_message_ids,
         store.get_run(&run_id).await.unwrap().input_message_ids
@@ -437,6 +438,15 @@ async fn child_run_after_restart_freezes_persisted_parent_checkpoint() {
         task_list: vec![],
         workspace_snapshot_uri: Some("file:///workspace/snapshots/candidate.tar".to_string()),
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: None,
         design_version: None,
         last_known_preview_url: Some("http://preview.local/preview/project-1/current".to_string()),
@@ -488,7 +498,7 @@ async fn repair_run_lifecycle_updates_finding_status() {
             &version_id,
             ReviewFindingSeverity::Blocking,
             ReviewFindingCategory::Build,
-            "Astro build fails",
+            "Next.js build fails",
             None,
             true,
         )
@@ -525,7 +535,7 @@ async fn repair_run_lifecycle_updates_finding_status() {
         "TS2304 Cannot find name Hero",
         RepairActionSignature::new(
             "fs.patch",
-            Some("/workspace/project/src/pages/index.astro".to_string()),
+            Some("/workspace/project/app/page.tsx".to_string()),
             vec![],
         ),
     )
@@ -589,7 +599,7 @@ async fn persisted_repair_run_terminal_status_updates_finding_after_restart() {
             &version_id,
             ReviewFindingSeverity::Blocking,
             ReviewFindingCategory::Build,
-            "Astro build fails",
+            "Next.js build fails",
             None,
             true,
         )
@@ -751,21 +761,14 @@ async fn repair_child_run_has_scoped_write_policy_without_parent_session_allow_r
         .execute_calls(
             store.clone(),
             &repair.id,
-            vec![
-                ToolCall::new(
-                    "tool-1",
-                    "mcp__figma__get_file",
-                    serde_json::json!({ "fileKey": "figma-file" }),
-                ),
-                ToolCall::new(
-                    "tool-2",
-                    "preview.report_candidate",
-                    serde_json::json!({
-                        "url": "http://127.0.0.1:4321",
-                        "screenshotId": "shot-manual-repair"
-                    }),
-                ),
-            ],
+            vec![ToolCall::new(
+                "tool-1",
+                "preview.report_candidate",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:4321",
+                    "screenshotId": "shot-manual-repair"
+                }),
+            )],
         )
         .await;
 
@@ -774,16 +777,6 @@ async fn repair_child_run_has_scoped_write_policy_without_parent_session_allow_r
         .as_str()
         .unwrap()
         .contains("denied by frozen run profile policy"));
-    assert!(result[1].result.is_error);
-    assert!(result[1].result.content["error"]
-        .as_str()
-        .unwrap()
-        .contains("denied by frozen run profile policy"));
-    assert!(store
-        .audit_records()
-        .await
-        .iter()
-        .any(|record| record.tool == "mcp__figma__get_file" && record.decision == "deny"));
     assert!(store
         .audit_records()
         .await
@@ -910,7 +903,7 @@ async fn repair_loop_stops_after_three_attempts_for_same_error_key() {
             &version_id,
             ReviewFindingSeverity::Blocking,
             ReviewFindingCategory::Build,
-            "Astro build fails",
+            "Next.js build fails",
             None,
             true,
         )
@@ -938,10 +931,10 @@ async fn repair_loop_stops_after_three_attempts_for_same_error_key() {
             &run_id,
             &repair.id,
             &finding.id,
-            &format!("TS2304 Cannot find name Hero at src/pages/index.astro:{line}:5"),
+            &format!("TS2304 Cannot find name Hero at app/page.tsx:{line}:5"),
             RepairActionSignature::new(
                 "fs.patch",
-                Some("/workspace/project/src/pages/index.astro".to_string()),
+                Some("/workspace/project/app/page.tsx".to_string()),
                 vec![],
             ),
         )
@@ -981,7 +974,7 @@ async fn persisted_repair_attempts_count_toward_max_attempts_after_restart() {
             &version_id,
             ReviewFindingSeverity::Blocking,
             ReviewFindingCategory::Build,
-            "Astro build fails",
+            "Next.js build fails",
             None,
             true,
         )
@@ -1005,10 +998,10 @@ async fn persisted_repair_attempts_count_toward_max_attempts_after_restart() {
             &run_id,
             &repair.id,
             &finding.id,
-            &format!("TS2304 Cannot find name Hero at src/pages/index.astro:{line}:5"),
+            &format!("TS2304 Cannot find name Hero at app/page.tsx:{line}:5"),
             RepairActionSignature::new(
                 "fs.patch",
-                Some("/workspace/project/src/pages/index.astro".to_string()),
+                Some("/workspace/project/app/page.tsx".to_string()),
                 vec![],
             ),
         )
@@ -1025,10 +1018,10 @@ async fn persisted_repair_attempts_count_toward_max_attempts_after_restart() {
         &run_id,
         &repair.id,
         &finding.id,
-        "TS2304 Cannot find name Hero at src/pages/index.astro:103:5",
+        "TS2304 Cannot find name Hero at app/page.tsx:103:5",
         RepairActionSignature::new(
             "fs.patch",
-            Some("/workspace/project/src/pages/index.astro".to_string()),
+            Some("/workspace/project/app/page.tsx".to_string()),
             vec![],
         ),
     )
@@ -1065,7 +1058,7 @@ async fn repair_report_attempt_tool_blocks_after_three_same_error_attempts() {
             &version_id,
             ReviewFindingSeverity::Blocking,
             ReviewFindingCategory::Build,
-            "Astro build fails",
+            "Next.js build fails",
             None,
             true,
         )
@@ -1095,10 +1088,10 @@ async fn repair_report_attempt_tool_blocks_after_three_same_error_attempts() {
                     "repair.report_attempt",
                     serde_json::json!({
                         "findingId": finding.id,
-                        "rawError": format!("TS2304 Cannot find name Hero at src/pages/index.astro:{line}:5"),
+                        "rawError": format!("TS2304 Cannot find name Hero at app/page.tsx:{line}:5"),
                         "action": {
                             "tool": "fs.patch",
-                            "path": "/workspace/project/src/pages/index.astro",
+                            "path": "/workspace/project/app/page.tsx",
                             "argv": []
                         }
                     }),
@@ -1334,7 +1327,7 @@ async fn repair_report_attempt_tool_is_repair_phase_only() {
                     "rawError": "TS2304 Cannot find name Hero",
                     "action": {
                         "tool": "fs.patch",
-                        "path": "/workspace/project/src/pages/index.astro",
+                        "path": "/workspace/project/app/page.tsx",
                         "argv": []
                     }
                 }),

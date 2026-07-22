@@ -569,6 +569,8 @@ fn is_recoverable_error_guard_kind(error_kind: &str) -> bool {
             | "docs.source_contract_invalid"
             | "patch.read_required"
             | "patch.stale_read"
+            | "mutation.read_required"
+            | "mutation.stale_lease"
             | "patch.old_str_missing"
             | "patch.old_str_ambiguous"
             | "build.missing_dependency"
@@ -626,6 +628,8 @@ fn recoverable_error_guard_guidance(error_kind: &str) -> &'static str {
         }
         "patch.read_required" => "Call fs.read on the target path before retrying fs.patch or fs.multi_patch.",
         "patch.stale_read" => "Read the file again and patch against the current content hash.",
+        "mutation.read_required" => "Call fs.read on the target path to establish a full observation lease before retrying the mutation.",
+        "mutation.stale_lease" => "Read the file again to renew the mutation lease against the current content hash.",
         "patch.old_str_missing" => {
             "Search or read the current file, then retry with an exact snippet from current contents."
         }

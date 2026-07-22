@@ -274,11 +274,57 @@ pub struct AgentRun {
     /// prevents a later Profile revision from silently changing a queued run.
     #[serde(default)]
     pub design_context_artifacts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub run_contract_version: Option<String>,
+    #[serde(default)]
+    pub content_plan_id: Option<String>,
+    #[serde(default)]
+    pub content_plan_revision: Option<u64>,
+    #[serde(default)]
+    pub content_plan_hash: Option<String>,
+    #[serde(default)]
+    pub content_plan_approval_id: Option<String>,
+    #[serde(default)]
+    pub content_plan_approval_state: Option<String>,
+    #[serde(default)]
+    pub generation_context_status: Option<String>,
+    #[serde(default)]
+    pub generation_context_runtime_mode: Option<String>,
+    #[serde(default)]
+    pub generation_context_schema_version: Option<String>,
+    #[serde(default)]
+    pub generation_context_compiler_version: Option<String>,
+    #[serde(default)]
+    pub generation_context_content_hash: Option<String>,
+    #[serde(default)]
+    pub generation_context_binding_hash: Option<String>,
+    #[serde(default)]
+    pub generation_context_runtime_attestation_hash: Option<String>,
+    #[serde(default)]
+    pub visual_binding_set_hash: Option<String>,
+    #[serde(default)]
+    pub visual_delivery_state: Option<String>,
+    #[serde(default)]
+    pub execution_profile: Option<String>,
+    #[serde(default)]
+    pub workflow_state: Option<String>,
+    #[serde(default)]
+    pub context_window_epoch: u64,
+    #[serde(default)]
+    pub context_injected_turn: Option<u32>,
+    #[serde(default)]
+    pub predecessor_run_id: Option<String>,
+    #[serde(default)]
+    pub successor_run_id: Option<String>,
+    #[serde(default)]
+    pub generation_context: Option<Value>,
     pub base_version_id: Option<String>,
     #[serde(default)]
     pub edit_base: Option<EditBase>,
     #[serde(default)]
     pub edit_impact_plan_hash: Option<String>,
+    #[serde(default)]
+    pub edit_mutation_preflight_completed: bool,
     pub output_version_id: Option<String>,
     pub finding_ids: Option<Vec<String>>,
     pub input_message_ids: Vec<String>,
@@ -310,6 +356,49 @@ pub struct ProjectRuntimeState {
     pub lockfile: String,
     pub registry: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRootMaterializationState {
+    Missing,
+    Verified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum StyleContractState {
+    PendingInitialization,
+    VerifiedDcp { identity: String },
+    VerifiedTemplateDefault { identity: String },
+    Mismatch { expected: String, actual: String },
+}
+
+impl StyleContractState {
+    pub fn is_verified(&self) -> bool {
+        matches!(
+            self,
+            Self::VerifiedDcp { .. } | Self::VerifiedTemplateDefault { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRuntimeAttestation {
+    pub schema_version: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub source_revision: u64,
+    pub app_root: String,
+    pub app_root_materialization_state: AppRootMaterializationState,
+    pub template_identity_state: String,
+    pub template_id: String,
+    pub template_version: String,
+    pub template_manifest_sha256: String,
+    pub style_contract_state: StyleContractState,
+    pub attestation_hash: String,
+    pub verified_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1534,6 +1623,52 @@ pub struct ConversationItem {
     pub created_at: DateTime<Utc>,
 }
 
+pub const OBSERVATION_RECEIPT_SCHEMA: &str = "observation-receipt@1";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationView {
+    Full,
+    Partial,
+    Injected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationOutcome {
+    ContentReturned,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationPurpose {
+    Context,
+    Source,
+    Diagnostic,
+    Verification,
+    RuntimeInternal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationReceipt {
+    pub schema_version: String,
+    pub run_id: String,
+    pub normalized_path: String,
+    pub content_sha256: String,
+    pub context_window_epoch: u64,
+    pub view: ObservationView,
+    pub last_outcome: ObservationOutcome,
+    pub first_read_turn: u32,
+    pub last_read_turn: u32,
+    pub read_count: u32,
+    pub purpose: ObservationPurpose,
+    pub delivered_bytes: u64,
+    pub estimated_tokens: u64,
+    pub duplicate_delivery: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewFindingEvidence {
@@ -1672,6 +1807,44 @@ pub enum AgentEvent {
         estimated: bool,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "model.turn_started", rename_all = "camelCase")]
+    ModelTurnStarted {
+        run_id: String,
+        turn: u32,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "observation.receipt", rename_all = "camelCase")]
+    ObservationReceipt {
+        run_id: String,
+        receipt: ObservationReceipt,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "generation_context.compiled", rename_all = "camelCase")]
+    GenerationContextCompiled {
+        run_id: String,
+        context_content_hash: String,
+        run_context_binding_hash: String,
+        serialized_bytes: u64,
+        sections: Vec<String>,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "generation_context.fallback", rename_all = "camelCase")]
+    GenerationContextFallback {
+        run_id: String,
+        reason: String,
+        design_source_kind: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "content_plan.approval_rejected", rename_all = "camelCase")]
+    ContentPlanApprovalRejected {
+        run_id: String,
+        plan_id: Option<String>,
+        revision: Option<u64>,
+        content_hash: Option<String>,
+        state: String,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "model.protocol_error", rename_all = "camelCase")]
     ModelProtocolError {
         run_id: String,
@@ -1718,7 +1891,7 @@ pub enum AgentEvent {
         turn: u32,
         stage: String,
         completed_steps: Vec<String>,
-        next_action: String,
+        next_action: Value,
         budgets: Value,
         timestamp: DateTime<Utc>,
     },
@@ -1797,6 +1970,11 @@ impl AgentEvent {
             | Self::MetricRecorded { run_id, .. }
             | Self::ModelExecution { run_id, .. }
             | Self::ModelUsage { run_id, .. }
+            | Self::ModelTurnStarted { run_id, .. }
+            | Self::ObservationReceipt { run_id, .. }
+            | Self::GenerationContextCompiled { run_id, .. }
+            | Self::GenerationContextFallback { run_id, .. }
+            | Self::ContentPlanApprovalRejected { run_id, .. }
             | Self::ModelProtocolError { run_id, .. }
             | Self::RunWatchdogTriggered { run_id, .. }
             | Self::RunProgressFingerprint { run_id, .. }
@@ -1915,6 +2093,24 @@ pub struct AgentCheckpoint {
     pub workspace_snapshot_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_result: Option<CheckpointBuildResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_context_binding_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_attestation_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_workspace_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_receipts_version: Option<u32>,
     pub brief_version: Option<String>,
     pub design_version: Option<String>,
     pub last_known_preview_url: Option<String>,

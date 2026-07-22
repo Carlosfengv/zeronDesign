@@ -9,7 +9,7 @@ async fn start_repair_run_requires_finding_ids() {
             "sandbox-parent-no-finding".to_string(),
             "sandbox-claim-parent-no-finding".to_string(),
             "workspace-sandbox-claim-parent-no-finding".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -79,7 +79,7 @@ async fn start_repair_run_can_target_review_child_finding() {
             "sandbox-review-repair".to_string(),
             "sandbox-claim-review-repair".to_string(),
             "workspace-sandbox-claim-review-repair".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -271,7 +271,7 @@ async fn start_run_rejects_unknown_parent_or_sandbox_binding() {
             "sandbox-project-2".to_string(),
             "sandbox-claim-project-2".to_string(),
             "workspace-sandbox-claim-project-2".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -359,7 +359,7 @@ async fn start_run_rejects_sandbox_phase_before_binding_ready() {
             "sandbox-claiming".to_string(),
             "sandbox-claim-claiming".to_string(),
             "workspace-sandbox-claim-claiming".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -411,7 +411,7 @@ async fn start_run_rejects_child_workspace_binding_mismatch() {
             "sandbox-parent".to_string(),
             "sandbox-claim-parent-mismatch".to_string(),
             "workspace-sandbox-claim-parent-mismatch".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -427,7 +427,7 @@ async fn start_run_rejects_child_workspace_binding_mismatch() {
             "sandbox-child".to_string(),
             "sandbox-claim-child-mismatch".to_string(),
             "workspace-sandbox-claim-child-mismatch".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )

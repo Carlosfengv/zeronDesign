@@ -374,6 +374,47 @@ pub enum RunVisualBindingRole {
     Candidate,
 }
 
+/// A visual binding supplied atomically with StartRun. The Runtime adds the
+/// durable Run identity before persisting it, so Generation Context can freeze
+/// the complete reference set before the first model turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartRunVisualBinding {
+    pub artifact_id: String,
+    pub role: RunVisualBindingRole,
+    pub route: String,
+    pub viewport: VisualViewport,
+    pub target: RunVisualTarget,
+    pub order: u32,
+}
+
+impl StartRunVisualBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        RunVisualBinding {
+            run_id: "start-run-validation".to_string(),
+            artifact_id: self.artifact_id.clone(),
+            role: self.role,
+            route: self.route.clone(),
+            viewport: self.viewport.clone(),
+            target: self.target.clone(),
+            order: self.order,
+        }
+        .validate()
+    }
+
+    pub fn bind_to_run(&self, run_id: &str) -> RunVisualBinding {
+        RunVisualBinding {
+            run_id: run_id.to_string(),
+            artifact_id: self.artifact_id.clone(),
+            role: self.role,
+            route: self.route.clone(),
+            viewport: self.viewport.clone(),
+            target: self.target.clone(),
+            order: self.order,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunVisualBinding {

@@ -7,8 +7,9 @@ use crate::{
     permission::{PermissionEngine, PermissionReason, PermissionResult, PermissionRules},
     profiles::policy,
     types::{
-        canonical_json_hash, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, PendingPermission,
-        TranscriptMode,
+        canonical_json_hash, AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ObservationOutcome,
+        ObservationPurpose, ObservationReceipt, ObservationView, PendingPermission, TranscriptMode,
+        OBSERVATION_RECEIPT_SCHEMA,
     },
 };
 use async_trait::async_trait;
@@ -359,6 +360,7 @@ pub struct ToolExecutor {
     remote_workspace: bool,
     runtime_storage_dir: Arc<PathBuf>,
     runtime_storage_overridden: bool,
+    observation_receipts_enabled: bool,
 }
 
 impl ToolExecutor {
@@ -384,6 +386,7 @@ impl ToolExecutor {
             permission_engine: PermissionEngine::new(permission_rules),
             runtime_storage_dir: Arc::new(workspace_root.join(".runtime-storage")),
             runtime_storage_overridden: false,
+            observation_receipts_enabled: false,
             workspace_root: Arc::new(workspace_root),
             policy_profile: RuntimePolicyProfile::Production,
             npm_registry: Arc::new("https://registry.internal.example/npm/".to_string()),
@@ -409,6 +412,7 @@ impl ToolExecutor {
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
     }
 
@@ -430,6 +434,7 @@ impl ToolExecutor {
             remote_workspace: self.remote_workspace,
             runtime_storage_dir,
             runtime_storage_overridden: self.runtime_storage_overridden,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
     }
 
@@ -445,6 +450,7 @@ impl ToolExecutor {
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
     }
 
@@ -462,6 +468,7 @@ impl ToolExecutor {
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
     }
 
@@ -477,6 +484,7 @@ impl ToolExecutor {
             remote_workspace,
             runtime_storage_dir: self.runtime_storage_dir.clone(),
             runtime_storage_overridden: self.runtime_storage_overridden,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
     }
 
@@ -492,7 +500,14 @@ impl ToolExecutor {
             remote_workspace: self.remote_workspace,
             runtime_storage_dir: Arc::new(runtime_storage_dir.into()),
             runtime_storage_overridden: true,
+            observation_receipts_enabled: self.observation_receipts_enabled,
         }
+    }
+
+    pub fn with_observation_receipts_enabled(&self, enabled: bool) -> Self {
+        let mut executor = self.clone();
+        executor.observation_receipts_enabled = enabled;
+        executor
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -594,6 +609,23 @@ impl ToolExecutor {
                 result: ToolResult::error(format!("No such tool available: {tool_name}")),
             };
         };
+        if replan_terminal_tool(tool.name()) && run_replan_required(&store, run_id).await {
+            return ToolExecution {
+                result: ToolResult::typed_error(
+                    format!(
+                        "{} is blocked because this Run requires a replacement EditImpactPlan",
+                        tool.name()
+                    ),
+                    "edit.replan_required",
+                    false,
+                    json!({
+                        "runId": run_id,
+                        "tool": tool.name(),
+                        "suggestedAction": "Create a successor Run with a new frozen Plan and Run Context Binding."
+                    }),
+                ),
+            };
+        }
         let approved_permission = store
             .approved_permission_for_tool(run_id, tool.name(), tool_use_id, &input)
             .await;
@@ -653,7 +685,7 @@ impl ToolExecutor {
         }
         if !tool_use_id.starts_with("bootstrap:") {
             if let Some((message, error_kind, metadata)) =
-                design_context_read_gate(&ctx.run, tool.name(), &input)
+                runtime_attestation_gate(&store, &ctx.run, tool.name(), &input).await
             {
                 if matches!(
                     error_kind.as_str(),
@@ -820,6 +852,54 @@ impl ToolExecutor {
 
         match audited_permission {
             PermissionResult::Allow { updated_input, .. } => {
+                if !ctx.allow_runtime_owned_writes
+                    && edit_plan_mutation_tool(tool.name(), &updated_input)
+                {
+                    let target = mutation_target(&updated_input);
+                    match store
+                        .preflight_edit_mutation(run_id, target.as_deref())
+                        .await
+                    {
+                        Ok(updated_run) => ctx.run = updated_run,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let error_kind = if message.contains("edit.plan_scope_violation") {
+                                "edit.plan_scope_violation"
+                            } else {
+                                "edit.plan_stale"
+                            };
+                            let replan_required = error_kind == "edit.plan_stale"
+                                || ctx.run.phase == crate::types::AgentPhase::Repair;
+                            if replan_required {
+                                mark_run_replan_required(
+                                    &store,
+                                    &ctx.run,
+                                    tool.name(),
+                                    target.as_deref(),
+                                    error_kind,
+                                )
+                                .await;
+                            }
+                            return ToolExecution {
+                                result: ToolResult::typed_error(
+                                    message,
+                                    error_kind,
+                                    true,
+                                    json!({
+                                        "runId": run_id,
+                                        "target": target,
+                                        "replanRequired": replan_required,
+                                        "suggestedAction": if replan_required {
+                                            "Stop mutation in this Run and create a successor Run bound to a current EditImpactPlan."
+                                        } else {
+                                            "Use a target declared by the frozen EditImpactPlan."
+                                        }
+                                    }),
+                                ),
+                            };
+                        }
+                    }
+                }
                 let progress = ProgressSink::new(run_id, tool_use_id, store.clone());
                 let tracked_input = updated_input.clone();
                 let input_hash = (!tool.is_read_only(&tracked_input)).then(|| {
@@ -913,7 +993,7 @@ impl ToolExecutor {
                         }
                     }
                 }
-                let execution = match tool.call(updated_input, ctx.clone(), progress).await {
+                let mut execution = match tool.call(updated_input, ctx.clone(), progress).await {
                     Ok(result) => ToolExecution {
                         result: truncate_large_result_if_needed(
                             result,
@@ -987,6 +1067,22 @@ impl ToolExecutor {
                     .await;
                 }
                 if !execution.result.is_error {
+                    if self.observation_receipts_enabled {
+                        deduplicate_read_delivery(
+                            &store,
+                            &ctx.run,
+                            tool.name(),
+                            &mut execution.result,
+                        )
+                        .await;
+                        record_observation_receipt(
+                            &store,
+                            &ctx.run,
+                            tool.name(),
+                            &execution.result,
+                        )
+                        .await;
+                    }
                     record_design_context_read(
                         &store,
                         &ctx.run,
@@ -1176,6 +1272,343 @@ impl ToolExecutor {
             )
             .await;
     }
+}
+
+const OBSERVATION_DELIVERY_MAX_ENTRIES: usize = 100;
+const OBSERVATION_DELIVERY_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+async fn deduplicate_read_delivery(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    result: &mut ToolResult,
+) {
+    if tool_name != "fs.read" {
+        return;
+    }
+    let Some(path) = result.content.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(text) = result.content.get("text").and_then(Value::as_str) else {
+        return;
+    };
+    let normalized_path = normalize_design_context_path(path);
+    let content_sha256 = crate::types::sha256_hex(text.as_bytes());
+    let events = store.events(&run.id).await;
+    let epoch = current_context_window_epoch(&events);
+    let Some(previous) =
+        visible_full_observation(&events, &normalized_path, &content_sha256, epoch)
+    else {
+        return;
+    };
+    result.content = json!({
+        "path": path,
+        "contentSha256": content_sha256,
+        "contextWindowEpoch": epoch,
+        "unchanged": true,
+        "alreadyObservedAtTurn": previous.first_read_turn,
+        "suggestedAction": "Use the previously observed content or mutate the file."
+    });
+}
+
+fn current_context_window_epoch(events: &[AgentEvent]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MetricRecorded { name, value, .. }
+                if name == "context_window_epoch_advanced" =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn visible_full_observation<'a>(
+    events: &'a [AgentEvent],
+    path: &str,
+    content_sha256: &str,
+    epoch: u64,
+) -> Option<&'a ObservationReceipt> {
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    for event in events.iter().rev() {
+        let AgentEvent::ObservationReceipt { receipt, .. } = event else {
+            continue;
+        };
+        if receipt.context_window_epoch != epoch
+            || receipt.view != ObservationView::Full
+            || receipt.last_outcome != ObservationOutcome::ContentReturned
+        {
+            continue;
+        }
+        entries = entries.saturating_add(1);
+        bytes = bytes.saturating_add(receipt.delivered_bytes);
+        if entries > OBSERVATION_DELIVERY_MAX_ENTRIES || bytes > OBSERVATION_DELIVERY_MAX_BYTES {
+            break;
+        }
+        if receipt.normalized_path == path && receipt.content_sha256 == content_sha256 {
+            return Some(receipt);
+        }
+    }
+    None
+}
+
+async fn record_observation_receipt(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    result: &ToolResult,
+) {
+    let deliveries = match tool_name {
+        "fs.read" => result
+            .content
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| {
+                vec![(
+                    path.to_string(),
+                    result
+                        .content
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    result
+                        .content
+                        .get("contentSha256")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    result
+                        .content
+                        .get("unchanged")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )]
+            })
+            .unwrap_or_default(),
+        "project.init" => result
+            .content
+            .get("sourceObservations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|observation| {
+                Some((
+                    observation.get("path")?.as_str()?.to_string(),
+                    observation
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    observation
+                        .get("contentSha256")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    false,
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if deliveries.is_empty() {
+        return;
+    }
+    let events = store.events(&run.id).await;
+    let turn = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelTurnStarted { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let context_window_epoch = current_context_window_epoch(&events);
+    for (path, text, declared_sha256, unchanged) in deliveries {
+        let normalized_path = normalize_design_context_path(&path);
+        let computed_sha256 = text
+            .as_deref()
+            .map(|text| crate::types::sha256_hex(text.as_bytes()));
+        if computed_sha256.is_some()
+            && declared_sha256.is_some()
+            && computed_sha256 != declared_sha256
+        {
+            continue;
+        }
+        let Some(content_sha256) = computed_sha256.or(declared_sha256) else {
+            continue;
+        };
+        let previous = events.iter().rev().find_map(|event| match event {
+            AgentEvent::ObservationReceipt { receipt, .. }
+                if receipt.normalized_path == normalized_path
+                    && receipt.content_sha256 == content_sha256
+                    && receipt.context_window_epoch == context_window_epoch
+                    && receipt.view == ObservationView::Full =>
+            {
+                Some(receipt)
+            }
+            _ => None,
+        });
+        let delivered_bytes = text.as_deref().map_or(0, |text| text.len() as u64);
+        let estimated_tokens = text
+            .as_deref()
+            .map_or(0, |text| (text.chars().count() as u64).div_ceil(4));
+        let receipt = ObservationReceipt {
+            schema_version: OBSERVATION_RECEIPT_SCHEMA.to_string(),
+            run_id: run.id.clone(),
+            normalized_path: normalized_path.clone(),
+            content_sha256,
+            context_window_epoch,
+            view: ObservationView::Full,
+            last_outcome: if unchanged {
+                ObservationOutcome::Unchanged
+            } else {
+                ObservationOutcome::ContentReturned
+            },
+            first_read_turn: previous
+                .map(|receipt| receipt.first_read_turn)
+                .unwrap_or(turn),
+            last_read_turn: turn,
+            read_count: previous
+                .map(|receipt| receipt.read_count.saturating_add(1))
+                .unwrap_or(1),
+            purpose: observation_purpose(&normalized_path),
+            delivered_bytes,
+            estimated_tokens,
+            duplicate_delivery: unchanged,
+        };
+        let _ = store
+            .append_event(AgentEvent::ObservationReceipt {
+                run_id: run.id.clone(),
+                receipt,
+                timestamp: Utc::now(),
+            })
+            .await;
+    }
+}
+
+fn observation_purpose(path: &str) -> ObservationPurpose {
+    if path.starts_with("inputs/")
+        || matches!(
+            path,
+            "state/style-contract.json" | "state/context.md" | "state/project.json"
+        )
+    {
+        ObservationPurpose::Context
+    } else if path == "state/read-tracking.json" {
+        ObservationPurpose::RuntimeInternal
+    } else if path.contains("diagnostic")
+        || path.contains("build-log")
+        || path.ends_with("build.log")
+        || path.starts_with("state/logs/")
+    {
+        ObservationPurpose::Diagnostic
+    } else {
+        ObservationPurpose::Source
+    }
+}
+
+fn replan_terminal_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "fs.write"
+            | "fs.write_chunk"
+            | "fs.commit_chunks"
+            | "fs.patch"
+            | "fs.multi_patch"
+            | "fs.delete"
+            | "project.init"
+            | "project.write_page"
+            | "project.build"
+            | "project.ensure_dependencies"
+            | "style.update_tokens"
+            | "component.apply"
+            | "package.install"
+            | "shell.run"
+            | "preview.dev_start"
+            | "preview.publish"
+            | "draft.snapshot_create"
+            | "run.complete"
+    )
+}
+
+async fn run_replan_required(store: &RuntimeStore, run_id: &str) -> bool {
+    store.events(run_id).await.iter().rev().any(|event| {
+        matches!(
+            event,
+            AgentEvent::RunWorkflowProgress { stage, .. } if stage == "replan_required"
+        )
+    })
+}
+
+async fn mark_run_replan_required(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    target: Option<&str>,
+    error_kind: &str,
+) {
+    let events = store.events(&run.id).await;
+    let turn = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelTurnStarted { turn, .. }
+            | AgentEvent::RunWorkflowProgress { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut completed_steps = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AgentEvent::RunWorkflowProgress {
+                completed_steps, ..
+            } => Some(completed_steps.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !completed_steps.iter().any(|step| step == "replan_required") {
+        completed_steps.push("replan_required".to_string());
+    }
+    let _ = store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: "edit_plan.replacement_required".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "tool": tool_name,
+                "target": target,
+                "errorKind": error_kind,
+                "blocking": true,
+            })),
+            timestamp: Utc::now(),
+        })
+        .await;
+    let _ = store
+        .append_event(AgentEvent::RunWorkflowProgress {
+            run_id: run.id.clone(),
+            turn,
+            stage: "replan_required".to_string(),
+            completed_steps,
+            next_action: json!({
+                "tool": "orchestrator.create_successor_run",
+                "reason": "the frozen Plan cannot authorize the required target"
+            }),
+            budgets: json!({}),
+            timestamp: Utc::now(),
+        })
+        .await;
+    let _ = store
+        .append_event(AgentEvent::StateChanged {
+            run_id: run.id.clone(),
+            state: "partial:replan_required".to_string(),
+            timestamp: Utc::now(),
+        })
+        .await;
+    let _ = store
+        .update_run_status(&run.id, AgentRunStatus::Partial)
+        .await;
 }
 
 async fn consume_permission_after_execution(
@@ -1568,6 +2001,341 @@ fn design_context_read_gate(
     ))
 }
 
+async fn runtime_attestation_gate(
+    store: &RuntimeStore,
+    run: &AgentRun,
+    tool_name: &str,
+    input: &Value,
+) -> Option<(String, String, Value)> {
+    if run.generation_context_binding_hash.is_none()
+        || run.generation_context_runtime_mode.as_deref() != Some("enabled")
+    {
+        return design_context_read_gate(run, tool_name, input);
+    }
+
+    if let Some(blocked) = design_source_access_gate(run, tool_name, input) {
+        return Some(blocked);
+    }
+    if !runtime_attestation_operation(run, tool_name, input) {
+        return None;
+    }
+
+    let frozen_dcp = match frozen_run_design_context_manifest(run) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            return Some((
+                message,
+                "runtime_attestation.frozen_resource_integrity_failed".to_string(),
+                json!({ "runId": run.id }),
+            ));
+        }
+    };
+    let context = match run
+        .generation_context
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "bound GenerationContext payload is missing".to_string())
+        .and_then(|value| {
+            serde_json::from_value::<crate::generation_context::GenerationContext>(value)
+                .map_err(|error| format!("bound GenerationContext is invalid: {error}"))
+        })
+        .and_then(|context| {
+            crate::generation_context::validate_generation_context_binding(&context)
+                .map_err(|error| error.to_string())?;
+            Ok(context)
+        }) {
+        Ok(context) => context,
+        Err(message) => {
+            return Some((
+                message,
+                "runtime_attestation.run_start_invalid".to_string(),
+                json!({ "runId": run.id }),
+            ));
+        }
+    };
+    if context.run_binding.run_id != run.id
+        || context.run_binding.project_id != run.project_id
+        || run.generation_context_content_hash.as_deref()
+            != Some(context.context_content_hash.as_str())
+        || run.generation_context_binding_hash.as_deref()
+            != Some(context.run_context_binding_hash.as_str())
+    {
+        return Some((
+            "RunStartAttestation does not match the persisted Run binding".to_string(),
+            "runtime_attestation.run_binding_mismatch".to_string(),
+            json!({ "runId": run.id }),
+        ));
+    }
+    use crate::generation_context::AttestationState;
+    let attestation = &context.attestation;
+    if attestation.artifact_state == AttestationState::Failed
+        || attestation.materialization_state == AttestationState::Failed
+        || attestation.template_identity_state != AttestationState::Verified
+        || attestation.app_root_declaration_state != AttestationState::Verified
+        || attestation.content_approval_state != AttestationState::Verified
+        || attestation.visual_bindings_state == AttestationState::Failed
+    {
+        return Some((
+            "RunStartAttestation contains an unverified required Runtime requirement".to_string(),
+            "runtime_attestation.run_start_unverified".to_string(),
+            json!({
+                "runId": run.id,
+                "runtimeAttestationHash": attestation.runtime_attestation_hash,
+            }),
+        ));
+    }
+    if let Some(manifest) = frozen_dcp.as_ref() {
+        let expected_hash = manifest.payload.artifact_manifest_hash.as_str();
+        if run.design_context_materialization_hash.as_deref() != Some(expected_hash) {
+            return Some((
+                "the frozen Design Context package has not been materialized and verified"
+                    .to_string(),
+                "runtime_attestation.materialization_unverified".to_string(),
+                json!({
+                    "runId": run.id,
+                    "expectedMaterializationHash": expected_hash,
+                    "actualMaterializationHash": run.design_context_materialization_hash,
+                    "attestationState": attestation.materialization_state,
+                }),
+            ));
+        }
+    }
+    let approval = store.content_plan_approval_store().verify_exact(
+        &run.project_id,
+        &context.payload.content_plan.plan_id,
+        context.payload.content_plan.revision,
+        &context.payload.content_plan.content_hash,
+    );
+    let approval_verified = approval.as_ref().is_ok_and(|verification| {
+        verification.state
+            == crate::content_plan_approval::ContentPlanApprovalVerificationState::Verified
+            && verification
+                .approval
+                .as_ref()
+                .map(|approval| approval.approval_id.as_str())
+                == Some(context.payload.content_plan.approval.approval_id.as_str())
+    });
+    if !approval_verified {
+        return Some((
+            "the exact Content Plan approval bound to this Run is no longer authoritative"
+                .to_string(),
+            "content_plan.approval_rejected".to_string(),
+            json!({
+                "planId": context.payload.content_plan.plan_id,
+                "revision": context.payload.content_plan.revision,
+                "contentHash": context.payload.content_plan.content_hash,
+                "approvalId": context.payload.content_plan.approval.approval_id,
+                "suggestedAction": "Create a new Run bound to the current approved Content Plan revision."
+            }),
+        ));
+    }
+
+    if tool_name == "project.init" {
+        let requested_path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or(context.payload.identity.app_root.as_str());
+        let requested_template = input.get("template").and_then(Value::as_str);
+        if requested_path != context.payload.identity.app_root {
+            return Some((
+                "project.init path does not match RunStartAttestation".to_string(),
+                "project.app_root_mismatch".to_string(),
+                json!({
+                    "expectedAppRoot": context.payload.identity.app_root,
+                    "receivedPath": requested_path,
+                }),
+            ));
+        }
+        if requested_template != Some(context.payload.identity.template_id.as_str()) {
+            return Some((
+                "project.init template does not match RunStartAttestation".to_string(),
+                "project.template_mismatch".to_string(),
+                json!({
+                    "expectedTemplate": context.payload.identity.template_id,
+                    "receivedTemplate": requested_template,
+                }),
+            ));
+        }
+    } else {
+        let Some(project) = run.project_state_snapshot.as_ref() else {
+            return Some((
+                format!("{tool_name} requires ProjectRuntimeAttestation from project.init"),
+                "project.runtime_attestation_missing".to_string(),
+                json!({ "suggestedAction": "Run project.init before this operation." }),
+            ));
+        };
+        if project.app_root != context.payload.identity.app_root
+            || project.template_key != context.payload.identity.template_id
+            || project.template_version != context.payload.identity.template_version
+            || project.template_manifest_sha256.as_deref()
+                != Some(context.payload.identity.template_manifest_hash.as_str())
+        {
+            return Some((
+                "ProjectRuntimeAttestation does not match the frozen GenerationContext identity"
+                    .to_string(),
+                "project.runtime_attestation_mismatch".to_string(),
+                json!({
+                    "runId": run.id,
+                    "sourceRevision": project.revision,
+                    "expectedAppRoot": context.payload.identity.app_root,
+                    "actualAppRoot": project.app_root,
+                    "expectedTemplateManifestSha256": context.payload.identity.template_manifest_hash,
+                    "actualTemplateManifestSha256": project.template_manifest_sha256,
+                }),
+            ));
+        }
+    }
+
+    source_fallback_read_gate(run, tool_name)
+}
+
+fn design_source_access_gate(
+    run: &AgentRun,
+    tool_name: &str,
+    input: &Value,
+) -> Option<(String, String, Value)> {
+    if tool_name != "fs.read" {
+        return None;
+    }
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(normalize_design_context_path)
+        .unwrap_or_default();
+    if path != "inputs/design-source.md" {
+        return None;
+    }
+    if run.design_fidelity_mode.as_deref() != Some("source_fallback") {
+        return Some((
+            "raw design source is not exposed in profile_only mode".to_string(),
+            "design_source.mode_forbidden".to_string(),
+            json!({ "requiredMode": "source_fallback" }),
+        ));
+    }
+    if run.design_source_size_bytes.unwrap_or(0) > 32 * 1024 {
+        return Some((
+            "large design source must be read through its index and design_source.read_sections"
+                .to_string(),
+            "design_source.index_required".to_string(),
+            json!({ "indexPath": "inputs/design-source-index.json" }),
+        ));
+    }
+    None
+}
+
+fn runtime_attestation_operation(run: &AgentRun, tool_name: &str, input: &Value) -> bool {
+    match tool_name {
+        "project.init"
+        | "project.write_page"
+        | "style.update_tokens"
+        | "project.ensure_dependencies"
+        | "project.build"
+        | "preview.publish"
+        | "preview.start"
+        | "preview.dev_start"
+        | "draft.snapshot_create"
+        | "shell.run" => true,
+        "fs.write" | "fs.write_chunk" | "fs.commit_chunks" | "fs.patch" | "fs.multi_patch"
+        | "fs.delete" => input
+            .get("path")
+            .or_else(|| input.get("targetPath"))
+            .and_then(Value::as_str)
+            .map(normalize_design_context_path)
+            .is_some_and(|path| {
+                path == context_app_root(run)
+                    || path.starts_with(&format!("{}/", context_app_root(run)))
+                    || path == "state/style-contract.json"
+            }),
+        _ => false,
+    }
+}
+
+fn edit_plan_mutation_tool(tool_name: &str, input: &Value) -> bool {
+    matches!(
+        tool_name,
+        "fs.write"
+            | "fs.commit_chunks"
+            | "fs.patch"
+            | "fs.multi_patch"
+            | "fs.delete"
+            | "project.write_page"
+            | "style.update_tokens"
+    ) || (tool_name == "project.ensure_dependencies"
+        && input.get("mode").and_then(Value::as_str) == Some("add"))
+}
+
+fn mutation_target(input: &Value) -> Option<String> {
+    input
+        .get("path")
+        .or_else(|| input.get("targetPath"))
+        .and_then(Value::as_str)
+        .map(normalize_design_context_path)
+}
+
+fn context_app_root(run: &AgentRun) -> &str {
+    run.generation_context
+        .as_ref()
+        .and_then(|context| context.pointer("/payload/identity/appRoot"))
+        .and_then(Value::as_str)
+        .unwrap_or("project")
+}
+
+fn source_fallback_read_gate(run: &AgentRun, tool_name: &str) -> Option<(String, String, Value)> {
+    if run.design_fidelity_mode.as_deref() != Some("source_fallback") {
+        return None;
+    }
+    let mut missing_files = Vec::new();
+    if run.design_source_size_bytes.unwrap_or(0) <= 32 * 1024 {
+        if !run
+            .design_context_read_files
+            .iter()
+            .any(|path| path == "inputs/design-source.md")
+        {
+            missing_files.push("inputs/design-source.md".to_string());
+        }
+    } else if !run
+        .design_context_read_files
+        .iter()
+        .any(|path| path == "inputs/design-source-index.json")
+    {
+        missing_files.push("inputs/design-source-index.json".to_string());
+    }
+    let missing_sections = if run.design_source_size_bytes.unwrap_or(0) > 32 * 1024 {
+        run.design_source_required_section_ids
+            .iter()
+            .filter(|section_id| {
+                run.design_source_sections
+                    .iter()
+                    .find(|section| &section.id == *section_id)
+                    .is_none_or(|section| {
+                        !run.design_source_read_section_hashes
+                            .iter()
+                            .any(|hash| hash == &section.sha256)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if missing_files.is_empty() && missing_sections.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "read the exact Source Fallback material before calling {tool_name}: missing files [{}], missing sections [{}]",
+            missing_files.join(", "),
+            missing_sections.join(", ")
+        ),
+        "design_context.read_required".to_string(),
+        json!({
+            "scope": "source_fallback",
+            "missingFiles": missing_files,
+            "missingSectionIds": missing_sections,
+        }),
+    ))
+}
+
 fn design_context_gate_mutation(tool_name: &str, input: &Value) -> bool {
     match tool_name {
         "project.init"
@@ -1861,12 +2629,14 @@ fn truncate_large_result_if_needed(
 mod design_context_gate_tests {
     use super::*;
     use crate::{
+        content_plan_approval::{RecordContentPlanApproval, RecordContentPlanChange},
         design_context::{
             DesignContextArtifactManifest, DesignContextManifest, DesignContextPackagePayload,
             DesignContextReadRequirement, ProfileCompatibilityMode, ProfileEnforcementMode,
             VerificationPolicySnapshot,
         },
-        types::AgentPhase,
+        generation_context::compile_generation_context,
+        types::{AgentPhase, Brief, ContentSource},
     };
 
     fn manifest() -> DesignContextManifest {
@@ -2141,5 +2911,176 @@ mod design_context_gate_tests {
             }).to_string(),
         }));
         assert!(!frozen_style_contract_read_is_verified(&run, &result));
+    }
+
+    #[tokio::test]
+    async fn enabled_generation_context_uses_attestation_without_model_dcp_reads() {
+        let store = RuntimeStore::new();
+        let project_id = "project-runtime-attestation";
+        store
+            .upsert_project_access(
+                project_id,
+                "principal-runtime-attestation".to_string(),
+                "ws-runtime-attestation".to_string(),
+            )
+            .await
+            .unwrap();
+        let sources = vec![ContentSource::readable(
+            "source-runtime-attestation",
+            "user",
+            "Authoritative homepage copy",
+        )];
+        let brief_run = store
+            .create_run(
+                project_id.to_string(),
+                AgentPhase::Brief,
+                "brief".to_string(),
+                "internal-balanced".to_string(),
+                sources.clone(),
+            )
+            .await;
+        let brief_id = store
+            .write_brief_draft(
+                &brief_run.id,
+                Brief {
+                    project_type: "website".to_string(),
+                    audience: "operators".to_string(),
+                    content_hierarchy: vec!["hero".to_string()],
+                    page_structure: json!([]),
+                    visual_direction: "calm".to_string(),
+                    recommended_template: "next-app".to_string(),
+                    assumptions: Vec::new(),
+                    missing_information: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+        let run = store
+            .create_run_with_context(
+                project_id.to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "internal-balanced".to_string(),
+                sources,
+                Some(brief_id),
+                None,
+            )
+            .await;
+        let approval = store
+            .content_plan_approval_store()
+            .approve(RecordContentPlanApproval {
+                project_id: project_id.to_string(),
+                plan_id: "content-plan-runtime-attestation".to_string(),
+                revision: 1,
+                content_hash: "a".repeat(64),
+                confirmation_event_id: "confirmation-runtime-attestation".to_string(),
+            })
+            .unwrap();
+        let storage = std::env::temp_dir().join(format!(
+            "zerondesign-runtime-attestation-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let context = compile_generation_context(&store, &storage, &run, &approval)
+            .await
+            .unwrap();
+        store.bind_run_generation_context(&context).await.unwrap();
+        let run = store
+            .set_run_generation_context_runtime_mode(&run.id, "enabled")
+            .await
+            .unwrap();
+        assert!(run.design_context_read_files.is_empty());
+        assert!(runtime_attestation_gate(
+            &store,
+            &run,
+            "project.init",
+            &json!({ "template": "next-app" }),
+        )
+        .await
+        .is_none());
+
+        let identity = &context.payload.identity;
+        let project = store
+            .upsert_project_runtime_state_with_template_identity(
+                project_id,
+                identity.app_root.clone(),
+                identity.template_id.clone(),
+                identity.template_version.clone(),
+                Some(identity.template_manifest_hash.clone()),
+                "next".to_string(),
+                Some("next-app".to_string()),
+                Some("0.1.0".to_string()),
+                "npm".to_string(),
+                "package-lock.json".to_string(),
+                "https://registry.internal.example/npm/".to_string(),
+            )
+            .await
+            .unwrap();
+        let run = store
+            .set_run_project_state_snapshot(&run.id, project)
+            .await
+            .unwrap();
+        assert!(runtime_attestation_gate(
+            &store,
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/app/page.tsx" }),
+        )
+        .await
+        .is_none());
+
+        store
+            .content_plan_approval_store()
+            .record_plan_change(RecordContentPlanChange {
+                project_id: project_id.to_string(),
+                plan_id: approval.plan_id.clone(),
+                revision: 2,
+                content_hash: "b".repeat(64),
+                change_event_id: "change-runtime-attestation".to_string(),
+            })
+            .unwrap();
+        let blocked = runtime_attestation_gate(
+            &store,
+            &run,
+            "fs.patch",
+            &json!({ "path": "project/app/page.tsx" }),
+        )
+        .await
+        .expect("stale approval must fail before mutation");
+        assert_eq!(blocked.1, "content_plan.approval_rejected");
+    }
+
+    #[tokio::test]
+    async fn replan_marker_is_persisted_as_a_terminal_run_fact() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "project-replan".to_string(),
+                AgentPhase::Repair,
+                "repair".to_string(),
+                "test".to_string(),
+                Vec::new(),
+            )
+            .await;
+        store.ensure_initial_checkpoint(&run.id).await.unwrap();
+
+        mark_run_replan_required(
+            &store,
+            &run,
+            "fs.patch",
+            Some("project/app/outside.tsx"),
+            "edit.plan_scope_violation",
+        )
+        .await;
+
+        assert!(run_replan_required(&store, &run.id).await);
+        assert_eq!(
+            store.get_run(&run.id).await.unwrap().status,
+            AgentRunStatus::Partial
+        );
+        assert!(store.events(&run.id).await.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunWorkflowProgress { stage, .. } if stage == "replan_required"
+        )));
     }
 }

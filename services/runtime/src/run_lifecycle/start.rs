@@ -1,20 +1,28 @@
 use super::start_validation::{sandbox_phase_requires_binding, validate_openable_sandbox_binding};
 use super::{
-    conflict as conflict_error, design_profile_error, internal as internal_error, not_found,
-    profile_service_error, repair_run_error, sandbox_binding_error, RunLifecycleError,
+    conflict as conflict_error, design_profile_error, internal as internal_error, invalid_request,
+    not_found, profile_service_error, repair_run_error, sandbox_binding_error, RunLifecycleError,
     RunLifecycleOutcome, RunLifecycleService,
 };
 use crate::{
-    config::PublicPrincipalAuthMode,
+    config::{ContentPlanAttestationMode, GenerationContextMode, PublicPrincipalAuthMode},
+    content_plan_approval::{
+        ContentPlanApprovalVerification, ContentPlanApprovalVerificationState,
+    },
     conversation::RuntimeStore,
     design_context::{
         compile_website_design_context, frozen_run_design_context_manifest,
         DesignContextCompileOptions, ProfileCompatibilityMode, VerifierRegistry,
     },
+    generation_context::{compile_generation_context, ContentPlanIdentity},
     project::resolve_built_in_template_for_init,
     types::{
         AgentEvent, AgentPhase, AgentRun, AgentRunStatus, ContentSource,
         DesignContextEnforcementBinding,
+    },
+    visual_artifact_store::VisualArtifactStore,
+    visual_contracts::{
+        DraftSnapshotRetentionState, RunVisualBindingRole, RunVisualTarget, StartRunVisualBinding,
     },
 };
 use chrono::Utc;
@@ -37,9 +45,12 @@ pub struct StartRunContext {
     pub edit_impact_plan_hash: Option<String>,
     pub sandbox_binding_id: Option<String>,
     pub parent_run_id: Option<String>,
+    pub predecessor_run_id: Option<String>,
     pub design_profile_id: Option<String>,
     pub design_fidelity_mode: Option<String>,
     pub model_resource_id: Option<String>,
+    pub content_plan: Option<ContentPlanIdentity>,
+    pub visual_bindings: Vec<StartRunVisualBinding>,
     pub finding_ids: Vec<String>,
 }
 
@@ -52,7 +63,10 @@ impl RunLifecycleService {
         validate_project_access_before_initial_run(self, &request).await?;
         validate_sandbox_context(&self.store, &request).await?;
         validate_project_lifecycle_context(&self.store, &request).await?;
+        validate_start_visual_bindings(self, &request).await?;
         inherit_edit_brief_from_base_version(&self.store, &mut request).await?;
+        let content_plan_verification = verify_requested_content_plan(self, &request)?;
+        let content_plan_identity = request.input_context.content_plan.clone();
         let prepared = self
             .design_profiles
             .prepare_run_context(crate::design_profile_service::RunProfileContextQuery {
@@ -74,7 +88,12 @@ impl RunLifecycleService {
             &self.config.agent_model,
             request.input_context.model_resource_id.as_deref(),
         );
-        if request.phase == AgentPhase::Edit && request.input_context.edit_base.is_some() {
+        if request.input_context.predecessor_run_id.is_some() {
+            validate_replan_successor(&self.store, &request).await?;
+        }
+        if matches!(request.phase, AgentPhase::Edit | AgentPhase::Repair)
+            && request.input_context.edit_base.is_some()
+        {
             let plan_hash = request
                 .input_context
                 .edit_impact_plan_hash
@@ -84,49 +103,64 @@ impl RunLifecycleService {
                 })?;
             self.store
                 .edit_guard_store()
-                .consume(&self.store.draft_preview_store(), plan_hash)
+                .validate_executable(&self.store.draft_preview_store(), plan_hash)
                 .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
         }
         let edit_base = request.input_context.edit_base.clone();
         let edit_impact_plan_hash = request.input_context.edit_impact_plan_hash.clone();
-        let run = if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
-            if request.phase == AgentPhase::Repair {
+        let run =
+            if let Some(predecessor_run_id) = request.input_context.predecessor_run_id.as_deref() {
                 self.store
-                    .create_repair_run_for_findings(
-                        parent_run_id,
-                        &request.input_context.finding_ids,
-                        None,
-                        request.agent_profile,
-                        selected_model.clone(),
-                    )
-                    .await
-                    .map_err(repair_run_error)?
-            } else {
-                self.store
-                    .create_child_run(
-                        parent_run_id,
+                    .create_replan_successor_run_with_context(
+                        predecessor_run_id,
+                        request.project_id,
                         request.phase,
                         request.agent_profile,
                         selected_model.clone(),
-                        None,
-                        request.input_context.finding_ids,
+                        content_sources,
+                        request.input_context.brief_id,
+                        request.input_context.base_version_id,
                     )
                     .await
-                    .map_err(|_| not_found(format!("parent run not found: {parent_run_id}")))?
-            }
-        } else {
-            self.store
-                .create_run_with_context(
-                    request.project_id,
-                    request.phase,
-                    request.agent_profile,
-                    selected_model,
-                    content_sources,
-                    request.input_context.brief_id,
-                    request.input_context.base_version_id,
-                )
-                .await
-        };
+                    .map_err(conflict_error)?
+            } else if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
+                if request.phase == AgentPhase::Repair {
+                    self.store
+                        .create_repair_run_for_findings(
+                            parent_run_id,
+                            &request.input_context.finding_ids,
+                            None,
+                            request.agent_profile,
+                            selected_model.clone(),
+                        )
+                        .await
+                        .map_err(repair_run_error)?
+                } else {
+                    self.store
+                        .create_child_run(
+                            parent_run_id,
+                            request.phase,
+                            request.agent_profile,
+                            selected_model.clone(),
+                            None,
+                            request.input_context.finding_ids,
+                        )
+                        .await
+                        .map_err(|_| not_found(format!("parent run not found: {parent_run_id}")))?
+                }
+            } else {
+                self.store
+                    .create_run_with_context(
+                        request.project_id,
+                        request.phase,
+                        request.agent_profile,
+                        selected_model,
+                        content_sources,
+                        request.input_context.brief_id,
+                        request.input_context.base_version_id,
+                    )
+                    .await
+            };
         let run = if let (Some(edit_base), Some(plan_hash)) = (edit_base, edit_impact_plan_hash) {
             self.store
                 .set_run_edit_context(&run.id, edit_base, plan_hash)
@@ -416,7 +450,11 @@ impl RunLifecycleService {
             };
         let run = maybe_provision_mutation_sandbox(self, run).await?;
         if sandbox_phase_requires_binding(run.phase) && run.sandbox_id.is_some() {
-            let allowed_parent_run_id = request.input_context.parent_run_id.as_deref();
+            let allowed_parent_run_id = request
+                .input_context
+                .parent_run_id
+                .as_deref()
+                .or(request.input_context.predecessor_run_id.as_deref());
             if let Err(error) = self
                 .store
                 .acquire_sandbox_binding_for_run(&run.id, allowed_parent_run_id)
@@ -457,6 +495,29 @@ impl RunLifecycleService {
                     .await);
             }
         }
+        let run = self.store.get_run(&run.id).await.unwrap_or(run);
+        for binding in &request.input_context.visual_bindings {
+            if let Err(error) = self
+                .store
+                .upsert_run_visual_binding(binding.bind_to_run(&run.id))
+                .await
+            {
+                return Err(self
+                    .compensate_created_run_error(
+                        &run,
+                        "visual_binding_freeze",
+                        conflict_error(error),
+                    )
+                    .await);
+            }
+        }
+        let run = apply_generation_context(
+            self,
+            run,
+            content_plan_identity.as_ref(),
+            content_plan_verification,
+        )
+        .await?;
         self.store
             .ensure_initial_checkpoint(&run.id)
             .await
@@ -469,6 +530,472 @@ impl RunLifecycleService {
             run_id: run.id,
             status: "queued".to_string(),
         })
+    }
+}
+
+impl RunLifecycleService {
+    pub async fn dispatch_replan_successor(
+        &self,
+        predecessor_run_id: &str,
+        replacement_plan_hash: &str,
+    ) -> Result<RunLifecycleOutcome, RunLifecycleError> {
+        let predecessor = self
+            .store
+            .get_run(predecessor_run_id)
+            .await
+            .ok_or_else(|| not_found(format!("run not found: {predecessor_run_id}")))?;
+        if let Some(successor_run_id) = predecessor.successor_run_id.as_deref() {
+            let successor = self.store.get_run(successor_run_id).await.ok_or_else(|| {
+                internal_error(anyhow::anyhow!(
+                    "successor Run is missing: {successor_run_id}"
+                ))
+            })?;
+            if successor.edit_impact_plan_hash.as_deref() != Some(replacement_plan_hash) {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "replan predecessor already has a different successor Run"
+                )));
+            }
+            return Ok(RunLifecycleOutcome {
+                run_id: successor.id,
+                status: serde_json::to_value(successor.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
+        let (plan_project_id, replacement_plan) = self
+            .store
+            .edit_guard_store()
+            .get_plan(replacement_plan_hash)
+            .ok_or_else(|| {
+                not_found(format!("EditImpactPlan not found: {replacement_plan_hash}"))
+            })?;
+        if plan_project_id != predecessor.project_id
+            || predecessor.edit_base.as_ref() != Some(&replacement_plan.edit_base)
+            || predecessor.edit_impact_plan_hash.as_deref() == Some(replacement_plan_hash)
+        {
+            return Err(conflict_error(anyhow::anyhow!(
+                "replacement EditImpactPlan does not replace the predecessor Run plan"
+            )));
+        }
+        self.store
+            .edit_guard_store()
+            .validate_executable(&self.store.draft_preview_store(), replacement_plan_hash)
+            .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
+        let has_replan_action = self
+            .store
+            .events(predecessor_run_id)
+            .await
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::RunWorkflowProgress { stage, .. }
+                        if stage == "replan_required"
+                )
+            });
+        if !has_replan_action {
+            return Err(conflict_error(anyhow::anyhow!(
+                "predecessor Run is not waiting for replan orchestration"
+            )));
+        }
+        match predecessor.status {
+            AgentRunStatus::Partial => {}
+            AgentRunStatus::NeedsUserInput if replacement_plan.requires_confirmation => {
+                self.store
+                    .update_run_status(predecessor_run_id, AgentRunStatus::Partial)
+                    .await
+                    .map_err(conflict_error)?;
+                self.store
+                    .append_event(AgentEvent::StateChanged {
+                        run_id: predecessor_run_id.to_string(),
+                        state: "partial:replan_required".to_string(),
+                        timestamp: Utc::now(),
+                    })
+                    .await
+                    .map_err(internal_error)?;
+            }
+            _ => {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "replan orchestration requires a Partial predecessor or a confirmed plan"
+                )));
+            }
+        }
+        let content_plan = match (
+            predecessor.content_plan_id.clone(),
+            predecessor.content_plan_revision,
+            predecessor.content_plan_hash.clone(),
+        ) {
+            (Some(plan_id), Some(revision), Some(content_hash)) => Some(ContentPlanIdentity {
+                plan_id,
+                revision,
+                content_hash,
+            }),
+            _ => None,
+        };
+        let model_resource_id = predecessor
+            .model
+            .strip_prefix("resource:")
+            .map(ToOwned::to_owned);
+        let content_sources = self.store.content_sources(predecessor_run_id).await;
+        let outcome = self
+            .start(StartRunCommand {
+                project_id: predecessor.project_id.clone(),
+                phase: predecessor.phase,
+                agent_profile: predecessor.agent_profile.clone(),
+                input_context: StartRunContext {
+                    content_sources,
+                    brief_id: predecessor.brief_version.clone(),
+                    base_version_id: predecessor.base_version_id.clone(),
+                    edit_base: Some(replacement_plan.edit_base.clone()),
+                    edit_impact_plan_hash: Some(replacement_plan_hash.to_string()),
+                    sandbox_binding_id: predecessor.sandbox_id.clone(),
+                    predecessor_run_id: Some(predecessor_run_id.to_string()),
+                    design_profile_id: predecessor.design_profile_id.clone(),
+                    design_fidelity_mode: predecessor.design_fidelity_mode.clone(),
+                    model_resource_id,
+                    content_plan,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        self.store
+            .append_conversation_item(
+                &predecessor.project_id,
+                Some(predecessor_run_id),
+                "orchestrator_dispatch",
+                Some("system"),
+                "A replacement EditImpactPlan created a successor Run.",
+                Some(json!({
+                    "successorRunId": outcome.run_id,
+                    "replacementPlanHash": replacement_plan_hash,
+                    "automatic": true,
+                })),
+            )
+            .await;
+        if predecessor.phase != AgentPhase::Edit || outcome.status != "queued" {
+            return Ok(outcome);
+        }
+        let user_message = self
+            .store
+            .conversation_items(&predecessor.project_id)
+            .await
+            .into_iter()
+            .rev()
+            .find(|item| {
+                item.run_id.as_deref() == Some(predecessor_run_id)
+                    && item.role.as_deref() == Some("user")
+                    && item.kind == "user_message"
+            })
+            .map(|item| item.text);
+        let Some(user_message) = user_message else {
+            return Ok(outcome);
+        };
+        self.continue_run(&outcome.run_id, user_message).await
+    }
+}
+
+fn verify_requested_content_plan(
+    service: &RunLifecycleService,
+    request: &StartRunCommand,
+) -> Result<Option<ContentPlanApprovalVerification>, RunLifecycleError> {
+    let verification = request
+        .input_context
+        .content_plan
+        .as_ref()
+        .map(|identity| {
+            service.store.content_plan_approval_store().verify_exact(
+                &request.project_id,
+                &identity.plan_id,
+                identity.revision,
+                &identity.content_hash,
+            )
+        })
+        .transpose()
+        .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
+    let enforce = request.phase == AgentPhase::Build
+        && (service.config.generation_context_mode == GenerationContextMode::Enabled
+            || service.config.content_plan_attestation_mode == ContentPlanAttestationMode::Enforce);
+    if enforce
+        && verification.as_ref().is_none_or(|verification| {
+            verification.state != ContentPlanApprovalVerificationState::Verified
+        })
+    {
+        let state = verification
+            .as_ref()
+            .map(|verification| approval_state_name(verification.state))
+            .unwrap_or("missing");
+        return Err(conflict_error(anyhow::anyhow!(
+            "content_plan.approval_rejected: exact verified approval required (state={state})"
+        )));
+    }
+    Ok(verification)
+}
+
+async fn validate_start_visual_bindings(
+    service: &RunLifecycleService,
+    request: &StartRunCommand,
+) -> Result<(), RunLifecycleError> {
+    if request.input_context.visual_bindings.is_empty() {
+        return Ok(());
+    }
+    let artifact_store =
+        VisualArtifactStore::open(service.config.runtime_storage_dir.join("visual-artifacts"))
+            .map_err(|error| invalid_request(error.to_string()))?;
+    for binding in &request.input_context.visual_bindings {
+        debug_assert_eq!(binding.role, RunVisualBindingRole::Reference);
+        let artifact = artifact_store
+            .get(&binding.artifact_id)
+            .map_err(|error| invalid_request(error.to_string()))?
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "visual artifact not found: {}",
+                    binding.artifact_id
+                ))
+            })?;
+        if artifact.project_id != request.project_id {
+            return Err(invalid_request(format!(
+                "visual artifact not found: {}",
+                binding.artifact_id
+            )));
+        }
+        if artifact.retention_state == DraftSnapshotRetentionState::DeletionPending {
+            return Err(invalid_request(
+                "VisualArtifact is pending deletion and cannot be bound".to_string(),
+            ));
+        }
+        artifact_store
+            .read_content(&artifact.id)
+            .map_err(|error| invalid_request(error.to_string()))?;
+        match &binding.target {
+            RunVisualTarget::StaticSnapshot {
+                snapshot_id,
+                source_hash,
+            } => {
+                let snapshot = service
+                    .store
+                    .get_draft_snapshot(snapshot_id)
+                    .await
+                    .ok_or_else(|| {
+                        invalid_request(format!("DraftSnapshot not found: {snapshot_id}"))
+                    })?;
+                if snapshot.project_id != request.project_id || snapshot.source_hash != *source_hash
+                {
+                    return Err(invalid_request(format!(
+                        "DraftSnapshot identity mismatch: {snapshot_id}"
+                    )));
+                }
+            }
+            RunVisualTarget::Version { version_id, .. } => {
+                let version = service
+                    .store
+                    .get_project_version(version_id)
+                    .await
+                    .ok_or_else(|| {
+                        invalid_request(format!("project version not found: {version_id}"))
+                    })?;
+                if version.project_id != request.project_id {
+                    return Err(invalid_request(format!(
+                        "project version not found: {version_id}"
+                    )));
+                }
+            }
+            RunVisualTarget::Draft {
+                session_id,
+                session_epoch,
+                source_revision,
+                source_hash,
+            } => {
+                let session = service
+                    .store
+                    .draft_preview_store()
+                    .get(session_id)
+                    .ok_or_else(|| {
+                        invalid_request(format!("DraftPreviewSession not found: {session_id}"))
+                    })?;
+                let snapshot = service
+                    .store
+                    .get_draft_snapshot(&session.durable_snapshot_id)
+                    .await
+                    .ok_or_else(|| {
+                        invalid_request(format!(
+                            "DraftSnapshot not found: {}",
+                            session.durable_snapshot_id
+                        ))
+                    })?;
+                if session.project_id != request.project_id
+                    || session.session_epoch != *session_epoch
+                    || session.workspace_revision != *source_revision
+                    || snapshot.project_id != request.project_id
+                    || snapshot.source_hash != *source_hash
+                {
+                    return Err(invalid_request(format!(
+                        "Draft visual target identity mismatch: {session_id}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn apply_generation_context(
+    service: &RunLifecycleService,
+    run: AgentRun,
+    identity: Option<&ContentPlanIdentity>,
+    verification: Option<ContentPlanApprovalVerification>,
+) -> Result<AgentRun, RunLifecycleError> {
+    if service.config.generation_context_mode == GenerationContextMode::Off
+        || !matches!(
+            run.phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        )
+    {
+        return Ok(run);
+    }
+    let verified_approval = verification.as_ref().and_then(|verification| {
+        (verification.state == ContentPlanApprovalVerificationState::Verified)
+            .then(|| verification.approval.clone())
+            .flatten()
+    });
+    let Some(approval) = verified_approval else {
+        let state = verification
+            .as_ref()
+            .map(|verification| approval_state_name(verification.state))
+            .unwrap_or("missing");
+        let reason = verification
+            .as_ref()
+            .and_then(|verification| verification.reason.clone())
+            .unwrap_or_else(|| "no Content Plan identity was supplied".to_string());
+        service
+            .store
+            .append_event(AgentEvent::ContentPlanApprovalRejected {
+                run_id: run.id.clone(),
+                plan_id: identity.map(|identity| identity.plan_id.clone()),
+                revision: identity.map(|identity| identity.revision),
+                content_hash: identity.map(|identity| identity.content_hash.clone()),
+                state: state.to_string(),
+                reason: reason.clone(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(internal_error)?;
+        let fallback = service
+            .store
+            .mark_run_generation_context_fallback(&run.id, identity, state, None)
+            .await
+            .map_err(internal_error)?;
+        service
+            .store
+            .append_event(AgentEvent::GenerationContextFallback {
+                run_id: run.id.clone(),
+                reason,
+                design_source_kind: design_source_kind(&run).to_string(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .map_err(internal_error)?;
+        return Ok(fallback);
+    };
+    match compile_generation_context(
+        &service.store,
+        &service.config.runtime_storage_dir,
+        &run,
+        &approval,
+    )
+    .await
+    {
+        Ok(context) => {
+            let serialized_bytes = serde_json::to_vec(&context)
+                .map_err(|error| internal_error(anyhow::anyhow!(error)))?
+                .len() as u64;
+            let bound = service
+                .store
+                .bind_run_generation_context(&context)
+                .await
+                .map_err(internal_error)?;
+            let bound = service
+                .store
+                .set_run_generation_context_runtime_mode(
+                    &bound.id,
+                    match service.config.generation_context_mode {
+                        GenerationContextMode::Shadow => "shadow",
+                        GenerationContextMode::Enabled => "enabled",
+                        GenerationContextMode::Off => "shadow",
+                    },
+                )
+                .await
+                .map_err(internal_error)?;
+            service
+                .store
+                .append_event(AgentEvent::GenerationContextCompiled {
+                    run_id: run.id,
+                    context_content_hash: context.context_content_hash,
+                    run_context_binding_hash: context.run_context_binding_hash,
+                    serialized_bytes,
+                    sections: vec![
+                        "identity".to_string(),
+                        "contentPlan".to_string(),
+                        "acceptance".to_string(),
+                        "design".to_string(),
+                        "content".to_string(),
+                        "visuals".to_string(),
+                        "project".to_string(),
+                    ],
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(internal_error)?;
+            Ok(bound)
+        }
+        Err(error) if service.config.generation_context_mode == GenerationContextMode::Shadow => {
+            let reason = error.to_string();
+            let fallback = service
+                .store
+                .mark_run_generation_context_fallback(
+                    &run.id,
+                    identity,
+                    "verified",
+                    Some(&approval.approval_id),
+                )
+                .await
+                .map_err(internal_error)?;
+            service
+                .store
+                .append_event(AgentEvent::GenerationContextFallback {
+                    run_id: run.id,
+                    reason,
+                    design_source_kind: design_source_kind(&fallback).to_string(),
+                    timestamp: Utc::now(),
+                })
+                .await
+                .map_err(internal_error)?;
+            Ok(fallback)
+        }
+        Err(error) => Err(service
+            .compensate_created_run_error(
+                &run,
+                "generation_context_compile",
+                conflict_error(anyhow::anyhow!(error.to_string())),
+            )
+            .await),
+    }
+}
+
+fn approval_state_name(state: ContentPlanApprovalVerificationState) -> &'static str {
+    match state {
+        ContentPlanApprovalVerificationState::Verified => "verified",
+        ContentPlanApprovalVerificationState::Missing => "missing",
+        ContentPlanApprovalVerificationState::Invalidated => "invalidated",
+        ContentPlanApprovalVerificationState::IdentityMismatch => "identity_mismatch",
+    }
+}
+
+fn design_source_kind(run: &AgentRun) -> &'static str {
+    if run.design_context_manifest.is_some() {
+        "design_profile"
+    } else {
+        "template_default"
     }
 }
 
@@ -864,6 +1391,7 @@ async fn validate_project_access_before_initial_run(
         && service.config.validate_startup().is_ok();
     if !production_auth_active
         || request.input_context.parent_run_id.is_some()
+        || request.input_context.predecessor_run_id.is_some()
         || !matches!(request.phase, AgentPhase::Brief | AgentPhase::Build)
     {
         return Ok(());
@@ -952,7 +1480,12 @@ async fn validate_sandbox_context(
 ) -> Result<(), RunLifecycleError> {
     let requested_binding = request.input_context.sandbox_binding_id.as_deref();
 
-    if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
+    if let Some(parent_run_id) = request
+        .input_context
+        .parent_run_id
+        .as_deref()
+        .or(request.input_context.predecessor_run_id.as_deref())
+    {
         let parent = store
             .get_run(parent_run_id)
             .await
@@ -1000,6 +1533,45 @@ async fn validate_sandbox_context(
         )));
     }
 
+    Ok(())
+}
+
+async fn validate_replan_successor(
+    store: &RuntimeStore,
+    request: &StartRunCommand,
+) -> Result<(), RunLifecycleError> {
+    if !matches!(request.phase, AgentPhase::Edit | AgentPhase::Repair) {
+        return Err(conflict_error(anyhow::anyhow!(
+            "replan successor phase must be Edit or Repair"
+        )));
+    }
+    let edit_base = request.input_context.edit_base.as_ref().ok_or_else(|| {
+        conflict_error(anyhow::anyhow!(
+            "replan successor requires a frozen EditBase"
+        ))
+    })?;
+    let plan_hash = request
+        .input_context
+        .edit_impact_plan_hash
+        .as_deref()
+        .ok_or_else(|| {
+            conflict_error(anyhow::anyhow!(
+                "replan successor requires a replacement EditImpactPlan"
+            ))
+        })?;
+    let (project_id, plan) = store
+        .edit_guard_store()
+        .get_plan(plan_hash)
+        .ok_or_else(|| not_found(format!("EditImpactPlan not found: {plan_hash}")))?;
+    if project_id != request.project_id || &plan.edit_base != edit_base {
+        return Err(conflict_error(anyhow::anyhow!(
+            "replacement EditImpactPlan identity does not match the requested project/EditBase"
+        )));
+    }
+    store
+        .edit_guard_store()
+        .validate_executable(&store.draft_preview_store(), plan_hash)
+        .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
     Ok(())
 }
 

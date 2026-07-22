@@ -1,12 +1,12 @@
 use crate::{
-    config::{RuntimeConfig, SandboxBackendMode},
+    config::{GenerationContextMode, RuntimeConfig, SandboxBackendMode},
     conversation::RuntimeStore,
     model_gateway::ModelClient,
     query_session::QuerySession,
     run_lifecycle::RunSessionLauncher,
     runtime::RuntimeSupervisor,
     tools::control_plane::control_plane_executor_for_config,
-    types::{AgentEvent, AgentRunStatus},
+    types::{AgentEvent, AgentPhase, AgentRunStatus},
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -42,7 +42,8 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
         let store = self.store.clone();
         let model = self.model.clone();
         supervisor.clone().spawn(task_name, false, async move {
-            let tool_executor = if let Some(run) = store.get_run(&run_id).await {
+            let run = store.get_run(&run_id).await;
+            let tool_executor = if let Some(run) = run.as_ref() {
                 let workspace_root = effective_workspace_root(&config, &run.project_id);
                 if config.sandbox_backend_mode == SandboxBackendMode::PhaseAContract {
                     // remote-fs-boundary: allow-begin phase-a-workspace-bootstrap
@@ -54,7 +55,16 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
                 control_plane_executor_for_config(&config)
             };
             let session_store = store.clone();
-            let session = QuerySession::with_tool_executor(store, model, tool_executor);
+            let generation_context_enabled = run.as_ref().is_some_and(|run| {
+                generation_context_required_for_phase(config.generation_context_mode, &run.phase)
+            });
+            let session = QuerySession::with_tool_executor_and_generation_context(
+                store,
+                model,
+                tool_executor,
+                generation_context_enabled,
+                config.observation_receipts_enabled,
+            );
             if let Err(error) = session.submit_run(&run_id).await {
                 if let Some(run) = session_store.get_run(&run_id).await {
                     if !run.status.is_terminal() && run.status != AgentRunStatus::NeedsUserInput {
@@ -94,6 +104,14 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
     }
 }
 
+fn generation_context_required_for_phase(mode: GenerationContextMode, phase: &AgentPhase) -> bool {
+    mode == GenerationContextMode::Enabled
+        && matches!(
+            phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        )
+}
+
 fn effective_workspace_root(config: &RuntimeConfig, project_id: &str) -> std::path::PathBuf {
     match config.sandbox_backend_mode {
         SandboxBackendMode::PhaseAContract => {
@@ -110,5 +128,30 @@ fn effective_workspace_root(config: &RuntimeConfig, project_id: &str) -> std::pa
             config.workspace_root.join(safe)
         }
         SandboxBackendMode::Kubernetes => config.workspace_root.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_context_is_required_only_for_consuming_phases() {
+        for phase in [AgentPhase::Build, AgentPhase::Edit, AgentPhase::Repair] {
+            assert!(generation_context_required_for_phase(
+                GenerationContextMode::Enabled,
+                &phase
+            ));
+        }
+        for phase in [AgentPhase::Brief, AgentPhase::Review, AgentPhase::Export] {
+            assert!(!generation_context_required_for_phase(
+                GenerationContextMode::Enabled,
+                &phase
+            ));
+        }
+        assert!(!generation_context_required_for_phase(
+            GenerationContextMode::Shadow,
+            &AgentPhase::Build
+        ));
     }
 }

@@ -143,13 +143,13 @@ async fn artifact_serving_supports_next_export_routes_and_assets() {
 async fn artifact_serving_supports_phase_a_global_workspace_root() {
     let workspace = unique_temp_dir("artifact-phase-a-global");
     let project_root = workspace.join("project/dist");
-    fs::create_dir_all(project_root.join("_astro")).unwrap();
+    fs::create_dir_all(project_root.join("_next")).unwrap();
     fs::write(
         project_root.join("index.html"),
-        r#"<link rel="stylesheet" href="/_astro/app.css"><main>Phase A Artifact</main>"#,
+        r#"<link rel="stylesheet" href="/_next/app.css"><main>Phase A Artifact</main>"#,
     )
     .unwrap();
-    fs::write(project_root.join("_astro/app.css"), "body{color:white}").unwrap();
+    fs::write(project_root.join("_next/app.css"), "body{color:white}").unwrap();
 
     let mut config = public_auth_disabled_config();
     config.workspace_root = workspace.clone();
@@ -176,12 +176,12 @@ async fn artifact_serving_supports_phase_a_global_workspace_root() {
     let body =
         String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap();
     assert!(body.contains("Phase A Artifact"));
-    assert!(body.contains(r#"href="/artifacts/phase-a-project/current/_astro/app.css""#));
+    assert!(body.contains(r#"href="/artifacts/phase-a-project/current/_next/app.css""#));
 
     let css = app
         .oneshot(
             Request::builder()
-                .uri("/artifacts/phase-a-project/current/_astro/app.css")
+                .uri("/artifacts/phase-a-project/current/_next/app.css")
                 .body(Body::empty())
                 .unwrap(),
         )

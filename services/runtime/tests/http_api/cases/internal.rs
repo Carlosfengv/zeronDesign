@@ -9,6 +9,102 @@ use anydesign_runtime::{
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 
 #[tokio::test]
+async fn generation_context_prometheus_export_is_admin_only_and_low_cardinality() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "metrics-project".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "resource:deepseek-v4-pro".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .mark_run_generation_context_fallback(&run.id, None, "not_required", None)
+        .await
+        .unwrap();
+    store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: "edit_plan.replacement_required".to_string(),
+            value: 1,
+            metadata: Some(json!({ "errorKind": "edit.plan_scope_violation" })),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .append_event(AgentEvent::MetricRecorded {
+            run_id: run.id.clone(),
+            name: "efficiency.time_to_iframe_applied_ms".to_string(),
+            value: 750,
+            metadata: Some(json!({ "executionProfile": "warm_hmr" })),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let mut config = phase_a_contract_config();
+    config.internal_admin_token = Some("generation-metrics-token".to_string());
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config,
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/metrics/generation-context")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+    let allowed = app
+        .oneshot(
+            Request::builder()
+                .uri("/internal/metrics/generation-context")
+                .header("authorization", "Bearer generation-metrics-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    let body = String::from_utf8(
+        to_bytes(allowed.into_body(), 128 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains(
+        "generation_context_compile_total{status=\"fallback_legacy_protocol\",phase=\"build\",template=\"unknown\"} 1"
+    ));
+    assert!(
+        body.contains("edit_impact_plan_replaced_total{reason=\"edit.plan_scope_violation\"} 1")
+    );
+    assert!(body.contains(
+        "draft_hmr_iframe_applied_seconds_count{phase=\"build\",template=\"unknown\"} 1"
+    ));
+    assert!(!body.contains("metrics-project"));
+    assert!(!body.contains(&run.id));
+    assert!(!body.contains("deepseek-v4-pro"));
+}
+
+#[tokio::test]
 async fn project_access_internal_route_requires_admin_and_persists_across_store_restart() {
     let storage = unique_temp_dir("project-access-persistence");
     let store = RuntimeStore::with_checkpoint_dir(storage.clone());
@@ -107,7 +203,7 @@ async fn design_context_enforcement_policy_requires_admin_uses_cas_and_survives_
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    design_profile_request("project-policy-1", vec!["astro-website"]).to_string(),
+                    design_profile_request("project-policy-1", vec!["next-app"]).to_string(),
                 ))
                 .unwrap(),
         )
@@ -228,7 +324,7 @@ async fn design_context_canary_metrics_export_is_admin_only_and_aggregates_froze
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
-    let mut profile_request = design_profile_request("project-canary-1", vec!["astro-website"]);
+    let mut profile_request = design_profile_request("project-canary-1", vec!["next-app"]);
     profile_request["profile"]["websiteContext"] = json!({ "enforcementMode": "enforced" });
     let created = app
         .clone()
@@ -248,7 +344,7 @@ async fn design_context_canary_metrics_export_is_admin_only_and_aggregates_froze
     let profile_id = created["designProfile"]["id"].as_str().unwrap();
     let profile = store.get_design_profile(profile_id).await.unwrap();
     let template = BuiltInTemplateRegistry::built_in()
-        .current(&TemplateId::parse("astro-website").unwrap())
+        .current(&TemplateId::parse("next-app").unwrap())
         .unwrap();
     let now = Utc::now();
     let baseline_started_at = now - ChronoDuration::hours(4);
@@ -291,12 +387,12 @@ async fn design_context_canary_metrics_export_is_admin_only_and_aggregates_froze
                 &run.id,
                 &profile,
                 Some("website"),
-                Some("astro-website"),
+                Some("next-app"),
             )
             .await
             .unwrap();
         let dcp = compile_website_design_context(
-            &profile.effective_for("website", "astro-website").unwrap(),
+            &profile.effective_for("website", "next-app").unwrap(),
             &website_brief(),
             &template,
             &DesignContextCompileOptions {
@@ -728,7 +824,7 @@ async fn internal_template_build_route_is_disabled_by_default() {
                 .body(Body::from(
                     json!({
                         "projectId": "project-1",
-                        "template": "astro-website",
+                        "template": "next-app",
                         "audience": "Internal teams",
                         "visualDirection": "Clear technical site"
                     })
@@ -770,7 +866,7 @@ async fn internal_template_build_route_requires_service_authorization_when_enabl
                 .body(Body::from(
                     json!({
                         "projectId": "project-1",
-                        "template": "astro-website",
+                        "template": "next-app",
                         "audience": "Internal teams",
                         "visualDirection": "Clear technical site"
                     })

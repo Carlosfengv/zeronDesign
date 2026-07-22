@@ -152,6 +152,7 @@ async fn get_element_observation(
 async fn create_edit_impact_plan(
     State(state): State<AppState>,
     Extension(policy): Extension<ApplicationAuthorizationPolicy>,
+    Extension(run_lifecycle): Extension<RunLifecycleService>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<CreateEditImpactPlanRequest>,
@@ -164,6 +165,10 @@ async fn create_edit_impact_plan(
         PROJECT_WRITE_OPERATION,
     )
     .await?;
+    let predecessor_run_id = request.predecessor_run_id.clone();
+    if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
+        authorize_project_run(&state, &project_id, predecessor_run_id).await?;
+    }
     let plan = state
         .store
         .edit_guard_store()
@@ -186,6 +191,19 @@ async fn create_edit_impact_plan(
         .ok_or_else(|| internal_error(anyhow::anyhow!("created EditImpactPlan is missing")))?;
     if plan_project_id != project_id {
         return Err(not_found("EditImpactPlan not found".to_string()));
+    }
+    if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
+        state
+            .store
+            .edit_guard_store()
+            .bind_replan_predecessor(&plan.plan_hash, &project_id, predecessor_run_id)
+            .map_err(edit_guard_error)?;
+        if !plan.requires_confirmation {
+            run_lifecycle
+                .dispatch_replan_successor(predecessor_run_id, &plan.plan_hash)
+                .await
+                .map_err(run_lifecycle_error)?;
+        }
     }
     Ok(Json(plan))
 }
@@ -218,6 +236,7 @@ async fn get_edit_impact_plan(
 async fn confirm_edit_impact_plan(
     State(state): State<AppState>,
     Extension(policy): Extension<ApplicationAuthorizationPolicy>,
+    Extension(run_lifecycle): Extension<RunLifecycleService>,
     Path((project_id, plan_hash)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<crate::visual_contracts::EditImpactPlan>, (StatusCode, Json<ErrorResponse>)> {
@@ -237,12 +256,22 @@ async fn confirm_edit_impact_plan(
     if stored_project_id != project_id {
         return Err(not_found(format!("EditImpactPlan not found: {plan_hash}")));
     }
-    state
+    let plan = state
         .store
         .edit_guard_store()
         .confirm(&state.store.draft_preview_store(), &plan_hash)
-        .map(Json)
-        .map_err(edit_guard_error)
+        .map_err(edit_guard_error)?;
+    if let Some(predecessor_run_id) = state
+        .store
+        .edit_guard_store()
+        .replan_predecessor(&plan_hash)
+    {
+        run_lifecycle
+            .dispatch_replan_successor(&predecessor_run_id, &plan_hash)
+            .await
+            .map_err(run_lifecycle_error)?;
+    }
+    Ok(Json(plan))
 }
 
 fn edit_guard_error(error: crate::edit_guard::EditGuardError) -> (StatusCode, Json<ErrorResponse>) {
@@ -324,7 +353,12 @@ async fn create_run_visual_binding(
         PROJECT_WRITE_OPERATION,
     )
     .await?;
-    authorize_project_run(&state, &project_id, &run_id).await?;
+    let run = authorize_project_run(&state, &project_id, &run_id).await?;
+    if run.generation_context_status.is_some() {
+        return Err(conflict_error(anyhow::anyhow!(
+            "Run visual bindings are frozen after Generation Context compilation; start a new Run with inputContext.visualBindings"
+        )));
+    }
     let artifact = load_project_visual_artifact(&state, &project_id, &request.artifact_id).await?;
     if artifact.retention_state
         == crate::visual_contracts::DraftSnapshotRetentionState::DeletionPending

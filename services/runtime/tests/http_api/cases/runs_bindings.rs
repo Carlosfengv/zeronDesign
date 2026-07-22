@@ -22,7 +22,7 @@ async fn start_run_input_context_binds_existing_sandbox() {
             "sandbox-1".to_string(),
             "sandbox-claim-1".to_string(),
             "workspace-sandbox-claim-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -143,7 +143,7 @@ async fn start_build_run_auto_provisions_sandbox_workspace_from_brief() {
     let binding = store.get_sandbox_binding(binding_id).await.unwrap();
     assert_eq!(binding.project_id, "project-1");
     assert_eq!(binding.status, SandboxBindingStatus::Busy);
-    assert_eq!(binding.warm_pool_name, "anydesign-astro-website-pool");
+    assert_eq!(binding.warm_pool_name, "anydesign-next-app-pool");
     assert_eq!(
         binding.workspace_pvc_name,
         format!("workspace-{}", binding.sandbox_claim_name)
@@ -159,7 +159,7 @@ async fn build_run_rejects_unconfirmed_brief_until_continue_confirms_it() {
             "sandbox-unconfirmed-brief".to_string(),
             "sandbox-claim-unconfirmed-brief".to_string(),
             "workspace-sandbox-claim-unconfirmed-brief".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -322,7 +322,7 @@ async fn sandbox_binding_is_exclusive_until_run_terminal() {
             "sandbox-exclusive".to_string(),
             "sandbox-claim-exclusive".to_string(),
             "workspace-sandbox-claim-exclusive".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -428,7 +428,7 @@ async fn start_run_input_context_creates_child_run_with_findings() {
             "sandbox-parent".to_string(),
             "sandbox-claim-parent".to_string(),
             "workspace-sandbox-claim-parent".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )

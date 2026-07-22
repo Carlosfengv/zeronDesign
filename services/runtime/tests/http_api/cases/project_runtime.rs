@@ -60,6 +60,90 @@ async fn preview_current_returns_promoted_version_contract() {
 }
 
 #[tokio::test]
+async fn project_history_returns_recoverable_drafts_and_publishable_versions() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-history".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let draft = store
+        .create_draft_snapshot(
+            "project-history",
+            "object://source-snapshots/project-history/draft-1.tar.zst".to_string(),
+            "a".repeat(64),
+            "next-app".to_string(),
+            "next-app@1".to_string(),
+            "runtime-dependency-policy@1".to_string(),
+            "b".repeat(64),
+            &run.id,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let version = store
+        .create_project_version_candidate(
+            "project-history",
+            &run.id,
+            "http://preview.local/project-history/current".to_string(),
+            None,
+            Some("object://source-snapshots/project-history/version-1.tar.zst".to_string()),
+        )
+        .await;
+    promote_preview(
+        &store,
+        "project-history",
+        &run.id,
+        &version.id,
+        PromotionGateReport::passing(),
+    )
+    .await
+    .unwrap();
+
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config: public_auth_disabled_config(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/projects/project-history/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["projectId"], "project-history");
+    let items = payload["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let draft_item = items
+        .iter()
+        .find(|item| item["kind"] == "draft_snapshot")
+        .unwrap();
+    assert_eq!(draft_item["snapshot"]["snapshotId"], draft.snapshot_id);
+    assert_eq!(draft_item["recoverable"], true);
+    assert_eq!(draft_item["publishable"], false);
+    let version_item = items
+        .iter()
+        .find(|item| item["kind"] == "work_version")
+        .unwrap();
+    assert_eq!(version_item["version"]["id"], version.id);
+    assert_eq!(version_item["recoverable"], true);
+    assert_eq!(version_item["publishable"], true);
+}
+
+#[tokio::test]
 async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
     let workspace = unique_temp_dir("runtime-state-lifecycle");
     let project_workspace = workspace.join("project-1");
@@ -135,7 +219,7 @@ async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
             "sandbox-1".to_string(),
             "sandbox-claim-1".to_string(),
             "workspace-sandbox-claim-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -198,7 +282,7 @@ async fn project_runtime_state_exposes_editable_lifecycle_metadata() {
         "runtime://snapshots/project-1/version-1"
     );
     assert_eq!(payload["appRoot"], "project");
-    assert_eq!(payload["templateKey"], "astro-website");
+    assert_eq!(payload["templateKey"], "next-app");
     assert_eq!(
         payload["styleContractPath"],
         "/workspace/state/style-contract.json"
@@ -298,7 +382,7 @@ async fn project_runtime_state_reads_phase_a_global_workspace_lifecycle_state() 
             "sandbox-1".to_string(),
             "sandbox-claim-1".to_string(),
             "workspace-sandbox-claim-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -435,7 +519,7 @@ async fn project_runtime_state_reads_kubernetes_workspace_channel_lifecycle_stat
             "sandbox-1".to_string(),
             "sandbox-claim-1".to_string(),
             "workspace-sandbox-claim-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )

@@ -108,6 +108,7 @@ pub struct CreateElementObservationRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateEditImpactPlanRequest {
     pub observation_id: Option<String>,
+    pub predecessor_run_id: Option<String>,
     pub scope: crate::visual_contracts::EditImpactScope,
     pub targets: Vec<String>,
     pub operations: Vec<crate::visual_contracts::EditImpactOperation>,

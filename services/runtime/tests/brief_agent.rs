@@ -20,7 +20,7 @@ fn valid_brief() -> serde_json::Value {
             }
         ],
         "visualDirection": "quiet technical confidence",
-        "recommendedTemplate": "astro-website",
+        "recommendedTemplate": "next-app",
         "assumptions": [],
         "missingInformation": [],
         "acceptanceCriteria": {
@@ -73,7 +73,7 @@ async fn prompt_and_markdown_produce_structured_brief_draft_and_wait_for_confirm
     let brief_id = paused.brief_version.expect("brief should be stored");
     let brief: Brief = store.get_brief(&brief_id).await.unwrap();
     assert_eq!(brief.project_type, "website");
-    assert_eq!(brief.recommended_template, "astro-website");
+    assert_eq!(brief.recommended_template, "next-app");
     assert!(!brief.content_hierarchy.is_empty());
     assert_eq!(
         store.brief_status(&brief_id).await,
@@ -157,7 +157,7 @@ async fn brief_write_draft_normalizes_common_model_field_aliases() {
     let brief_id = paused.brief_version.expect("brief should be stored");
     let brief: Brief = store.get_brief(&brief_id).await.unwrap();
     assert_eq!(brief.project_type, "website");
-    assert_eq!(brief.recommended_template, "astro-website");
+    assert_eq!(brief.recommended_template, "next-app");
     assert_eq!(brief.visual_direction, "polished product launch");
 }
 
@@ -271,7 +271,7 @@ async fn invalid_brief_json_is_recoverable_and_not_completed() {
                 "contentHierarchy": [],
                 "pageStructure": [],
                 "visualDirection": "",
-                "recommendedTemplate": "astro-website",
+                "recommendedTemplate": "next-app",
                 "assumptions": [],
                 "missingInformation": []
             }),

@@ -52,7 +52,7 @@ async fn get_brief_returns_structured_draft_and_owner_context() {
     assert_eq!(payload["runId"], run.id);
     assert_eq!(payload["status"], "draft");
     assert_eq!(payload["runStatus"], "needs_user_input");
-    assert_eq!(payload["brief"]["recommendedTemplate"], "astro-website");
+    assert_eq!(payload["brief"]["recommendedTemplate"], "next-app");
 }
 
 #[tokio::test]

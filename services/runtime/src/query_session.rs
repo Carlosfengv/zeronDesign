@@ -24,6 +24,20 @@ impl QuerySession {
         }
     }
 
+    pub fn with_tool_executor_and_generation_context(
+        store: RuntimeStore,
+        model: Arc<dyn ModelClient>,
+        tool_executor: crate::tools::runtime::ToolExecutor,
+        generation_context_enabled: bool,
+        observation_receipts_enabled: bool,
+    ) -> Self {
+        Self {
+            loop_runner: AgentLoop::with_tool_executor(store, model, tool_executor)
+                .with_generation_context_enabled(generation_context_enabled)
+                .with_observation_receipts_enabled(observation_receipts_enabled),
+        }
+    }
+
     pub async fn submit_run(&self, run_id: &str) -> Result<()> {
         self.loop_runner.run(run_id).await?;
         Ok(())

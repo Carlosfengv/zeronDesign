@@ -11,7 +11,7 @@ async fn required_unsupported_extended_token_blocks_build_with_capability_state(
         store: store.clone(),
         model: Arc::new(MockModelClient::new(vec![])),
     });
-    let mut create_request = design_profile_request("project-capability", vec!["astro-website"]);
+    let mut create_request = design_profile_request("project-capability", vec!["next-app"]);
     create_request["profile"]["schemaVersion"] = json!("design-profile@2");
     create_request["profile"]["extendedTokenMapping"] =
         json!({ "imagery.unsupportedShader": "required" });
@@ -63,7 +63,7 @@ async fn required_unsupported_extended_token_blocks_build_with_capability_state(
                 content_hierarchy: vec!["Home".to_string()],
                 page_structure: json!([]),
                 visual_direction: "specific".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -150,7 +150,7 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    design_profile_request("project-unique", vec!["astro-website"]).to_string(),
+                    design_profile_request("project-unique", vec!["next-app"]).to_string(),
                 ))
                 .unwrap(),
         )
@@ -171,7 +171,7 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
                 .body(Body::from(
                     json!({
                         "name": "Second active profile",
-                        "profile": design_profile_request("project-unique", vec!["astro-website"])["profile"].clone()
+                        "profile": design_profile_request("project-unique", vec!["next-app"])["profile"].clone()
                     })
                     .to_string(),
                 ))
@@ -210,7 +210,7 @@ async fn design_profile_rejects_multiple_active_profiles_for_same_project() {
                 .body(Body::from(
                     json!({
                         "name": "Second active profile",
-                        "profile": design_profile_request("project-unique", vec!["astro-website"])["profile"].clone()
+                        "profile": design_profile_request("project-unique", vec!["next-app"])["profile"].clone()
                     })
                     .to_string(),
                 ))
@@ -246,7 +246,7 @@ async fn start_run_uses_explicit_platform_then_project_profile_binding() {
                     design_profile_request_for_scope(
                         None,
                         json!({ "platform": true }),
-                        vec!["astro-website"],
+                        vec!["next-app"],
                     )
                     .to_string(),
                 ))
@@ -266,7 +266,7 @@ async fn start_run_uses_explicit_platform_then_project_profile_binding() {
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                    design_profile_request("project-1", vec!["next-app"]).to_string(),
                 ))
                 .unwrap(),
         )
@@ -413,7 +413,7 @@ async fn start_run_does_not_implicitly_apply_a_platform_profile() {
                     design_profile_request_for_scope(
                         None,
                         json!({ "platform": true }),
-                        vec!["astro-website"],
+                        vec!["next-app"],
                     )
                     .to_string(),
                 ))
@@ -614,7 +614,7 @@ async fn continue_edit_run_design_profile_conflict_enters_needs_user_input() {
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                    design_profile_request("project-1", vec!["next-app"]).to_string(),
                 ))
                 .unwrap(),
         )

@@ -10,6 +10,7 @@ fn internal_route_family_is_frozen() {
                 "GET",
                 "/internal/projects/{project_id}/design-context-canary-metrics",
             ),
+            ("GET", "/internal/metrics/generation-context"),
             (
                 "PUT",
                 "/internal/projects/{project_id}/design-context-enforcement",

@@ -45,7 +45,21 @@ pub(super) fn run_lifecycle_error(
         crate::run_lifecycle::RunLifecycleError::InvalidRequest(message) => bad_request(message),
         crate::run_lifecycle::RunLifecycleError::NotFound(message) => not_found(message),
         crate::run_lifecycle::RunLifecycleError::Conflict(message) => {
-            conflict_error(anyhow::anyhow!(message))
+            let error_code = [
+                "content_plan.approval_rejected",
+                "generation_context.required_content_overflow",
+                "generation_context.binding_immutable",
+            ]
+            .into_iter()
+            .find(|code| message.contains(code))
+            .map(ToOwned::to_owned);
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: message,
+                    error_code,
+                }),
+            )
         }
         crate::run_lifecycle::RunLifecycleError::Internal(message) => {
             internal_error(anyhow::anyhow!(message))

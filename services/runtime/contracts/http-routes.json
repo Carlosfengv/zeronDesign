@@ -78,6 +78,7 @@
     { "surface": "internal", "path": "/internal/previews/promote", "methods": ["POST"], "authorization": "internal_service", "bodyLimit": "axum-default-json", "featureFlag": "ENABLE_INTERNAL_PROMOTE_API", "response": "json" },
     { "surface": "internal", "path": "/internal/projects/{project_id}/access", "methods": ["PUT"], "authorization": "internal_service", "bodyLimit": "axum-default-json", "featureFlag": null, "response": "json" },
     { "surface": "internal", "path": "/internal/projects/{project_id}/design-context-canary-metrics", "methods": ["GET"], "authorization": "internal_service", "bodyLimit": "none", "featureFlag": null, "response": "json" },
+    { "surface": "internal", "path": "/internal/metrics/generation-context", "methods": ["GET"], "authorization": "internal_service", "bodyLimit": "none", "featureFlag": null, "response": "openmetrics" },
     { "surface": "internal", "path": "/internal/projects/{project_id}/design-context-enforcement", "methods": ["PUT"], "authorization": "internal_service", "bodyLimit": "axum-default-json", "featureFlag": null, "response": "json" },
     { "surface": "internal", "path": "/internal/projects/{project_id}/release-evidence", "methods": ["GET"], "authorization": "internal_service", "bodyLimit": "none", "featureFlag": null, "response": "json" },
     { "surface": "internal", "path": "/internal/projects/{project_id}/release-sandbox", "methods": ["POST"], "authorization": "internal_service", "bodyLimit": "none", "featureFlag": null, "response": "json" },

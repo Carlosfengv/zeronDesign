@@ -47,7 +47,7 @@ fn website_brief() -> Brief {
             }
         ]),
         visual_direction: "quiet technical confidence".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: vec![],
         missing_information: vec![],
     }
@@ -352,14 +352,14 @@ async fn briefs_are_persisted_with_confirmation_status_after_restart() {
     let snapshots = fs::read_to_string(&brief_log_path).unwrap();
     assert!(snapshots.contains("\"status\":\"draft\""));
     assert!(snapshots.contains("\"status\":\"confirmed\""));
-    assert!(snapshots.contains("\"recommendedTemplate\":\"astro-website\""));
+    assert!(snapshots.contains("\"recommendedTemplate\":\"next-app\""));
     assert!(snapshots.contains("\"acceptanceContract\""));
     assert!(snapshots.contains("\"schemaVersion\":\"acceptance-contract@1\""));
 
     let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
     let reloaded_brief = reloaded_store.get_brief(&brief_id).await.unwrap();
     assert_eq!(reloaded_brief.project_type, "website");
-    assert_eq!(reloaded_brief.recommended_template, "astro-website");
+    assert_eq!(reloaded_brief.recommended_template, "next-app");
     let acceptance_contract = reloaded_store
         .get_acceptance_contract(&brief_id)
         .await
@@ -403,7 +403,7 @@ async fn sandbox_bindings_are_persisted_as_project_workspace_scope() {
             "claim-sandbox-pending".to_string(),
             "claim-project-1".to_string(),
             "workspace-project-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -455,7 +455,7 @@ async fn sandbox_bindings_are_persisted_as_project_workspace_scope() {
             "claim-sandbox-other".to_string(),
             "claim-project-2".to_string(),
             "workspace-project-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -540,6 +540,15 @@ async fn agent_runs_are_persisted_and_recovered_after_store_restart() {
         task_list: vec![],
         workspace_snapshot_uri: Some("file:///workspace/snapshots/recover.tar".to_string()),
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: Some("brief-1".to_string()),
         design_version: None,
         last_known_preview_url: Some("http://preview.local/preview/project-1/current".to_string()),
@@ -731,7 +740,7 @@ async fn persisted_active_run_keeps_workspace_binding_exclusive_after_restart() 
             "sandbox-workspace-active".to_string(),
             "sandbox-claim-workspace-active".to_string(),
             "workspace-project-1".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -808,6 +817,15 @@ async fn latest_checkpoint_for_run_recovers_file_written_before_run_pointer() {
         task_list: vec![],
         workspace_snapshot_uri: None,
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: None,
         design_version: None,
         last_known_preview_url: None,
@@ -956,6 +974,15 @@ async fn runtime_restart_resumes_running_run_from_latest_checkpoint() {
         task_list: vec![],
         workspace_snapshot_uri: Some("file:///workspace/snapshots/recover.tar".to_string()),
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: Some("brief-1".to_string()),
         design_version: None,
         last_known_preview_url: Some("http://preview.local/preview/project-1/current".to_string()),
@@ -1024,6 +1051,15 @@ async fn startup_recovery_spawns_run_with_checkpoint_message_window() {
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -1106,7 +1142,7 @@ async fn runtime_restart_reacquires_ready_sandbox_before_resuming_checkpoint() {
             "sandbox-recover".to_string(),
             "sandbox-claim-recover".to_string(),
             "workspace-sandbox-claim-recover".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -1134,6 +1170,15 @@ async fn runtime_restart_reacquires_ready_sandbox_before_resuming_checkpoint() {
         task_list: vec![],
         workspace_snapshot_uri: Some("file:///workspace/snapshots/recover-build.tar".to_string()),
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: Some("brief-1".to_string()),
         design_version: None,
         last_known_preview_url: Some("http://preview.local/preview/project-1/current".to_string()),
@@ -1175,7 +1220,7 @@ async fn runtime_restart_fails_sandbox_run_when_binding_is_unavailable() {
             "sandbox-failed".to_string(),
             "sandbox-claim-failed".to_string(),
             "workspace-sandbox-claim-failed".to_string(),
-            "anydesign-astro-website-pool".to_string(),
+            "anydesign-next-app-pool".to_string(),
             "anydesign-sandboxes".to_string(),
             SandboxChannelProtocol::Websocket,
         )
@@ -1203,6 +1248,15 @@ async fn runtime_restart_fails_sandbox_run_when_binding_is_unavailable() {
         task_list: vec![],
         workspace_snapshot_uri: Some("file:///workspace/snapshots/recover-build.tar".to_string()),
         build_result: None,
+        context_content_hash: None,
+        run_context_binding_hash: None,
+        runtime_attestation_hash: None,
+        context_window_epoch: None,
+        execution_profile: None,
+        target_session_epoch: None,
+        target_workspace_revision: None,
+        workflow_state: None,
+        observation_receipts_version: None,
         brief_version: Some("brief-1".to_string()),
         design_version: None,
         last_known_preview_url: Some("http://preview.local/preview/project-1/current".to_string()),

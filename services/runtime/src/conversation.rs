@@ -63,6 +63,13 @@ pub struct SequencedAgentEvent {
     pub event: AgentEvent,
 }
 
+fn normalize_edit_target(path: &str) -> String {
+    path.trim_start_matches("/workspace/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
     inner: Arc<RwLock<RuntimeStoreInner>>,
@@ -148,6 +155,8 @@ struct RuntimeStoreInner {
     profile_token_sync_operations: HashMap<String, ProfileTokenSyncOperation>,
     run_scoped_resources: HashMap<String, RunScopedResources>,
     continue_interrupt_requests: HashSet<String>,
+    generation_context_payload_cache:
+        HashMap<String, crate::generation_context::GenerationContextPayload>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -690,9 +699,65 @@ impl RuntimeStore {
         brief_version: Option<String>,
         base_version_id: Option<String>,
     ) -> AgentRun {
+        self.create_run_with_context_internal(
+            project_id,
+            phase,
+            agent_profile,
+            model,
+            content_sources,
+            brief_version,
+            base_version_id,
+            None,
+        )
+        .await
+        .expect("initial Run creation cannot fail predecessor validation")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_replan_successor_run_with_context(
+        &self,
+        predecessor_run_id: &str,
+        project_id: String,
+        phase: crate::types::AgentPhase,
+        agent_profile: String,
+        model: String,
+        content_sources: Vec<ContentSource>,
+        brief_version: Option<String>,
+        base_version_id: Option<String>,
+    ) -> Result<AgentRun> {
+        self.create_run_with_context_internal(
+            project_id,
+            phase,
+            agent_profile,
+            model,
+            content_sources,
+            brief_version,
+            base_version_id,
+            Some(predecessor_run_id.to_string()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_run_with_context_internal(
+        &self,
+        project_id: String,
+        phase: crate::types::AgentPhase,
+        agent_profile: String,
+        model: String,
+        content_sources: Vec<ContentSource>,
+        brief_version: Option<String>,
+        base_version_id: Option<String>,
+        predecessor_run_id: Option<String>,
+    ) -> Result<AgentRun> {
         let now = Utc::now();
         let run_id = self.next_id("run");
         let project_state_snapshot = self.get_project_runtime_state(&project_id).await;
+        let predecessor_events = if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
+            self.events(predecessor_run_id).await
+        } else {
+            Vec::new()
+        };
         let profile_snapshot = policy::snapshot_for_profile(phase, &agent_profile, None);
         let run = AgentRun {
             id: run_id.clone(),
@@ -743,9 +808,32 @@ impl RuntimeStore {
             design_context_style_contract_verified: None,
             design_context_manifest: None,
             design_context_artifacts: BTreeMap::new(),
+            run_contract_version: Some("legacy@1".to_string()),
+            content_plan_id: None,
+            content_plan_revision: None,
+            content_plan_hash: None,
+            content_plan_approval_id: None,
+            content_plan_approval_state: None,
+            generation_context_status: None,
+            generation_context_runtime_mode: None,
+            generation_context_schema_version: None,
+            generation_context_compiler_version: None,
+            generation_context_content_hash: None,
+            generation_context_binding_hash: None,
+            generation_context_runtime_attestation_hash: None,
+            visual_binding_set_hash: None,
+            visual_delivery_state: None,
+            execution_profile: None,
+            workflow_state: None,
+            context_window_epoch: 0,
+            context_injected_turn: None,
+            predecessor_run_id: predecessor_run_id.clone(),
+            successor_run_id: None,
+            generation_context: None,
             base_version_id,
             edit_base: None,
             edit_impact_plan_hash: None,
+            edit_mutation_preflight_completed: false,
             output_version_id: None,
             finding_ids: None,
             input_message_ids: vec![self.next_id("message")],
@@ -758,6 +846,39 @@ impl RuntimeStore {
         };
 
         let mut inner = self.inner.write().await;
+        if predecessor_run_id.is_some() {
+            self.hydrate_persisted_runs(&mut inner)?;
+        }
+        let predecessor_snapshot =
+            if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
+                let predecessor = inner
+                    .runs
+                    .get_mut(predecessor_run_id)
+                    .ok_or_else(|| anyhow!("predecessor run not found: {predecessor_run_id}"))?;
+                if predecessor.project_id != project_id || predecessor.phase != phase {
+                    return Err(anyhow!(
+                        "replan successor must preserve predecessor project and phase"
+                    ));
+                }
+                if predecessor.status != AgentRunStatus::Partial
+                || !predecessor_events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::RunWorkflowProgress { stage, .. } if stage == "replan_required"
+                ))
+            {
+                return Err(anyhow!(
+                    "replan successor requires a Partial predecessor in replan_required"
+                ));
+            }
+                if predecessor.successor_run_id.is_some() {
+                    return Err(anyhow!("replan predecessor already has a successor Run"));
+                }
+                predecessor.successor_run_id = Some(run_id.clone());
+                predecessor.updated_at = now;
+                Some(predecessor.clone())
+            } else {
+                None
+            };
         inner.runs.insert(run_id.clone(), run.clone());
         inner.events.insert(run_id.clone(), Vec::new());
         let content_source_snapshot = RunContentSourcesSnapshot {
@@ -767,6 +888,21 @@ impl RuntimeStore {
         };
         inner.content_sources.insert(run_id, content_sources);
         drop(inner);
+        if let Some(predecessor) = predecessor_snapshot {
+            self.append_run_snapshot(&predecessor)?;
+            self.append_event(AgentEvent::MetricRecorded {
+                run_id: predecessor.id,
+                name: "run.successor_created".to_string(),
+                value: 1,
+                metadata: Some(json!({
+                    "successorRunId": run.id,
+                    "phase": run.phase,
+                    "reason": "edit_plan_replacement",
+                })),
+                timestamp: now,
+            })
+            .await?;
+        }
         if let Err(error) = self.append_run_snapshot(&run) {
             eprintln!("failed to append run snapshot {}: {error}", run.id);
         }
@@ -776,7 +912,7 @@ impl RuntimeStore {
                 run.id
             );
         }
-        run
+        Ok(run)
     }
 
     pub async fn create_child_run(
@@ -808,6 +944,19 @@ impl RuntimeStore {
         let run_id = self.next_id("run");
         let profile_snapshot =
             policy::snapshot_for_profile(phase, &agent_profile, parent.checkpoint_id.clone());
+        let execution_profile = if phase == crate::types::AgentPhase::Repair {
+            let cold = parent
+                .edit_impact_plan_hash
+                .as_deref()
+                .and_then(|plan_hash| self.edit_guard_store.get_plan(plan_hash))
+                .is_some_and(|(project_id, plan)| {
+                    project_id == parent.project_id
+                        && crate::generation_context::edit_impact_plan_requires_cold_dev(&plan)
+                });
+            Some(crate::generation_context::execution_profile_for_phase(phase, cold).to_string())
+        } else {
+            None
+        };
         let run = AgentRun {
             id: run_id.clone(),
             project_id: parent.project_id.clone(),
@@ -878,12 +1027,37 @@ impl RuntimeStore {
             design_context_style_contract_verified: None,
             design_context_manifest: parent.design_context_manifest.clone(),
             design_context_artifacts: parent.design_context_artifacts.clone(),
+            // A child run receives a new immutable run binding. It may inherit
+            // frozen design inputs, but never the parent's GenerationContext.
+            run_contract_version: Some("legacy@1".to_string()),
+            content_plan_id: None,
+            content_plan_revision: None,
+            content_plan_hash: None,
+            content_plan_approval_id: None,
+            content_plan_approval_state: None,
+            generation_context_status: None,
+            generation_context_runtime_mode: None,
+            generation_context_schema_version: None,
+            generation_context_compiler_version: None,
+            generation_context_content_hash: None,
+            generation_context_binding_hash: None,
+            generation_context_runtime_attestation_hash: None,
+            visual_binding_set_hash: None,
+            visual_delivery_state: None,
+            execution_profile,
+            workflow_state: None,
+            context_window_epoch: 0,
+            context_injected_turn: None,
+            predecessor_run_id: Some(parent.id.clone()),
+            successor_run_id: None,
+            generation_context: None,
             base_version_id: parent
                 .output_version_id
                 .clone()
                 .or(parent.base_version_id.clone()),
             edit_base: parent.edit_base.clone(),
             edit_impact_plan_hash: parent.edit_impact_plan_hash.clone(),
+            edit_mutation_preflight_completed: false,
             output_version_id: None,
             finding_ids: if finding_ids.is_empty() {
                 None
@@ -899,9 +1073,31 @@ impl RuntimeStore {
             completed_at: None,
         };
 
+        let parent_snapshot = if let Some(parent_run) = inner.runs.get_mut(parent_run_id) {
+            parent_run.successor_run_id = Some(run_id.clone());
+            parent_run.updated_at = now;
+            Some(parent_run.clone())
+        } else {
+            None
+        };
         inner.runs.insert(run_id.clone(), run.clone());
         inner.events.insert(run_id, Vec::new());
         drop(inner);
+        if let Some(parent_snapshot) = parent_snapshot {
+            self.append_run_snapshot(&parent_snapshot)?;
+            let _ = self
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: parent_snapshot.id,
+                    name: "run.successor_created".to_string(),
+                    value: 1,
+                    metadata: Some(json!({
+                        "successorRunId": run.id,
+                        "phase": run.phase,
+                    })),
+                    timestamp: now,
+                })
+                .await;
+        }
         self.append_run_snapshot(&run)?;
         Ok(run)
     }
@@ -916,17 +1112,283 @@ impl RuntimeStore {
         if plan_hash.len() != 64 || !plan_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(anyhow!("edit impact plan hash is invalid"));
         }
+        let (plan_project_id, plan) = self
+            .edit_guard_store
+            .get_plan(&plan_hash)
+            .ok_or_else(|| anyhow!("edit.plan_stale: plan not found"))?;
         let mut inner = self.inner.write().await;
         self.hydrate_persisted_runs(&mut inner)?;
         let run = inner
             .runs
             .get_mut(run_id)
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
-        if run.phase != crate::types::AgentPhase::Edit {
-            return Err(anyhow!("edit context can only be attached to Edit runs"));
+        if !matches!(
+            run.phase,
+            crate::types::AgentPhase::Edit | crate::types::AgentPhase::Repair
+        ) {
+            return Err(anyhow!(
+                "edit context can only be attached to Edit or Repair runs"
+            ));
+        }
+        if plan_project_id != run.project_id || plan.plan_hash != plan_hash {
+            return Err(anyhow!("edit.plan_stale: plan identity mismatch"));
         }
         run.edit_base = Some(edit_base);
         run.edit_impact_plan_hash = Some(plan_hash);
+        run.execution_profile = Some(
+            crate::generation_context::execution_profile_for_phase(
+                run.phase,
+                crate::generation_context::edit_impact_plan_requires_cold_dev(&plan),
+            )
+            .to_string(),
+        );
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn preflight_edit_mutation(
+        &self,
+        run_id: &str,
+        target: Option<&str>,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if !matches!(
+            run.phase,
+            crate::types::AgentPhase::Edit | crate::types::AgentPhase::Repair
+        ) || run.edit_impact_plan_hash.is_none()
+        {
+            return Ok(run.clone());
+        }
+        let plan_hash = run.edit_impact_plan_hash.clone().unwrap();
+        let (project_id, plan) = self
+            .edit_guard_store
+            .get_plan(&plan_hash)
+            .ok_or_else(|| anyhow!("edit.plan_stale: plan not found"))?;
+        if project_id != run.project_id || plan.plan_hash != plan_hash {
+            return Err(anyhow!("edit.plan_stale: plan identity mismatch"));
+        }
+        if let Some(target) = target {
+            let target = normalize_edit_target(target);
+            if !plan
+                .targets
+                .iter()
+                .map(|target| normalize_edit_target(target))
+                .any(|allowed| allowed == target)
+            {
+                return Err(anyhow!(
+                    "edit.plan_scope_violation: target {target} is outside the frozen EditImpactPlan"
+                ));
+            }
+        }
+        if !run.edit_mutation_preflight_completed {
+            self.edit_guard_store
+                .consume(&self.draft_preview_store, &plan_hash)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            run.edit_mutation_preflight_completed = true;
+            run.updated_at = Utc::now();
+        }
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn bind_run_generation_context(
+        &self,
+        context: &crate::generation_context::GenerationContext,
+    ) -> Result<AgentRun> {
+        if context.schema_version != crate::generation_context::GENERATION_CONTEXT_SCHEMA {
+            return Err(anyhow!("unsupported GenerationContext schema"));
+        }
+        crate::generation_context::validate_generation_context_binding(context)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(&context.run_binding.run_id)
+            .ok_or_else(|| anyhow!("run not found: {}", context.run_binding.run_id))?;
+        if run.project_id != context.run_binding.project_id {
+            return Err(anyhow!("GenerationContext project binding mismatch"));
+        }
+        if let Some(existing) = run.generation_context_binding_hash.as_deref() {
+            if existing == context.run_context_binding_hash {
+                return Ok(run.clone());
+            }
+            return Err(anyhow!(
+                "generation_context.binding_immutable: run already has a different binding"
+            ));
+        }
+        let value = serde_json::to_value(context)?;
+        run.run_contract_version =
+            Some(crate::generation_context::GENERATION_CONTEXT_SCHEMA.to_string());
+        run.content_plan_id = Some(context.payload.content_plan.plan_id.clone());
+        run.content_plan_revision = Some(context.payload.content_plan.revision);
+        run.content_plan_hash = Some(context.payload.content_plan.content_hash.clone());
+        run.content_plan_approval_id =
+            Some(context.payload.content_plan.approval.approval_id.clone());
+        run.content_plan_approval_state = Some(context.payload.content_plan.approval.state.clone());
+        run.generation_context_status = Some("compiled".to_string());
+        run.generation_context_schema_version = Some(context.schema_version.clone());
+        run.generation_context_compiler_version =
+            Some(crate::generation_context::GENERATION_CONTEXT_COMPILER_VERSION.to_string());
+        run.generation_context_content_hash = Some(context.context_content_hash.clone());
+        run.generation_context_binding_hash = Some(context.run_context_binding_hash.clone());
+        run.generation_context_runtime_attestation_hash =
+            Some(context.attestation.runtime_attestation_hash.clone());
+        run.visual_binding_set_hash = Some(crate::types::canonical_json_hash(&json!(
+            context.payload.visuals.bindings
+        )));
+        run.visual_delivery_state = Some(
+            if context.payload.visuals.bindings.is_empty() {
+                "not_applicable"
+            } else {
+                "pending"
+            }
+            .to_string(),
+        );
+        run.execution_profile = Some(context.payload.execution_profile.clone());
+        run.workflow_state = Some("context_ready".to_string());
+        run.context_window_epoch = 0;
+        run.context_injected_turn = None;
+        run.generation_context = Some(value);
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn set_run_generation_context_runtime_mode(
+        &self,
+        run_id: &str,
+        mode: &str,
+    ) -> Result<AgentRun> {
+        if !matches!(mode, "shadow" | "enabled") {
+            return Err(anyhow!(
+                "unsupported GenerationContext runtime mode: {mode}"
+            ));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        run.generation_context_runtime_mode = Some(mode.to_string());
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub async fn update_run_generation_runtime_progress(
+        &self,
+        run_id: &str,
+        workflow_state: Option<&str>,
+        context_window_epoch: Option<u64>,
+        context_injected_turn: Option<u32>,
+        visual_delivery_state: Option<&str>,
+    ) -> Result<AgentRun> {
+        if workflow_state.is_some_and(|state| state.trim().is_empty()) {
+            return Err(anyhow!("workflow state cannot be empty"));
+        }
+        if visual_delivery_state.is_some_and(|state| {
+            !matches!(
+                state,
+                "pending" | "delivered" | "unavailable" | "not_applicable"
+            )
+        }) {
+            return Err(anyhow!("unsupported visual delivery state"));
+        }
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if let Some(workflow_state) = workflow_state {
+            run.workflow_state = Some(workflow_state.to_string());
+        }
+        if let Some(epoch) = context_window_epoch {
+            if epoch < run.context_window_epoch {
+                return Err(anyhow!("context window epoch cannot move backwards"));
+            }
+            run.context_window_epoch = epoch;
+        }
+        if let Some(turn) = context_injected_turn {
+            run.context_injected_turn = Some(turn);
+        }
+        if let Some(state) = visual_delivery_state {
+            run.visual_delivery_state = Some(state.to_string());
+        }
+        run.updated_at = Utc::now();
+        let run = run.clone();
+        drop(inner);
+        self.append_run_snapshot(&run)?;
+        Ok(run)
+    }
+
+    pub(crate) async fn cached_generation_context_payload(
+        &self,
+        cache_key: &str,
+    ) -> Option<crate::generation_context::GenerationContextPayload> {
+        self.inner
+            .read()
+            .await
+            .generation_context_payload_cache
+            .get(cache_key)
+            .cloned()
+    }
+
+    pub(crate) async fn cache_generation_context_payload(
+        &self,
+        cache_key: String,
+        payload: crate::generation_context::GenerationContextPayload,
+    ) {
+        self.inner
+            .write()
+            .await
+            .generation_context_payload_cache
+            .entry(cache_key)
+            .or_insert(payload);
+    }
+
+    pub async fn mark_run_generation_context_fallback(
+        &self,
+        run_id: &str,
+        identity: Option<&crate::generation_context::ContentPlanIdentity>,
+        approval_state: &str,
+        approval_id: Option<&str>,
+    ) -> Result<AgentRun> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let run = inner
+            .runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if run.generation_context_binding_hash.is_some() {
+            return Err(anyhow!(
+                "generation_context.binding_immutable: compiled binding cannot fall back"
+            ));
+        }
+        if let Some(identity) = identity {
+            run.content_plan_id = Some(identity.plan_id.clone());
+            run.content_plan_revision = Some(identity.revision);
+            run.content_plan_hash = Some(identity.content_hash.clone());
+        }
+        run.content_plan_approval_state = Some(approval_state.to_string());
+        run.content_plan_approval_id = approval_id.map(ToOwned::to_owned);
+        run.generation_context_status = Some("fallback_legacy_protocol".to_string());
         run.updated_at = Utc::now();
         let run = run.clone();
         drop(inner);
@@ -1078,6 +1540,18 @@ impl RuntimeStore {
             .filter(|run| run.project_id == project_id)
             .cloned()
             .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(runs)
+    }
+
+    pub async fn all_runs(&self) -> Result<Vec<AgentRun>> {
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        let mut runs = inner.runs.values().cloned().collect::<Vec<_>>();
         runs.sort_by(|left, right| {
             left.started_at
                 .cmp(&right.started_at)
@@ -2227,10 +2701,13 @@ impl RuntimeStore {
             .runs
             .get_mut(run_id)
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
-        frozen_run_design_context_manifest(run)
-            .map_err(|error| anyhow!(error))?
-            .ok_or_else(|| anyhow!("cannot verify a style contract without a frozen DCP"))?;
-        if verified && run.design_context_materialization_hash.is_none() {
+        let frozen_dcp = frozen_run_design_context_manifest(run).map_err(|error| anyhow!(error))?;
+        if frozen_dcp.is_none() && run.project_state_snapshot.is_none() {
+            return Err(anyhow!(
+                "cannot verify a template-default style contract before project initialization"
+            ));
+        }
+        if frozen_dcp.is_some() && verified && run.design_context_materialization_hash.is_none() {
             return Err(anyhow!(
                 "cannot verify a style contract before DCP materialization"
             ));
@@ -2935,6 +3412,15 @@ impl RuntimeStore {
             task_list: Vec::new(),
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: run.generation_context_content_hash.clone(),
+            run_context_binding_hash: run.generation_context_binding_hash.clone(),
+            runtime_attestation_hash: run.generation_context_runtime_attestation_hash.clone(),
+            context_window_epoch: Some(run.context_window_epoch),
+            execution_profile: run.execution_profile.clone(),
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: run.workflow_state.clone(),
+            observation_receipts_version: None,
             brief_version: Some(brief_id.clone()),
             design_version: run.design_version,
             last_known_preview_url: None,
@@ -3060,6 +3546,15 @@ impl RuntimeStore {
             task_list: Vec::new(),
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: run.generation_context_content_hash.clone(),
+            run_context_binding_hash: run.generation_context_binding_hash.clone(),
+            runtime_attestation_hash: run.generation_context_runtime_attestation_hash.clone(),
+            context_window_epoch: Some(run.context_window_epoch),
+            execution_profile: run.execution_profile.clone(),
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: run.workflow_state.clone(),
+            observation_receipts_version: None,
             brief_version: Some(brief_id.to_string()),
             design_version: run.design_version,
             last_known_preview_url: None,
@@ -3969,31 +4464,47 @@ impl RuntimeStore {
         tool_name: &str,
         input_hash: &str,
     ) -> Result<ToolExecutionReservation> {
-        let mut inner = self.inner.write().await;
-        self.hydrate_tool_executions(&mut inner)?;
         let key = (run_id.to_string(), tool_use_id.to_string());
-        if let Some(existing) = inner.tool_executions.get(&key).cloned() {
-            if existing.tool_name != tool_name || existing.input_hash != input_hash {
-                return Ok(ToolExecutionReservation::Conflict(existing));
+        let execution = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_tool_executions(&mut inner)?;
+            if let Some(existing) = inner.tool_executions.get(&key).cloned() {
+                if existing.tool_name != tool_name || existing.input_hash != input_hash {
+                    return Ok(ToolExecutionReservation::Conflict(existing));
+                }
+                return Ok(match existing.status {
+                    ToolExecutionStatus::Completed => ToolExecutionReservation::Replay(existing),
+                    ToolExecutionStatus::Started => ToolExecutionReservation::InDoubt(existing),
+                });
             }
-            return Ok(match existing.status {
-                ToolExecutionStatus::Completed => ToolExecutionReservation::Replay(existing),
-                ToolExecutionStatus::Started => ToolExecutionReservation::InDoubt(existing),
-            });
-        }
-        let execution = ToolExecutionRecord {
-            run_id: run_id.to_string(),
-            tool_use_id: tool_use_id.to_string(),
-            tool_name: tool_name.to_string(),
-            input_hash: input_hash.to_string(),
-            status: ToolExecutionStatus::Started,
-            result_content: None,
-            result_is_error: false,
-            result_metadata: None,
-            updated_at: Utc::now(),
+            let execution = ToolExecutionRecord {
+                run_id: run_id.to_string(),
+                tool_use_id: tool_use_id.to_string(),
+                tool_name: tool_name.to_string(),
+                input_hash: input_hash.to_string(),
+                status: ToolExecutionStatus::Started,
+                result_content: None,
+                result_is_error: false,
+                result_metadata: None,
+                updated_at: Utc::now(),
+            };
+            // Publish the in-doubt marker in memory before releasing the lock so a
+            // concurrent duplicate cannot execute while the durable reservation is written.
+            inner.tool_executions.insert(key.clone(), execution.clone());
+            execution
         };
-        self.append_tool_execution_snapshot(&execution)?;
-        inner.tool_executions.insert(key, execution);
+        if let Err(error) = self.append_tool_execution_snapshot(&execution) {
+            let mut inner = self.inner.write().await;
+            if inner.tool_executions.get(&key).is_some_and(|current| {
+                current.status == ToolExecutionStatus::Started
+                    && current.tool_name == execution.tool_name
+                    && current.input_hash == execution.input_hash
+                    && current.updated_at == execution.updated_at
+            }) {
+                inner.tool_executions.remove(&key);
+            }
+            return Err(error);
+        }
         Ok(ToolExecutionReservation::Reserved)
     }
 
@@ -4005,32 +4516,37 @@ impl RuntimeStore {
         input_hash: &str,
         result: ToolExecutionCompletion,
     ) -> Result<ToolExecutionRecord> {
-        let mut inner = self.inner.write().await;
-        self.hydrate_tool_executions(&mut inner)?;
         let key = (run_id.to_string(), tool_use_id.to_string());
-        let existing =
-            inner.tool_executions.get(&key).cloned().ok_or_else(|| {
+        let completed = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_tool_executions(&mut inner)?;
+            let existing = inner.tool_executions.get(&key).cloned().ok_or_else(|| {
                 anyhow!("tool execution was not reserved: {run_id}/{tool_use_id}")
             })?;
-        if existing.tool_name != tool_name || existing.input_hash != input_hash {
-            return Err(anyhow!(
-                "tool execution identity changed for {run_id}/{tool_use_id}"
-            ));
-        }
-        if existing.status == ToolExecutionStatus::Completed {
-            return Ok(existing);
-        }
-        let result = durable_tool_execution_completion(result);
-        let completed = ToolExecutionRecord {
-            status: ToolExecutionStatus::Completed,
-            result_content: Some(result.content),
-            result_is_error: result.is_error,
-            result_metadata: result.metadata,
-            updated_at: Utc::now(),
-            ..existing
+            if existing.tool_name != tool_name || existing.input_hash != input_hash {
+                return Err(anyhow!(
+                    "tool execution identity changed for {run_id}/{tool_use_id}"
+                ));
+            }
+            if existing.status == ToolExecutionStatus::Completed {
+                return Ok(existing);
+            }
+            let result = durable_tool_execution_completion(result);
+            ToolExecutionRecord {
+                status: ToolExecutionStatus::Completed,
+                result_content: Some(result.content),
+                result_is_error: result.is_error,
+                result_metadata: result.metadata,
+                updated_at: Utc::now(),
+                ..existing
+            }
         };
         self.append_tool_execution_snapshot(&completed)?;
-        inner.tool_executions.insert(key, completed.clone());
+        self.inner
+            .write()
+            .await
+            .tool_executions
+            .insert(key, completed.clone());
         Ok(completed)
     }
 
@@ -4607,6 +5123,17 @@ impl RuntimeStore {
             task_list: Vec::new(),
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: run.generation_context_content_hash.clone(),
+            run_context_binding_hash: run.generation_context_binding_hash.clone(),
+            runtime_attestation_hash: run.generation_context_runtime_attestation_hash.clone(),
+            context_window_epoch: Some(run.context_window_epoch),
+            execution_profile: run.execution_profile.clone(),
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: run.workflow_state.clone(),
+            observation_receipts_version: (run.run_contract_version.as_deref()
+                == Some(crate::generation_context::GENERATION_CONTEXT_SCHEMA))
+            .then_some(1),
             brief_version: run.brief_version,
             design_version: run.design_version,
             last_known_preview_url: None,
@@ -5690,6 +6217,22 @@ impl RuntimeStore {
         run_id: &str,
         version_id: &str,
     ) -> Option<ArtifactPublishRecord> {
+        if let Some(publish) = self
+            .inner
+            .read()
+            .await
+            .artifact_publishes
+            .values()
+            .filter(|publish| {
+                publish.project_id == project_id
+                    && publish.run_id == run_id
+                    && publish.version_id == version_id
+            })
+            .max_by_key(|publish| publish.revision)
+            .cloned()
+        {
+            return Some(publish);
+        }
         let mut inner = self.inner.write().await;
         self.hydrate_artifact_transactions(&mut inner).ok()?;
         inner
@@ -6282,7 +6825,10 @@ impl RuntimeStore {
         if !force_new {
             if let Some(existing) = run_snapshots.clone().find(|snapshot| {
                 snapshot.source_hash == source_hash
-                    && snapshot.source_snapshot_uri == source_snapshot_uri
+                    && snapshot.template_id == template_id
+                    && snapshot.template_version == template_version
+                    && snapshot.dependency_policy_version == dependency_policy_version
+                    && snapshot.design_context_hash == design_context_hash
             }) {
                 return Ok(existing.clone());
             }
@@ -6577,6 +7123,16 @@ impl RuntimeStore {
     }
 
     pub async fn get_project_version(&self, version_id: &str) -> Option<ProjectVersion> {
+        if let Some(version) = self
+            .inner
+            .read()
+            .await
+            .project_versions
+            .get(version_id)
+            .cloned()
+        {
+            return Some(version);
+        }
         {
             let mut inner = self.inner.write().await;
             self.hydrate_artifact_transactions(&mut inner).ok()?;
@@ -6709,6 +7265,16 @@ impl RuntimeStore {
     }
 
     pub async fn current_project_version(&self, project_id: &str) -> Option<ProjectVersion> {
+        if let Some(version) = {
+            let inner = self.inner.read().await;
+            inner
+                .project_current_versions
+                .get(project_id)
+                .and_then(|current_id| inner.project_versions.get(current_id))
+                .cloned()
+        } {
+            return Some(version);
+        }
         let current_id = {
             let mut inner = self.inner.write().await;
             self.hydrate_artifact_transactions(&mut inner).ok()?;
@@ -7239,6 +7805,89 @@ fn channel_lease_transition_allowed(from: ChannelLeaseStatus, to: ChannelLeaseSt
                 | (ChannelLeaseStatus::Failed, ChannelLeaseStatus::Acquiring)
                 | (ChannelLeaseStatus::Released, ChannelLeaseStatus::Acquiring)
         )
+}
+
+#[cfg(test)]
+mod cache_fast_path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn release_evidence_lookups_use_live_memory_before_persistence_hydration() {
+        let store = RuntimeStore::new();
+        let now = Utc::now();
+        let version = ProjectVersion {
+            id: "version-live".to_string(),
+            project_id: "project-live".to_string(),
+            source_snapshot_uri: Some("source://live".to_string()),
+            preview_url: "https://preview.invalid".to_string(),
+            screenshot_uri: None,
+            screenshot_id: None,
+            status: ProjectVersionStatus::Promoted,
+            created_by_run_id: "run-live".to_string(),
+            created_at: now,
+            promoted_at: Some(now),
+        };
+        let publish = ArtifactPublishRecord {
+            id: "publish-live".to_string(),
+            idempotency_key: "project-live/run-live/build-live".to_string(),
+            project_id: "project-live".to_string(),
+            run_id: "run-live".to_string(),
+            build_id: "build-live".to_string(),
+            version_id: version.id.clone(),
+            sandbox_binding_id: None,
+            pod_uid: None,
+            candidate_manifest_hash: "candidate-live".to_string(),
+            artifact_manifest_hash: Some("artifact-live".to_string()),
+            source_snapshot_uri: "source://live".to_string(),
+            expected_current_version_id: None,
+            status: ArtifactPublishStatus::Promoted,
+            revision: 3,
+            staged_uri: None,
+            immutable_artifact_uri: Some("artifact://live".to_string()),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            gc_after: None,
+        };
+        {
+            let mut inner = store.inner.write().await;
+            inner
+                .project_current_versions
+                .insert(version.project_id.clone(), version.id.clone());
+            inner
+                .project_versions
+                .insert(version.id.clone(), version.clone());
+            inner
+                .artifact_publishes
+                .insert(publish.id.clone(), publish.clone());
+        }
+
+        // A persistence hydration attempt would fail on these malformed snapshots.
+        fs::write(store.artifact_publish_log_path.as_ref(), b"not-json\n").unwrap();
+        fs::write(store.promotion_commit_log_path.as_ref(), b"not-json\n").unwrap();
+        fs::write(store.outbox_log_path.as_ref(), b"not-json\n").unwrap();
+
+        assert_eq!(
+            store
+                .current_project_version("project-live")
+                .await
+                .map(|version| version.id),
+            Some("version-live".to_string())
+        );
+        assert_eq!(
+            store
+                .get_project_version("version-live")
+                .await
+                .map(|version| version.project_id),
+            Some("project-live".to_string())
+        );
+        assert_eq!(
+            store
+                .artifact_publish_for_version("project-live", "run-live", "version-live")
+                .await,
+            Some(publish)
+        );
+    }
 }
 
 fn preview_updated_outbox_id(project_id: &str, version_id: &str) -> String {

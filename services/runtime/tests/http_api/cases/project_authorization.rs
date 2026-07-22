@@ -65,7 +65,7 @@ fn authorization_dcp_profile(id: &str, scope_project_id: &str) -> DesignProfile 
         website_context: json!({ "enforcementMode": "observe" }),
         content: json!({}),
         accessibility: json!({}),
-        technical: json!({ "allowedTemplates": ["astro-website"] }),
+        technical: json!({ "allowedTemplates": ["next-app"] }),
         governance: json!({ "conflictBehavior": "ask" }),
         signature_rules: Vec::new(),
         overrides: json!({}),
@@ -89,18 +89,13 @@ async fn attach_authorization_dcp(
         )
         .await;
     store
-        .attach_run_effective_design_profile(
-            &run.id,
-            profile,
-            Some("website"),
-            Some("astro-website"),
-        )
+        .attach_run_effective_design_profile(&run.id, profile, Some("website"), Some("next-app"))
         .await?;
     let template = BuiltInTemplateRegistry::built_in()
-        .current(&TemplateId::parse("astro-website").unwrap())
+        .current(&TemplateId::parse("next-app").unwrap())
         .unwrap();
     let dcp = compile_website_design_context(
-        &profile.effective_for("website", "astro-website").unwrap(),
+        &profile.effective_for("website", "next-app").unwrap(),
         &website_brief(),
         &template,
         &DesignContextCompileOptions::default(),

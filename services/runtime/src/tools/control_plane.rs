@@ -93,6 +93,7 @@ pub fn control_plane_executor_for_config(config: &RuntimeConfig) -> ToolExecutor
         .with_runtime_browser_proxy_base_url(config.runtime_browser_proxy_base_url())
         .with_remote_workspace(config.sandbox_backend_mode == SandboxBackendMode::Kubernetes)
         .with_runtime_storage_dir(config.runtime_storage_dir.clone())
+        .with_observation_receipts_enabled(config.observation_receipts_enabled)
         .with_workspace_root(&config.workspace_root)
 }
 

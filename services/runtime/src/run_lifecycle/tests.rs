@@ -2,7 +2,7 @@ use super::{
     BuildSandboxProvisioner, EditWorkspaceRestorer, RunLifecycleService, RunSessionLauncher,
 };
 use crate::{
-    config::RuntimeConfig,
+    config::{ContentPlanAttestationMode, GenerationContextMode, RuntimeConfig},
     conversation::RuntimeStore,
     design_context::{
         compile_website_design_context, DesignContextCompileOptions,
@@ -17,14 +17,158 @@ use crate::{
     },
     visual_contracts::{EditBase, EditImpactOperation, EditImpactRisk, EditImpactScope},
 };
+
+#[tokio::test]
+async fn enforced_build_rejects_missing_content_plan_before_creating_a_run() {
+    let store = RuntimeStore::new();
+    let brief_run = store
+        .create_run(
+            "project-content-plan-enforce".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief_draft(
+            &brief_run.id,
+            Brief {
+                project_type: "website".to_string(),
+                audience: "operators".to_string(),
+                content_hierarchy: vec!["hero".to_string()],
+                page_structure: serde_json::json!([]),
+                visual_direction: "clear".to_string(),
+                recommended_template: "next-app".to_string(),
+                assumptions: vec![],
+                missing_information: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+    let mut config = RuntimeConfig::from_env();
+    config.generation_context_mode = GenerationContextMode::Enabled;
+    config.content_plan_attestation_mode = ContentPlanAttestationMode::Enforce;
+    let service = RunLifecycleService::new(
+        config,
+        store.clone(),
+        Arc::new(RecordingSessionLauncher::default()),
+        Arc::new(UnusedSandboxProvisioner),
+        Arc::new(UnusedEditWorkspaceRestorer),
+        crate::design_profile_service::DesignProfileService::new(store.clone()),
+    );
+
+    let error = service
+        .start(super::StartRunCommand {
+            project_id: "project-content-plan-enforce".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            input_context: super::StartRunContext {
+                brief_id: Some(brief_id),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, super::RunLifecycleError::Conflict(message) if message.contains("content_plan.approval_rejected"))
+    );
+    let runs = store
+        .project_runs("project-content-plan-enforce")
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].phase, AgentPhase::Brief);
+}
 use chrono::Utc;
 use std::{
     collections::BTreeMap,
+    fs,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
+
+#[tokio::test]
+async fn replan_successor_lineage_survives_runtime_restart() {
+    let temp = std::env::temp_dir().join(format!(
+        "zerondesign-replan-lineage-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let checkpoint_dir = temp.join("checkpoints");
+    let run_log_dir = temp.join("run-log");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    let predecessor = store
+        .create_run(
+            "project-replan-restart".to_string(),
+            AgentPhase::Repair,
+            "repair".to_string(),
+            "internal-balanced".to_string(),
+            Vec::new(),
+        )
+        .await;
+    store
+        .append_event(AgentEvent::RunWorkflowProgress {
+            run_id: predecessor.id.clone(),
+            turn: 1,
+            stage: "replan_required".to_string(),
+            completed_steps: vec!["replan_required".to_string()],
+            next_action: serde_json::json!({ "tool": "orchestrator.create_successor_run" }),
+            budgets: serde_json::json!({}),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .ensure_initial_checkpoint(&predecessor.id)
+        .await
+        .unwrap();
+    store
+        .update_run_status(&predecessor.id, AgentRunStatus::Partial)
+        .await
+        .unwrap();
+    let successor = store
+        .create_replan_successor_run_with_context(
+            &predecessor.id,
+            predecessor.project_id.clone(),
+            AgentPhase::Repair,
+            "repair".to_string(),
+            "internal-balanced".to_string(),
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let reloaded = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert_eq!(
+        reloaded
+            .get_run(&predecessor.id)
+            .await
+            .unwrap()
+            .successor_run_id
+            .as_deref(),
+        Some(successor.id.as_str())
+    );
+    assert_eq!(
+        reloaded
+            .get_run(&successor.id)
+            .await
+            .unwrap()
+            .predecessor_run_id
+            .as_deref(),
+        Some(predecessor.id.as_str())
+    );
+    drop(reloaded);
+    fs::remove_dir_all(temp).unwrap();
+}
 
 struct UnusedSandboxProvisioner;
 
@@ -435,7 +579,7 @@ async fn start_edit_cancels_created_run_when_workspace_restore_fails() {
 }
 
 #[tokio::test]
-async fn start_draft_edit_freezes_revision_and_consumes_confirmation_without_restoring_workspace() {
+async fn start_draft_edit_freezes_revision_and_consumes_confirmation_at_first_mutation() {
     let store = RuntimeStore::new();
     let binding = store
         .create_sandbox_binding(
@@ -527,7 +671,122 @@ async fn start_draft_edit_freezes_revision_and_consumes_confirmation_without_res
     assert!(store
         .edit_guard_store()
         .validate_executable(&store.draft_preview_store(), &plan.plan_hash)
+        .is_ok());
+    let scope_error = store
+        .preflight_edit_mutation(&run.id, Some("app/outside-plan.tsx"))
+        .await
+        .unwrap_err();
+    assert!(scope_error
+        .to_string()
+        .contains("edit.plan_scope_violation"));
+    assert!(store
+        .edit_guard_store()
+        .validate_executable(&store.draft_preview_store(), &plan.plan_hash)
+        .is_ok());
+    let run = store
+        .preflight_edit_mutation(&run.id, Some("app/layout.tsx"))
+        .await
+        .unwrap();
+    assert!(run.edit_mutation_preflight_completed);
+    assert!(store
+        .edit_guard_store()
+        .validate_executable(&store.draft_preview_store(), &plan.plan_hash)
         .is_err());
+    let later_scope_error = store
+        .preflight_edit_mutation(&run.id, Some("app/outside-after-first-mutation.tsx"))
+        .await
+        .unwrap_err();
+    assert!(later_scope_error
+        .to_string()
+        .contains("edit.plan_scope_violation"));
+
+    let replacement_plan = store
+        .edit_guard_store()
+        .create_plan(
+            &store.draft_preview_store(),
+            crate::edit_guard::CreateEditImpactPlan {
+                observation_id: None,
+                scope: EditImpactScope::Local,
+                targets: vec!["app/page.tsx".to_string()],
+                operations: vec![EditImpactOperation::Copy],
+                risk: EditImpactRisk::Low,
+                edit_base: run.edit_base.clone().unwrap(),
+            },
+        )
+        .unwrap();
+    assert!(!replacement_plan.requires_confirmation);
+    store
+        .append_event(AgentEvent::RunWorkflowProgress {
+            run_id: run.id.clone(),
+            turn: 1,
+            stage: "replan_required".to_string(),
+            completed_steps: vec!["replan_required".to_string()],
+            next_action: serde_json::json!({ "tool": "orchestrator.create_successor_run" }),
+            budgets: serde_json::json!({}),
+            timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+    store
+        .update_run_status(&run.id, AgentRunStatus::Partial)
+        .await
+        .unwrap();
+    store
+        .append_conversation_item(
+            &run.project_id,
+            Some(&run.id),
+            "user_message",
+            Some("user"),
+            "Update the homepage copy.",
+            None,
+        )
+        .await;
+    let successor = service
+        .dispatch_replan_successor(&run.id, &replacement_plan.plan_hash)
+        .await
+        .unwrap();
+    assert_eq!(successor.status, "running");
+    let repair = store.get_run(&successor.run_id).await.unwrap();
+    assert_eq!(
+        repair.edit_impact_plan_hash.as_deref(),
+        Some(replacement_plan.plan_hash.as_str())
+    );
+    assert_ne!(repair.edit_impact_plan_hash, run.edit_impact_plan_hash);
+    assert_eq!(repair.predecessor_run_id.as_deref(), Some(run.id.as_str()));
+    assert_eq!(
+        store
+            .get_run(&run.id)
+            .await
+            .unwrap()
+            .successor_run_id
+            .as_deref(),
+        Some(repair.id.as_str())
+    );
+    assert_eq!(
+        launcher.launched.lock().unwrap().as_slice(),
+        [repair.id.clone()]
+    );
+    let idempotent = service
+        .dispatch_replan_successor(&run.id, &replacement_plan.plan_hash)
+        .await
+        .unwrap();
+    assert_eq!(idempotent.run_id, repair.id);
+    let duplicate = store
+        .create_replan_successor_run_with_context(
+            &run.id,
+            run.project_id.clone(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            Vec::new(),
+            run.brief_version.clone(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(duplicate
+        .to_string()
+        .contains("already has a successor Run"));
 }
 
 #[tokio::test]

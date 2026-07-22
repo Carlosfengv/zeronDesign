@@ -91,6 +91,8 @@ struct StoredPlan {
     plan: EditImpactPlan,
     observation_id: Option<String>,
     project_id: String,
+    #[serde(default)]
+    predecessor_run_id: Option<String>,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -320,6 +322,7 @@ impl EditGuardStore {
             plan: plan.clone(),
             observation_id: request.observation_id,
             project_id,
+            predecessor_run_id: None,
             created_at: Utc::now(),
         };
         let mut state = self.state.lock().unwrap();
@@ -338,6 +341,50 @@ impl EditGuardStore {
             .plans
             .get(plan_hash)
             .map(|stored| (stored.project_id.clone(), stored.plan.clone()))
+    }
+
+    pub fn bind_replan_predecessor(
+        &self,
+        plan_hash: &str,
+        project_id: &str,
+        predecessor_run_id: &str,
+    ) -> Result<(), EditGuardError> {
+        if predecessor_run_id.trim().is_empty() {
+            return Err(EditGuardError::InvalidInput(
+                "predecessorRunId must not be empty".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut stored = state
+            .plans
+            .get(plan_hash)
+            .cloned()
+            .ok_or_else(|| EditGuardError::NotFound(plan_hash.to_string()))?;
+        if stored.project_id != project_id {
+            return Err(EditGuardError::NotFound(plan_hash.to_string()));
+        }
+        if let Some(existing) = stored.predecessor_run_id.as_deref() {
+            if existing != predecessor_run_id {
+                return Err(conflict(
+                    "edit.replan_predecessor_conflict",
+                    "EditImpactPlan is already bound to another predecessor Run",
+                ));
+            }
+            return Ok(());
+        }
+        stored.predecessor_run_id = Some(predecessor_run_id.to_string());
+        append_jsonl(&self.plan_log, &stored)?;
+        state.plans.insert(plan_hash.to_string(), stored);
+        Ok(())
+    }
+
+    pub fn replan_predecessor(&self, plan_hash: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .plans
+            .get(plan_hash)
+            .and_then(|stored| stored.predecessor_run_id.clone())
     }
 
     pub fn confirm(
@@ -532,6 +579,13 @@ fn read_or_create_signing_key(path: &Path) -> Result<Vec<u8>, EditGuardError> {
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let key = rand::random::<[u8; 32]>().to_vec();
+            let parent = path.parent().ok_or_else(|| {
+                EditGuardError::Storage("observation signing key path has no parent".to_string())
+            })?;
+            let temp_path = parent.join(format!(
+                ".observation-signing-key-{:016x}.tmp",
+                rand::random::<u64>()
+            ));
             let mut options = OpenOptions::new();
             options.create_new(true).write(true);
             #[cfg(unix)]
@@ -539,31 +593,31 @@ fn read_or_create_signing_key(path: &Path) -> Result<Vec<u8>, EditGuardError> {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            match options.open(path) {
-                Ok(mut file) => match file.write_all(&key).and_then(|_| file.sync_all()) {
-                    Ok(()) => Ok(key),
-                    Err(error) => Err(error.into()),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Another Runtime instance won create_new but may still be between
-                    // file creation and fsync. Read the winner's key; never overwrite it.
-                    for _ in 0..100 {
-                        match fs::read(path) {
-                            Ok(key) if key.len() >= 32 => return Ok(key),
-                            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
-                            Err(read_error)
-                                if read_error.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(2));
-                            }
-                            Err(read_error) => return Err(read_error.into()),
-                        }
-                    }
-                    Err(EditGuardError::Storage(
-                        "observation signing key creation did not complete".to_string(),
-                    ))
+            let mut file = options.open(&temp_path)?;
+            if let Err(error) = file.write_all(&key).and_then(|_| file.sync_all()) {
+                fs::remove_file(&temp_path).ok();
+                return Err(error.into());
+            }
+            drop(file);
+            match fs::hard_link(&temp_path, path) {
+                Ok(()) => {
+                    fs::remove_file(&temp_path).ok();
+                    Ok(key)
                 }
-                Err(error) => Err(error.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    fs::remove_file(&temp_path).ok();
+                    let winning_key = fs::read(path)?;
+                    if winning_key.len() < 32 {
+                        return Err(EditGuardError::Storage(
+                            "observation signing key is too short".to_string(),
+                        ));
+                    }
+                    Ok(winning_key)
+                }
+                Err(error) => {
+                    fs::remove_file(&temp_path).ok();
+                    Err(error.into())
+                }
             }
         }
         Err(error) => Err(error.into()),
@@ -747,6 +801,53 @@ mod tests {
             store.consume(&drafts, &plan.plan_hash),
             Err(EditGuardError::Conflict {
                 kind: "edit.plan_stale",
+                ..
+            })
+        ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn replan_predecessor_binding_survives_restart_and_cannot_be_rebound() {
+        let root = root("replan-binding");
+        let (drafts, session) = session(&root);
+        let store = EditGuardStore::open(&root).unwrap();
+        let plan = store
+            .create_plan(
+                &drafts,
+                CreateEditImpactPlan {
+                    observation_id: None,
+                    scope: EditImpactScope::Local,
+                    targets: vec!["app/page.tsx".to_string()],
+                    operations: vec![EditImpactOperation::Copy],
+                    risk: EditImpactRisk::Low,
+                    edit_base: EditBase::Draft {
+                        snapshot_id: session.durable_snapshot_id.clone(),
+                        session_id: session.session_id.clone(),
+                        expected_session_epoch: session.session_epoch,
+                        expected_workspace_revision: session.workspace_revision,
+                        writer_lease_id: session.writer_lease_id.clone(),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .bind_replan_predecessor(&plan.plan_hash, "project-1", "run-predecessor-1")
+            .unwrap();
+        drop(store);
+
+        let store = EditGuardStore::open(&root).unwrap();
+        assert_eq!(
+            store.replan_predecessor(&plan.plan_hash).as_deref(),
+            Some("run-predecessor-1")
+        );
+        store
+            .bind_replan_predecessor(&plan.plan_hash, "project-1", "run-predecessor-1")
+            .unwrap();
+        assert!(matches!(
+            store.bind_replan_predecessor(&plan.plan_hash, "project-1", "run-predecessor-2"),
+            Err(EditGuardError::Conflict {
+                kind: "edit.replan_predecessor_conflict",
                 ..
             })
         ));

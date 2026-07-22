@@ -1,5 +1,6 @@
 use super::{invalid_request, sandbox_binding_error, start::StartRunCommand, RunLifecycleError};
 use crate::{conversation::RuntimeStore, types::AgentPhase};
+use std::collections::HashSet;
 
 pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleError> {
     required("projectId", &command.project_id)?;
@@ -29,6 +30,17 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
         command.input_context.parent_run_id.as_deref(),
     )?;
     optional(
+        "predecessorRunId",
+        command.input_context.predecessor_run_id.as_deref(),
+    )?;
+    if command.input_context.parent_run_id.is_some()
+        && command.input_context.predecessor_run_id.is_some()
+    {
+        return Err(invalid_request(
+            "parentRunId and predecessorRunId are mutually exclusive".to_string(),
+        ));
+    }
+    optional(
         "designProfileId",
         command.input_context.design_profile_id.as_deref(),
     )?;
@@ -53,6 +65,25 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
             ));
         }
         required("modelResourceId", model_resource_id)?;
+    }
+    if command.input_context.visual_bindings.len() > 16 {
+        return Err(invalid_request(
+            "visualBindings must contain at most 16 entries".to_string(),
+        ));
+    }
+    let mut visual_slots = HashSet::new();
+    for binding in &command.input_context.visual_bindings {
+        binding.validate().map_err(invalid_request)?;
+        if binding.role != crate::visual_contracts::RunVisualBindingRole::Reference {
+            return Err(invalid_request(
+                "StartRun visualBindings may only contain reference bindings".to_string(),
+            ));
+        }
+        if !visual_slots.insert((binding.role, binding.order)) {
+            return Err(invalid_request(
+                "visualBindings role/order pairs must be unique".to_string(),
+            ));
+        }
     }
     for finding_id in &command.input_context.finding_ids {
         if finding_id.trim().is_empty() {

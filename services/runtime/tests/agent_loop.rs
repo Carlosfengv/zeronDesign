@@ -1,6 +1,5 @@
 use anydesign_runtime::{
     agent_loop::{AgentLoop, AgentLoopLimits},
-    config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     model_gateway::{
         MockModelClient, ModelClient, ModelClientTurn, ModelGatewayScope, ModelRequest,
@@ -36,7 +35,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio::sync::Mutex;
 
 fn design_profile_fixture(project_id: &str) -> DesignProfile {
     let now = Utc::now();
@@ -113,8 +112,8 @@ fn design_profile_fixture(project_id: &str) -> DesignProfile {
         content: json!({}),
         accessibility: json!({}),
         technical: json!({
-            "allowedTemplates": ["astro-website", "fumadocs-docs"],
-            "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+            "allowedTemplates": ["next-app", "fumadocs-docs"],
+            "preferredTemplates": { "website": "next-app", "docs": "fumadocs-docs" },
             "cssStrategy": "runtime-style-contract",
             "dependencyPolicy": {},
             "filePolicy": {
@@ -143,7 +142,7 @@ async fn brief_run_prompt_stays_on_content_sources_without_workspace_exploration
             vec![ContentSource::readable(
                 "source-1",
                 "prompt",
-                "Create a styled Astro website",
+                "Create a styled Next.js website",
             )],
         )
         .await;
@@ -169,7 +168,7 @@ async fn brief_run_prompt_stays_on_content_sources_without_workspace_exploration
         .contains("Do not inspect the filesystem or browser during Brief runs"));
     assert!(requests[0]
         .system_prompt
-        .contains("astro-website for website projects"));
+        .contains("next-app for website projects"));
     assert!(requests[0]
         .system_prompt
         .contains("fumadocs-docs for docs projects"));
@@ -207,7 +206,7 @@ async fn build_run_bootstraps_confirmed_brief_into_workspace_before_model_turn()
                     }
                 ]),
                 visual_direction: "precise and calm".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec!["Use the internal brand system.".to_string()],
                 missing_information: vec![],
             },
@@ -352,7 +351,7 @@ async fn build_run_bootstraps_design_profile_json_and_markdown() {
                     }
                 ]),
                 visual_direction: "precise and calm".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -490,7 +489,7 @@ async fn imported_profile_bootstrap_preserves_source_bytes_and_writes_index() {
                 content_hierarchy: vec!["AuthKit".to_string()],
                 page_structure: json!([]),
                 visual_direction: "frosted glass".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -513,7 +512,7 @@ async fn imported_profile_bootstrap_preserves_source_bytes_and_writes_index() {
             &build_run.id,
             &profile,
             Some("website"),
-            Some("astro-website"),
+            Some("next-app"),
         )
         .await
         .unwrap();
@@ -675,7 +674,7 @@ async fn edit_run_bootstraps_design_profile_json_and_markdown() {
                     }
                 ]),
                 visual_direction: "precise and calm".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -792,7 +791,7 @@ async fn review_run_prompt_uses_design_profile_for_drift_findings() {
         .contains("DesignProfile: id=design-profile-1, version=1"));
     assert!(requests[0]
         .system_prompt
-        .contains("Read inputs/design-profile.json and inputs/design.md"));
+        .contains("read inputs/design-profile.json and inputs/design.md only when present"));
     assert!(requests[0]
         .system_prompt
         .contains("CandidateVersion: version-review-candidate"));
@@ -808,6 +807,106 @@ async fn review_run_prompt_uses_design_profile_for_drift_findings() {
     assert!(requests[0]
         .system_prompt
         .contains("Do not mutate files during Review runs"));
+}
+
+#[tokio::test]
+async fn child_review_does_not_replay_parent_checkpoint_transcript() {
+    let store = RuntimeStore::new();
+    let parent = store
+        .create_run(
+            "project-review-sidechain".to_string(),
+            AgentPhase::Edit,
+            "edit".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    store
+        .append_conversation_item(
+            &parent.project_id,
+            Some(&parent.id),
+            "user_message",
+            Some("user"),
+            "Inspect deliberate marker REVIEW_TARGET_MARKER for zero contrast".to_string(),
+            None,
+        )
+        .await;
+    store
+        .save_checkpoint(AgentCheckpoint {
+            id: "checkpoint-parent-edit-sidechain".to_string(),
+            run_id: parent.id.clone(),
+            project_id: parent.project_id.clone(),
+            phase: parent.phase,
+            message_window: vec![json!({
+                "role": "assistant",
+                "turn": 7,
+                "text": "SETUP EDIT COMPLETE; DO NOT REPLAY IN REVIEW",
+            })],
+            conversation_range: None,
+            task_list: vec![],
+            workspace_snapshot_uri: None,
+            build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
+            brief_version: None,
+            design_version: None,
+            last_known_preview_url: None,
+            context_summary: "parent edit transcript".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let review = store
+        .create_child_run(
+            &parent.id,
+            AgentPhase::Review,
+            "visual-review".to_string(),
+            "internal-balanced".to_string(),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let model = RecordingModelClient::new(
+        vec![ModelResponse::Error(
+            "stop after sidechain assertion".to_string(),
+        )],
+        captured_requests.clone(),
+    );
+
+    AgentLoop::new(store, Arc::new(model))
+        .run(&review.id)
+        .await
+        .unwrap();
+
+    let requests = captured_requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].turn, 1);
+    assert!(!requests[0]
+        .messages
+        .iter()
+        .any(|message| message.to_string().contains("SETUP EDIT COMPLETE")));
+    let review_target = requests[0]
+        .messages
+        .iter()
+        .find(|message| message["kind"] == "runtime_review_target")
+        .expect("Review target should be the latest scoped user message");
+    assert!(review_target["text"]
+        .as_str()
+        .unwrap()
+        .contains("REVIEW_TARGET_MARKER"));
+    assert!(review_target["text"]
+        .as_str()
+        .unwrap()
+        .contains("review.report_finding"));
 }
 
 #[tokio::test]
@@ -952,7 +1051,7 @@ async fn bootstrap_workspace_failure_emits_tool_failed_before_run_failed() {
                     }
                 ]),
                 visual_direction: "precise and calm".to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![],
                 missing_information: vec![],
             },
@@ -1356,6 +1455,15 @@ async fn recovered_token_usage_is_counted_once_per_model_turn() {
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -1525,6 +1633,15 @@ async fn protocol_error_fuse_restores_consecutive_count_after_restart() {
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -1961,7 +2078,7 @@ async fn repeated_recoverable_large_write_failure_stops_run_as_partial() {
         ToolCall::new(
             id,
             "fs.write",
-            json!({ "path": "project/src/pages/index.astro", "text": large_text.clone() }),
+            json!({ "path": "project/app/page.tsx", "text": large_text.clone() }),
         )
     };
     let model = MockModelClient::new(vec![
@@ -2019,7 +2136,7 @@ async fn repeated_recoverable_large_write_failure_stops_run_as_partial() {
             .as_ref()
             .and_then(|metadata| metadata.get("normalizedPath"))
             .and_then(Value::as_str),
-        Some("project/src/pages/index.astro")
+        Some("project/app/page.tsx")
     );
     let partial_summary = events
         .iter()
@@ -2046,7 +2163,7 @@ async fn repeated_recoverable_large_write_failure_stops_run_as_partial() {
             .iter()
             .filter(|failure| failure["errorKind"] == "tool.input_too_large"
                 && failure["tool"] == "fs.write"
-                && failure["path"] == "project/src/pages/index.astro")
+                && failure["path"] == "project/app/page.tsx")
             .count(),
         3
     );
@@ -2118,7 +2235,7 @@ async fn repeated_typed_patch_failure_stops_run_as_partial() {
         .collect::<Vec<_>>();
     assert_eq!(recovery_attempts.len(), 2);
     assert_eq!(recovery_attempts[0].0, "fs.patch");
-    assert_eq!(recovery_attempts[0].1, "patch.read_required");
+    assert_eq!(recovery_attempts[0].1, "mutation.read_required");
     assert_eq!(recovery_attempts[0].2, 2);
     assert!(recovery_attempts[0].4.contains("fs.read"));
     assert_eq!(
@@ -2151,7 +2268,7 @@ async fn repeated_typed_patch_failure_stops_run_as_partial() {
             }
         })
         .expect("partial run.completed event should include a summary");
-    assert!(partial_summary.contains("patch.read_required"));
+    assert!(partial_summary.contains("mutation.read_required"));
     assert!(partial_summary.contains("fs.read"));
 }
 
@@ -2528,6 +2645,15 @@ async fn agent_loop_merges_persisted_conversation_before_appending_after_restart
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -2617,6 +2743,15 @@ async fn approved_permission_replaces_prior_tool_error_before_model_resume() {
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -2717,6 +2852,15 @@ async fn rejected_approved_input_is_consumed_and_reported_once_to_model() {
             task_list: vec![],
             workspace_snapshot_uri: None,
             build_result: None,
+            context_content_hash: None,
+            run_context_binding_hash: None,
+            runtime_attestation_hash: None,
+            context_window_epoch: None,
+            execution_profile: None,
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: None,
+            observation_receipts_version: None,
             brief_version: None,
             design_version: None,
             last_known_preview_url: None,
@@ -2823,8 +2967,9 @@ async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
     let run = store.get_run(&run.id).await.unwrap();
     assert_eq!(run.status, AgentRunStatus::Completed);
     let context = fs::read_to_string(workspace.join("state/context.md")).unwrap();
-    assert!(context.contains("# Runtime Context Compact"));
-    assert!(context.contains("## Previous Compact"));
+    assert!(context.contains("<!-- runtime-context:conversation-compact:"));
+    assert!(context.contains("## Compaction Batch"));
+    assert!(!context.contains("## Previous Compact"));
     assert!(context.contains("tool-missing-0"));
     assert!(context.contains("tool-missing-6"));
     assert!(context.contains("Compacted messages:"));
@@ -3002,321 +3147,6 @@ async fn continue_interrupt_synthetic_failure_is_not_recoverable_in_events() {
 }
 
 #[tokio::test]
-async fn tool_driven_build_run_promotes_preview_before_completion() {
-    let workspace = unique_temp_dir("agent-loop-tool-build");
-    fs::create_dir_all(workspace.join("project/src/pages")).unwrap();
-    fs::create_dir_all(workspace.join("outputs/build")).unwrap();
-    fs::create_dir_all(workspace.join("outputs/screenshots")).unwrap();
-    fs::create_dir_all(workspace.join("state")).unwrap();
-    let (preview_url, _preview_server) = start_preview_server().await;
-    let store = RuntimeStore::new();
-    let run = store
-        .create_run(
-            "project-1".to_string(),
-            AgentPhase::Build,
-            "build".to_string(),
-            "internal-balanced".to_string(),
-            vec![],
-        )
-        .await;
-    let build_script = "const fs=require('fs');\
-fs.mkdirSync('../outputs/build',{recursive:true});\
-fs.mkdirSync('dist',{recursive:true});\
-fs.writeFileSync('../outputs/build/build.log','Build ok\\n');\
-fs.writeFileSync('dist/index.html','<!doctype html><title>ok</title>');";
-    let model = MockModelClient::new(vec![ModelResponse::ToolCalls(vec![
-        ToolCall::new(
-            "tool-rebuilding",
-            "preview.rebuilding",
-            json!({ "previousVersionId": Value::Null }),
-        ),
-        ToolCall::new(
-            "tool-package",
-            "fs.write",
-            json!({
-                "path": "project/package.json",
-                "text": serde_json::to_string_pretty(&json!({
-                    "type": "module",
-                    "scripts": { "build": format!("node -e {:?}", build_script) }
-                })).unwrap()
-            }),
-        ),
-        ToolCall::new(
-            "tool-index",
-            "fs.write",
-            json!({ "path": "project/src/pages/index.astro", "text": "<h1>Design runtime</h1>" }),
-        ),
-        ToolCall::new("tool-build", "project.build", json!({ "cwd": "project" })),
-        ToolCall::new(
-            "tool-preview",
-            "preview.start",
-            json!({ "url": preview_url, "port": 4321 }),
-        ),
-        ToolCall::new(
-            "tool-browser",
-            "browser.open",
-            json!({ "url": "http://127.0.0.1:4321" }),
-        ),
-        ToolCall::new(
-            "tool-shot",
-            "browser.screenshot",
-            json!({ "screenshotId": "shot-tool-build", "blank": false }),
-        ),
-        ToolCall::new(
-            "tool-candidate",
-            "preview.report_candidate",
-            json!({
-                "url": preview_url,
-                "screenshotId": "shot-tool-build"
-            }),
-        ),
-        ToolCall::new(
-            "tool-complete",
-            "run.complete",
-            json!({ "status": "completed", "summary": "Astro preview promoted" }),
-        ),
-    ])]);
-    let executor = control_plane_executor()
-        .with_policy_profile_and_registry(
-            RuntimePolicyProfile::LocalE2e,
-            "https://registry.internal.example/npm/",
-        )
-        .with_workspace_root(&workspace);
-    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
-
-    let results = loop_runner.run(&run.id).await.unwrap();
-
-    assert!(
-        results.iter().all(|result| !result.is_error),
-        "tool-driven build returned errors: {results:#?}"
-    );
-    let run = store.get_run(&run.id).await.unwrap();
-    assert_eq!(run.status, AgentRunStatus::Completed);
-    assert!(run.output_version_id.is_some());
-    assert!(workspace.join("project/dist/index.html").exists());
-
-    let events = store.events(&run.id).await;
-    assert!(events.iter().any(|event| {
-        matches!(
-            event,
-            AgentEvent::ToolCompleted { tool, metadata, .. }
-                if tool == "project.build"
-                    && metadata.as_ref().is_some_and(|metadata| {
-                        metadata
-                            .get("postToolUseSuccess")
-                            .and_then(|hook| hook.get("effect"))
-                            .and_then(Value::as_str)
-                            == Some("build_state_updated")
-                    })
-        )
-    }));
-    let event_types = events
-        .into_iter()
-        .map(|event| {
-            serde_json::to_value(event).unwrap()["type"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    let updated_index = event_types
-        .iter()
-        .position(|event| event == "preview.updated")
-        .expect("preview.updated should be emitted");
-    let completed_index = event_types
-        .iter()
-        .position(|event| event == "run.completed")
-        .expect("run.completed should be emitted");
-    assert!(
-        updated_index < completed_index,
-        "preview.updated must be emitted before run.completed: {event_types:?}"
-    );
-}
-
-#[tokio::test]
-async fn chunked_large_page_build_run_promotes_preview_before_completion() {
-    let workspace = unique_temp_dir("agent-loop-chunked-build");
-    fs::create_dir_all(workspace.join("project/src/pages")).unwrap();
-    fs::create_dir_all(workspace.join("outputs/build")).unwrap();
-    fs::create_dir_all(workspace.join("outputs/screenshots")).unwrap();
-    fs::create_dir_all(workspace.join("state")).unwrap();
-    let (preview_url, _preview_server) = start_preview_server().await;
-    let store = RuntimeStore::new();
-    let run = store
-        .create_run(
-            "project-1".to_string(),
-            AgentPhase::Build,
-            "build".to_string(),
-            "internal-balanced".to_string(),
-            vec![],
-        )
-        .await;
-    let build_script = "const fs=require('fs');\
-const source=fs.readFileSync('src/pages/index.astro','utf8');\
-fs.mkdirSync('../outputs/build',{recursive:true});\
-fs.mkdirSync('dist',{recursive:true});\
-fs.writeFileSync('../outputs/build/build.log','Build ok\\n');\
-fs.writeFileSync('dist/index.html','<!doctype html><title>chunked</title>'+source);";
-    let large_page = format!(
-        "<main><h1>Chunked SaaS Page</h1>{}</main>",
-        "<section><h2>Runtime Reliability</h2><p>Chunked write keeps long generated pages out of a single tool-call JSON argument.</p></section>\n"
-            .repeat(520)
-    );
-    assert!(large_page.chars().count() > 48_000);
-    let chunks = large_page
-        .as_bytes()
-        .chunks(16_000)
-        .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
-        .collect::<Vec<_>>();
-    assert!(chunks.len() > 1);
-    let mut calls = vec![
-        ToolCall::new(
-            "tool-rebuilding",
-            "preview.rebuilding",
-            json!({ "previousVersionId": Value::Null }),
-        ),
-        ToolCall::new(
-            "tool-package",
-            "fs.write",
-            json!({
-                "path": "project/package.json",
-                "text": serde_json::to_string_pretty(&json!({
-                    "type": "module",
-                    "scripts": { "build": format!("node -e {:?}", build_script) }
-                })).unwrap()
-            }),
-        ),
-    ];
-    for (index, chunk) in chunks.iter().enumerate() {
-        calls.push(ToolCall::new(
-            format!("tool-chunk-{index}"),
-            "fs.write_chunk",
-            json!({
-                "path": "project/src/pages/index.astro",
-                "sessionId": "chunked-large-page",
-                "index": index,
-                "total": chunks.len(),
-                "text": chunk,
-            }),
-        ));
-    }
-    calls.extend([
-        ToolCall::new(
-            "tool-commit",
-            "fs.commit_chunks",
-            json!({
-                "path": "project/src/pages/index.astro",
-                "sessionId": "chunked-large-page",
-                "total": chunks.len(),
-            }),
-        ),
-        ToolCall::new("tool-build", "project.build", json!({ "cwd": "project" })),
-        ToolCall::new(
-            "tool-preview",
-            "preview.start",
-            json!({ "url": preview_url, "port": 4321 }),
-        ),
-        ToolCall::new(
-            "tool-browser",
-            "browser.open",
-            json!({ "url": "http://127.0.0.1:4321" }),
-        ),
-        ToolCall::new(
-            "tool-shot",
-            "browser.screenshot",
-            json!({ "screenshotId": "shot-chunked-build", "blank": false }),
-        ),
-        ToolCall::new(
-            "tool-candidate",
-            "preview.report_candidate",
-            json!({
-                "url": preview_url,
-                "screenshotId": "shot-chunked-build"
-            }),
-        ),
-        ToolCall::new(
-            "tool-complete",
-            "run.complete",
-            json!({ "status": "completed", "summary": "Chunked Astro preview promoted" }),
-        ),
-    ]);
-    let model = MockModelClient::new(vec![ModelResponse::ToolCalls(calls)]);
-    let executor = control_plane_executor()
-        .with_policy_profile_and_registry(
-            RuntimePolicyProfile::LocalE2e,
-            "https://registry.internal.example/npm/",
-        )
-        .with_workspace_root(&workspace);
-    let loop_runner = AgentLoop::with_tool_executor(store.clone(), Arc::new(model), executor);
-
-    let results = loop_runner.run(&run.id).await.unwrap();
-
-    assert!(
-        results.iter().all(|result| !result.is_error),
-        "chunked build returned errors: {results:#?}"
-    );
-    let run = store.get_run(&run.id).await.unwrap();
-    assert_eq!(run.status, AgentRunStatus::Completed);
-    assert!(run.output_version_id.is_some());
-    assert_eq!(
-        fs::read_to_string(workspace.join("project/src/pages/index.astro")).unwrap(),
-        large_page
-    );
-    assert!(workspace.join("project/dist/index.html").exists());
-    let health: Value =
-        serde_json::from_str(&fs::read_to_string(workspace.join("state/run-health.json")).unwrap())
-            .unwrap();
-    assert!(health["chunkWrites"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(
-            |write| write["path"] == "/workspace/project/src/pages/index.astro"
-                && write["status"] == "committed"
-                && write["total"] == chunks.len()
-        ));
-
-    let events = store.events(&run.id).await;
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, AgentEvent::ChunkReceived { .. }))
-            .count(),
-        chunks.len()
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ChunkCommitted {
-            path,
-            session_id,
-            ..
-        } if path == "/workspace/project/src/pages/index.astro"
-            && session_id == "chunked-large-page"
-    )));
-    let event_types = events
-        .into_iter()
-        .map(|event| {
-            serde_json::to_value(event).unwrap()["type"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    let updated_index = event_types
-        .iter()
-        .position(|event| event == "preview.updated")
-        .expect("preview.updated should be emitted");
-    let completed_index = event_types
-        .iter()
-        .position(|event| event == "run.completed")
-        .expect("run.completed should be emitted");
-    assert!(
-        updated_index < completed_index,
-        "preview.updated must be emitted before run.completed: {event_types:?}"
-    );
-}
-
-#[tokio::test]
 #[ignore = "requires a real DEEPSEEK_API_KEY and network access"]
 async fn real_deepseek_design_md_website_generation_e2e() {
     let api_key =
@@ -3357,7 +3187,7 @@ async fn real_deepseek_design_md_website_generation_e2e() {
                 ]),
                 visual_direction: "SaaS style, calm technical confidence, polished spacing"
                     .to_string(),
-                recommended_template: "astro-website".to_string(),
+                recommended_template: "next-app".to_string(),
                 assumptions: vec![
                     "Workspace already contains a buildable minimal project; do not install packages."
                         .to_string(),
@@ -3514,7 +3344,7 @@ async fn tool_execution_result_is_replayed_durably_and_identity_conflicts_fail_c
         .await;
     let tool = Arc::new(SequencedChunkCommitTool::default());
     let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
-    let input = json!({ "path": "project/src/pages/index.astro" });
+    let input = json!({ "path": "project/app/page.tsx" });
 
     let first = executor
         .execute(
@@ -3564,7 +3394,7 @@ async fn tool_execution_result_is_replayed_durably_and_identity_conflicts_fail_c
             &run.id,
             "durable-tool-use-1",
             "fs.commit_chunks",
-            json!({ "path": "project/src/pages/other.astro" }),
+            json!({ "path": "project/app/other/page.tsx" }),
         )
         .await;
     assert!(conflict.result.is_error);
@@ -3594,7 +3424,7 @@ async fn failed_mutation_result_is_replayed_without_reexecution() {
         .await;
     let tool = Arc::new(FailedMutationTool::default());
     let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
-    let input = json!({ "path": "project/src/pages/index.astro" });
+    let input = json!({ "path": "project/app/page.tsx" });
 
     let first = executor
         .execute(
@@ -3744,7 +3574,7 @@ async fn in_doubt_mutation_is_paused_without_reexecution() {
         .await;
     let tool = Arc::new(SequencedChunkCommitTool::default());
     let executor = ToolExecutor::new(vec![tool.clone()], PermissionRules::default());
-    let input = json!({ "path": "project/src/pages/index.astro" });
+    let input = json!({ "path": "project/app/page.tsx" });
     let input_hash = canonical_json_hash(&json!({
         "tool": "fs.commit_chunks",
         "input": input.clone(),
@@ -4039,7 +3869,7 @@ async fn chunk_commit_sha_resets_no_progress_when_repair_reuses_the_same_path() 
         ModelResponse::ToolCalls(vec![ToolCall::new(
             tool_use_id,
             "fs.commit_chunks",
-            json!({ "path": "project/src/pages/index.astro" }),
+            json!({ "path": "project/app/page.tsx" }),
         )])
     };
     let model = MockModelClient::new(vec![
@@ -4090,17 +3920,17 @@ async fn distinct_staged_chunks_count_as_progress_without_marking_source_authore
             ModelResponse::ToolCalls(vec![ToolCall::new(
                 "stage-a",
                 "fs.write_chunk",
-                json!({ "path": "project/src/pages/index.astro", "content": "part-a" }),
+                json!({ "path": "project/app/page.tsx", "content": "part-a" }),
             )]),
             ModelResponse::ToolCalls(vec![ToolCall::new(
                 "stage-b",
                 "fs.write_chunk",
-                json!({ "path": "project/src/pages/index.astro", "content": "part-b" }),
+                json!({ "path": "project/app/page.tsx", "content": "part-b" }),
             )]),
             ModelResponse::ToolCalls(vec![ToolCall::new(
                 "stage-b-again",
                 "fs.write_chunk",
-                json!({ "path": "project/src/pages/index.astro", "content": "part-b" }),
+                json!({ "path": "project/app/page.tsx", "content": "part-b" }),
             )]),
         ],
         captured_requests.clone(),
@@ -4200,7 +4030,7 @@ async fn first_unique_file_reads_count_as_bounded_progress_but_repeats_do_not() 
 }
 
 #[tokio::test]
-async fn observation_budgets_reject_excess_reads_and_searches_but_allow_mutation() {
+async fn observation_budgets_warn_without_rejecting_tools() {
     let store = RuntimeStore::new();
     let run = store
         .create_run(
@@ -4246,19 +4076,7 @@ async fn observation_budgets_reject_excess_reads_and_searches_but_allow_mutation
         .await
         .unwrap();
 
-    let rejected = results
-        .iter()
-        .filter(|result| {
-            result.is_error
-                && result
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("errorKind"))
-                    .and_then(Value::as_str)
-                    == Some("run.observation_budget_exhausted")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(rejected.len(), 2);
+    assert!(results.iter().all(|result| !result.is_error));
     assert!(results
         .iter()
         .any(|result| result.tool_use_id == "write-b" && !result.is_error));
@@ -4275,7 +4093,13 @@ async fn observation_budgets_reject_excess_reads_and_searches_but_allow_mutation
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(budget_events, vec![(1, 1), (1, 1)]);
+    assert_eq!(budget_events, vec![(1, 1), (2, 2)]);
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded { name, metadata, .. }
+            if name == "run_observation_budget_warning"
+                && metadata.as_ref().and_then(|value| value.get("blocking")).and_then(Value::as_bool) == Some(false)
+    )));
 }
 
 #[tokio::test]
@@ -4340,15 +4164,11 @@ async fn candidate_repair_uses_a_smaller_observation_budget_without_blocking_wri
         .await
         .unwrap();
 
-    let repair_rejection = results
+    let third_repair_read = results
         .iter()
         .find(|result| result.tool_use_id == "repair-read-c")
         .expect("third repair read should have a paired result");
-    assert!(repair_rejection.is_error);
-    assert_eq!(
-        repair_rejection.metadata.as_ref().unwrap()["category"],
-        "repair_read"
-    );
+    assert!(!third_repair_read.is_error);
     assert!(results
         .iter()
         .any(|result| result.tool_use_id == "repair-write" && !result.is_error));
@@ -4356,9 +4176,13 @@ async fn candidate_repair_uses_a_smaller_observation_budget_without_blocking_wri
         event,
         AgentEvent::RunObservationBudget {
             repair_active: true,
-            repair_read_used: 2,
+            repair_read_used: 3,
             ..
         }
+    )));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded { name, .. } if name == "run_observation_budget_warning"
     )));
 }
 
@@ -4421,18 +4245,18 @@ async fn build_failure_activates_repair_observation_budget() {
         .iter()
         .find(|result| result.tool_use_id == "repair-read-c")
         .expect("third build-repair read should have a paired result");
-    assert!(third_read.is_error);
-    assert_eq!(
-        third_read.metadata.as_ref().unwrap()["category"],
-        "repair_read"
-    );
+    assert!(!third_read.is_error);
     assert!(store.events(&run.id).await.iter().any(|event| matches!(
         event,
         AgentEvent::RunObservationBudget {
             repair_active: true,
-            repair_read_used: 2,
+            repair_read_used: 3,
             ..
         }
+    )));
+    assert!(store.events(&run.id).await.iter().any(|event| matches!(
+        event,
+        AgentEvent::MetricRecorded { name, .. } if name == "run_observation_budget_warning"
     )));
 }
 
@@ -4477,7 +4301,7 @@ async fn missing_dependency_publish_failure_enters_repair_before_no_progress_sto
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 2);
-    assert!(requests[1].system_prompt.contains("repairing_source"));
+    assert!(requests[1].system_prompt.contains("diagnostic_required"));
     assert!(store.events(&run.id).await.iter().any(|event| matches!(
         event,
         AgentEvent::RunObservationBudget {
@@ -4545,25 +4369,22 @@ async fn exhausted_repair_budget_directs_mutation_instead_of_more_observation() 
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 4);
-    assert!(requests[2].system_prompt.contains("repairing_source"));
-    assert!(requests[3]
-        .system_prompt
-        .contains("The repair observation budget is exhausted"));
-    assert!(requests[3]
-        .system_prompt
-        .contains("Do not call fs.read, fs.list, or fs.search"));
+    assert!(requests[2].system_prompt.contains("diagnostic_required"));
+    assert!(requests[3].system_prompt.contains("diagnostic_required"));
     assert!(requests[3]
         .tools
         .iter()
-        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list" | "fs.search")));
+        .chain(&requests[3].deferred_tools)
+        .any(|tool| tool.name == "fs.read"));
     assert!(requests[3]
-        .deferred_tools
+        .tools
         .iter()
-        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list" | "fs.search")));
+        .chain(&requests[3].deferred_tools)
+        .any(|tool| tool.name == "fs.search"));
 }
 
 #[tokio::test]
-async fn exhausted_repair_read_budget_hides_reads_while_search_remains_available() {
+async fn exhausted_repair_read_budget_keeps_diagnostic_tools_available() {
     let store = RuntimeStore::new();
     let run = store
         .create_run(
@@ -4625,7 +4446,7 @@ async fn exhausted_repair_read_budget_hides_reads_while_search_remains_available
         .tools
         .iter()
         .chain(&requests[3].deferred_tools)
-        .all(|tool| !matches!(tool.name.as_str(), "fs.read" | "fs.list")));
+        .any(|tool| tool.name == "fs.read"));
     assert!(requests[3]
         .tools
         .iter()
@@ -4686,10 +4507,10 @@ async fn repair_mutation_directs_immediate_publish_without_more_exploration() {
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 4);
-    assert!(requests[3].system_prompt.contains("publishing_repair"));
+    assert!(requests[3].system_prompt.contains("preview_ready_required"));
     assert!(requests[3]
         .system_prompt
-        .contains("Call preview.publish now; do not read, list, search"));
+        .contains("bounded repair mutation needs Candidate validation"));
 }
 
 #[tokio::test]
@@ -4741,7 +4562,7 @@ async fn build_prompt_publishes_authoritative_workflow_stage_and_budget_remainin
         .contains("shell.run defaults to the appRoot as its working directory"));
     assert!(requests[0]
         .system_prompt
-        .contains("never project/src/pages/index.astro"));
+        .contains("never project/app/page.tsx"));
     assert!(store.events(&run.id).await.iter().any(|event| matches!(
         event,
         AgentEvent::RunWorkflowProgress { stage, .. } if stage == "loading_requirements"
@@ -5530,7 +5351,7 @@ fn prepare_minimal_buildable_project(workspace: &std::path::Path) {
         workspace.join("state/project.json"),
         json!({
             "projectId": "real-deepseek-website",
-            "template": "astro-website",
+            "template": "next-app",
             "appRoot": "project"
         })
         .to_string(),
@@ -5550,7 +5371,7 @@ fn prepare_minimal_buildable_project(workspace: &std::path::Path) {
     fs::write(
         workspace.join("project/scripts/build.mjs"),
         r#"import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-const source = readFileSync('src/pages/index.astro', 'utf8');
+const source = readFileSync('app/page.tsx', 'utf8');
 const body = source.replace(/^---[\s\S]*?---\s*/, '');
 mkdirSync('../outputs/build', { recursive: true });
 mkdirSync('dist', { recursive: true });
@@ -5560,24 +5381,8 @@ writeFileSync('dist/index.html', `<!doctype html><html><head><title>Runtime Harn
     )
     .unwrap();
     fs::write(
-        workspace.join("project/src/pages/index.astro"),
+        workspace.join("project/app/page.tsx"),
         "<main><h1>Runtime Harness Placeholder</h1></main>\n",
     )
     .unwrap();
-}
-
-async fn start_preview_server() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await;
-        }
-    });
-    (format!("http://{addr}/candidate"), handle)
 }

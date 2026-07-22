@@ -96,13 +96,24 @@ async fn design_context_diagnostics(
         .map(|requirement| requirement.path.clone())
         .collect::<Vec<_>>();
     let fidelity = latest_fidelity_summary(&state, &run).await;
+    let runtime_attested = run.run_contract_version.as_deref()
+        == Some(crate::generation_context::GENERATION_CONTEXT_SCHEMA)
+        && run.generation_context_status.as_deref() == Some("compiled")
+        && run.generation_context_runtime_attestation_hash.is_some();
     Ok(Json(json!({
         "runId": run.id,
         "package": package_summary(&run, &manifest),
         "requiredReads": required_reads,
         "readFiles": run.design_context_read_files,
         "missingRequiredReads": missing_required_reads,
-        "gate": if missing_required_reads.is_empty() { "ready" } else { "read_required" },
+        "readProtocol": if runtime_attested { "deprecated_compatibility" } else { "legacy_gate" },
+        "gate": if runtime_attested || missing_required_reads.is_empty() { "ready" } else { "read_required" },
+        "generationContext": if runtime_attested {
+            serde_json::to_value(crate::generation_context::status_for_run(&run))
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        },
         "materialization": {
             "hash": run.design_context_materialization_hash,
             "ready": run.design_context_materialization_hash.is_some(),

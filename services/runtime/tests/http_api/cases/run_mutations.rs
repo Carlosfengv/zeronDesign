@@ -108,7 +108,7 @@ async fn cancel_run_cleans_staged_chunk_sessions_for_run() {
         session_dir.join("manifest.json"),
         json!({
             "runId": run.id.clone(),
-            "path": "/workspace/project/large.astro",
+            "path": "/workspace/project/large.next",
             "total": 1,
             "chunks": [0]
         })

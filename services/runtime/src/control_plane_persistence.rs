@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
-    sync::Mutex,
+    sync::mpsc,
 };
 
 const MIGRATION: &str = include_str!("../migrations/0001_postgres_control_plane_files.sql");
@@ -15,8 +15,24 @@ const MIGRATION: &str = include_str!("../migrations/0001_postgres_control_plane_
 /// generated artifacts and source blobs deliberately remain outside this mirror.
 pub struct PostgresControlPlaneMirror {
     root: PathBuf,
-    database_url: String,
-    connection: Mutex<Option<Client>>,
+    worker: mpsc::Sender<ControlPlaneRequest>,
+}
+
+struct ControlPlaneRow {
+    relative: String,
+    bytes: Vec<u8>,
+    expected_sha256: String,
+}
+
+enum ControlPlaneRequest {
+    SyncFile {
+        relative: String,
+        path: PathBuf,
+        response: mpsc::Sender<Result<()>>,
+    },
+    Load {
+        response: mpsc::Sender<Result<Vec<ControlPlaneRow>>>,
+    },
 }
 
 impl std::fmt::Debug for PostgresControlPlaneMirror {
@@ -24,7 +40,6 @@ impl std::fmt::Debug for PostgresControlPlaneMirror {
         formatter
             .debug_struct("PostgresControlPlaneMirror")
             .field("root", &self.root)
-            .field("database_url", &"[redacted]")
             .finish_non_exhaustive()
     }
 }
@@ -37,54 +52,37 @@ impl PostgresControlPlaneMirror {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let database_url_owned = database_url.to_string();
-        let client = std::thread::spawn({
-            let database_url = database_url_owned.clone();
-            move || connect(&database_url)
-        })
-        .join()
-        .map_err(|_| anyhow!("PostgreSQL control-plane startup thread panicked"))??;
-        let mirror = Self {
-            root,
-            database_url: database_url_owned,
-            connection: Mutex::new(Some(client)),
-        };
-        mirror.with_client(|client| {
-            client.batch_execute(MIGRATION)?;
-            Ok(())
-        })?;
+        let (worker, requests) = mpsc::channel();
+        let (ready, startup) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("control-plane-postgres".to_string())
+            .spawn(move || control_plane_worker(database_url_owned, requests, ready))
+            .context("spawn PostgreSQL control-plane worker")?;
+        wait_for_worker(startup)?;
+        let mirror = Self { root, worker };
         mirror.restore_or_import()?;
         Ok(Some(mirror))
     }
 
     pub fn sync_file(&self, path: &Path) -> Result<()> {
         let relative = self.relative_control_plane_path(path)?;
-        let bytes = fs::read(path)
-            .with_context(|| format!("read control-plane cache {}", path.display()))?;
-        let digest = sha256_hex(&bytes);
-        self.with_client(|client| {
-            client.execute(
-                "INSERT INTO runtime_control_plane_files
-                    (file_path, content, content_sha256, revision)
-                 VALUES ($1, $2, $3, 1)
-                 ON CONFLICT (file_path) DO UPDATE
-                 SET content = EXCLUDED.content,
-                     content_sha256 = EXCLUDED.content_sha256,
-                     revision = runtime_control_plane_files.revision + 1,
-                     updated_at = CURRENT_TIMESTAMP",
-                &[&relative, &bytes, &digest],
-            )?;
-            Ok(())
-        })
+        let (response, result) = mpsc::channel();
+        self.worker
+            .send(ControlPlaneRequest::SyncFile {
+                relative,
+                path: path.to_path_buf(),
+                response,
+            })
+            .map_err(|_| anyhow!("PostgreSQL control-plane worker stopped"))?;
+        wait_for_worker(result)
     }
 
     fn restore_or_import(&self) -> Result<()> {
-        let rows = self.with_client(|client| {
-            Ok(client.query(
-                "SELECT file_path, content, content_sha256
-                 FROM runtime_control_plane_files ORDER BY file_path",
-                &[],
-            )?)
-        })?;
+        let (response, result) = mpsc::channel();
+        self.worker
+            .send(ControlPlaneRequest::Load { response })
+            .map_err(|_| anyhow!("PostgreSQL control-plane worker stopped"))?;
+        let rows = wait_for_worker(result)?;
         if rows.is_empty() {
             for path in list_control_plane_files(&self.root)? {
                 self.sync_file(&path)?;
@@ -95,9 +93,9 @@ impl PostgresControlPlaneMirror {
         let mut authoritative = BTreeSet::new();
         let mut contents = BTreeMap::new();
         for row in rows {
-            let relative: String = row.get(0);
-            let bytes: Vec<u8> = row.get(1);
-            let expected_sha256: String = row.get(2);
+            let relative = row.relative;
+            let bytes = row.bytes;
+            let expected_sha256 = row.expected_sha256;
             validate_relative_path(&relative)?;
             if sha256_hex(&bytes) != expected_sha256 {
                 return Err(anyhow!(
@@ -142,40 +140,116 @@ impl PostgresControlPlaneMirror {
         }
         Ok(relative)
     }
+}
 
-    fn with_client<T: Send>(
-        &self,
-        operation: impl FnOnce(&mut Client) -> Result<T> + Send,
-    ) -> Result<T> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let mut connection = self
-                        .connection
-                        .lock()
-                        .map_err(|_| anyhow!("PostgreSQL control-plane lock poisoned"))?;
-                    if connection
-                        .as_mut()
-                        .is_some_and(|client| client.simple_query("SELECT 1").is_err())
-                    {
-                        *connection = None;
-                    }
-                    if connection.is_none() {
-                        *connection = Some(connect(&self.database_url)?);
-                    }
-                    let result = operation(connection.as_mut().ok_or_else(|| {
-                        anyhow!("PostgreSQL control-plane connection unavailable")
-                    })?);
-                    if result.is_err()
-                        && connection.as_ref().is_some_and(postgres::Client::is_closed)
-                    {
-                        *connection = None;
-                    }
-                    result
-                })
-                .join()
-                .map_err(|_| anyhow!("PostgreSQL control-plane operation thread panicked"))?
-        })
+fn control_plane_worker(
+    database_url: String,
+    requests: mpsc::Receiver<ControlPlaneRequest>,
+    ready: mpsc::Sender<Result<()>>,
+) {
+    let mut connection = match connect(&database_url).and_then(|mut client| {
+        client.batch_execute(MIGRATION)?;
+        Ok(client)
+    }) {
+        Ok(client) => {
+            if ready.send(Ok(())).is_err() {
+                return;
+            }
+            Some(client)
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    for request in requests {
+        let response_delivered = match request {
+            ControlPlaneRequest::SyncFile {
+                relative,
+                path,
+                response,
+            } => {
+                let result = with_worker_client(&database_url, &mut connection, |client| {
+                    // Read only after this request reaches the serialized worker. This
+                    // prevents an older snapshot from overwriting a newer concurrent append.
+                    let bytes = fs::read(&path)
+                        .with_context(|| format!("read control-plane cache {}", path.display()))?;
+                    let digest = sha256_hex(&bytes);
+                    client.execute(
+                        "INSERT INTO runtime_control_plane_files
+                            (file_path, content, content_sha256, revision)
+                         VALUES ($1, $2, $3, 1)
+                         ON CONFLICT (file_path) DO UPDATE
+                         SET content = EXCLUDED.content,
+                             content_sha256 = EXCLUDED.content_sha256,
+                             revision = runtime_control_plane_files.revision + 1,
+                             updated_at = CURRENT_TIMESTAMP",
+                        &[&relative, &bytes, &digest],
+                    )?;
+                    Ok(())
+                });
+                response.send(result).is_ok()
+            }
+            ControlPlaneRequest::Load { response } => {
+                let result = with_worker_client(&database_url, &mut connection, |client| {
+                    client
+                        .query(
+                            "SELECT file_path, content, content_sha256
+                             FROM runtime_control_plane_files ORDER BY file_path",
+                            &[],
+                        )?
+                        .into_iter()
+                        .map(|row| {
+                            Ok(ControlPlaneRow {
+                                relative: row.try_get(0)?,
+                                bytes: row.try_get(1)?,
+                                expected_sha256: row.try_get(2)?,
+                            })
+                        })
+                        .collect()
+                });
+                response.send(result).is_ok()
+            }
+        };
+        if !response_delivered {
+            break;
+        }
+    }
+}
+
+fn with_worker_client<T>(
+    database_url: &str,
+    connection: &mut Option<Client>,
+    operation: impl FnOnce(&mut Client) -> Result<T>,
+) -> Result<T> {
+    if connection.as_ref().is_some_and(Client::is_closed) {
+        *connection = None;
+    }
+    if connection.is_none() {
+        *connection = Some(connect(database_url)?);
+    }
+    let result = operation(
+        connection
+            .as_mut()
+            .ok_or_else(|| anyhow!("PostgreSQL control-plane connection unavailable"))?,
+    );
+    if result.is_err() && connection.as_ref().is_some_and(Client::is_closed) {
+        *connection = None;
+    }
+    result
+}
+
+fn wait_for_worker<T>(receiver: mpsc::Receiver<Result<T>>) -> Result<T> {
+    let wait = || {
+        receiver
+            .recv()
+            .map_err(|_| anyhow!("PostgreSQL control-plane worker stopped before responding"))?
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }
 
