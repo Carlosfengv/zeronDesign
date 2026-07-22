@@ -1,6 +1,9 @@
 use anydesign_runtime::{
     conversation::RuntimeStore,
-    sandbox_adapter::{parse_claim_phase_from_json, SandboxClaimManifest, SandboxClaimPhase},
+    sandbox_adapter::{
+        parse_claim_phase_from_json, KubectlSandboxClient, SandboxAdapter, SandboxAdapterConfig,
+        SandboxClaimManifest, SandboxClaimPhase, SandboxKubeClient,
+    },
     tools::{
         runtime::ToolContext,
         sandbox::{
@@ -8,7 +11,7 @@ use anydesign_runtime::{
             WebSocketWorkspaceChannelTransport, WorkspaceBackend, WorkspaceChannelClientTls,
         },
     },
-    types::AgentPhase,
+    types::{AgentPhase, SandboxBindingStatus, SandboxChannelProtocol},
     workspace_auth::{WorkspaceChannelClaims, WorkspaceChannelJwtIssuer},
     RuntimeConfig,
 };
@@ -16,9 +19,116 @@ use std::{
     fs,
     net::TcpListener as StdTcpListener,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpStream, process::Command, time};
+
+#[tokio::test]
+async fn k8s_sandbox_release_waits_for_terminal_absence() {
+    if std::env::var("RUN_SANDBOX_RELEASE_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping Sandbox release E2E; set RUN_SANDBOX_RELEASE_E2E=1 to enable");
+        return;
+    }
+
+    let kubectl = std::env::var("KUBECTL").unwrap_or_else(|_| "kubectl".to_string());
+    let namespace =
+        std::env::var("ANYDESIGN_E2E_NAMESPACE").unwrap_or_else(|_| "ws-runtime-rc".into());
+    let project_id = std::env::var("ANYDESIGN_RELEASE_E2E_PROJECT_ID").unwrap_or_else(|_| {
+        format!(
+            "release-terminal-smoke-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        )
+    });
+    let store = RuntimeStore::new();
+    let client: Arc<dyn SandboxKubeClient> =
+        Arc::new(KubectlSandboxClient::new().with_program(kubectl.clone()));
+    let adapter = SandboxAdapter::new(
+        store.clone(),
+        client,
+        SandboxAdapterConfig {
+            namespace: namespace.clone(),
+            channel_protocol: SandboxChannelProtocol::Websocket,
+            wait_timeout: Duration::from_secs(120),
+            poll_interval: Duration::from_millis(250),
+        },
+    );
+
+    let binding = adapter
+        .claim("next-app", &project_id)
+        .await
+        .expect("create release smoke SandboxClaim");
+    let cleanup_kubectl = kubectl.clone();
+    let cleanup_namespace = namespace.clone();
+    let cleanup_claim = binding.sandbox_claim_name.clone();
+    let cleanup = Cleanup::new(move || {
+        std::process::Command::new(&cleanup_kubectl)
+            .args([
+                "delete",
+                "sandboxclaim",
+                &cleanup_claim,
+                "-n",
+                &cleanup_namespace,
+                "--ignore-not-found=true",
+                "--wait=false",
+            ])
+            .status()
+            .ok();
+    });
+    let ready = adapter
+        .wait_ready(&binding.id)
+        .await
+        .expect("release smoke Sandbox must become Ready");
+    let started = time::Instant::now();
+    let deleted = adapter
+        .release(&ready.id)
+        .await
+        .expect("release smoke must reach terminal absence");
+    let release_duration_ms = started.elapsed().as_millis();
+
+    assert_eq!(deleted.status, SandboxBindingStatus::Deleted);
+    let claim_resource = format!("sandboxclaim/{}", ready.sandbox_claim_name);
+    let sandbox_resource = format!("sandbox/{}", ready.sandbox_name);
+    let verification = Command::new(&kubectl)
+        .args([
+            "get",
+            &claim_resource,
+            &sandbox_resource,
+            "-n",
+            &namespace,
+            "--ignore-not-found=true",
+            "-o",
+            "name",
+        ])
+        .output()
+        .await
+        .expect("verify terminal Sandbox resource absence");
+    assert!(
+        verification.status.success(),
+        "terminal absence verification failed: {}",
+        String::from_utf8_lossy(&verification.stderr)
+    );
+    assert!(
+        verification.stdout.is_empty(),
+        "release returned before resources were absent: {}",
+        String::from_utf8_lossy(&verification.stdout)
+    );
+    assert_eq!(
+        store.get_sandbox_binding(&ready.id).await.unwrap().status,
+        SandboxBindingStatus::Deleted
+    );
+    println!(
+        "sandbox_release_terminal_smoke project={} claim={} sandbox={} duration_ms={} status=deleted resources_absent=true",
+        project_id,
+        ready.sandbox_claim_name,
+        ready.sandbox_name,
+        release_duration_ms
+    );
+    drop(cleanup);
+}
 
 #[tokio::test]
 async fn k8s_sandbox_claim_workspace_channel_smoke() {

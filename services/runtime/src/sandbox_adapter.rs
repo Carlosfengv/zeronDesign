@@ -110,6 +110,15 @@ pub trait SandboxKubeClient: Send + Sync {
         Ok(SandboxRuntimeIdentity::default())
     }
     async fn delete_claim(&self, namespace: &str, claim_name: &str) -> Result<()>;
+    async fn sandbox_resources_absent(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        sandbox_name: &str,
+    ) -> Result<bool> {
+        let _ = sandbox_name;
+        Ok(self.claim_phase(namespace, claim_name).await? == SandboxClaimPhase::Deleted)
+    }
 }
 
 #[async_trait]
@@ -156,6 +165,17 @@ where
 
     async fn delete_claim(&self, namespace: &str, claim_name: &str) -> Result<()> {
         (**self).delete_claim(namespace, claim_name).await
+    }
+
+    async fn sandbox_resources_absent(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        sandbox_name: &str,
+    ) -> Result<bool> {
+        (**self)
+            .sandbox_resources_absent(namespace, claim_name, sandbox_name)
+            .await
     }
 }
 
@@ -269,6 +289,32 @@ where
             ));
         }
         Ok(())
+    }
+
+    async fn sandbox_resources_absent(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        sandbox_name: &str,
+    ) -> Result<bool> {
+        let args = vec![
+            "get".to_string(),
+            format!("sandboxclaim/{claim_name}"),
+            format!("sandbox/{sandbox_name}"),
+            "-n".to_string(),
+            namespace.to_string(),
+            "--ignore-not-found=true".to_string(),
+            "-o".to_string(),
+            "name".to_string(),
+        ];
+        let output = self.runner.run(&self.kubectl, &args, None).await?;
+        if !output.status_success {
+            return Err(anyhow!(
+                "kubectl verify Sandbox release failed: {}",
+                output.stderr
+            ));
+        }
+        Ok(output.stdout.trim().is_empty())
     }
 
     async fn claim_phase(&self, namespace: &str, claim_name: &str) -> Result<SandboxClaimPhase> {
@@ -389,6 +435,7 @@ where
             "-n".to_string(),
             namespace.to_string(),
             "--ignore-not-found=true".to_string(),
+            "--wait=false".to_string(),
         ];
         let output = self.runner.run(&self.kubectl, &args, None).await?;
         if !output.status_success {
@@ -780,6 +827,29 @@ where
         self.client
             .delete_claim(&binding.namespace, &binding.sandbox_claim_name)
             .await?;
+        let deadline = Instant::now() + self.config.wait_timeout;
+        loop {
+            if self
+                .client
+                .sandbox_resources_absent(
+                    &binding.namespace,
+                    &binding.sandbox_claim_name,
+                    &binding.sandbox_name,
+                )
+                .await?
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "sandbox release did not remove SandboxClaim and Sandbox before timeout: claim={} sandbox={} binding={}",
+                    binding.sandbox_claim_name,
+                    binding.sandbox_name,
+                    binding.id
+                ));
+            }
+            time::sleep(self.config.poll_interval).await;
+        }
         self.store
             .update_sandbox_binding_status(binding_id, SandboxBindingStatus::Deleted)
             .await

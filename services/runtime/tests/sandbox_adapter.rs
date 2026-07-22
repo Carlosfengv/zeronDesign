@@ -161,7 +161,7 @@ fn sandbox_claim_manifest_uses_v1beta1_warm_pool_ref_and_workspace_label() {
     let manifest = SandboxClaimManifest::new(
         "project-demo-abc",
         "anydesign-sandboxes",
-        "anydesign-astro-website-pool",
+        "anydesign-next-app-pool",
     );
     let yaml = manifest.to_yaml();
 
@@ -169,7 +169,7 @@ fn sandbox_claim_manifest_uses_v1beta1_warm_pool_ref_and_workspace_label() {
     assert!(yaml.contains("apiVersion: extensions.agents.x-k8s.io/v1beta1"));
     assert!(yaml.contains("kind: SandboxClaim"));
     assert!(yaml.contains("warmPoolRef:"));
-    assert!(yaml.contains("name: anydesign-astro-website-pool"));
+    assert!(yaml.contains("name: anydesign-next-app-pool"));
     assert!(yaml.contains("anydesign.dev/workspace-pvc: workspace-project-demo-abc"));
     assert!(!yaml.contains("additionalPodMetadata:\n    labels:"));
     assert!(yaml.contains("ttlSecondsAfterFinished: 14400"));
@@ -180,10 +180,7 @@ fn sandbox_claim_manifest_uses_v1beta1_warm_pool_ref_and_workspace_label() {
 
 #[test]
 fn sandbox_names_are_k8s_safe_and_template_specific() {
-    assert_eq!(
-        warm_pool_name("astro-website"),
-        "anydesign-astro-website-pool"
-    );
+    assert_eq!(warm_pool_name("next-app"), "anydesign-next-app-pool");
     assert!(sandbox_claim_name("Project_ABC", "sandbox-123").starts_with("project-project-abc"));
     assert!(sandbox_claim_name("x", "y").len() <= 63);
 
@@ -383,7 +380,7 @@ async fn kubectl_client_applies_manifest_and_reads_claim_phase() {
     let manifest = SandboxClaimManifest::new(
         "project-demo-sandbox",
         "anydesign-sandboxes",
-        "anydesign-astro-website-pool",
+        "anydesign-next-app-pool",
     );
 
     client.create_claim(&manifest).await.unwrap();
@@ -450,6 +447,7 @@ async fn kubectl_client_applies_manifest_and_reads_claim_phase() {
             "-n",
             "anydesign-sandboxes",
             "--ignore-not-found=true",
+            "--wait=false",
         ]
     );
 }
@@ -482,7 +480,7 @@ async fn kubectl_client_reports_apply_and_get_failures() {
     let manifest = SandboxClaimManifest::new(
         "project-demo-sandbox",
         "anydesign-sandboxes",
-        "anydesign-astro-website-pool",
+        "anydesign-next-app-pool",
     );
     assert!(client
         .create_claim(&manifest)
@@ -519,15 +517,48 @@ async fn kubectl_client_reports_apply_and_get_failures() {
 }
 
 #[tokio::test]
+async fn arc_kube_client_delegates_terminal_absence_verification() {
+    let runner = FakeCommandRunner::new(vec![CommandOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        status_success: true,
+    }]);
+    let client: Arc<dyn SandboxKubeClient> =
+        Arc::new(KubectlSandboxClient::with_runner(runner.clone()).with_program("kubectl-test"));
+
+    assert!(client
+        .sandbox_resources_absent(
+            "anydesign-sandboxes",
+            "project-demo-claim",
+            "project-demo-sandbox",
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        runner.commands()[0].args,
+        vec![
+            "get",
+            "sandboxclaim/project-demo-claim",
+            "sandbox/project-demo-sandbox",
+            "-n",
+            "anydesign-sandboxes",
+            "--ignore-not-found=true",
+            "-o",
+            "name",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn claim_creates_manifest_and_binding() {
     let store = RuntimeStore::new();
     let client = FakeSandboxClient::default();
     let adapter = SandboxAdapter::new(store.clone(), client.clone(), test_config());
 
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
 
     assert_eq!(binding.project_id, "project-1");
-    assert_eq!(binding.warm_pool_name, "anydesign-astro-website-pool");
+    assert_eq!(binding.warm_pool_name, "anydesign-next-app-pool");
     assert_eq!(
         binding.workspace_pvc_name,
         workspace_pvc_name(&binding.sandbox_claim_name)
@@ -536,7 +567,7 @@ async fn claim_creates_manifest_and_binding() {
     assert_eq!(binding.channel_protocol, SandboxChannelProtocol::Websocket);
     let created = client.created.lock().unwrap();
     assert_eq!(created.len(), 1);
-    assert_eq!(created[0].warm_pool_name, "anydesign-astro-website-pool");
+    assert_eq!(created[0].warm_pool_name, "anydesign-next-app-pool");
     assert_eq!(created[0].workspace_pvc_name, binding.workspace_pvc_name);
     let claim_yaml = created[0].to_yaml();
     assert!(claim_yaml.contains(&format!(
@@ -554,7 +585,7 @@ async fn wait_ready_updates_binding_status() {
         SandboxClaimPhase::Ready,
     ]);
     let adapter = SandboxAdapter::new(store.clone(), client, test_config());
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
 
     let ready = adapter.wait_ready(&binding.id).await.unwrap();
 
@@ -570,7 +601,7 @@ async fn open_channel_rejects_binding_before_ready() {
     let store = RuntimeStore::new();
     let client = FakeSandboxClient::default();
     let adapter = SandboxAdapter::new(store.clone(), client, test_config());
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
 
     let error = adapter.open_channel(&binding.id).await.unwrap_err();
 
@@ -590,7 +621,7 @@ async fn open_channel_returns_ready_workspace_endpoint() {
         vec![Some("actual-sandbox-7f9b".to_string())],
     );
     let adapter = SandboxAdapter::new(store.clone(), client, test_config());
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
     let ready = adapter.wait_ready(&binding.id).await.unwrap();
 
     let channel = adapter.open_channel(&ready.id).await.unwrap();
@@ -619,9 +650,10 @@ async fn open_channel_returns_ready_workspace_endpoint() {
 #[tokio::test]
 async fn release_deletes_claim_and_marks_binding_deleted() {
     let store = RuntimeStore::new();
-    let client = FakeSandboxClient::with_phases(vec![SandboxClaimPhase::Ready]);
+    let client =
+        FakeSandboxClient::with_phases(vec![SandboxClaimPhase::Ready, SandboxClaimPhase::Deleted]);
     let adapter = SandboxAdapter::new(store.clone(), client.clone(), test_config());
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
     let ready = adapter.wait_ready(&binding.id).await.unwrap();
 
     let deleted = adapter.release(&ready.id).await.unwrap();
@@ -642,11 +674,53 @@ async fn release_deletes_claim_and_marks_binding_deleted() {
 }
 
 #[tokio::test]
+async fn release_waits_until_claim_and_sandbox_are_absent() {
+    let store = RuntimeStore::new();
+    let client = FakeSandboxClient::with_phases(vec![
+        SandboxClaimPhase::Ready,
+        SandboxClaimPhase::Ready,
+        SandboxClaimPhase::Deleted,
+    ]);
+    let adapter = SandboxAdapter::new(store.clone(), client, test_config());
+    let binding = adapter
+        .claim("next-app", "project-release-wait")
+        .await
+        .unwrap();
+    let ready = adapter.wait_ready(&binding.id).await.unwrap();
+
+    let deleted = adapter.release(&ready.id).await.unwrap();
+
+    assert_eq!(deleted.status, SandboxBindingStatus::Deleted);
+}
+
+#[tokio::test]
+async fn release_timeout_does_not_mark_binding_deleted() {
+    let store = RuntimeStore::new();
+    let client = FakeSandboxClient::with_phases(vec![SandboxClaimPhase::Ready]);
+    let adapter = SandboxAdapter::new(store.clone(), client, test_config());
+    let binding = adapter
+        .claim("next-app", "project-release-timeout")
+        .await
+        .unwrap();
+    let ready = adapter.wait_ready(&binding.id).await.unwrap();
+
+    let error = adapter.release(&ready.id).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("did not remove SandboxClaim and Sandbox"));
+    assert_eq!(
+        store.get_sandbox_binding(&binding.id).await.unwrap().status,
+        SandboxBindingStatus::Ready
+    );
+}
+
+#[tokio::test]
 async fn wait_ready_timeout_marks_binding_failed() {
     let store = RuntimeStore::new();
     let client = FakeSandboxClient::with_phases(vec![SandboxClaimPhase::Pending]);
     let adapter = SandboxAdapter::new(store.clone(), client, test_config());
-    let binding = adapter.claim("astro-website", "project-1").await.unwrap();
+    let binding = adapter.claim("next-app", "project-1").await.unwrap();
 
     let result = adapter.wait_ready(&binding.id).await;
 
