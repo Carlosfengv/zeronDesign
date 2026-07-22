@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use crate::{
     config::{ModelProvider, RuntimeConfig},
     tools::registry::{McpToolInfo, ToolLoadingPolicy},
-    types::AgentPhase,
+    types::{canonical_json_hash, AgentPhase},
 };
 
 const MAX_STREAMING_TOOL_ARGUMENT_CHARS: usize = 96_000;
@@ -131,6 +131,17 @@ pub struct ModelExecutionSnapshot {
     pub provider_request_id: Option<String>,
     #[serde(default)]
     pub provider_attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_input: Option<ModelExecutionVisualInputSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelExecutionVisualInputSnapshot {
+    pub state: String,
+    pub image_count: u32,
+    pub artifact_sha256s: Vec<String>,
+    pub media_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +417,7 @@ impl HttpModelGatewayClient {
         request: ModelRequest,
         scope: ModelGatewayScope,
     ) -> Result<ModelClientTurn> {
+        let idempotency_key = provider_gateway_idempotency_key(&request, &scope);
         let request_id = format!(
             "runtime-{}-{}-{}",
             request.run_id,
@@ -419,7 +431,7 @@ impl HttpModelGatewayClient {
         let payload = json!({
             "schemaVersion": PROVIDER_GATEWAY_TURN_REQUEST_SCHEMA,
             "requestId": request_id,
-            "idempotencyKey": format!("{}:turn-{}", request.run_id, request.turn),
+            "idempotencyKey": idempotency_key,
             "deadlineAt": (Utc::now() + ChronoDuration::from_std(self.request_timeout).unwrap_or_else(|_| ChronoDuration::seconds(180))).to_rfc3339(),
             "scope": {
                 "workspaceId": scope.workspace_id,
@@ -529,6 +541,18 @@ impl HttpModelGatewayClient {
         }
         unreachable!("Provider Gateway transport attempts are at least one")
     }
+}
+
+fn provider_gateway_idempotency_key(request: &ModelRequest, scope: &ModelGatewayScope) -> String {
+    let request_hash = canonical_json_hash(&json!({
+        "domain": "runtime-provider-gateway-idempotency@1",
+        "scope": {
+            "workspaceId": scope.workspace_id,
+            "projectId": scope.project_id,
+        },
+        "request": request,
+    }));
+    format!("runtime:{request_hash}")
 }
 
 fn provider_gateway_transport_error_retryable(error: &reqwest::Error) -> bool {
@@ -1480,6 +1504,40 @@ impl ModelClient for EmptyModelClient {
 #[cfg(test)]
 mod visual_content_tests {
     use super::*;
+
+    fn gateway_request(system_prompt: &str) -> ModelRequest {
+        ModelRequest {
+            run_id: "run-8".to_string(),
+            turn: 1,
+            model: "resource:deepseek-v4-pro".to_string(),
+            phase: AgentPhase::Build,
+            agent_profile: "build".to_string(),
+            system_prompt: system_prompt.to_string(),
+            messages: vec![json!({ "role": "user", "content": "build" })],
+            tools: Vec::new(),
+            deferred_tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn gateway_idempotency_is_stable_but_not_reused_for_changed_run_context() {
+        let scope = ModelGatewayScope {
+            workspace_id: "workspace-1".to_string(),
+            project_id: "project-1".to_string(),
+        };
+        let first = gateway_request("context-a");
+        let same = gateway_request("context-a");
+        let changed = gateway_request("context-b");
+
+        assert_eq!(
+            provider_gateway_idempotency_key(&first, &scope),
+            provider_gateway_idempotency_key(&same, &scope)
+        );
+        assert_ne!(
+            provider_gateway_idempotency_key(&first, &scope),
+            provider_gateway_idempotency_key(&changed, &scope)
+        );
+    }
 
     #[test]
     fn direct_openai_provider_receives_resolved_image_bytes() {

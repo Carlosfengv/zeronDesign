@@ -150,6 +150,27 @@ async fn visual_artifact_api_normalizes_authorizes_and_survives_restart() {
         serde_json::from_slice(&to_bytes(listed.into_body(), 32_768).await.unwrap()).unwrap();
     assert_eq!(listed_json["bindings"].as_array().unwrap().len(), 1);
 
+    store
+        .mark_run_generation_context_fallback(&run.id, None, "missing", None)
+        .await
+        .unwrap();
+    let mutation_after_freeze = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/projects/project-visual/runs/{}/visual-bindings",
+                    run.id
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(binding_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mutation_after_freeze.status(), StatusCode::CONFLICT);
+
     let visual_review = app
         .clone()
         .oneshot(

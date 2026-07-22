@@ -694,7 +694,12 @@ impl RuntimeConfig {
 }
 
 fn secret_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+    env::var(name).ok().and_then(normalize_secret)
+}
+
+fn normalize_secret(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn secret_file_env(name: &str) -> Option<String> {
@@ -758,6 +763,15 @@ fn agent_model_from_env(provider: ModelProvider) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_environment_values_are_trimmed_before_use() {
+        assert_eq!(
+            normalize_secret("  workload-token\r\n".to_string()),
+            Some("workload-token".to_string())
+        );
+        assert_eq!(normalize_secret(" \r\n".to_string()), None);
+    }
 
     fn phase_a_config() -> RuntimeConfig {
         let mut config = RuntimeConfig::from_env();

@@ -453,6 +453,19 @@ pub struct ModelExecutionSummary {
     pub provider_request_id: Option<String>,
     #[serde(default)]
     pub provider_attempt_count: u32,
+    /// Hashes-only proof that Runtime-bound image bytes passed Gateway
+    /// integrity checks and were included in a Provider-accepted request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_input: Option<VisualInputSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualInputSummary {
+    pub state: String,
+    pub image_count: u32,
+    pub artifact_sha256s: Vec<String>,
+    pub media_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2163,6 +2176,15 @@ impl GatewayService {
         let resolved_request = self
             .resolve_visual_artifacts_for_resource(resource, request)
             .await?;
+        let visual_input = verified_visual_input_summary(&resolved_request).map_err(|message| {
+            GatewayApiError::new(
+                StatusCode::BAD_REQUEST,
+                request.request_id.clone(),
+                "invalid_visual_artifact",
+                message,
+                false,
+            )
+        })?;
         let tool_aliases = ProviderToolAliasMap::from_request(&resolved_request)?;
         let body = openai_request_body(&resolved_request, resource, &tool_aliases)?;
         // Runtime's deadline is the authoritative bound for a logical turn.
@@ -2266,7 +2288,13 @@ impl GatewayService {
                 .filter(|value| !value.trim().is_empty())
                 .map(ToOwned::to_owned)
         });
-        parse_openai_response(value, provider_request_id, request, &tool_aliases)
+        let mut provider_turn =
+            parse_openai_response(value, provider_request_id, request, &tool_aliases)?;
+        // This attestation is attached only after the Provider accepted the
+        // normalized request and returned a valid response. It never stores
+        // image bytes, data URLs, prompts, or artifact storage locations.
+        provider_turn.visual_input = visual_input;
+        Ok(provider_turn)
     }
 }
 
@@ -4344,6 +4372,7 @@ fn build_turn_response(
             automatic_switch,
             provider_request_id: provider_request_id.clone(),
             provider_attempt_count,
+            visual_input: provider.visual_input,
         },
         usage: provider.usage,
         provider: ProviderMetadata {
@@ -4519,10 +4548,15 @@ fn normalize_messages(
     let mut index = 0;
     while index < request.input.messages.len() {
         let message = &request.input.messages[index];
-        let role = message
+        let raw_role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| "Every message requires a role".to_string())?;
+        let role = match raw_role {
+            "assistant" | "tool" | "user" => raw_role,
+            "system" | "model" | "runtime" => "system",
+            _ => return Err(format!("Unsupported runtime message role: {raw_role}")),
+        };
         if role == "assistant" {
             if let Some(tool_calls) = message.get("toolCalls").and_then(Value::as_array) {
                 pending_tool_call_ids.clear();
@@ -4949,6 +4983,70 @@ struct ProviderTurn {
     usage: Usage,
     provider_request_id: Option<String>,
     attempt_count: u32,
+    visual_input: Option<VisualInputSummary>,
+}
+
+fn verified_visual_input_summary(
+    request: &GatewayTurnRequest,
+) -> std::result::Result<Option<VisualInputSummary>, String> {
+    let mut artifact_sha256s = Vec::new();
+    let mut media_types = Vec::new();
+    for message in &request.input.messages {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+            let sha256 = block
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| "resolved image content block has an invalid sha256".to_string())?;
+            let media_type = block
+                .get("mediaType")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "resolved image content block has an invalid mediaType".to_string()
+                })?;
+            let data_base64 = block
+                .get("dataBase64")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "resolved image content block is missing verified bytes".to_string()
+                })?;
+            let bytes = BASE64_STANDARD
+                .decode(data_base64)
+                .map_err(|_| "resolved image content block has invalid base64 bytes".to_string())?;
+            let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+            if actual_sha256 != sha256 {
+                return Err("resolved image content block hash drifted before dispatch".to_string());
+            }
+            artifact_sha256s.push(sha256.to_string());
+            if !media_types.iter().any(|candidate| candidate == media_type) {
+                media_types.push(media_type.to_string());
+            }
+        }
+    }
+    if artifact_sha256s.is_empty() {
+        return Ok(None);
+    }
+    let image_count = u32::try_from(artifact_sha256s.len())
+        .map_err(|_| "resolved image count exceeds the execution schema".to_string())?;
+    Ok(Some(VisualInputSummary {
+        state: "verified_and_provider_accepted".to_string(),
+        image_count,
+        artifact_sha256s,
+        media_types,
+    }))
 }
 
 fn parse_openai_response(
@@ -5187,6 +5285,7 @@ fn parse_openai_response(
         },
         provider_request_id,
         attempt_count: 1,
+        visual_input: None,
     })
 }
 
@@ -5317,6 +5416,7 @@ mod tests {
 
     #[test]
     fn resolved_visual_content_blocks_become_real_openai_image_inputs() {
+        let image_sha = format!("{:x}", Sha256::digest([1_u8, 2, 3]));
         let mut turn_request = request(Some("allowed"));
         turn_request.routing.required_capabilities.vision = true;
         turn_request.input.messages = vec![json!({
@@ -5327,7 +5427,7 @@ mod tests {
                     "type": "image",
                     "artifactId": "visual-1",
                     "mediaType": "image/png",
-                    "sha256": "a".repeat(64),
+                    "sha256": image_sha,
                     "width": 1440,
                     "height": 900,
                     "dataBase64": "AQID"
@@ -5341,6 +5441,9 @@ mod tests {
         vision_resource.capabilities.max_image_count = 4;
         let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
         let body = openai_request_body(&turn_request, &vision_resource, &aliases).unwrap();
+        let visual_input = verified_visual_input_summary(&turn_request)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(body["messages"][1]["content"][0]["type"], "text");
         assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
@@ -5348,6 +5451,10 @@ mod tests {
             body["messages"][1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AQID"
         );
+        assert_eq!(visual_input.state, "verified_and_provider_accepted");
+        assert_eq!(visual_input.image_count, 1);
+        assert_eq!(visual_input.artifact_sha256s, vec![image_sha]);
+        assert_eq!(visual_input.media_types, vec!["image/png"]);
     }
 
     #[test]
@@ -5660,6 +5767,25 @@ mod tests {
         let body = openai_request_body(&turn_request, &deepseek, &aliases).unwrap();
 
         assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn runtime_control_messages_are_normalized_to_provider_system_messages() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.messages = vec![json!({
+            "role": "runtime",
+            "kind": "runtime_visual_delivery_state",
+            "text": "Continue without visual references.",
+        })];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+
+        let messages = normalize_messages(&turn_request, &aliases).unwrap();
+
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(
+            messages[1]["content"],
+            "Continue without visual references."
+        );
     }
 
     #[test]

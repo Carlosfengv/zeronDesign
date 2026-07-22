@@ -22,7 +22,27 @@
         "selectionPolicyRevision": { "type": "integer", "minimum": 1 },
         "capabilitySnapshotHash": { "type": "string" },
         "selectionReason": { "type": "string" },
-        "automaticSwitch": { "type": "object" }
+        "automaticSwitch": { "type": "object" },
+        "visualInput": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "imageCount", "artifactSha256s", "mediaTypes"],
+          "properties": {
+            "state": { "const": "verified_and_provider_accepted" },
+            "imageCount": { "type": "integer", "minimum": 1 },
+            "artifactSha256s": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+            },
+            "mediaTypes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["image/png", "image/jpeg", "image/webp"] }
+            }
+          }
+        }
       }
     },
     "usage": {

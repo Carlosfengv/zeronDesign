@@ -40,13 +40,13 @@
     {
       "schemaVersion": "model-selection-policy@1",
       "id": "local-deepseek-v4-pro-default",
-      "revision": 3,
+      "revision": 4,
       "scope": {
         "workspaceIds": [],
         "projectIds": []
       },
       "appliesTo": {
-        "phases": ["brief", "build", "edit", "repair"],
+        "phases": ["brief", "build", "edit", "review", "repair"],
         "agentProfiles": []
       },
       "candidates": [

@@ -35,12 +35,12 @@ case "${RUN_READINESS_PROBE}" in
     ;;
 esac
 
-kubectl_args=()
-if [[ -n "${CONTEXT}" ]]; then
-  kubectl_args+=(--context "${CONTEXT}")
-fi
 kube() {
-  "${KUBECTL}" "${kubectl_args[@]}" "$@"
+  if [[ -n "${CONTEXT}" ]]; then
+    "${KUBECTL}" --context "${CONTEXT}" "$@"
+  else
+    "${KUBECTL}" "$@"
+  fi
 }
 
 read -r desired_revision desired_policy_revision desired_max_attempts desired_daily_tokens < <(
@@ -54,8 +54,8 @@ if (!resource || !policy) throw new Error("authoritative resource or policy is m
 if (resource.schemaVersion !== "model-resource@1" || resource.kind !== "openai_compatible") {
   throw new Error("authoritative model resource contract is invalid");
 }
-if (!resource.enabled || resource.physicalModel !== resourceId) {
-  throw new Error("authoritative model resource must be enabled and target its declared model");
+if (!resource.enabled || typeof resource.physicalModel !== "string" || !resource.physicalModel.trim()) {
+  throw new Error("authoritative model resource must be enabled and declare a physical model");
 }
 if (!String(resource.auth?.secretRef || "").startsWith("file:/var/run/secrets/")) {
   throw new Error("authoritative configuration must contain only a mounted file secret reference");
@@ -65,6 +65,9 @@ if (!policy.candidates?.some(candidate => candidate.modelResourceId === resource
 }
 if (!policy.directSelection?.allowedModelResourceIds?.includes(resourceId)) {
   throw new Error("authoritative policy does not allow direct model selection");
+}
+if (!policy.appliesTo?.phases?.includes("review")) {
+  throw new Error("authoritative policy must allow the Review phase required by Repair");
 }
 for (const value of [resource.revision, policy.revision, resource.defaults?.maxAttempts, policy.limits?.dailyInputTokens]) {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error("authoritative revisions and limits must be positive integers");
@@ -177,6 +180,9 @@ if (policy.id !== policyId || policy.revision !== Number(policyRevision)) {
 }
 if (policy.limits?.dailyInputTokens !== Number(dailyTokens)) {
   throw new Error("current model selection policy token limit differs from the authoritative declaration");
+}
+if (!policy.appliesTo?.phases?.includes("review")) {
+  throw new Error("current model selection policy does not allow the Review phase");
 }
 NODE
 
