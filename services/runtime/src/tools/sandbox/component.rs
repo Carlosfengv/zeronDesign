@@ -239,7 +239,8 @@ fn ensure_next_app(ctx: &ToolContext) -> Result<(), ToolError> {
         .project_state_snapshot
         .as_ref()
         .is_some_and(|state| {
-            state.template_key == "next-app" && state.template_version == "next-app@1"
+            state.template_key == "next-app"
+                && matches!(state.template_version.as_str(), "next-app@1" | "next-app@2")
         });
     if supported {
         Ok(())
@@ -247,7 +248,7 @@ fn ensure_next_app(ctx: &ToolContext) -> Result<(), ToolError> {
         Err(typed_recoverable(
             "component registry item is incompatible with this template",
             "component.template_incompatible",
-            json!({ "blocking": false, "compatibleTemplates": ["next-app@1"] }),
+            json!({ "blocking": false, "compatibleTemplates": ["next-app@1", "next-app@2"] }),
         ))
     }
 }

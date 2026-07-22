@@ -238,14 +238,19 @@ impl PublicationStore {
     }
 
     pub fn pending_outbox(&self) -> Vec<PublicationOutboxEvent> {
-        self.state
-            .lock()
-            .unwrap()
+        let snapshot = self.state.lock().unwrap();
+        snapshot
             .outbox
             .values()
             .filter(|event| {
                 event.status == PublicationOutboxStatus::Pending
                     && event.next_attempt_at <= Utc::now()
+                    && snapshot
+                        .runtimes
+                        .get(&event.project_id)
+                        .is_some_and(|runtime| {
+                            runtime.desired_generation == event.desired_generation
+                        })
             })
             .cloned()
             .collect()
@@ -304,7 +309,8 @@ impl PublicationStore {
                             .runtimes
                             .get(&event.project_id)
                             .is_some_and(|runtime| {
-                                runtime.observed_generation < event.desired_generation
+                                runtime.desired_generation == event.desired_generation
+                                    && runtime.observed_generation < event.desired_generation
                             })
                 })
                 .map(|event| event.id.clone())
@@ -391,6 +397,20 @@ impl PublicationStore {
             .get(&outbox.project_id)
             .cloned()
             .ok_or_else(|| PublicationStoreError::NotFound(outbox.project_id.clone()))?;
+        if operation.id != outbox.operation_id
+            || operation.project_id != outbox.project_id
+            || operation.desired_generation != outbox.desired_generation
+            || runtime.project_id != outbox.project_id
+        {
+            return Err(PublicationStoreError::Storage(
+                "publication outbox linkage is invalid".to_string(),
+            ));
+        }
+        if runtime.desired_generation != outbox.desired_generation {
+            return Err(PublicationStoreError::Conflict(
+                "stale publication outbox cannot update a newer desired generation".to_string(),
+            ));
+        }
         update(&mut operation, &mut runtime, &mut outbox)?;
         let now = Utc::now();
         operation.updated_at = now;
@@ -526,11 +546,14 @@ fn persist_commit(
         runtime,
         outbox,
     };
+    let mut next_snapshot = snapshot.clone();
+    apply_commit_with_key(&mut next_snapshot, commit.clone(), scoped_key)?;
+    validate_snapshot(&next_snapshot)?;
     append_commit(root, &commit)?;
     sync_mirror(mirror, &root.join(JOURNAL_FILE))?;
-    apply_commit_with_key(snapshot, commit, scoped_key)?;
-    write_checkpoint(root, snapshot)?;
+    write_checkpoint(root, &next_snapshot)?;
     sync_mirror(mirror, &root.join(CHECKPOINT_FILE))?;
+    *snapshot = next_snapshot;
     Ok(())
 }
 

@@ -18,8 +18,8 @@ pub use registry::{
     TemplateRegistryBuildError, UnknownTemplate,
 };
 pub use spec::{
-    BuildSpec, ComponentRegistryRef, DependencyPolicyRef, DevelopmentServerSpec,
-    MutationPolicySpec, PreviewSpec, SourceContractSpec, StyleContractSpec, StyleTokenSpec,
-    TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateSpec, TemplateWriteMode,
-    ValidationContractSpec,
+    BuildSpec, ComponentRegistryRef, DependencyPolicyRef, DevelopmentServerSpec, EditableRoute,
+    EditableSurfaceMetadata, EditableSurfaceView, MutationPolicySpec, PreviewSpec,
+    SourceContractSpec, StyleContractSpec, StyleTokenSpec, TemplateCapabilities, TemplateFile,
+    TemplateFileRole, TemplateSpec, TemplateWriteMode, ValidationContractSpec,
 };

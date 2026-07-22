@@ -2,12 +2,13 @@ use anydesign_runtime::conversation::RuntimeStore;
 
 fn test_storage_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "zerondesign-draft-snapshot-store-{}-{}",
+        "zerondesign-draft-snapshot-store-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        rand::random::<u64>()
     ))
 }
 
@@ -37,7 +38,7 @@ async fn draft_snapshots_are_idempotent_and_survive_runtime_restart() {
     let replayed = store
         .create_draft_snapshot(
             "project-1",
-            "object://source-snapshots/project-1/source-1.tar.zst".to_string(),
+            "runtime://source-snapshots/project-1/equivalent-source".to_string(),
             source_hash,
             "next-app".to_string(),
             "next-app@1".to_string(),
@@ -50,6 +51,7 @@ async fn draft_snapshots_are_idempotent_and_survive_runtime_restart() {
         .await
         .unwrap();
     assert_eq!(replayed.snapshot_id, created.snapshot_id);
+    assert_eq!(replayed.source_snapshot_uri, created.source_snapshot_uri);
 
     let restarted = RuntimeStore::with_checkpoint_dir(&storage);
     let recovered = restarted

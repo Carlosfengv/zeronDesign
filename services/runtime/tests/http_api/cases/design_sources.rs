@@ -106,7 +106,7 @@ async fn design_source_artifact_api_is_authorized_immutable_and_restart_safe() {
         .unwrap();
     assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
 
-    let mut linked_profile = design_profile_request("project-source", vec!["astro-website"]);
+    let mut linked_profile = design_profile_request("project-source", vec!["next-app"]);
     linked_profile["profile"]["source"] = json!({
         "kind": "imported",
         "primarySourceArtifactId": artifact_id,
@@ -127,7 +127,7 @@ async fn design_source_artifact_api_is_authorized_immutable_and_restart_safe() {
         .unwrap();
     assert_eq!(linked.status(), StatusCode::OK);
 
-    let mut mismatched_profile = design_profile_request("other-project", vec!["astro-website"]);
+    let mut mismatched_profile = design_profile_request("other-project", vec!["next-app"]);
     mismatched_profile["profile"]["source"] = linked_profile["profile"]["source"].clone();
     let mismatched = app
         .clone()

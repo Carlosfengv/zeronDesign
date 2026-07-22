@@ -1,9 +1,57 @@
 use super::*;
+use anydesign_runtime::config::{ContentPlanAttestationMode, GenerationContextMode, ModelProvider};
+use anydesign_runtime::content_plan_approval::{
+    RecordContentPlanApproval, RecordContentPlanChange,
+};
 use anydesign_runtime::design_profile_service::{CreateProfileCommand, DesignProfileService};
+use anydesign_runtime::generation_context::ContentPlanIdentity;
+use anydesign_runtime::model_gateway::model_client_from_config;
+use anydesign_runtime::run_metrics::calculate_run_efficiency_metrics;
 use anydesign_runtime::types::AgentRun;
 
-#[tokio::test]
-async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
+fn configure_real_provider_gateway(config: &mut RuntimeConfig, model_resource_id: &str) {
+    config.model_provider = ModelProvider::InternalGateway;
+    config.model_gateway_url = std::env::var("MODEL_GATEWAY_URL")
+        .expect("MODEL_GATEWAY_URL must point to the credential-backed Provider Gateway");
+    config.model_gateway_auth_token = std::env::var("MODEL_GATEWAY_AUTH_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("MODEL_GATEWAY_AUTH_TOKEN_FILE")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| {
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|error| {
+                            panic!("reading MODEL_GATEWAY_AUTH_TOKEN_FILE {path}: {error}")
+                        })
+                        .trim()
+                        .to_string()
+                })
+        });
+    config.agent_model = model_resource_id.to_string();
+}
+
+#[test]
+fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
+    std::thread::Builder::new()
+        .name("docs-lifecycle-e2e".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(
+                    public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds_inner(),
+                )
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds_inner() {
     let workspace = unique_temp_dir("http-docs-lifecycle-edit");
     let store = RuntimeStore::new();
     let brief_run = store
@@ -20,7 +68,6 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
         .await
         .unwrap();
     store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
-    let (preview_url, _preview_server) = start_preview_server().await;
     let build_script = "const fs=require('fs'); fs.mkdirSync('out/docs',{recursive:true}); const mdx=fs.readFileSync('content/docs/index.mdx','utf8'); const head='<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime docs lifecycle</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style>'; const navigation='<nav><a href=\"/\">Home</a><a href=\"/docs/\">Docs</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label>'; fs.writeFileSync('out/docs/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body>${navigation}<main><h1 id=\"overview\">Overview</h1><p>${mdx}</p></main></body></html>`); fs.writeFileSync('out/index.html', `<!doctype html><html lang=\"en\"><head>${head}</head><body>${navigation}<main><h1>Docs lifecycle</h1></main></body></html>`);";
     let model = MockModelClient::new(vec![
         ModelResponse::ToolCalls(vec![ToolCall::new(
@@ -28,6 +75,18 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
             "project.init",
             json!({ "template": "fumadocs-docs" }),
         )]),
+        ModelResponse::ToolCalls(vec![
+            ToolCall::new(
+                "docs-package-read",
+                "fs.read",
+                json!({ "path": "project/package.json" }),
+            ),
+            ToolCall::new(
+                "docs-mdx-read",
+                "fs.read",
+                json!({ "path": "project/content/docs/index.mdx" }),
+            ),
+        ]),
         ModelResponse::ToolCalls(vec![
             ToolCall::new(
                 "docs-package",
@@ -54,34 +113,14 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
             ),
         ]),
         ModelResponse::ToolCalls(vec![ToolCall::new(
-            "docs-build",
-            "project.build",
-            json!({ "cwd": "project" }),
-        )]),
-        ModelResponse::ToolCalls(vec![
-            ToolCall::new(
-                "docs-preview",
-                "preview.start",
-                json!({ "url": preview_url, "port": 4321 }),
-            ),
-            ToolCall::new(
-                "docs-browser",
-                "browser.open",
-                json!({ "url": preview_url }),
-            ),
-            ToolCall::new(
-                "docs-shot",
-                "browser.screenshot",
-                json!({ "screenshotId": "shot-docs-build", "blank": false }),
-            ),
-        ]),
-        ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-candidate",
             "preview.publish",
-            json!({
-                "url": preview_url,
-                "screenshotId": "shot-docs-build"
-            }),
+            json!({}),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-candidate-retry",
+            "preview.publish",
+            json!({}),
         )]),
         ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-complete",
@@ -103,34 +142,14 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
             }),
         )]),
         ModelResponse::ToolCalls(vec![ToolCall::new(
-            "docs-edit-build",
-            "project.build",
-            json!({ "cwd": "project" }),
-        )]),
-        ModelResponse::ToolCalls(vec![
-            ToolCall::new(
-                "docs-edit-preview",
-                "preview.start",
-                json!({ "url": preview_url, "port": 4321 }),
-            ),
-            ToolCall::new(
-                "docs-edit-browser",
-                "browser.open",
-                json!({ "url": preview_url }),
-            ),
-            ToolCall::new(
-                "docs-edit-shot",
-                "browser.screenshot",
-                json!({ "screenshotId": "shot-docs-edit", "blank": false }),
-            ),
-        ]),
-        ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-edit-candidate",
             "preview.publish",
-            json!({
-                "url": preview_url,
-                "screenshotId": "shot-docs-edit"
-            }),
+            json!({}),
+        )]),
+        ModelResponse::ToolCalls(vec![ToolCall::new(
+            "docs-edit-candidate-retry",
+            "preview.publish",
+            json!({}),
         )]),
         ModelResponse::ToolCalls(vec![ToolCall::new(
             "docs-edit-complete",
@@ -282,24 +301,298 @@ async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
 }
 
 #[tokio::test]
-#[ignore = "requires a real DEEPSEEK_API_KEY, network access, and npm registry access"]
+#[ignore = "requires a credential-backed Provider Gateway, network access, and npm registry access"]
+async fn real_provider_generation_context_greenfield_build() {
+    let approval_reference = std::env::var("RUNTIME_PROVIDER_APPROVAL_ID")
+        .expect("RUNTIME_PROVIDER_APPROVAL_ID must be set for this test");
+    let model_resource_id =
+        std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
+    let workspace = unique_temp_dir("real-provider-generation-context-greenfield");
+    let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
+    store
+        .upsert_project_access(
+            "real-generation-context-greenfield",
+            "principal-generation-context-canary".to_string(),
+            "ws-generation-context-canary".to_string(),
+        )
+        .await
+        .unwrap();
+
+    let mut profile_payload =
+        design_profile_request("real-generation-context-greenfield", vec!["next-app"])["profile"]
+            .as_object()
+            .unwrap()
+            .clone();
+    profile_payload.insert(
+        "websiteContext".to_string(),
+        json!({
+            "enforcementMode": "enforced",
+            "craftPacks": ["accessibility-baseline", "responsive-layout"]
+        }),
+    );
+    let profiles = DesignProfileService::new(store.clone());
+    let profile = profiles
+        .create(CreateProfileCommand {
+            project_id: Some("real-generation-context-greenfield".to_string()),
+            name: "Real provider Generation Context candidate".to_string(),
+            payload: profile_payload,
+        })
+        .await
+        .unwrap();
+    profiles
+        .bind_project("real-generation-context-greenfield", &profile.id)
+        .await
+        .unwrap();
+
+    let plan_payload = json!({
+        "fixture": "generation-context-greenfield-v1",
+        "intent": "Build a compact runtime reliability website",
+        "requiredText": "GENERATION CONTEXT REAL PROVIDER"
+    });
+    let plan_identity = ContentPlanIdentity {
+        plan_id: "real-generation-context-greenfield-plan".to_string(),
+        revision: 1,
+        content_hash: anydesign_runtime::types::sha256_hex(
+            &serde_json::to_vec(&plan_payload).unwrap(),
+        ),
+    };
+    store
+        .content_plan_approval_store()
+        .record_plan_change(RecordContentPlanChange {
+            project_id: "real-generation-context-greenfield".to_string(),
+            plan_id: plan_identity.plan_id.clone(),
+            revision: plan_identity.revision,
+            content_hash: plan_identity.content_hash.clone(),
+            change_event_id: "real-generation-context-plan-created".to_string(),
+        })
+        .unwrap();
+    let approval = store
+        .content_plan_approval_store()
+        .approve(RecordContentPlanApproval {
+            project_id: "real-generation-context-greenfield".to_string(),
+            plan_id: plan_identity.plan_id.clone(),
+            revision: plan_identity.revision,
+            content_hash: plan_identity.content_hash.clone(),
+            confirmation_event_id: approval_reference.clone(),
+        })
+        .unwrap();
+
+    let brief_run = store
+        .create_run(
+            "real-generation-context-greenfield".to_string(),
+            AgentPhase::Brief,
+            "brief".to_string(),
+            model_resource_id.clone(),
+            vec![],
+        )
+        .await;
+    let brief_id = store
+        .write_brief(&brief_run.id, website_brief())
+        .await
+        .unwrap();
+    store.confirm_brief(&brief_run.id, &brief_id).await.unwrap();
+
+    let mut config = phase_a_contract_config();
+    config.workspace_root = workspace.clone();
+    configure_real_provider_gateway(&mut config, &model_resource_id);
+    config.policy_profile = RuntimePolicyProfile::LocalE2e;
+    config.npm_registry = std::env::var("RUNTIME_E2E_NPM_REGISTRY")
+        .unwrap_or_else(|_| "https://registry.npmjs.org/".to_string());
+    config.enable_design_context_package = true;
+    config.enable_design_context_enforcement = true;
+    config.generation_context_mode = GenerationContextMode::Enabled;
+    config.content_plan_attestation_mode = ContentPlanAttestationMode::Enforce;
+    config.content_plan_approval_producer_required = true;
+    config.observation_receipts_enabled = true;
+    config.design_context_enforcement_allowlist_json = Some(
+        json!([{
+            "projectId": "real-generation-context-greenfield",
+            "designProfileId": profile.id,
+            "designProfileVersion": profile.version,
+        }])
+        .to_string(),
+    );
+    let model = model_client_from_config(&config).unwrap();
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config,
+        store: store.clone(),
+        model: Arc::new(model),
+    });
+    let content_sources = vec![
+        ContentSource::readable(
+            "generation-context-greenfield-prompt",
+            "prompt",
+            "Build a compact operational SaaS website for runtime engineers. The hero must contain the exact text GENERATION CONTEXT REAL PROVIDER. Include sections for immutable context, typed recovery, and durable drafts. Follow the Runtime-owned workflow and do not inventory or read DCP files.",
+        ),
+        ContentSource::readable(
+            "generation-context-greenfield-design",
+            "design_md",
+            "# Design\n- Calm technical interface\n- Strong visual hierarchy\n- Responsive navigation\n- Use the Runtime Style Contract tokens",
+        ),
+    ];
+    let run_id = start_public_run(
+        app,
+        "real-generation-context-greenfield",
+        "build",
+        json!({
+            "briefId": brief_id,
+            "contentPlan": plan_identity,
+            "modelResourceId": model_resource_id.clone(),
+            "contentSources": content_sources,
+        }),
+    )
+    .await;
+    if !wait_for_terminal_with_timeout(&store, &run_id, REAL_PROVIDER_STAGE_TIMEOUT_SECS).await {
+        emit_real_provider_run_stream(
+            &store,
+            &run_id,
+            "real-generation-context-greenfield",
+            "greenfield",
+        )
+        .await;
+        panic!("Generation Context run {run_id} did not reach a terminal state");
+    }
+    emit_real_provider_run_stream(
+        &store,
+        &run_id,
+        "real-generation-context-greenfield",
+        "greenfield",
+    )
+    .await;
+
+    let run = store.get_run(&run_id).await.unwrap();
+    let events = store.events(&run_id).await;
+    let metrics = calculate_run_efficiency_metrics(&run, &events);
+    let compiled = events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::GenerationContextCompiled { .. }));
+    let dcp_read_count = run
+        .design_context_read_files
+        .iter()
+        .filter(|path| {
+            matches!(
+                path.as_str(),
+                "inputs/design-profile.json"
+                    | "inputs/design-profile-usage.md"
+                    | "inputs/component-recipes.json"
+                    | "inputs/template-style-contract.json"
+            )
+        })
+        .count();
+    let first_build_succeeded = events.iter().any(
+        |event| matches!(event, AgentEvent::ToolCompleted { tool, .. } if tool == "project.build"),
+    );
+    let gateway_execution = events.iter().find_map(|event| match event {
+        AgentEvent::ModelExecution { snapshot, .. }
+            if snapshot["modelResourceId"] == model_resource_id =>
+        {
+            Some(snapshot.clone())
+        }
+        _ => None,
+    });
+    let event_payload = serde_json::to_vec(&events).unwrap();
+    let sample = json!({
+        "schemaVersion": "generation-context-real-provider-sample@1",
+        "project": "real-generation-context-greenfield",
+        "bucket": "greenfield",
+        "runId": run_id,
+        "provider": {
+            "name": "deepseek",
+            "modelResourceId": model_resource_id,
+            "approvalReference": approval_reference,
+            "execution": gateway_execution.clone(),
+        },
+        "status": run.status,
+        "source": {
+            "storageRef": "local-evidence://real-generation-context-greenfield/events",
+            "contentSha256": anydesign_runtime::types::sha256_hex(&event_payload),
+        },
+        "generationContext": {
+            "compiled": compiled,
+            "contextContentHash": run.generation_context_content_hash,
+            "runContextBindingHash": run.generation_context_binding_hash,
+            "runtimeAttestationHash": run.generation_context_runtime_attestation_hash,
+            "approvalId": approval.approval_id,
+        },
+        "firstBuildSucceeded": first_build_succeeded,
+        "metrics": metrics,
+        "dcpModelReadCount": dcp_read_count,
+    });
+    if let Ok(path) = std::env::var("RUNTIME_E2E_GENERATION_CONTEXT_SAMPLE_OUT") {
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&sample).unwrap()),
+        )
+        .unwrap_or_else(|error| panic!("writing Generation Context sample {path}: {error}"));
+    }
+    if let Ok(path) = std::env::var("RUNTIME_E2E_GENERATION_CONTEXT_EVENTS_OUT") {
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&events).unwrap()),
+        )
+        .unwrap_or_else(|error| panic!("writing Generation Context events {path}: {error}"));
+    }
+    eprintln!(
+        "REAL_PROVIDER_GENERATION_CONTEXT_EVIDENCE {}",
+        serde_json::to_string(&sample).unwrap()
+    );
+
+    assert!(compiled, "candidate must compile GenerationContext@1");
+    assert!(
+        gateway_execution.is_some(),
+        "candidate must be executed by the governed deepseek-v4-pro Model Resource"
+    );
+    assert_eq!(
+        dcp_read_count, 0,
+        "candidate must not return to mandatory DCP file reads"
+    );
+    assert_eq!(
+        run.status,
+        AgentRunStatus::Completed,
+        "real Generation Context candidate should complete; metrics={metrics:#?}"
+    );
+    assert!(
+        first_build_succeeded,
+        "candidate must complete its first build"
+    );
+    if let Some(session) = store
+        .draft_preview_store()
+        .active_for_project("real-generation-context-greenfield")
+    {
+        assert_eq!(session.last_ready_revision, session.workspace_revision);
+        assert_eq!(session.durable_revision, session.workspace_revision);
+        assert!(!session.durable_snapshot_id.trim().is_empty());
+    } else {
+        let snapshot = store
+            .list_project_draft_snapshots("real-generation-context-greenfield")
+            .await
+            .into_iter()
+            .rev()
+            .find(|snapshot| snapshot.created_by_run_id == run_id)
+            .expect("local static Preview fallback must retain its DraftSnapshot");
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.template_id, "next-app");
+        assert!(snapshot.source_snapshot_uri.starts_with("runtime://"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a credential-backed Provider Gateway, network access, and npm registry access"]
 async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
-    let api_key =
-        std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set for this test");
     let _approval_reference = std::env::var("RUNTIME_PROVIDER_APPROVAL_ID")
         .expect("RUNTIME_PROVIDER_APPROVAL_ID must be set for this test");
-    let base_url =
-        std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let model_name = std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+    let model_resource_id =
+        std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
     let workspace = unique_temp_dir("real-provider-http-lifecycle");
     let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
     let project_filter = std::env::var("REAL_PROVIDER_PROJECT_FILTER").ok();
     let website_profile = if project_filter.as_deref() != Some("docs") {
-        let mut profile_payload =
-            design_profile_request("real-http-website", vec!["astro-website"])["profile"]
-                .as_object()
-                .unwrap()
-                .clone();
+        let mut profile_payload = design_profile_request("real-http-website", vec!["next-app"])
+            ["profile"]
+            .as_object()
+            .unwrap()
+            .clone();
         profile_payload.insert(
             "websiteContext".to_string(),
             json!({
@@ -326,7 +619,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
     };
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
-    config.agent_model = model_name;
+    configure_real_provider_gateway(&mut config, &model_resource_id);
     config.policy_profile = RuntimePolicyProfile::LocalE2e;
     config.npm_registry = std::env::var("RUNTIME_E2E_NPM_REGISTRY")
         .unwrap_or_else(|_| "https://registry.npmjs.org/".to_string());
@@ -342,9 +635,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
             .to_string(),
         );
     }
-    let model = OpenAiCompatibleModelClient::new(base_url, api_key, Some("deepseek"))
-        .with_streaming(env_flag("MODEL_STREAMING"))
-        .with_strict_tools(env_flag("MODEL_STRICT_TOOLS"));
+    let model = model_client_from_config(&config).unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
         config,
@@ -357,6 +648,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
             &store,
             &workspace,
             "real-http-website",
+            &model_resource_id,
             website_brief(),
             vec![
                 ContentSource::readable(
@@ -367,7 +659,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
                 ContentSource::readable(
                     "website-instructions",
                     "prompt",
-                    "Use project.init with astro-website if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Prefer style.update_tokens for color edits. Do not use raw npm/pnpm install commands through shell.run.",
+                    "Use project.init with next-app if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Prefer style.update_tokens for color edits. Do not use raw npm/pnpm install commands through shell.run.",
                 ),
             ],
             "Acceptance criteria: the promoted website artifact must contain the literal text TESTXXX in the hero title. Change the hero title to TESTXXX 标题内容, set the primary theme color token to #f97316 using style.update_tokens when possible, then rebuild and promote with preview.publish exactly once. Do not call run.complete until the served artifact contains TESTXXX.",
@@ -385,6 +677,7 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
             &store,
             &workspace,
             "real-http-docs",
+            &model_resource_id,
             docs_brief(),
             vec![
                 ContentSource::readable(
@@ -409,26 +702,21 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
 }
 
 #[tokio::test]
-#[ignore = "requires a real DEEPSEEK_API_KEY, network access, and npm registry access"]
+#[ignore = "requires a credential-backed Provider Gateway, network access, and npm registry access"]
 async fn real_provider_attachment_docs_lifecycle() {
-    let api_key =
-        std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set for this test");
     let _approval_reference = std::env::var("RUNTIME_PROVIDER_APPROVAL_ID")
         .expect("RUNTIME_PROVIDER_APPROVAL_ID must be set for this test");
-    let base_url =
-        std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let model_name = std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+    let model_resource_id =
+        std::env::var("DEEPSEEK_E2E_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".into());
     let workspace = unique_temp_dir("real-provider-attachment-docs");
     let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
     let mut config = phase_a_contract_config();
     config.workspace_root = workspace.clone();
-    config.agent_model = model_name;
+    configure_real_provider_gateway(&mut config, &model_resource_id);
     config.policy_profile = RuntimePolicyProfile::LocalE2e;
     config.npm_registry = std::env::var("RUNTIME_E2E_NPM_REGISTRY")
         .unwrap_or_else(|_| "https://registry.npmjs.org/".to_string());
-    let model = OpenAiCompatibleModelClient::new(base_url, api_key, Some("deepseek"))
-        .with_streaming(env_flag("MODEL_STREAMING"))
-        .with_strict_tools(env_flag("MODEL_STRICT_TOOLS"));
+    let model = model_client_from_config(&config).unwrap();
     let app = http_api::router_with_state(AppState {
         supervisor: http_api::RuntimeSupervisor::new(),
         config,
@@ -441,6 +729,7 @@ async fn real_provider_attachment_docs_lifecycle() {
         &store,
         &workspace,
         "real-attachment-docs",
+        &model_resource_id,
         docs_brief(),
         vec![ContentSource::readable(
             "attachment-aurora-workspace-guide",
@@ -456,12 +745,35 @@ async fn real_provider_attachment_docs_lifecycle() {
     .await;
 }
 
+async fn assert_governed_model_resource_execution(
+    store: &RuntimeStore,
+    run_id: &str,
+    model_resource_id: &str,
+) {
+    let run = store.get_run(run_id).await.expect("real-provider Run");
+    assert_eq!(
+        run.model, model_resource_id,
+        "Run must bind only the selected Model Resource ID"
+    );
+    assert!(
+        store.events(run_id).await.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ModelExecution { snapshot, .. }
+                    if snapshot["modelResourceId"].as_str() == Some(model_resource_id)
+            )
+        }),
+        "Run {run_id} must contain governed Gateway execution evidence for {model_resource_id}"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_real_provider_lifecycle_project(
     app: axum::Router,
     store: &RuntimeStore,
     workspace_root: &Path,
     project_id: &str,
+    model_resource_id: &str,
     brief: Brief,
     content_sources: Vec<ContentSource>,
     edit_prompt: &str,
@@ -488,6 +800,7 @@ async fn run_real_provider_lifecycle_project(
         "build",
         json!({
             "briefId": brief_id,
+            "modelResourceId": model_resource_id,
             "contentSources": content_sources
         }),
     )
@@ -501,6 +814,7 @@ async fn run_real_provider_lifecycle_project(
     }
     emit_real_provider_run_stream(store, &build_run_id, project_id, "build").await;
     let build_run = store.get_run(&build_run_id).await.unwrap();
+    assert_governed_model_resource_execution(store, &build_run_id, model_resource_id).await;
     assert_eq!(
         build_run.status,
         AgentRunStatus::Completed,
@@ -566,7 +880,8 @@ async fn run_real_provider_lifecycle_project(
         json!({
             "briefId": brief_id,
             "baseVersionId": runtime_state["currentVersionId"],
-            "sandboxBindingId": runtime_state["sandboxBindingId"]
+            "sandboxBindingId": runtime_state["sandboxBindingId"],
+            "modelResourceId": model_resource_id
         }),
     )
     .await;
@@ -580,6 +895,7 @@ async fn run_real_provider_lifecycle_project(
     }
     emit_real_provider_run_stream(store, &edit_run_id, project_id, "edit").await;
     let edit_run = store.get_run(&edit_run_id).await.unwrap();
+    assert_governed_model_resource_execution(store, &edit_run_id, model_resource_id).await;
     assert_eq!(
         edit_run.status,
         AgentRunStatus::Completed,
@@ -692,7 +1008,8 @@ async fn run_real_provider_lifecycle_project(
             "repair",
             json!({
                 "parentRunId": review.id,
-                "findingIds": [finding.id]
+                "findingIds": [finding.id],
+                "modelResourceId": model_resource_id
             }),
         )
         .await;
@@ -706,6 +1023,7 @@ async fn run_real_provider_lifecycle_project(
         }
         emit_real_provider_run_stream(store, &repair_run_id, project_id, "repair").await;
         let repair_run = store.get_run(&repair_run_id).await.unwrap();
+        assert_governed_model_resource_execution(store, &repair_run_id, model_resource_id).await;
         assert_eq!(
             repair_run.status,
             AgentRunStatus::Completed,

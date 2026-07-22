@@ -106,7 +106,7 @@ fn item(
         license: "MIT",
         dependencies: Vec::new(),
         registry_dependencies: Vec::new(),
-        compatible_templates: vec!["next-app@1"],
+        compatible_templates: vec!["next-app@1", "next-app@2"],
         security_scan: "runtime-static-source-reviewed",
         content_hash,
         files: vec![ComponentRegistryFile {
@@ -188,7 +188,7 @@ mod tests {
     fn registry_items_are_hash_frozen_shadcn_records() {
         let badge = get("badge").unwrap();
         assert_eq!(badge.item_type, "registry:ui");
-        assert_eq!(badge.compatible_templates, ["next-app@1"]);
+        assert_eq!(badge.compatible_templates, ["next-app@1", "next-app@2"]);
         assert_eq!(badge.content_hash.len(), 64);
         assert_eq!(badge.files[0].sha256, sha256_hex(BADGE_SOURCE.as_bytes()));
         assert!(search("status").iter().any(|item| item.name == "badge"));

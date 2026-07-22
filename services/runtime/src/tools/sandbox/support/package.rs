@@ -4,9 +4,12 @@ use super::*;
 pub(super) struct DependencyRestoreOutcome {
     pub(super) attempted: bool,
     pub(super) succeeded: bool,
+    pub(super) attempts: u32,
     pub(super) reason: Option<String>,
     pub(super) log_path: Option<String>,
 }
+
+const MAX_AUTOMATIC_DEPENDENCY_RESTORE_ATTEMPTS: u32 = 2;
 
 pub(super) async fn maybe_restore_project_dependencies(
     workspace: &dyn WorkspaceBackend,
@@ -40,50 +43,72 @@ pub(super) async fn maybe_restore_project_dependencies(
         )
         .await;
     let argv = package_install_argv(package_manager, "restore", &[], &registry);
-    let output = command
-        .run_with_output_events(
-            ctx,
-            &argv,
-            cwd,
-            120_000,
-            Some(progress.clone()),
-            "package.install",
-        )
-        .await
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::TimedOut {
-                typed_recoverable(
-                    "project.build dependency restore timed out".to_string(),
-                    "build.missing_dependency",
-                    json!({
-                        "reason": reason,
-                        "packageManager": package_manager,
-                        "suggestedAction": "Retry project.build or run project.ensure_dependencies after checking package registry connectivity."
-                    }),
-                )
-            } else if error.kind() == io::ErrorKind::Interrupted {
-                ToolError::Recoverable(error.to_string())
-            } else {
-                typed_recoverable(
-                    format!("project.build dependency restore failed to start {package_manager}: {error}"),
-                    "build.missing_dependency",
-                    json!({
-                        "reason": reason,
-                        "packageManager": package_manager,
-                        "suggestedAction": "Run project.ensure_dependencies or verify the package manager is available."
-                    }),
-                )
-            }
-        })?;
-    let restore_tool_use_id = format!("{}-restore", progress.tool_use_id());
-    let log_path =
-        write_package_install_log(workspace, ctx, &restore_tool_use_id, &argv, &output).await?;
+    let mut attempts = 0;
+    let (output, log_path) = loop {
+        attempts += 1;
+        let output = command
+            .run_with_output_events(
+                ctx,
+                &argv,
+                cwd,
+                120_000,
+                Some(progress.clone()),
+                "package.install",
+            )
+            .await
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    typed_recoverable(
+                        "project.build dependency restore timed out".to_string(),
+                        "build.missing_dependency",
+                        json!({
+                            "reason": reason,
+                            "packageManager": package_manager,
+                            "attempts": attempts,
+                            "suggestedAction": "Retry project.build or run project.ensure_dependencies after checking package registry connectivity."
+                        }),
+                    )
+                } else if error.kind() == io::ErrorKind::Interrupted {
+                    ToolError::Recoverable(error.to_string())
+                } else {
+                    typed_recoverable(
+                        format!("project.build dependency restore failed to start {package_manager}: {error}"),
+                        "build.missing_dependency",
+                        json!({
+                            "reason": reason,
+                            "packageManager": package_manager,
+                            "attempts": attempts,
+                            "suggestedAction": "Run project.ensure_dependencies or verify the package manager is available."
+                        }),
+                    )
+                }
+            })?;
+        let restore_tool_use_id = format!("{}-restore-attempt-{attempts}", progress.tool_use_id());
+        let log_path =
+            write_package_install_log(workspace, ctx, &restore_tool_use_id, &argv, &output).await?;
+        if !should_retry_automatic_dependency_restore(output.success, &output.stderr, attempts) {
+            break (output, log_path);
+        }
+        progress
+            .emit_tool_output(
+                "package.install",
+                "stderr",
+                format!(
+                    "transient registry failure during dependency restore; retrying ({}/{})\n",
+                    attempts + 1,
+                    MAX_AUTOMATIC_DEPENDENCY_RESTORE_ATTEMPTS
+                ),
+            )
+            .await;
+        time::sleep(Duration::from_millis(500)).await;
+    };
     let state = json!({
         "needsRestore": !output.success,
         "reason": reason,
         "lastRestoreAt": Utc::now().to_rfc3339(),
         "lastRestoreLogPath": log_path,
         "packageManager": package_manager,
+        "attempts": attempts,
         "status": output.status,
         "success": output.success,
     });
@@ -98,15 +123,22 @@ pub(super) async fn maybe_restore_project_dependencies(
             json!({
                 "reason": reason,
                 "packageManager": package_manager,
+                "attempts": attempts,
                 "status": output.status,
                 "logPath": log_path,
-                "suggestedAction": "Open diagnostics.build_log or rerun project.ensure_dependencies after fixing dependency errors."
+                "failureKind": dependency_install_failure_kind(&output.stderr),
+                "suggestedAction": if dependency_install_failure_kind(&output.stderr) == "infrastructure.registry_unavailable" {
+                    "Verify the internal npm proxy and its upstream/cache availability, then rerun project.ensure_dependencies."
+                } else {
+                    "Open diagnostics.build_log or rerun project.ensure_dependencies after fixing dependency errors."
+                }
             }),
         ));
     }
     Ok(DependencyRestoreOutcome {
         attempted: true,
         succeeded: true,
+        attempts,
         reason: Some(reason),
         log_path: Some(log_path),
     })
@@ -424,6 +456,12 @@ pub(super) fn dependency_install_failure_kind(stderr: &str) -> &'static str {
     }
 }
 
+fn should_retry_automatic_dependency_restore(success: bool, stderr: &str, attempts: u32) -> bool {
+    !success
+        && attempts < MAX_AUTOMATIC_DEPENDENCY_RESTORE_ATTEMPTS
+        && dependency_install_failure_kind(stderr) == "infrastructure.registry_unavailable"
+}
+
 pub(super) async fn dependency_restore_reason(
     workspace: &dyn WorkspaceBackend,
     ctx: &ToolContext,
@@ -667,4 +705,33 @@ pub(super) fn is_public_registry(registry: &str) -> bool {
         return false;
     }
     matches!(url.scheme(), "http" | "https")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_retry_automatic_dependency_restore;
+
+    #[test]
+    fn automatic_restore_retries_only_bounded_transient_registry_failures() {
+        assert!(should_retry_automatic_dependency_restore(
+            false,
+            "npm error code ECONNRESET",
+            1,
+        ));
+        assert!(!should_retry_automatic_dependency_restore(
+            false,
+            "npm error code ECONNRESET",
+            2,
+        ));
+        assert!(!should_retry_automatic_dependency_restore(
+            false,
+            "npm error ERESOLVE unable to resolve dependency tree",
+            1,
+        ));
+        assert!(!should_retry_automatic_dependency_restore(
+            true,
+            "npm error code ECONNRESET",
+            1,
+        ));
+    }
 }

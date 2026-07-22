@@ -31,8 +31,13 @@ pub async fn build_frozen_snapshot(
     workflow_id: &str,
     snapshot: &DraftSnapshot,
 ) -> Result<ProductionBuildOutput> {
-    if snapshot.template_id != "next-app" || snapshot.template_version != "next-app@1" {
-        bail!("PublishWorkflow currently supports only the next-app@1 production contract");
+    if snapshot.template_id != "next-app"
+        || !matches!(
+            snapshot.template_version.as_str(),
+            "next-app@1" | "next-app@2"
+        )
+    {
+        bail!("PublishWorkflow currently supports the next-app@1/@2 production contracts");
     }
     let files = verified_source_files(runtime_storage_dir, snapshot)?;
     if files.is_empty() || files.len() > MAX_SOURCE_FILES {
@@ -88,6 +93,16 @@ pub async fn build_frozen_snapshot(
 
 pub fn verify_frozen_snapshot(runtime_storage_dir: &Path, snapshot: &DraftSnapshot) -> Result<()> {
     verified_source_files(runtime_storage_dir, snapshot).map(|_| ())
+}
+
+pub(super) fn cleanup_build_workspace(runtime_storage_dir: &Path, workflow_id: &str) -> Result<()> {
+    let workflow_root = runtime_storage_dir
+        .join("publish-workflows")
+        .join(safe_segment(workflow_id));
+    if workflow_root.exists() {
+        fs::remove_dir_all(workflow_root)?;
+    }
+    Ok(())
 }
 
 fn verified_source_files(
@@ -324,6 +339,27 @@ mod tests {
         visual_contracts::{DraftSnapshotRetentionState, DRAFT_SNAPSHOT_SCHEMA},
     };
     use chrono::Utc;
+
+    #[test]
+    fn cleanup_removes_only_the_selected_workflow_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "publish-workflow-cleanup-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let selected = root.join("publish-workflows/workflow-selected/source");
+        let retained = root.join("publish-workflows/workflow-retained/source");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::write(selected.join("package.json"), b"{}").unwrap();
+        std::fs::write(retained.join("package.json"), b"{}").unwrap();
+
+        cleanup_build_workspace(&root, "workflow-selected").unwrap();
+
+        assert!(!root.join("publish-workflows/workflow-selected").exists());
+        assert!(root.join("publish-workflows/workflow-retained").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "production build canary requires Node.js and npm registry/cache access"]

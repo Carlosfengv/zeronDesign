@@ -21,7 +21,7 @@ use anydesign_runtime::{
         sandbox::sandbox_tools,
         streaming::{tool_result_error_text, StreamingToolExecutor},
     },
-    types::{AgentPhase, ProjectRuntimeState},
+    types::{canonical_json_hash, AgentPhase, ProjectRuntimeState},
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -369,7 +369,28 @@ async fn built_in_manifest_hashes_match_current_project_init_output() {
             .unwrap()
             .manifest_sha256
             .clone();
-        assert_eq!(actual, expected, "{template} manifest drifted");
+        if template == "next-app" {
+            // next-app@2 binds current materialized source bytes together with
+            // Runtime-owned EditableSurface metadata. next-app@1 remains a
+            // historical compatibility identity for existing projects.
+            assert_eq!(
+                actual.as_str(),
+                "0e373a2f8df3ab64d22d87a973ef0e9229221c4ef33ebc17287f927b6c2357b6"
+            );
+            let spec = registry
+                .current(&TemplateId::parse("next-app").unwrap())
+                .unwrap();
+            let identity_hash = canonical_json_hash(&json!({
+                "domain": "template-manifest-hash@2",
+                "templateId": spec.id.as_str(),
+                "templateVersion": spec.version.as_str(),
+                "sourceManifestHash": actual.as_str(),
+                "editableSurface": &spec.editable_surface,
+            }));
+            assert_eq!(expected.as_str(), identity_hash);
+        } else {
+            assert_eq!(actual, expected, "{template} manifest drifted");
+        }
     }
 }
 
@@ -380,7 +401,31 @@ fn next_app_freezes_shadcn_base_ui_tailwind_and_static_export_contracts() {
         .current(&TemplateId::parse("next-app").unwrap())
         .unwrap();
     assert_eq!(spec.framework.as_str(), "nextjs");
-    assert_eq!(spec.version.as_str(), "next-app@1");
+    assert_eq!(spec.version.as_str(), "next-app@2");
+    let editable = spec.editable_surface_view("project").unwrap();
+    assert_eq!(editable.primary_routes[0].route, "/");
+    assert_eq!(editable.primary_routes[0].source, "project/app/page.tsx");
+    assert_eq!(
+        editable.component_roots,
+        ["project/components", "project/components/ui"]
+    );
+    assert_eq!(editable.token_file, "project/app/tokens.css");
+    assert!(editable
+        .protected_paths
+        .contains(&"project/package.json".to_string()));
+    assert!(spec.editable_surface_view("../outside").is_err());
+
+    let legacy = registry
+        .resolve_version(
+            &TemplateId::parse("next-app").unwrap(),
+            &TemplateVersion::parse("next-app@1").unwrap(),
+            &ManifestHash::parse(
+                "919771231a9745aee050a3280518189d4b8d9f106d6ba334a896f41eac253067",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(legacy.editable_surface.primary_routes.is_empty());
     assert_eq!(spec.preview.output_directories, vec!["out"]);
     assert_eq!(
         spec.dependency_policy.version,
@@ -426,7 +471,16 @@ fn fumadocs_template_pins_a_resolvable_yuku_analyzer_graph() {
     let registry = BuiltInTemplateRegistry::built_in();
     let template_id = TemplateId::parse("fumadocs-docs").unwrap();
     let spec = registry.current(&template_id).unwrap();
-    assert_eq!(spec.version.as_str(), "fumadocs-docs@runtime-p5");
+    assert_eq!(spec.version.as_str(), "fumadocs-docs@runtime-p6");
+    let editable = spec.editable_surface_view("project").unwrap();
+    assert_eq!(editable.primary_routes[0].route, "/docs/");
+    assert_eq!(
+        editable.primary_routes[0].source,
+        "project/app/docs/[[...slug]]/page.jsx"
+    );
+    assert!(editable
+        .content_roots
+        .contains(&"project/content/docs".to_string()));
     let package_json = spec
         .files
         .iter()
@@ -497,6 +551,16 @@ fn fumadocs_template_pins_a_resolvable_yuku_analyzer_graph() {
             .unwrap(),
         )
         .expect("runtime-p4 projects must remain resolvable");
+    registry
+        .resolve_version(
+            &template_id,
+            &TemplateVersion::parse("fumadocs-docs@runtime-p5").unwrap(),
+            &ManifestHash::parse(
+                "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
+            )
+            .unwrap(),
+        )
+        .expect("runtime-p5 projects must remain resolvable");
 }
 
 async fn initialize_and_hash(template: &str) -> ManifestHash {

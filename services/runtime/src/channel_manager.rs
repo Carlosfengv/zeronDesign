@@ -100,16 +100,23 @@ impl ChannelManager {
                 && lease.status == ChannelLeaseStatus::Ready
                 && lease.expires_at > Utc::now()
         }) {
-            let now = Utc::now();
-            if now - lease.heartbeat_at
-                < Duration::seconds(CHANNEL_LEASE_HEARTBEAT_INTERVAL_SECONDS)
-            {
+            let transport_is_live = match lease.transport {
+                ChannelLeaseTransport::ServiceDns => true,
+                ChannelLeaseTransport::PortForward => self.port_forward_is_live(&lease).await,
+            };
+            if transport_is_live {
+                let now = Utc::now();
+                if now - lease.heartbeat_at
+                    < Duration::seconds(CHANNEL_LEASE_HEARTBEAT_INTERVAL_SECONDS)
+                {
+                    return endpoint_from_lease(&lease, scheme, path);
+                }
+                lease.heartbeat_at = now;
+                lease.expires_at = now + Duration::seconds(CHANNEL_LEASE_TTL_SECONDS);
+                let lease = store.put_channel_lease(lease).await?;
                 return endpoint_from_lease(&lease, scheme, path);
             }
-            lease.heartbeat_at = now;
-            lease.expires_at = now + Duration::seconds(CHANNEL_LEASE_TTL_SECONDS);
-            let lease = store.put_channel_lease(lease).await?;
-            return endpoint_from_lease(&lease, scheme, path);
+            self.retire_stale_lease(store, lease).await?;
         }
 
         let lease_id = sha256_hex(
@@ -261,6 +268,25 @@ impl ChannelManager {
             }
         }
         Ok(())
+    }
+
+    async fn port_forward_is_live(&self, lease: &ChannelLeaseRecord) -> bool {
+        let Some(local_port) = lease.local_port else {
+            return false;
+        };
+        let child_is_running = {
+            let mut children = self.children.lock().await;
+            let Some(child) = children.get_mut(&lease.id) else {
+                return false;
+            };
+            matches!(child.try_wait(), Ok(None))
+        };
+        if !child_is_running {
+            return false;
+        }
+        TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], local_port)))
+            .await
+            .is_ok()
     }
 
     async fn retire_stale_lease(

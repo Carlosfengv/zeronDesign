@@ -305,6 +305,50 @@ impl Tool for DraftSnapshotCreateTool {
             ));
         }
 
+        // Dev Preview mutations already freeze and persist the current
+        // revision before marking the DraftPreviewSession durable. Reuse that
+        // authoritative snapshot instead of trying to create a second
+        // build-based snapshot from stale outputs/build evidence.
+        if let Some(session) = ctx
+            .store
+            .draft_preview_store()
+            .active_for_project(&ctx.project_id)
+        {
+            if session.status == crate::visual_contracts::DraftPreviewSessionStatus::Ready
+                && session.last_ready_revision == session.workspace_revision
+                && session.durable_revision == session.workspace_revision
+            {
+                if let Some(snapshot) = ctx
+                    .store
+                    .get_draft_snapshot(&session.durable_snapshot_id)
+                    .await
+                {
+                    return Ok(ToolResult::ok(json!({
+                        "status": "snapshot_reused",
+                        "draftSnapshot": snapshot,
+                        "previewUrl": session.proxy_url,
+                        "visualReview": {
+                            "mode": "advisory",
+                            "status": "not_requested",
+                            "reason": "Visual Review sidechain has not run. This does not block generation completion."
+                        }
+                    })));
+                }
+            }
+            return Err(typed_recoverable(
+                "draft.snapshot_create is waiting for the current Dev Preview revision",
+                "draft.preview_revision_pending",
+                json!({
+                    "sessionId": session.session_id,
+                    "sessionEpoch": session.session_epoch,
+                    "workspaceRevision": session.workspace_revision,
+                    "lastReadyRevision": session.last_ready_revision,
+                    "durableRevision": session.durable_revision,
+                    "suggestedAction": "Call preview.dev_status until the current revision is ready and durable, then retry draft.snapshot_create."
+                }),
+            ));
+        }
+
         let build = read_workspace_json(&*self.workspace, &ctx, "outputs/build/latest.json")
             .await
             .ok_or_else(|| {

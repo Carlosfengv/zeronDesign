@@ -1,5 +1,5 @@
 use super::{
-    build::{build_frozen_snapshot, verify_frozen_snapshot},
+    build::{build_frozen_snapshot, cleanup_build_workspace, verify_frozen_snapshot},
     PublishWorkflowStore, StartPublishWorkflowRequest,
 };
 use crate::{
@@ -369,6 +369,13 @@ impl PublishWorkflowService {
             None,
             None,
         )?;
+        if let Err(error) = cleanup_build_workspace(&self.config.runtime_storage_dir, &workflow.id)
+        {
+            eprintln!(
+                "failed to remove PublishWorkflow build workspace {}: {error}",
+                workflow.id
+            );
+        }
         Ok(())
     }
 
@@ -844,6 +851,13 @@ impl PublishWorkflowController {
                     .service
                     .store
                     .set_status(&id, status, Some(error.to_string()));
+                if let Err(cleanup_error) =
+                    cleanup_build_workspace(&self.service.config.runtime_storage_dir, &id)
+                {
+                    eprintln!(
+                        "failed to remove failed PublishWorkflow build workspace {id}: {cleanup_error}"
+                    );
+                }
             }
             processed += 1;
         }

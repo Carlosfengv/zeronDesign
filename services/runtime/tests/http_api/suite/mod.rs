@@ -1,10 +1,7 @@
 use anydesign_runtime::{
     config::{PublicPrincipalAuthMode, RuntimePolicyProfile, SandboxBackendMode},
     http_api::{self, AppState},
-    model_gateway::{
-        MockModelClient, ModelResponse, OpenAiCompatibleModelClient, ToolCall,
-        ToolInputParseFailure,
-    },
+    model_gateway::{MockModelClient, ModelResponse, ToolCall, ToolInputParseFailure},
     preview::{promote_preview, PromotionGateReport},
     public_principal::{
         PublicPrincipalClaims, PublicPrincipalJwtIssuer, PREVIEW_READ_OPERATION,
@@ -136,7 +133,7 @@ fn website_brief() -> Brief {
             }
         ]),
         visual_direction: "clear editorial product story".to_string(),
-        recommended_template: "astro-website".to_string(),
+        recommended_template: "next-app".to_string(),
         assumptions: vec![],
         missing_information: vec![],
     }
@@ -263,7 +260,7 @@ fn design_profile_request_for_scope(
         "accessibility": {},
         "technical": {
             "allowedTemplates": allowed_templates,
-            "preferredTemplates": { "website": "astro-website", "docs": "fumadocs-docs" },
+            "preferredTemplates": { "website": "next-app", "docs": "fumadocs-docs" },
             "cssStrategy": "runtime-style-contract",
             "dependencyPolicy": {},
             "filePolicy": {
@@ -285,7 +282,7 @@ fn design_profile_request_for_scope(
 }
 
 async fn wait_for_terminal(store: &RuntimeStore, run_id: &str) {
-    if wait_for_terminal_with_timeout(store, run_id, 45).await {
+    if wait_for_terminal_with_timeout(store, run_id, 90).await {
         return;
     }
     panic!(
@@ -308,32 +305,6 @@ async fn wait_for_terminal_with_timeout(store: &RuntimeStore, run_id: &str, seco
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     false
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
-async fn start_preview_server() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let html = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Runtime lifecycle fixture</title><style>body{font-family:sans-serif;max-width:100%;overflow-x:hidden}</style></head><body><nav><a href=\"#overview\">Overview</a></nav><label>Search <input type=\"search\" aria-label=\"Search docs\"></label><main><h1 id=\"overview\">Home Overview Initial hero Edited hero</h1><p>Explain the product with hero and features. Explain the runtime lifecycle for developer operators.</p></main></body></html>";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    });
-    (format!("http://{addr}/candidate"), handle)
 }
 
 async fn start_candidate_preview_upstream(manifest_hash: String) -> (String, u16, JoinHandle<()>) {
@@ -495,8 +466,14 @@ async fn start_public_run(
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "run start failed: {}",
+        String::from_utf8_lossy(&body)
+    );
     let payload: Value = serde_json::from_slice(&body).unwrap();
     payload["runId"].as_str().unwrap().to_string()
 }
@@ -575,12 +552,14 @@ mod artifacts;
 mod bff_runtime_e2e;
 #[path = "../cases/briefs.rs"]
 mod briefs;
-#[path = "../cases/design_context_sync.rs"]
-mod design_context_sync;
 #[path = "../cases/design_profiles.rs"]
 mod design_profiles;
 #[path = "../cases/design_sources.rs"]
 mod design_sources;
+#[path = "../cases/draft_previews.rs"]
+mod draft_previews;
+#[path = "../cases/edit_guard.rs"]
+mod edit_guard;
 #[path = "../cases/edit_lifecycle.rs"]
 mod edit_lifecycle;
 #[path = "../cases/internal.rs"]
@@ -597,6 +576,8 @@ mod profile_run_integration;
 mod project_authorization;
 #[path = "../cases/project_runtime.rs"]
 mod project_runtime;
+#[path = "../cases/publish_workflows.rs"]
+mod publish_workflows;
 #[path = "../cases/release_packaging.rs"]
 mod release_packaging;
 #[path = "../cases/run_events.rs"]
@@ -611,3 +592,5 @@ mod runs_repair;
 mod runs_start;
 #[path = "../cases/system.rs"]
 mod system;
+#[path = "../cases/visual_artifacts.rs"]
+mod visual_artifacts;

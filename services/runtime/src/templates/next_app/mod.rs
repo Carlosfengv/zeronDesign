@@ -1,10 +1,11 @@
 use super::{
-    BuildSpec, ComponentRegistryRef, DependencyPolicyRef, DevelopmentServerSpec, FrameworkId,
-    ManifestHash, MutationPolicySpec, PreviewSpec, RenderPageRequest, RenderedFile,
-    SandboxExecutionProfileId, SandboxExecutionProfileRef, SandboxExecutionProfileVersion,
-    SourceContractReport, SourceContractSpec, SourceSnapshot, StyleContractSpec, StyleTokenSpec,
-    TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateId, TemplateOperationError,
-    TemplateOperations, TemplateSpec, TemplateVersion, TemplateWriteMode, ValidationContractSpec,
+    BuildSpec, ComponentRegistryRef, DependencyPolicyRef, DevelopmentServerSpec, EditableRoute,
+    EditableSurfaceMetadata, FrameworkId, ManifestHash, MutationPolicySpec, PreviewSpec,
+    RenderPageRequest, RenderedFile, SandboxExecutionProfileId, SandboxExecutionProfileRef,
+    SandboxExecutionProfileVersion, SourceContractReport, SourceContractSpec, SourceSnapshot,
+    StyleContractSpec, StyleTokenSpec, TemplateCapabilities, TemplateFile, TemplateFileRole,
+    TemplateId, TemplateOperationError, TemplateOperations, TemplateSpec, TemplateVersion,
+    TemplateWriteMode, ValidationContractSpec,
 };
 use crate::artifact_manifest::ArtifactDeliverySpec;
 use std::path::{Component, Path, PathBuf};
@@ -208,7 +209,7 @@ impl TemplateOperations for NextAppOperations {
                 "\"next\"",
                 "\"react\"",
                 "\"@base-ui/react\"",
-                "\"build\": \"next build\"",
+                "\"build\": \"next build --webpack\"",
             ],
             "package.json must preserve the pinned Next/React/Base UI build contract",
             &mut violations,
@@ -246,13 +247,43 @@ impl TemplateOperations for NextAppOperations {
 }
 
 pub fn spec() -> TemplateSpec {
+    spec_with_identity(
+        "next-app@2",
+        "4d13a0eef750c58680f1d83a2c0df524e001cd634be49df25fdc6dd85a301ff5",
+        EditableSurfaceMetadata {
+            primary_routes: vec![EditableRoute {
+                route: "/".to_string(),
+                source: "app/page.tsx".to_string(),
+            }],
+            component_roots: vec!["components".to_string(), "components/ui".to_string()],
+            content_roots: Vec::new(),
+            inspection_hints: vec![
+                "app/page.tsx".to_string(),
+                "app/layout.tsx".to_string(),
+                "app/globals.css".to_string(),
+                "app/tokens.css".to_string(),
+            ],
+        },
+    )
+}
+
+pub fn legacy_spec() -> TemplateSpec {
+    spec_with_identity(
+        "next-app@1",
+        "919771231a9745aee050a3280518189d4b8d9f106d6ba334a896f41eac253067",
+        EditableSurfaceMetadata::default(),
+    )
+}
+
+fn spec_with_identity(
+    version: &str,
+    manifest_sha256: &str,
+    editable_surface: EditableSurfaceMetadata,
+) -> TemplateSpec {
     TemplateSpec {
         id: TemplateId::parse("next-app").unwrap(),
-        version: TemplateVersion::parse("next-app@1").unwrap(),
-        manifest_sha256: ManifestHash::parse(
-            "919771231a9745aee050a3280518189d4b8d9f106d6ba334a896f41eac253067",
-        )
-        .unwrap(),
+        version: TemplateVersion::parse(version).unwrap(),
+        manifest_sha256: ManifestHash::parse(manifest_sha256).unwrap(),
         framework: FrameworkId::parse("nextjs").unwrap(),
         surface: "website",
         default_title: "AnyDesign React Project",
@@ -262,6 +293,7 @@ pub fn spec() -> TemplateSpec {
         },
         files: FILES,
         inspection_files: SOURCE_PATHS,
+        editable_surface,
         build: BuildSpec {
             argv: vec!["npm".to_string(), "run".to_string(), "build".to_string()],
             timeout_ms: 180_000,

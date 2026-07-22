@@ -51,6 +51,7 @@ const SECRET_PATTERNS = [
 ];
 const MANAGED_PREVIEW_SCRIPT = "/opt/anydesign/bootstrap/static-preview-server.js";
 const PROCESS_LOG_LIMIT = 64 * 1024;
+const PROCESS_EXIT_DRAIN_GRACE_MS = 250;
 const TOKEN_REPLAY_LOG = path.join(WORKSPACE_ROOT, ".anydesign", "channel-jti-replay.jsonl");
 const TOKEN_REPLAY_COMPACT_INTERVAL = 256;
 
@@ -500,8 +501,18 @@ async function startManagedProcess(request, payload) {
   const cwd = resolveWorkspacePath(request.path || "/workspace", "existing");
   const child = spawn(payload.argv[0], payload.argv.slice(1), {
     cwd,
-    env: process.env,
+    // Static PreviewLease routing has a dedicated, Runtime-owned port. The
+    // next-app sandbox keeps CANDIDATE_PREVIEW_PORT=3000 for managed Dev, so
+    // inheriting that value here would make the static proxy's 4321 target a
+    // permanent false-positive.
+    env: isManagedPreview
+      ? { ...process.env, CANDIDATE_PREVIEW_PORT: "4321" }
+      : process.env,
     stdio: ["ignore", "pipe", "pipe"],
+    // npm launches the framework Dev server as a child process. A dedicated
+    // process group lets process.stop terminate the full tree so a restarted
+    // lease cannot inherit an orphan that still owns the preview port.
+    detached: true,
   });
   const lease = {
     id: leaseId,
@@ -540,17 +551,70 @@ async function stopManagedProcess(leaseId) {
     return managedProcessStatus(leaseId);
   }
   lease.status = "stopping";
-  lease.child.kill("SIGTERM");
+  signalManagedProcessGroup(lease.child, "SIGTERM");
   await Promise.race([
     once(lease.child, "close"),
     new Promise((resolve) => setTimeout(resolve, 2000)),
   ]);
   if (lease.status === "stopping") {
-    lease.child.kill("SIGKILL");
+    signalManagedProcessGroup(lease.child, "SIGKILL");
     lease.status = "stopped";
     lease.exitedAt = new Date().toISOString();
   }
   return managedProcessStatus(leaseId);
+}
+
+function signalManagedProcessGroup(child, signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error.code !== "ESRCH") {
+      child.kill(signal);
+    }
+  }
+}
+
+async function descendantProcessIds(rootPid) {
+  return await new Promise((resolve) => {
+    let output = "";
+    const ps = spawn("ps", ["-Ao", "pid=,ppid="], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    ps.stdout.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+    });
+    ps.on("error", () => resolve([]));
+    ps.on("close", () => {
+      const children = new Map();
+      for (const line of output.split("\n")) {
+        const [pidText, parentText] = line.trim().split(/\s+/);
+        const pid = Number(pidText);
+        const parent = Number(parentText);
+        if (!Number.isInteger(pid) || !Number.isInteger(parent)) continue;
+        const siblings = children.get(parent) || [];
+        siblings.push(pid);
+        children.set(parent, siblings);
+      }
+      const descendants = [];
+      const pending = [...(children.get(rootPid) || [])];
+      while (pending.length > 0) {
+        const pid = pending.pop();
+        descendants.push(pid);
+        pending.push(...(children.get(pid) || []));
+      }
+      resolve(descendants);
+    });
+  });
+}
+
+function signalProcessIds(pids, signal) {
+  for (const pid of pids.reverse()) {
+    try {
+      process.kill(pid, signal);
+    } catch (error) {
+      if (error.code !== "ESRCH") continue;
+    }
+  }
 }
 
 async function copyDir(source, target, skipDirNames) {
@@ -581,6 +645,8 @@ function runProcess(argv, cwd, timeoutMs) {
     let timedOut = false;
     let exitCode = null;
     let settled = false;
+    let exitDrainTimeout;
+    let exitPoll;
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
       env: process.env,
@@ -591,6 +657,8 @@ function runProcess(argv, cwd, timeoutMs) {
     const finish = (callback) => {
       if (settled) return;
       settled = true;
+      clearInterval(exitPoll);
+      clearTimeout(exitDrainTimeout);
       callback();
     };
     const signalProcessGroup = (signal) => {
@@ -613,12 +681,37 @@ function runProcess(argv, cwd, timeoutMs) {
 
     const timeout = setTimeout(async () => {
       timedOut = true;
-      signalProcessGroup("SIGTERM");
+      const descendants = await descendantProcessIds(child.pid);
+      const processTree = [child.pid, ...descendants];
+      signalProcessIds([...processTree], "SIGTERM");
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 1000));
-      signalProcessGroup("SIGKILL");
+      signalProcessIds([...processTree], "SIGKILL");
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
       finish(() => resolve(result()));
     }, timeoutMs);
     timeout.unref();
+
+    const scheduleExitedCompletion = (code) => {
+      exitCode = code;
+      clearTimeout(timeout);
+      if (exitDrainTimeout) return;
+      exitDrainTimeout = setTimeout(() => {
+        signalProcessGroup("SIGTERM");
+        finish(() => resolve(result()));
+      }, PROCESS_EXIT_DRAIN_GRACE_MS);
+      exitDrainTimeout.unref();
+    };
+
+    // ChildProcess normally emits `exit` and then `close`, but npm lifecycle
+    // process trees have shown an exited/reaped parent without either callback
+    // completing this Promise. `exitCode` is maintained by Node independently
+    // of those listeners, so polling it provides a bounded final fallback.
+    exitPoll = setInterval(() => {
+      if (!timedOut && child.exitCode !== null) {
+        scheduleExitedCompletion(child.exitCode);
+      }
+    }, 50);
+    exitPoll.unref();
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -628,12 +721,23 @@ function runProcess(argv, cwd, timeoutMs) {
     });
     child.on("error", (error) => {
       clearTimeout(timeout);
+      clearTimeout(exitDrainTimeout);
       finish(() => reject(error));
+    });
+    child.on("exit", (code) => {
+      // `close` waits for every inherited stdio descriptor to close. npm
+      // lifecycle descendants can keep those descriptors open after the npm
+      // parent has already exited successfully, which otherwise leaves the
+      // Runtime tool execution in-doubt until its transport deadline. Give
+      // buffered output a short grace period, then return the authoritative
+      // parent exit status and terminate any leaked process-group members.
+      if (!timedOut) scheduleExitedCompletion(code);
     });
     child.on("close", (code) => {
       exitCode = code;
       if (!timedOut) {
         clearTimeout(timeout);
+        clearTimeout(exitDrainTimeout);
         finish(() => resolve(result()));
       }
     });

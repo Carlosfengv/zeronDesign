@@ -55,6 +55,10 @@ impl Tool for PreviewDevStartTool {
         _progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
         ensure_dev_preview_supported(&ctx)?;
+        if ctx.run.generation_context_runtime_mode.as_deref() == Some("enabled") {
+            let runtime_attestation = project_runtime_attestation(&*self.workspace, &ctx).await?;
+            require_materialized_project_attestation(&runtime_attestation, self.name())?;
+        }
         if !ctx.remote_workspace {
             return Err(typed_recoverable(
                 "preview.dev_start requires a managed sandbox process lease",
@@ -304,8 +308,37 @@ impl Tool for PreviewDevStopTool {
             .await
             .unwrap_or_else(|| json!({ "status": "stopped", "accessible": false }));
         if let Some(lease_id) = state.get("leaseId").and_then(Value::as_str) {
-            self.command.stop_process(&ctx, lease_id).await.ok();
-            ctx.store.stop_preview_lease(lease_id).await.ok();
+            let process = self
+                .command
+                .stop_process(&ctx, lease_id)
+                .await
+                .map_err(|error| {
+                    typed_recoverable(
+                        format!("development preview process could not be stopped: {error}"),
+                        "preview.dev_stop_failed",
+                        json!({ "blocking": false }),
+                    )
+                })?;
+            if !matches!(process.status.as_str(), "stopped" | "exited" | "failed") {
+                return Err(typed_recoverable(
+                    format!(
+                        "development preview process did not reach a terminal state: {}",
+                        process.status
+                    ),
+                    "preview.dev_stop_incomplete",
+                    json!({ "blocking": false, "processStatus": process.status }),
+                ));
+            }
+            ctx.store
+                .stop_preview_lease(lease_id)
+                .await
+                .map_err(|error| {
+                    typed_recoverable(
+                        format!("development preview lease could not be stopped: {error}"),
+                        "preview.lease_stop_failed",
+                        json!({ "blocking": false }),
+                    )
+                })?;
         }
         if let Some(session_id) = state.get("sessionId").and_then(Value::as_str) {
             ctx.store
@@ -435,10 +468,19 @@ pub(super) async fn freeze_draft_revision(
         .publish_source_snapshot(&ctx.project_id, &snapshot_key, files)
         .await
         .map_err(|error| ToolError::Terminal(error.to_string()))?;
+    let inherited_design_context_hash = match based_on_snapshot_id.as_deref() {
+        Some(snapshot_id) => ctx
+            .store
+            .get_draft_snapshot(snapshot_id)
+            .await
+            .map(|snapshot| snapshot.design_context_hash),
+        None => None,
+    };
     let design_context_hash = ctx
         .run
         .design_context_content_hash
         .clone()
+        .or(inherited_design_context_hash)
         .unwrap_or_else(|| canonical_json_hash(&json!({ "designContext": "none" })));
     ctx.store
         .create_draft_revision_snapshot(

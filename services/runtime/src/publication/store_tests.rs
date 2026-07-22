@@ -143,3 +143,76 @@ fn delivered_outbox_and_reconciling_checkpoint_persist_together() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn stale_outbox_cannot_update_a_newer_generation_or_poison_recovery() {
+    let root = root("stale-outbox");
+    let store = PublicationStore::open(&root).unwrap();
+    store.commit_intent(&publish("publish-key")).unwrap();
+    let stale_outbox = store.pending_outbox().pop().unwrap();
+    let (unpublish, _) = store
+        .commit_intent(&PublicationIntent {
+            project_id: "project-1".into(),
+            workspace_namespace: "ws-project-one".into(),
+            kind: PublishOperationKind::Unpublish,
+            release_id: None,
+            expected_current_release_id: None,
+            expected_generation: Some(1),
+            runtime_profile_id: "static-web-v1".into(),
+            idempotency_key: "unpublish-key".into(),
+        })
+        .unwrap();
+
+    let pending = store.pending_outbox();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id, unpublish.id);
+    assert!(matches!(
+        store.record_reconcile_failure(&stale_outbox.id, "stale failure"),
+        Err(PublicationStoreError::Conflict(_))
+    ));
+
+    drop(store);
+    let recovered = PublicationStore::open(&root).unwrap();
+    assert_eq!(
+        recovered.runtime("project-1").unwrap().desired_generation,
+        2
+    );
+    assert_eq!(recovered.pending_outbox().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_commit_is_rejected_before_it_reaches_the_journal() {
+    let root = root("invalid-before-append");
+    let store = PublicationStore::open(&root).unwrap();
+    store.commit_intent(&publish("publish-key")).unwrap();
+    let journal_before = fs::read(root.join(JOURNAL_FILE)).unwrap();
+
+    let mut snapshot = store.state.lock().unwrap();
+    let operation = snapshot.operations.values().next().unwrap().clone();
+    let outbox = snapshot.outbox.values().next().unwrap().clone();
+    let mut runtime = snapshot.runtimes.values().next().unwrap().clone();
+    runtime.desired_generation += 1;
+    let scoped_key = framed_hash(&[
+        operation.project_id.as_str(),
+        operation.idempotency_key_hash.as_str(),
+    ]);
+    assert!(matches!(
+        persist_commit(
+            &store.root,
+            None,
+            &mut snapshot,
+            operation,
+            runtime,
+            outbox,
+            scoped_key,
+        ),
+        Err(PublicationStoreError::Storage(_))
+    ));
+    drop(snapshot);
+
+    assert_eq!(fs::read(root.join(JOURNAL_FILE)).unwrap(), journal_before);
+    drop(store);
+    PublicationStore::open(&root).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

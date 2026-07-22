@@ -514,6 +514,17 @@ async fn save_promotion_checkpoint(
                 source_snapshot_uri: version.source_snapshot_uri.clone(),
                 screenshot_id: version.screenshot_id.clone(),
             }),
+            context_content_hash: run.generation_context_content_hash.clone(),
+            run_context_binding_hash: run.generation_context_binding_hash.clone(),
+            runtime_attestation_hash: run.generation_context_runtime_attestation_hash.clone(),
+            context_window_epoch: Some(run.context_window_epoch),
+            execution_profile: run.execution_profile.clone(),
+            target_session_epoch: None,
+            target_workspace_revision: None,
+            workflow_state: run.workflow_state.clone(),
+            observation_receipts_version: (run.run_contract_version.as_deref()
+                == Some(crate::generation_context::GENERATION_CONTEXT_SCHEMA))
+            .then_some(1),
             brief_version: run.brief_version,
             design_version: run.design_version,
             last_known_preview_url: Some(version.preview_url.clone()),

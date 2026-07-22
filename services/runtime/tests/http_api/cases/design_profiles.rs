@@ -129,7 +129,7 @@ async fn imported_design_profile_requires_review_before_activation_and_survives_
         .is_some_and(|issues| !issues.is_empty()));
 
     let mut candidate =
-        design_profile_request("project-import", vec!["astro-website"])["profile"].clone();
+        design_profile_request("project-import", vec!["next-app"])["profile"].clone();
     candidate["signatureRules"] = json!([{
         "id": "authkit-primary",
         "category": "color",
@@ -215,7 +215,7 @@ async fn imported_design_profile_requires_review_before_activation_and_survives_
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/design-profiles/{profile_id}/versions/3/fidelity-report?surface=website&template=astro-website"
+                    "/design-profiles/{profile_id}/versions/3/fidelity-report?surface=website&template=next-app"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -298,7 +298,7 @@ async fn design_profile_api_create_bind_and_resolve_for_runs() {
                 .uri("/design-profiles")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    design_profile_request("project-1", vec!["astro-website"]).to_string(),
+                    design_profile_request("project-1", vec!["next-app"]).to_string(),
                 ))
                 .unwrap(),
         )
@@ -335,8 +335,7 @@ async fn design_profile_api_create_bind_and_resolve_for_runs() {
         .unwrap();
     assert_eq!(fetched.status(), StatusCode::OK);
 
-    let update_profile =
-        design_profile_request("project-1", vec!["astro-website"])["profile"].clone();
+    let update_profile = design_profile_request("project-1", vec!["next-app"])["profile"].clone();
     let updated = app
         .clone()
         .oneshot(

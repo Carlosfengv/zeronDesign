@@ -65,6 +65,7 @@ impl Tool for FsWriteTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_write_path(&input, &ctx)?;
         let text = required_str(&input, "text")?;
+        authorize_existing_file_mutation(&*self.workspace, &ctx, &path).await?;
         ensure_project_mutation_content(&path, text, &ctx)?;
         preview_dev::validate_dev_file_mutation(&ctx, &path)?;
         self.workspace
@@ -73,6 +74,7 @@ impl Tool for FsWriteTool {
             .map_err(|error| {
                 ToolError::Recoverable(format!("failed to write {}: {error}", path.display()))
             })?;
+        advance_mutation_lease(&*self.workspace, &ctx, &path, text).await?;
         let draft_preview =
             preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({
@@ -295,7 +297,7 @@ impl Tool for FsCommitChunksTool {
             content.push_str(&chunk);
         }
         let existing_content = match mode {
-            "create" => match self.workspace.read_to_string(&ctx, &final_path).await {
+            "create" => match self.workspace.path_kind(&ctx, &final_path).await {
                 Ok(_) => {
                     return Err(ToolError::Recoverable(format!(
                         "fs.commit_chunks mode=create refused to overwrite existing {}",
@@ -304,12 +306,13 @@ impl Tool for FsCommitChunksTool {
                 }
                 Err(_) => String::new(),
             },
-            "append" => self
-                .workspace
-                .read_to_string(&ctx, &final_path)
-                .await
+            "append" => authorize_existing_file_mutation(&*self.workspace, &ctx, &final_path)
+                .await?
                 .unwrap_or_default(),
-            _ => String::new(),
+            _ => {
+                authorize_existing_file_mutation(&*self.workspace, &ctx, &final_path).await?;
+                String::new()
+            }
         };
         let final_content = if mode == "append" {
             format!("{existing_content}{content}")
@@ -342,6 +345,7 @@ impl Tool for FsCommitChunksTool {
                     final_path.display()
                 ))
             })?;
+        advance_mutation_lease(&*self.workspace, &ctx, &final_path, &final_content).await?;
         let _ = self
             .workspace
             .remove_dir_all(&ctx, &staged_session_dir(&ctx, &session_id))
@@ -468,39 +472,15 @@ impl Tool for FsPatchTool {
             .get("replaceAll")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let read_entry = read_tracking_entry(&*self.workspace, &ctx, &path).await;
-        if read_entry.is_none() {
-            return Err(typed_recoverable(
-                "fs.patch requires reading the target file first. Call fs.read on the path, then retry with a small unique oldStr of roughly 2-6 lines; do not paste the whole file.".to_string(),
-                "patch.read_required",
-                json!({
-                    "path": display_workspace_path(&path, &ctx),
-                    "suggestedAction": "Call fs.read on this path before fs.patch."
-                }),
-            ));
-        }
-        let content = self
-            .workspace
-            .read_to_string(&ctx, &path)
-            .await
-            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        let current_hash = sha256_hex(content.as_bytes());
-        let read_hash = read_entry
-            .as_ref()
-            .and_then(|entry| entry.get("contentHash").and_then(Value::as_str));
-        if read_hash != Some(current_hash.as_str()) {
-            return Err(typed_recoverable(
-                "file has been modified since fs.read; read it again before attempting fs.patch"
-                    .to_string(),
-                "patch.stale_read",
-                json!({
-                    "path": display_workspace_path(&path, &ctx),
-                    "currentHash": current_hash,
-                    "readHash": read_hash,
-                    "suggestedAction": "Call fs.read again and patch against current contents."
-                }),
-            ));
-        }
+        let content = authorize_existing_file_mutation(&*self.workspace, &ctx, &path)
+            .await?
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "fs.patch target does not exist",
+                    "mutation.target_missing",
+                    json!({ "path": display_workspace_path(&path, &ctx) }),
+                )
+            })?;
         let count = content.matches(old_str).count();
         if count == 0 {
             return Err(typed_recoverable(
@@ -527,7 +507,7 @@ impl Tool for FsPatchTool {
             .write_string(&ctx, &path, &new_content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&*self.workspace, &ctx, &path, &new_content).await?;
+        advance_mutation_lease(&*self.workspace, &ctx, &path, &new_content).await?;
         let draft_preview =
             preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({
@@ -615,39 +595,15 @@ impl Tool for FsMultiPatchTool {
         let path = checked_existing_path(&input, &ctx)?;
         ensure_not_nested_package_root(&path, &ctx)?;
         ensure_project_mutation_write_path(&path, &ctx)?;
-        let read_entry = read_tracking_entry(&*self.workspace, &ctx, &path).await;
-        if read_entry.is_none() {
-            return Err(typed_recoverable(
-                "fs.multi_patch requires reading the target file first. Call fs.read on the path, then retry with small unique oldStr snippets.".to_string(),
-                "patch.read_required",
-                json!({
-                    "path": display_workspace_path(&path, &ctx),
-                    "suggestedAction": "Call fs.read on this path before fs.multi_patch."
-                }),
-            ));
-        }
-        let original_content = self
-            .workspace
-            .read_to_string(&ctx, &path)
-            .await
-            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        let current_hash = sha256_hex(original_content.as_bytes());
-        let read_hash = read_entry
-            .as_ref()
-            .and_then(|entry| entry.get("contentHash").and_then(Value::as_str));
-        if read_hash != Some(current_hash.as_str()) {
-            return Err(typed_recoverable(
-                "file has been modified since fs.read; read it again before attempting fs.multi_patch"
-                    .to_string(),
-                "patch.stale_read",
-                json!({
-                    "path": display_workspace_path(&path, &ctx),
-                    "currentHash": current_hash,
-                    "readHash": read_hash,
-                    "suggestedAction": "Call fs.read again and patch against current contents."
-                }),
-            ));
-        }
+        let original_content = authorize_existing_file_mutation(&*self.workspace, &ctx, &path)
+            .await?
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "fs.multi_patch target does not exist",
+                    "mutation.target_missing",
+                    json!({ "path": display_workspace_path(&path, &ctx) }),
+                )
+            })?;
 
         let edits = input
             .get("edits")
@@ -705,7 +661,7 @@ impl Tool for FsMultiPatchTool {
             .write_string(&ctx, &path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&*self.workspace, &ctx, &path, &content).await?;
+        advance_mutation_lease(&*self.workspace, &ctx, &path, &content).await?;
         let draft_preview =
             preview_dev::record_dev_file_mutation(&*self.workspace, &ctx, &path).await;
         Ok(ToolResult::ok(json!({

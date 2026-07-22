@@ -81,6 +81,15 @@ impl Tool for StyleUpdateTokensTool {
                     }),
                 )
             })?;
+        let runtime_attestation =
+            if ctx.run.generation_context_runtime_mode.as_deref() == Some("enabled") {
+                let attestation = project_runtime_attestation(&*self.workspace, &ctx).await?;
+                require_materialized_project_attestation(&attestation, self.name())?;
+                require_verified_style_contract(&attestation, self.name())?;
+                Some(attestation)
+            } else {
+                None
+            };
         let token_file = contract
             .get("tokenFile")
             .and_then(Value::as_str)
@@ -203,12 +212,13 @@ impl Tool for StyleUpdateTokensTool {
             .write_string(&ctx, &token_path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(&*self.workspace, &ctx, &token_path, &content).await?;
+        advance_mutation_lease(&*self.workspace, &ctx, &token_path, &content).await?;
         let draft_preview = preview_dev::record_dev_mutation(&*self.workspace, &ctx).await;
         Ok(ToolResult::ok(json!({
             "tokenFile": display_workspace_path(&token_path, &ctx),
             "updated": true,
             "changes": changes,
+            "runtimeAttestation": runtime_attestation,
             "draftPreview": draft_preview,
         })))
     }

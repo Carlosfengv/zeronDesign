@@ -4,6 +4,7 @@ use super::{
 };
 use crate::artifact_manifest::ArtifactDeliverySpec;
 use crate::generation_contract::GenerationContract;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +178,34 @@ pub struct TemplateFile {
     pub write_mode: TemplateWriteMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableRoute {
+    pub route: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableSurfaceMetadata {
+    pub primary_routes: Vec<EditableRoute>,
+    pub component_roots: Vec<String>,
+    pub content_roots: Vec<String>,
+    pub inspection_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableSurfaceView {
+    pub primary_routes: Vec<EditableRoute>,
+    pub global_style_files: Vec<String>,
+    pub component_roots: Vec<String>,
+    pub content_roots: Vec<String>,
+    pub token_file: String,
+    pub protected_paths: Vec<String>,
+    pub inspection_hints: Vec<String>,
+}
+
 impl TemplateFile {
     pub fn content_for_write(&self) -> &str {
         if self.trim_final_newline {
@@ -198,6 +227,7 @@ pub struct TemplateSpec {
     pub sandbox_execution_profile: SandboxExecutionProfileRef,
     pub files: &'static [TemplateFile],
     pub inspection_files: &'static [&'static str],
+    pub editable_surface: EditableSurfaceMetadata,
     pub build: BuildSpec,
     pub development_server: Option<DevelopmentServerSpec>,
     pub preview: PreviewSpec,
@@ -225,6 +255,7 @@ impl std::fmt::Debug for TemplateSpec {
             .field("sandbox_execution_profile", &self.sandbox_execution_profile)
             .field("files", &self.files)
             .field("inspection_files", &self.inspection_files)
+            .field("editable_surface", &self.editable_surface)
             .field("build", &self.build)
             .field("development_server", &self.development_server)
             .field("preview", &self.preview)
@@ -252,6 +283,7 @@ impl PartialEq for TemplateSpec {
             && self.sandbox_execution_profile == other.sandbox_execution_profile
             && self.files == other.files
             && self.inspection_files == other.inspection_files
+            && self.editable_surface == other.editable_surface
             && self.build == other.build
             && self.development_server == other.development_server
             && self.preview == other.preview
@@ -270,6 +302,63 @@ impl PartialEq for TemplateSpec {
 impl Eq for TemplateSpec {}
 
 impl TemplateSpec {
+    pub fn editable_surface_view(&self, app_root: &str) -> Result<EditableSurfaceView, String> {
+        validate_relative_path(app_root, "appRoot")?;
+        let prepend = |path: &str| -> Result<String, String> {
+            validate_relative_path(path, "EditableSurface path")?;
+            Ok(format!("{app_root}/{path}"))
+        };
+        let primary_routes = self
+            .editable_surface
+            .primary_routes
+            .iter()
+            .map(|route| {
+                if !route.route.starts_with('/') || route.route.starts_with("//") {
+                    return Err(format!("invalid editable route: {}", route.route));
+                }
+                Ok(EditableRoute {
+                    route: route.route.clone(),
+                    source: prepend(&route.source)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let protected = self
+            .source_contract
+            .protected_paths
+            .iter()
+            .chain(self.mutation_policy.protected_write_paths.iter())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let protected_paths = protected
+            .iter()
+            .map(|path| prepend(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EditableSurfaceView {
+            primary_routes,
+            global_style_files: vec![prepend(self.style.global_css_file)?],
+            component_roots: self
+                .editable_surface
+                .component_roots
+                .iter()
+                .map(|path| prepend(path))
+                .collect::<Result<Vec<_>, _>>()?,
+            content_roots: self
+                .editable_surface
+                .content_roots
+                .iter()
+                .map(|path| prepend(path))
+                .collect::<Result<Vec<_>, _>>()?,
+            token_file: prepend(self.style.token_file)?,
+            protected_paths,
+            inspection_hints: self
+                .editable_surface
+                .inspection_hints
+                .iter()
+                .map(|path| prepend(path))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
     pub fn generation_contract(&self) -> Result<GenerationContract, String> {
         let output_directory = self
             .preview
@@ -295,4 +384,17 @@ impl TemplateSpec {
         contract.validate()?;
         Ok(contract)
     }
+}
+
+fn validate_relative_path(path: &str, label: &str) -> Result<(), String> {
+    if path.trim().is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(format!("{label} must be a normalized relative path"));
+    }
+    Ok(())
 }

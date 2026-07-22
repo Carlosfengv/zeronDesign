@@ -105,6 +105,10 @@ fn status_payload(run: &AgentRun) -> Result<Value, ToolError> {
                 .collect::<serde_json::Map<_, _>>()
         })
         .unwrap_or_default();
+    let runtime_attested = run.run_contract_version.as_deref()
+        == Some(crate::generation_context::GENERATION_CONTEXT_SCHEMA)
+        && run.generation_context_status.as_deref() == Some("compiled")
+        && run.generation_context_runtime_attestation_hash.is_some();
     Ok(json!({
         "package": {
             "version": run.design_context_package_version,
@@ -134,7 +138,21 @@ fn status_payload(run: &AgentRun) -> Result<Value, ToolError> {
         "requiredReads": required_reads,
         "readFiles": run.design_context_read_files,
         "missingRequiredReads": missing_reads,
-        "gate": if missing_reads.is_empty() { "ready" } else { "read_required" },
+        "readProtocol": if runtime_attested { "deprecated_compatibility" } else { "legacy_gate" },
+        "gate": if runtime_attested || missing_reads.is_empty() { "ready" } else { "read_required" },
+        "generationContext": if runtime_attested {
+            json!({
+                "status": run.generation_context_status,
+                "runtimeMode": run.generation_context_runtime_mode,
+                "contextContentHash": run.generation_context_content_hash,
+                "runContextBindingHash": run.generation_context_binding_hash,
+                "runtimeAttestationHash": run.generation_context_runtime_attestation_hash,
+                "executionProfile": run.execution_profile,
+                "workflowState": run.workflow_state,
+            })
+        } else {
+            Value::Null
+        },
     }))
 }
 

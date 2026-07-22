@@ -306,7 +306,7 @@ pub(super) async fn apply_design_profile_initial_tokens(
             .write_string(ctx, &token_path, &content)
             .await
             .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-        record_read_path(workspace, ctx, &token_path, &content).await?;
+        advance_mutation_lease(workspace, ctx, &token_path, &content).await?;
     }
     Ok(changes)
 }

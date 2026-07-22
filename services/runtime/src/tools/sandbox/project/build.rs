@@ -52,6 +52,15 @@ impl Tool for ProjectBuildTool {
         ctx: ToolContext,
         progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
+        let runtime_attestation =
+            if ctx.run.generation_context_runtime_mode.as_deref() == Some("enabled") {
+                let attestation = project_runtime_attestation(&*self.workspace, &ctx).await?;
+                require_materialized_project_attestation(&attestation, self.name())?;
+                require_verified_style_contract(&attestation, self.name())?;
+                Some(attestation)
+            } else {
+                None
+            };
         let cwd = input
             .get("cwd")
             .and_then(Value::as_str)
@@ -201,6 +210,7 @@ impl Tool for ProjectBuildTool {
             "packageManager": package_manager,
             "dependencyRestoreAttempted": dependency_restore.attempted,
             "dependencyRestoreSucceeded": dependency_restore.succeeded,
+            "dependencyRestoreAttempts": dependency_restore.attempts,
             "dependencyRestoreReason": dependency_restore.reason,
             "dependencyRestoreLogPath": dependency_restore.log_path,
             "startedAt": started_at.to_rfc3339(),
@@ -237,6 +247,8 @@ impl Tool for ProjectBuildTool {
             .update_run_status(&ctx.run.id, AgentRunStatus::Validating)
             .await
             .map_err(|error| ToolError::Terminal(error.to_string()))?;
+        let mut latest = latest;
+        latest["runtimeAttestation"] = json!(runtime_attestation);
         Ok(ToolResult::ok(latest))
     }
 }
@@ -429,6 +441,14 @@ impl Tool for ProjectEnsureDependenciesTool {
         ctx: ToolContext,
         progress: ProgressSink,
     ) -> Result<ToolResult, ToolError> {
+        let runtime_attestation =
+            if ctx.run.generation_context_runtime_mode.as_deref() == Some("enabled") {
+                let attestation = project_runtime_attestation(&*self.workspace, &ctx).await?;
+                require_materialized_project_attestation(&attestation, self.name())?;
+                Some(attestation)
+            } else {
+                None
+            };
         let result = run_package_install(
             self.name(),
             &*self.workspace,
@@ -441,6 +461,7 @@ impl Tool for ProjectEnsureDependenciesTool {
         Ok(ToolResult::ok(json!({
             "ensured": true,
             "dependencyState": result,
+            "runtimeAttestation": runtime_attestation,
         })))
     }
 }

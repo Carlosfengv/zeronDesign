@@ -123,7 +123,9 @@ impl BuiltInTemplateRegistry {
         Self::new(vec![
             fumadocs_docs::legacy_p3_spec(),
             fumadocs_docs::legacy_p4_spec(),
+            fumadocs_docs::legacy_p5_spec(),
             fumadocs_docs::spec(),
+            next_app::legacy_spec(),
             next_app::spec(),
         ])
         .expect("built-in template registry must be valid")

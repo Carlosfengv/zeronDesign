@@ -22,8 +22,9 @@ use crate::{
         schema::{object_schema, string_schema},
     },
     types::{
-        AgentEvent, AgentPhase, AgentRunStatus, ArtifactPublishStatus, ReviewFindingCategory,
-        ReviewFindingEvidence, ReviewFindingSeverity,
+        canonical_json_hash, AgentEvent, AgentPhase, AgentRunStatus, AppRootMaterializationState,
+        ArtifactPublishStatus, ProjectRuntimeAttestation, ReviewFindingCategory,
+        ReviewFindingEvidence, ReviewFindingSeverity, StyleContractState,
     },
     workspace_auth::WorkspaceChannelJwtIssuer,
 };
@@ -34,6 +35,7 @@ use scraper::{Html as ParsedHtml, Selector};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs, io,
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},

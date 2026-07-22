@@ -1,12 +1,13 @@
 mod build_overlay;
 
 use super::{
-    BuildOverlayRequest, BuildSpec, DependencyPolicyRef, DevelopmentServerSpec, FrameworkId,
-    ManifestHash, MutationPolicySpec, PreviewSpec, RenderDocumentRequest, RenderedFile,
-    SandboxExecutionProfileId, SandboxExecutionProfileRef, SandboxExecutionProfileVersion,
-    SourceContractReport, SourceContractSpec, SourceSnapshot, StyleContractSpec, StyleTokenSpec,
-    TemplateCapabilities, TemplateFile, TemplateFileRole, TemplateId, TemplateOperationError,
-    TemplateOperations, TemplateSpec, TemplateVersion, TemplateWriteMode, ValidationContractSpec,
+    BuildOverlayRequest, BuildSpec, DependencyPolicyRef, DevelopmentServerSpec, EditableRoute,
+    EditableSurfaceMetadata, FrameworkId, ManifestHash, MutationPolicySpec, PreviewSpec,
+    RenderDocumentRequest, RenderedFile, SandboxExecutionProfileId, SandboxExecutionProfileRef,
+    SandboxExecutionProfileVersion, SourceContractReport, SourceContractSpec, SourceSnapshot,
+    StyleContractSpec, StyleTokenSpec, TemplateCapabilities, TemplateFile, TemplateFileRole,
+    TemplateId, TemplateOperationError, TemplateOperations, TemplateSpec, TemplateVersion,
+    TemplateWriteMode, ValidationContractSpec,
 };
 use crate::artifact_manifest::ArtifactDeliverySpec;
 use serde_json::Value;
@@ -406,9 +407,35 @@ impl TemplateOperations for FumadocsDocsOperations {
 
 pub fn spec() -> TemplateSpec {
     spec_with_identity(
+        "fumadocs-docs@runtime-p6",
+        "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
+        FILES,
+        EditableSurfaceMetadata {
+            primary_routes: vec![EditableRoute {
+                route: "/docs/".to_string(),
+                source: "app/docs/[[...slug]]/page.jsx".to_string(),
+            }],
+            component_roots: vec!["components".to_string(), "components/ui".to_string()],
+            content_roots: vec!["content/docs".to_string()],
+            inspection_hints: vec![
+                "app/docs/[[...slug]]/page.jsx".to_string(),
+                "app/docs/layout.jsx".to_string(),
+                "app/global.css".to_string(),
+                "app/tokens.css".to_string(),
+                "components/mdx.jsx".to_string(),
+                "content/docs/index.mdx".to_string(),
+                "content/docs/meta.json".to_string(),
+            ],
+        },
+    )
+}
+
+pub fn legacy_p5_spec() -> TemplateSpec {
+    spec_with_identity(
         "fumadocs-docs@runtime-p5",
         "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
         FILES,
+        EditableSurfaceMetadata::default(),
     )
 }
 
@@ -417,6 +444,7 @@ pub fn legacy_p3_spec() -> TemplateSpec {
         "fumadocs-docs@runtime-p3",
         "753ce62ea481258e9620bafe2d5e53e31da2db7c037945f6266490cc0d1336e4",
         FILES_RUNTIME_P3,
+        EditableSurfaceMetadata::default(),
     )
 }
 
@@ -425,6 +453,7 @@ pub fn legacy_p4_spec() -> TemplateSpec {
         "fumadocs-docs@runtime-p4",
         "3fb0f309bb3ce8cc7044d21981bc72bde1938f95f904e2589b75c443f7143cd3",
         FILES_RUNTIME_P4,
+        EditableSurfaceMetadata::default(),
     )
 }
 
@@ -432,6 +461,7 @@ fn spec_with_identity(
     version: &str,
     manifest_sha256: &str,
     files: &'static [TemplateFile],
+    editable_surface: EditableSurfaceMetadata,
 ) -> TemplateSpec {
     TemplateSpec {
         id: TemplateId::parse("fumadocs-docs").unwrap(),
@@ -456,6 +486,7 @@ fn spec_with_identity(
             "content/docs/index.mdx",
             "content/docs/meta.json",
         ],
+        editable_surface,
         build: BuildSpec {
             argv: vec!["npm".to_string(), "run".to_string(), "build".to_string()],
             timeout_ms: 180_000,

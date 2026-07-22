@@ -42,12 +42,13 @@ impl Tool for FsDeleteTool {
     ) -> Result<ToolResult, ToolError> {
         let path = checked_delete_path(&input, &ctx).map_err(ToolError::PermissionDenied)?;
         preview_dev::validate_dev_mutation(&ctx)?;
-        match self
+        let kind = self
             .workspace
             .path_kind(&ctx, &path)
             .await
-            .map_err(|error| ToolError::Recoverable(error.to_string()))?
-        {
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+        authorize_existing_file_mutation(&*self.workspace, &ctx, &path).await?;
+        match kind {
             WorkspacePathKind::Dir => self
                 .workspace
                 .remove_dir_all(&ctx, &path)
@@ -59,6 +60,7 @@ impl Tool for FsDeleteTool {
                 .await
                 .map_err(|error| ToolError::Recoverable(error.to_string()))?,
         }
+        invalidate_mutation_lease(&*self.workspace, &ctx, &path).await?;
         let draft_preview = preview_dev::record_dev_mutation(&*self.workspace, &ctx).await;
         Ok(ToolResult::ok(json!({
             "path": display_workspace_path(&path, &ctx),

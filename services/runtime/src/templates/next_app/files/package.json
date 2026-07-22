@@ -6,7 +6,7 @@
   "packageManager": "npm@10.9.0",
   "scripts": {
     "dev": "next dev --hostname 0.0.0.0",
-    "build": "next build",
+    "build": "next build --webpack",
     "preview": "serve out --listen 3000",
     "typecheck": "tsc --noEmit"
   },

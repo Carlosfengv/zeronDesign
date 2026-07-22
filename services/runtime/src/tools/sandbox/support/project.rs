@@ -1,5 +1,154 @@
 use super::*;
 
+const PROJECT_RUNTIME_ATTESTATION_SCHEMA: &str = "project-runtime-attestation@1";
+
+pub(super) async fn project_runtime_attestation(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+) -> Result<ProjectRuntimeAttestation, ToolError> {
+    let state = ctx.run.project_state_snapshot.as_ref().ok_or_else(|| {
+        typed_recoverable(
+            "project runtime attestation requires initialized project state",
+            "project.runtime_attestation_missing",
+            json!({
+                "runId": ctx.run.id,
+                "suggestedAction": "Run project.init, then call project.inspect again."
+            }),
+        )
+    })?;
+    let template = resolve_project_template_spec(ctx)?;
+    let manifest = state.template_manifest_sha256.as_deref().ok_or_else(|| {
+        typed_recoverable(
+            "project runtime state is missing its exact Template manifest identity",
+            "project.template_identity_unverified",
+            json!({ "suggestedAction": "Restore the exact historical TemplateSpec identity before continuing." }),
+        )
+    })?;
+    let app_root_relative = project_app_root_relative(ctx);
+    let app_root = ctx.workspace_root.join(&app_root_relative);
+    let materialized = workspace
+        .path_kind(ctx, &app_root.join("package.json"))
+        .await
+        .is_ok();
+    let app_root_materialization_state = if materialized {
+        AppRootMaterializationState::Verified
+    } else {
+        AppRootMaterializationState::Missing
+    };
+
+    let expected = ctx
+        .run
+        .design_context_artifacts
+        .get("inputs/template-style-contract.json")
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or_else(|| template.style.render(&template.id, &app_root_relative));
+    let expected_identity =
+        canonical_json_hash(&crate::style_contract::style_contract_identity(&expected));
+    let actual = read_workspace_json(workspace, ctx, "state/style-contract.json").await;
+    let style_contract_state = match actual {
+        Some(actual) => {
+            let actual_identity =
+                canonical_json_hash(&crate::style_contract::style_contract_identity(&actual));
+            if actual_identity == expected_identity {
+                if ctx.run.design_context_manifest.is_some() {
+                    StyleContractState::VerifiedDcp {
+                        identity: actual_identity,
+                    }
+                } else {
+                    StyleContractState::VerifiedTemplateDefault {
+                        identity: actual_identity,
+                    }
+                }
+            } else {
+                StyleContractState::Mismatch {
+                    expected: expected_identity.clone(),
+                    actual: actual_identity,
+                }
+            }
+        }
+        None if !materialized => StyleContractState::PendingInitialization,
+        None => StyleContractState::Mismatch {
+            expected: expected_identity.clone(),
+            actual: "missing".to_string(),
+        },
+    };
+
+    ctx.store
+        .set_run_design_context_style_contract_verified(
+            &ctx.run.id,
+            style_contract_state.is_verified(),
+        )
+        .await
+        .map_err(|error| {
+            ToolError::Terminal(format!("record style contract attestation: {error}"))
+        })?;
+
+    let attestation_hash = canonical_json_hash(&json!({
+        "domain": "project-runtime-attestation-hash@1",
+        "runId": ctx.run.id,
+        "projectId": ctx.project_id,
+        "sourceRevision": state.revision,
+        "appRoot": state.app_root,
+        "appRootMaterializationState": app_root_materialization_state,
+        "templateIdentityState": "verified",
+        "templateId": template.id.as_str(),
+        "templateVersion": template.version.as_str(),
+        "templateManifestSha256": manifest,
+        "styleContractState": style_contract_state,
+    }));
+    Ok(ProjectRuntimeAttestation {
+        schema_version: PROJECT_RUNTIME_ATTESTATION_SCHEMA.to_string(),
+        run_id: ctx.run.id.clone(),
+        project_id: ctx.project_id.clone(),
+        source_revision: state.revision,
+        app_root: state.app_root.clone(),
+        app_root_materialization_state,
+        template_identity_state: "verified".to_string(),
+        template_id: template.id.as_str().to_string(),
+        template_version: template.version.as_str().to_string(),
+        template_manifest_sha256: manifest.to_string(),
+        style_contract_state,
+        attestation_hash,
+        verified_at: Utc::now(),
+    })
+}
+
+pub(super) fn require_materialized_project_attestation(
+    attestation: &ProjectRuntimeAttestation,
+    operation: &str,
+) -> Result<(), ToolError> {
+    if attestation.app_root_materialization_state == AppRootMaterializationState::Verified {
+        return Ok(());
+    }
+    Err(typed_recoverable(
+        format!("{operation} requires a materialized App Root"),
+        "project.app_root_unmaterialized",
+        json!({
+            "attestationHash": attestation.attestation_hash,
+            "appRoot": attestation.app_root,
+            "suggestedAction": "Run project.init and inspect the resulting Runtime attestation before retrying."
+        }),
+    ))
+}
+
+pub(super) fn require_verified_style_contract(
+    attestation: &ProjectRuntimeAttestation,
+    operation: &str,
+) -> Result<(), ToolError> {
+    if attestation.style_contract_state.is_verified() {
+        return Ok(());
+    }
+    Err(typed_recoverable(
+        format!("{operation} requires a verified Runtime-owned Style Contract"),
+        "style.contract_attestation_failed",
+        json!({
+            "attestationHash": attestation.attestation_hash,
+            "styleContractState": attestation.style_contract_state,
+            "suggestedAction": "Use project.inspect to diagnose the Style Contract identity mismatch."
+        }),
+    ))
+}
+
 pub(super) fn default_project_dir(ctx: &ToolContext) -> PathBuf {
     ctx.workspace_root.join(project_app_root_relative(ctx))
 }
@@ -318,13 +467,33 @@ pub(super) async fn record_read_path(
     path: &Path,
     content: &str,
 ) -> Result<(), ToolError> {
+    record_mutation_lease(workspace, ctx, path, content, "observed_full").await
+}
+
+pub(super) async fn advance_mutation_lease(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+    content: &str,
+) -> Result<(), ToolError> {
+    record_mutation_lease(workspace, ctx, path, content, "self_authored").await
+}
+
+async fn record_mutation_lease(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+    content: &str,
+    origin: &str,
+) -> Result<(), ToolError> {
     let display_path = display_workspace_path(path, ctx);
     let mut tracking = read_workspace_json(workspace, ctx, "state/read-tracking.json")
         .await
-        .unwrap_or_else(|| json!({ "paths": [] }));
+        .unwrap_or_else(|| json!({ "schemaVersion": "mutation-lease@1", "paths": [] }));
     if !tracking.is_object() {
-        tracking = json!({ "paths": [] });
+        tracking = json!({ "schemaVersion": "mutation-lease@1", "paths": [] });
     }
+    tracking["schemaVersion"] = json!("mutation-lease@1");
     let paths = tracking
         .as_object_mut()
         .and_then(|object| object.get_mut("paths"))
@@ -335,6 +504,7 @@ pub(super) async fn record_read_path(
         "readAt": Utc::now(),
         "contentHash": sha256_hex(content.as_bytes()),
         "bytes": content.len(),
+        "origin": origin,
     });
     match paths {
         Some(entries) => {
@@ -353,6 +523,89 @@ pub(super) async fn record_read_path(
         None => {
             tracking["paths"] = json!([entry]);
         }
+    }
+    write_workspace_json(workspace, ctx, "state/read-tracking.json", &tracking).await
+}
+
+pub(super) async fn authorize_existing_file_mutation(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+) -> Result<Option<String>, ToolError> {
+    match workspace.path_kind(ctx, path).await {
+        Err(_) => return Ok(None),
+        Ok(WorkspacePathKind::Dir) => {
+            return Err(typed_recoverable(
+                "recursive directory mutation requires an explicit Runtime-owned operation",
+                "mutation.read_required",
+                json!({
+                    "path": display_workspace_path(path, ctx),
+                    "suggestedAction": "Delete or modify individual observed files instead of recursively mutating a directory."
+                }),
+            ));
+        }
+        Ok(WorkspacePathKind::File) => {}
+    }
+    let content = workspace
+        .read_to_string(ctx, path)
+        .await
+        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+    let current_hash = sha256_hex(content.as_bytes());
+    let lease = read_tracking_entry(workspace, ctx, path)
+        .await
+        .ok_or_else(|| {
+            typed_recoverable(
+            "existing file mutation requires reading the target file first to establish a full observation lease",
+                "mutation.read_required",
+                json!({
+                    "path": display_workspace_path(path, ctx),
+                    "currentHash": current_hash,
+                    "suggestedAction": "Call fs.read on this file, then retry the mutation."
+                }),
+            )
+        })?;
+    let lease_hash = lease.get("contentHash").and_then(Value::as_str);
+    let origin = lease
+        .get("origin")
+        .and_then(Value::as_str)
+        .unwrap_or("observed_full");
+    if !matches!(origin, "observed_full" | "self_authored") {
+        return Err(typed_recoverable(
+            "existing file mutation lease has an unsupported origin",
+            "mutation.read_required",
+            json!({ "path": display_workspace_path(path, ctx), "origin": origin }),
+        ));
+    }
+    if lease_hash != Some(current_hash.as_str()) {
+        return Err(typed_recoverable(
+            "file has been modified since fs.read established the current Run mutation lease",
+            "mutation.stale_lease",
+            json!({
+                "path": display_workspace_path(path, ctx),
+                "leaseHash": lease_hash,
+                "currentHash": current_hash,
+                "suggestedAction": "Call fs.read again and re-plan against the current file contents."
+            }),
+        ));
+    }
+    Ok(Some(content))
+}
+
+pub(super) async fn invalidate_mutation_lease(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    path: &Path,
+) -> Result<(), ToolError> {
+    let Some(mut tracking) = read_workspace_json(workspace, ctx, "state/read-tracking.json").await
+    else {
+        return Ok(());
+    };
+    let display_path = display_workspace_path(path, ctx);
+    if let Some(paths) = tracking.get_mut("paths").and_then(Value::as_array_mut) {
+        paths.retain(|entry| {
+            entry.get("path").and_then(Value::as_str) != Some(display_path.as_str())
+                || entry.get("runId").and_then(Value::as_str) != Some(ctx.run.id.as_str())
+        });
     }
     write_workspace_json(workspace, ctx, "state/read-tracking.json", &tracking).await
 }

@@ -131,6 +131,42 @@ impl Tool for PreviewStartTool {
                     ));
                 }
             };
+            let readiness = self
+                .command
+                .run(
+                    &ctx,
+                    &[
+                        "node".to_string(),
+                        "-e".to_string(),
+                        "const url='http://127.0.0.1:4321/healthz';const deadline=Date.now()+10000;const probe=()=>fetch(url).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`)}).then(()=>process.exit(0)).catch(error=>{if(Date.now()>=deadline){console.error(error.message);process.exit(1)}setTimeout(probe,100)});probe();".to_string(),
+                    ],
+                    &ctx.workspace_root,
+                    12_000,
+                )
+                .await;
+            if !readiness.as_ref().is_ok_and(|output| output.success) {
+                let process_status = self.command.process_status(&ctx, &lease.id).await.ok();
+                self.command.stop_process(&ctx, &lease.id).await.ok();
+                ctx.store.stop_preview_lease(&lease.id).await.ok();
+                let readiness_detail = readiness
+                    .map(|output| output.stderr)
+                    .unwrap_or_else(|error| error.to_string());
+                let process_detail = process_status
+                    .map(|status| {
+                        format!(
+                            "status={}, stdout={}, stderr={}",
+                            status.status, status.stdout, status.stderr
+                        )
+                    })
+                    .unwrap_or_else(|| "process status unavailable".to_string());
+                return Err(typed_recoverable(
+                    format!(
+                        "preview process did not become ready: {readiness_detail}; {process_detail}"
+                    ),
+                    "preview.process_not_ready",
+                    json!({ "leaseId": lease.id }),
+                ));
+            }
             let url = format!("{}/previews/{}/", ctx.runtime_public_base_url, lease.id);
             let state = json!({
                 "status": "running",

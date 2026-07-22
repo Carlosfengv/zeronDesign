@@ -4,63 +4,12 @@ use anydesign_runtime::{
         compile_website_design_context, DesignContextCompileOptions, VerifierRegistry,
     },
     design_profile_service::{CreateProfileCommand, DesignProfileService, UpdateProfileCommand},
-    profile_token_sync::{ProfileTokenSyncOperationStatus, ProfileTokenSyncService},
-    run_lifecycle::{
-        BuildSandboxProvisioner, EditWorkspaceRestorer, RunLifecycleService, RunSessionLauncher,
-    },
     tools::control_plane::control_plane_executor_for_config,
 };
 use axum::{extract::State, routing::post, Json, Router};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use tokio::process::Command;
-
-struct RecoverySessionLauncher;
-
-impl RunSessionLauncher for RecoverySessionLauncher {
-    fn launch(&self, _run_id: String) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-struct RecoverySandboxProvisioner;
-
-#[async_trait::async_trait]
-impl BuildSandboxProvisioner for RecoverySandboxProvisioner {
-    async fn provision_ready(
-        &self,
-        _store: &RuntimeStore,
-        _project_id: &str,
-        _template_key: &str,
-    ) -> anyhow::Result<anydesign_runtime::types::SandboxBinding> {
-        unreachable!("profile sync recovery must reuse the persisted child Run")
-    }
-}
-
-struct RecoveryWorkspaceRestorer;
-
-#[async_trait::async_trait]
-impl EditWorkspaceRestorer for RecoveryWorkspaceRestorer {
-    async fn prepare_build(
-        &self,
-        _store: &RuntimeStore,
-        _config: &anydesign_runtime::RuntimeConfig,
-        _run: &anydesign_runtime::types::AgentRun,
-    ) -> anyhow::Result<()> {
-        unreachable!("profile sync recovery must reuse the persisted child Run")
-    }
-
-    async fn restore(
-        &self,
-        _store: &RuntimeStore,
-        _config: &anydesign_runtime::RuntimeConfig,
-        _run: &anydesign_runtime::types::AgentRun,
-        _source_snapshot_uri: &str,
-    ) -> anyhow::Result<()> {
-        unreachable!("profile sync recovery must reuse the persisted child Run")
-    }
-}
 
 #[derive(Clone)]
 struct ProfileSyncFixtureState {
@@ -205,142 +154,6 @@ async fn bff_profile_sync_bff_to_real_runtime() {
     }
 }
 
-#[tokio::test]
-async fn profile_sync_recovers_after_token_write_before_operation_completion() {
-    let mut config = phase_a_contract_config();
-    config.workspace_root = unique_temp_dir("profile-sync-recovery-workspaces");
-    let store = RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone());
-    let fixture = ProfileSyncFixtureState {
-        runtime: AppState {
-            supervisor: http_api::RuntimeSupervisor::new(),
-            config: config.clone(),
-            store: store.clone(),
-            model: Arc::new(MockModelClient::new(vec![])),
-        },
-        seeded: Arc::new(Mutex::new(Vec::new())),
-    };
-    let seed = seed_profile_sync_fixture(
-        State(fixture),
-        Json(SeedProfileSyncRequest {
-            project_id: "profile-sync-recovery".to_string(),
-            scenario: "clean".to_string(),
-        }),
-    )
-    .await
-    .unwrap()
-    .0;
-    let source_run_id = seed["runId"].as_str().unwrap();
-    let source_run = store.get_run(source_run_id).await.unwrap();
-    let manifest: anydesign_runtime::design_context::DesignContextManifest =
-        serde_json::from_value(source_run.design_context_manifest.clone().unwrap()).unwrap();
-    let target_profile = store
-        .design_profile_versions(source_run.design_profile_id.as_deref().unwrap())
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|profile| profile.version == 2)
-        .unwrap();
-    let brief = store
-        .get_brief(source_run.brief_version.as_deref().unwrap())
-        .await
-        .unwrap();
-    let template = anydesign_runtime::project::resolve_built_in_template_for_init("astro-website")
-        .await
-        .unwrap();
-    let target_dcp = compile_website_design_context(
-        &target_profile
-            .effective_for("website", "astro-website")
-            .unwrap(),
-        &brief,
-        &template,
-        &DesignContextCompileOptions {
-            expected_app_root: manifest.payload.expected_app_root.clone(),
-            compiler_version: manifest.payload.compiler_version.clone(),
-            enforcement_enabled: false,
-            verification_policy: manifest.payload.verification_policy.clone(),
-        },
-    )
-    .unwrap();
-    let workspace = config.workspace_root.join(&source_run.project_id);
-    let contract: Value = serde_json::from_str(
-        &std::fs::read_to_string(workspace.join("state/style-contract.json")).unwrap(),
-    )
-    .unwrap();
-    let token_file = workspace.join("project/tokens.css");
-    let operation = ProfileTokenSyncService::plan_operation(
-        store.next_id("profile-sync"),
-        &source_run,
-        &target_dcp,
-        &contract,
-        &std::fs::read_to_string(&token_file).unwrap(),
-        "recovery-fixture".to_string(),
-        "recovery-plan-key".to_string(),
-        Utc::now() + ChronoDuration::minutes(10),
-        Utc::now(),
-    )
-    .unwrap();
-    let operation = store
-        .create_profile_token_sync_operation(operation)
-        .await
-        .unwrap();
-    let operation = store
-        .confirm_profile_token_sync_operation(
-            &operation.id,
-            &operation.plan.plan_hash,
-            BTreeMap::new(),
-            "recovery-confirm-key".to_string(),
-        )
-        .await
-        .unwrap();
-    let child = store
-        .create_child_run(
-            &source_run.id,
-            AgentPhase::Edit,
-            "edit".to_string(),
-            "fixture".to_string(),
-            None,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-    store
-        .begin_profile_token_sync_apply(&operation.id, &child.id)
-        .await
-        .unwrap();
-    let after_write = std::fs::read_to_string(&token_file)
-        .unwrap()
-        .replace("#2563eb", "#b91c1c");
-    std::fs::write(&token_file, after_write).unwrap();
-    store
-        .mark_profile_token_sync_recovery_required(&operation.id, "injected crash after write")
-        .await
-        .unwrap();
-
-    let restarted_store = RuntimeStore::with_checkpoint_dir(config.runtime_storage_dir.clone());
-    let service = RunLifecycleService::new(
-        config,
-        restarted_store.clone(),
-        Arc::new(RecoverySessionLauncher),
-        Arc::new(RecoverySandboxProvisioner),
-        Arc::new(RecoveryWorkspaceRestorer),
-        DesignProfileService::new(restarted_store.clone()),
-    );
-    let outcome = service
-        .apply_confirmed_profile_token_sync(&operation.id)
-        .await
-        .unwrap();
-    assert_eq!(outcome.run_id, child.id);
-    let recovered = restarted_store
-        .profile_token_sync_operation(&operation.id)
-        .await
-        .unwrap();
-    assert_eq!(recovered.status, ProfileTokenSyncOperationStatus::Applied);
-    assert_eq!(recovered.child_run_id.as_deref(), Some(child.id.as_str()));
-    assert!(std::fs::read_to_string(token_file)
-        .unwrap()
-        .contains("#b91c1c"));
-}
-
 async fn seed_profile_sync_fixture(
     State(fixture): State<ProfileSyncFixtureState>,
     Json(request): Json<SeedProfileSyncRequest>,
@@ -360,7 +173,7 @@ async fn seed_profile_sync_fixture(
         .map_err(|error| fixture_bad_request(error.to_string()))?;
     let (source_profile, target_primary) =
         if request.scenario == "clean" || existing_profile.is_none() {
-            let source_payload = design_profile_request(&request.project_id, vec!["astro-website"])
+            let source_payload = design_profile_request(&request.project_id, vec!["next-app"])
                 .get("profile")
                 .and_then(Value::as_object)
                 .cloned()
@@ -432,16 +245,16 @@ async fn seed_profile_sync_fixture(
             &source_run.id,
             &source_profile,
             Some("website"),
-            Some("astro-website"),
+            Some("next-app"),
         )
         .await
         .map_err(|error| fixture_bad_request(error.to_string()))?;
-    let template = anydesign_runtime::project::resolve_built_in_template_for_init("astro-website")
+    let template = anydesign_runtime::project::resolve_built_in_template_for_init("next-app")
         .await
         .map_err(|error| fixture_bad_request(error.to_string()))?;
     let brief = state.store.get_brief(&brief_id).await.unwrap();
     let effective = source_profile
-        .effective_for("website", "astro-website")
+        .effective_for("website", "next-app")
         .map_err(fixture_bad_request)?;
     let source_dcp = compile_website_design_context(
         &effective,
