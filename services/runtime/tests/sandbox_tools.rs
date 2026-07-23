@@ -2418,6 +2418,76 @@ async fn runtime_project_state_is_authoritative_and_workspace_hint_is_protected(
 }
 
 #[tokio::test]
+async fn project_inspect_routes_a_fresh_workspace_with_authoritative_state_to_init() {
+    let initialized_workspace = setup_workspace();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let initialized_executor = sandbox_executor(&initialized_workspace);
+    let initialized = initialized_executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "state-init",
+                "project.init",
+                json!({ "template": "next-app" }),
+            )],
+        )
+        .await;
+    assert!(!initialized[0].result.is_error);
+
+    let rebound_workspace = setup_workspace();
+    let rebound_executor = sandbox_executor(&rebound_workspace);
+    let inspected = rebound_executor
+        .execute_calls(
+            store.clone(),
+            &run_id,
+            vec![ToolCall::new(
+                "state-inspect-rebound-workspace",
+                "project.inspect",
+                json!({}),
+            )],
+        )
+        .await;
+
+    assert!(
+        !inspected[0].result.is_error,
+        "{}",
+        tool_result_error_text(&inspected[0].result)
+    );
+    assert_eq!(inspected[0].result.content["projectHint"], Value::Null);
+    assert_eq!(inspected[0].result.content["projectStateConflict"], false);
+    assert_eq!(
+        inspected[0].result.content["lifecycle"]["initialized"],
+        false
+    );
+    assert_eq!(
+        inspected[0].result.content["nextAction"]["tool"],
+        "project.init"
+    );
+
+    let reinitialized = rebound_executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![ToolCall::new(
+                "state-reinitialize-rebound-workspace",
+                "project.init",
+                json!({ "template": "next-app" }),
+            )],
+        )
+        .await;
+    assert!(
+        !reinitialized[0].result.is_error,
+        "{}",
+        tool_result_error_text(&reinitialized[0].result)
+    );
+    assert!(rebound_workspace.join("state/project.json").exists());
+    assert!(rebound_workspace.join("state/style-contract.json").exists());
+    assert!(rebound_workspace.join("project/package.json").exists());
+}
+
+#[tokio::test]
 async fn project_init_fumadocs_docs_writes_docs_source_contract() {
     let workspace = setup_workspace();
     let store = RuntimeStore::new();

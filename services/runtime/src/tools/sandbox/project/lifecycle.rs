@@ -95,12 +95,7 @@ impl Tool for ProjectInitTool {
             project_runtime_attestation(&*self.workspace, &attestation_ctx).await?;
         require_materialized_project_attestation(&runtime_attestation, "project.init")?;
         require_verified_style_contract(&runtime_attestation, "project.init")?;
-        let source_observations = if attestation_ctx
-            .run
-            .generation_context_runtime_mode
-            .as_deref()
-            == Some("enabled")
-        {
+        let source_observations = if attestation_ctx.run.phase == AgentPhase::Build {
             project_init_source_observations(&*self.workspace, &attestation_ctx).await?
         } else {
             Vec::new()
@@ -443,7 +438,11 @@ impl Tool for ProjectInspectTool {
                     .iter()
                     .any(|key| authority.get(key) != hint.get(key))
             }
-            (Some(_), None) => true,
+            // A newly bound or restored workspace may not have materialized the
+            // Runtime-owned hint yet. RuntimeStore remains authoritative in that
+            // case, and the lifecycle response below must be allowed to direct
+            // the caller to project.init when the App Root is also absent.
+            (Some(_), None) => false,
             _ => false,
         };
         if project_state_conflict {

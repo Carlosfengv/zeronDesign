@@ -486,6 +486,11 @@ struct OperationBudgetUsage {
 #[serde(default, rename_all = "camelCase")]
 struct RunProgressState {
     source_mutations: BTreeMap<String, String>,
+    authored_source_paths: BTreeSet<String>,
+    required_routes: BTreeSet<String>,
+    required_route_text: BTreeMap<String, BTreeSet<String>>,
+    authored_source_requirements: BTreeMap<String, BTreeSet<String>>,
+    staged_source_requirements: BTreeMap<String, BTreeSet<String>>,
     source_digest: Option<String>,
     candidate_digest: Option<String>,
     rejected_candidate_digests: BTreeSet<String>,
@@ -1051,6 +1056,29 @@ impl AgentLoop {
         if progress_reconciled && progress_state.fingerprint() != pre_reconcile_fingerprint {
             last_progress_fingerprint = progress_state.fingerprint();
             consecutive_no_progress = 0;
+        }
+        match self
+            .bootstrap_generation_project_if_needed(&run, &mut progress_state, &mut message_window)
+            .await
+        {
+            Ok(bootstrap_results) => {
+                if !bootstrap_results.is_empty() {
+                    results.extend(bootstrap_results);
+                    progress_state.seed_substantive_progress();
+                    last_progress_fingerprint = progress_state.fingerprint();
+                    consecutive_no_progress = 0;
+                }
+            }
+            Err(error) => {
+                self.finalize(
+                    run_id,
+                    AgentRunStatus::Failed,
+                    &format!("Project bootstrap failed: {error}"),
+                    &message_window,
+                )
+                .await?;
+                return Ok(results);
+            }
         }
         let first_turn = message_window
             .iter()
@@ -2725,6 +2753,229 @@ impl AgentLoop {
         messages
     }
 
+    async fn bootstrap_generation_project_if_needed(
+        &self,
+        run: &AgentRun,
+        progress_state: &mut RunProgressState,
+        message_window: &mut Vec<Value>,
+    ) -> Result<Vec<ToolResultMessage>> {
+        if run.phase != AgentPhase::Build
+            || progress_state
+                .completed_steps
+                .contains("project_initialized")
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        if run.project_state_snapshot.is_some() {
+            let inspect_call = ToolCall::new(
+                format!("bootstrap:project.inspect:{}", run.id),
+                "project.inspect",
+                json!({}),
+            );
+            self.record_tool_starts(&run.id, std::slice::from_ref(&inspect_call))
+                .await;
+            let inspect_result = self
+                .execute_recorded_tools(&run.id, vec![inspect_call.clone()])
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("project.inspect returned no bootstrap result"))?;
+            update_progress_state(
+                progress_state,
+                std::slice::from_ref(&inspect_call),
+                std::slice::from_ref(&inspect_result),
+            );
+            upsert_approved_tool_exchange(message_window, 0, &inspect_call, &inspect_result);
+            if inspect_result.is_error {
+                return Err(anyhow!(
+                    "{}",
+                    inspect_result
+                        .content
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("project.inspect failed during Runtime bootstrap")
+                ));
+            }
+            results.push(inspect_result);
+            if progress_state
+                .completed_steps
+                .contains("project_initialized")
+            {
+                return Ok(results);
+            }
+        }
+
+        let template = generation_run_template_key(run)
+            .ok_or_else(|| anyhow!("frozen Build identity is missing templateId"))?
+            .to_string();
+        let app_root = run
+            .generation_context
+            .as_ref()
+            .and_then(|context| context.pointer("/payload/identity/appRoot"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                run.project_state_snapshot
+                    .as_ref()
+                    .map(|project| project.app_root.as_str())
+            })
+            .ok_or_else(|| anyhow!("frozen Build identity is missing appRoot"))?
+            .to_string();
+        let mut init_call = ToolCall::new(
+            format!("bootstrap:project.init:{}", run.id),
+            "project.init",
+            json!({
+                "template": template,
+                "path": app_root,
+            }),
+        );
+        self.record_tool_starts(&run.id, std::slice::from_ref(&init_call))
+            .await;
+        let mut init_result = self
+            .execute_recorded_tools(&run.id, vec![init_call.clone()])
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("project.init returned no bootstrap result"))?;
+        update_progress_state(
+            progress_state,
+            std::slice::from_ref(&init_call),
+            std::slice::from_ref(&init_result),
+        );
+        upsert_approved_tool_exchange(message_window, 0, &init_call, &init_result);
+        if init_result.is_error
+            && init_result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("errorKind"))
+                .and_then(Value::as_str)
+                == Some("design_context.read_required")
+        {
+            let missing_files = init_result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("missingFiles"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            results.push(init_result);
+            for (index, path) in missing_files.into_iter().enumerate() {
+                let path = path.as_str().ok_or_else(|| {
+                    anyhow!("design_context.read_required returned a non-string missing file")
+                })?;
+                let read_call = ToolCall::new(
+                    format!("bootstrap:design-context-read:{index}:{}", run.id),
+                    "fs.read",
+                    json!({ "path": path }),
+                );
+                self.record_tool_starts(&run.id, std::slice::from_ref(&read_call))
+                    .await;
+                let read_result = self
+                    .execute_recorded_tools(&run.id, vec![read_call.clone()])
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("fs.read returned no Design Context result"))?;
+                update_progress_state(
+                    progress_state,
+                    std::slice::from_ref(&read_call),
+                    std::slice::from_ref(&read_result),
+                );
+                upsert_approved_tool_exchange(message_window, 0, &read_call, &read_result);
+                if read_result.is_error {
+                    return Err(anyhow!(
+                        "{}",
+                        read_result
+                            .content
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("required Design Context read failed")
+                    ));
+                }
+                results.push(read_result);
+            }
+
+            init_call = ToolCall::new(
+                format!("bootstrap:project.init:retry:{}", run.id),
+                "project.init",
+                json!({
+                    "template": template,
+                    "path": app_root,
+                }),
+            );
+            self.record_tool_starts(&run.id, std::slice::from_ref(&init_call))
+                .await;
+            init_result = self
+                .execute_recorded_tools(&run.id, vec![init_call.clone()])
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("project.init returned no retry result"))?;
+            update_progress_state(
+                progress_state,
+                std::slice::from_ref(&init_call),
+                std::slice::from_ref(&init_result),
+            );
+            upsert_approved_tool_exchange(message_window, 0, &init_call, &init_result);
+        }
+        if init_result.is_error {
+            return Err(anyhow!(
+                "{}",
+                init_result
+                    .content
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("project.init failed during Runtime bootstrap")
+            ));
+        }
+        results.push(init_result);
+
+        if run.generation_context_runtime_mode.as_deref() != Some("enabled") {
+            let bootstrap_reads = [
+                ("brief", "inputs/brief.md"),
+                ("content-sources", "inputs/content-sources.json"),
+                ("style-contract", "state/style-contract.json"),
+            ];
+            for (label, path) in bootstrap_reads {
+                let read_call = ToolCall::new(
+                    format!("bootstrap:{label}:{}", run.id),
+                    "fs.read",
+                    json!({ "path": path }),
+                );
+                self.record_tool_starts(&run.id, std::slice::from_ref(&read_call))
+                    .await;
+                let read_result = self
+                    .execute_recorded_tools(&run.id, vec![read_call.clone()])
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("fs.read returned no {label} bootstrap result"))?;
+                update_progress_state(
+                    progress_state,
+                    std::slice::from_ref(&read_call),
+                    std::slice::from_ref(&read_result),
+                );
+                upsert_approved_tool_exchange(message_window, 0, &read_call, &read_result);
+                if read_result.is_error {
+                    return Err(anyhow!(
+                        "{}",
+                        read_result
+                            .content
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("required Build context read failed")
+                    ));
+                }
+                results.push(read_result);
+            }
+            progress_state
+                .completed_steps
+                .insert("inputs_inventoried".to_string());
+        }
+        Ok(results)
+    }
+
     async fn execute_approved_permission(
         &self,
         run_id: &str,
@@ -4295,11 +4546,11 @@ impl AgentLoop {
             expected_app_root.is_none_or(|expected| project.app_root == expected)
                 && expected_template.is_none_or(|expected| project.template_key == expected)
         });
-        if project_matches {
-            state
-                .completed_steps
-                .insert("project_initialized".to_string());
-        } else if run.phase == AgentPhase::Build {
+        // RuntimeStore proves the declared project identity, but it does not
+        // prove that the currently bound workspace has materialized the App
+        // Root and Style Contract. Only a successful project.inspect or
+        // project.init result may establish project_initialized.
+        if !project_matches && run.phase == AgentPhase::Build {
             state.completed_steps.remove("project_initialized");
             state.completed_steps.remove("project_inspected");
         }
@@ -5853,7 +6104,9 @@ fn workflow_progress_snapshot(
                 "load the Runtime-derived Editable Surface and current project facts",
             ),
         )
-    } else if !has("source_authored") {
+    } else if !has("source_authored")
+        || (next_app && phase == AgentPhase::Build && !has("source_file_authored"))
+    {
         (
             "source_authoring",
             workflow_action(
@@ -6016,10 +6269,11 @@ fn workflow_driver_supports(run: &AgentRun) -> bool {
             run.phase,
             AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
         )
-        && matches!(
-            run.execution_profile.as_deref(),
-            Some("greenfield_static" | "cold_dev" | "warm_hmr" | "repair_cold_dev" | "repair_warm")
-        )
+        && (run.phase == AgentPhase::Build
+            || matches!(
+                run.execution_profile.as_deref(),
+                Some("cold_dev" | "warm_hmr" | "repair_cold_dev" | "repair_warm")
+            ))
 }
 
 fn workflow_driver_action_input(action: &str) -> Option<Value> {
@@ -6263,6 +6517,12 @@ fn update_progress_state(
             }
             "fs.read" if normalized_path == "inputs/brief.md" => {
                 state.completed_steps.insert("brief_loaded".to_string());
+                if let Some(text) = result.content.get("text").and_then(Value::as_str) {
+                    state.required_routes.extend(brief_required_routes(text));
+                    state
+                        .required_route_text
+                        .extend(brief_required_route_text(text));
+                }
             }
             "fs.read" if normalized_path == "inputs/content-sources.json" => {
                 state
@@ -6283,6 +6543,16 @@ fn update_progress_state(
                 state
                     .completed_steps
                     .insert("project_inspected".to_string());
+                if result
+                    .content
+                    .pointer("/lifecycle/initialized")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    state
+                        .completed_steps
+                        .insert("project_initialized".to_string());
+                }
             }
             "review.report_finding" => {
                 state
@@ -6434,10 +6704,29 @@ fn update_progress_state(
                 state.completed_steps.remove("dev_restarted");
                 if call.name != "project.init" && progress_target_is_project_source(target) {
                     state.completed_steps.insert("source_authored".to_string());
+                    let authored_paths = source_mutation_paths(call);
+                    state.authored_source_paths.extend(
+                        authored_paths
+                            .iter()
+                            .filter(|path| progress_target_is_project_source(path))
+                            .cloned(),
+                    );
+                    update_authored_source_requirements(state, call, &authored_paths);
+                    if is_direct_source_file_mutation_tool(&call.name)
+                        && authored_paths
+                            .iter()
+                            .any(|path| progress_target_is_route_source(path))
+                    {
+                        state
+                            .completed_steps
+                            .insert("source_file_authored".to_string());
+                    }
                 }
                 if state.completed_steps.contains("repair_required") {
                     state.completed_steps.insert("repair_mutated".to_string());
                 }
+            } else if call.name == "fs.write_chunk" {
+                update_staged_source_requirements(state, call);
             }
         }
         if let Some(epoch) = find_u64_field(&result.content, "sessionEpoch") {
@@ -6487,6 +6776,32 @@ fn update_progress_state(
 fn progress_target_is_project_source(target: &str) -> bool {
     let normalized = target.trim_start_matches("/workspace/");
     normalized == "project" || normalized.starts_with("project/")
+}
+
+fn progress_target_is_route_source(target: &str) -> bool {
+    let normalized = target
+        .trim_start_matches("/workspace/")
+        .trim_end_matches('/');
+    let Some((prefix, file)) = normalized.rsplit_once('/') else {
+        return false;
+    };
+    prefix.starts_with("project/app")
+        && matches!(file, "page.tsx" | "page.jsx" | "page.ts" | "page.js")
+}
+
+fn source_mutation_paths(call: &ToolCall) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    if let Some(path) = call.input.get("path").and_then(Value::as_str) {
+        paths.insert(path.trim_start_matches("/workspace/").to_string());
+    }
+    if let Some(patches) = call.input.get("patches").and_then(Value::as_array) {
+        for patch in patches {
+            if let Some(path) = patch.get("path").and_then(Value::as_str) {
+                paths.insert(path.trim_start_matches("/workspace/").to_string());
+            }
+        }
+    }
+    paths
 }
 
 fn generation_run_template_key(run: &AgentRun) -> Option<&str> {
@@ -6606,7 +6921,9 @@ fn workflow_tool_denial(
     generation_context_enabled: bool,
     call: &ToolCall,
 ) -> Option<String> {
-    targeted_review_tool_denial(run, state, call)
+    greenfield_authoring_tool_denial(run, state, call)
+        .or_else(|| greenfield_lifecycle_tool_denial(run, state, call))
+        .or_else(|| targeted_review_tool_denial(run, state, call))
         .or_else(|| targeted_fumadocs_repair_tool_denial(run, state, call))
         .or_else(|| {
             legacy_fumadocs_initial_publish_tool_denial(
@@ -6618,6 +6935,345 @@ fn workflow_tool_denial(
         })
         .or_else(|| fumadocs_repair_tool_denial(run, state, generation_context_enabled, call))
         .or_else(|| cold_dev_tool_denial(run, state, call).map(str::to_string))
+}
+
+fn greenfield_authoring_tool_denial(
+    run: &AgentRun,
+    state: &RunProgressState,
+    call: &ToolCall,
+) -> Option<String> {
+    let context_ready = [
+        "project_initialized",
+        "project_source_read",
+        "brief_loaded",
+        "content_sources_loaded",
+    ]
+    .into_iter()
+    .all(|step| state.completed_steps.contains(step));
+    let missing_route_sources = greenfield_missing_required_route_sources(run, state);
+    let missing_route_text = greenfield_missing_required_route_text(run, state);
+    if run.phase != AgentPhase::Build
+        || generation_run_template_key(run) != Some("next-app")
+        || !context_ready
+        || (missing_route_sources.is_empty() && missing_route_text.is_empty())
+    {
+        return None;
+    }
+    let repeated_token_mutation =
+        call.name == "style.update_tokens" && state.completed_steps.contains("source_authored");
+    let authoring_tool = is_direct_source_file_mutation_tool(&call.name)
+        || is_staged_source_progress_tool(&call.name)
+        || call.name == "style.update_tokens";
+    (repeated_token_mutation || !authoring_tool)
+    .then(|| {
+        let missing = missing_route_sources
+            .into_iter()
+            .chain(missing_route_text.into_iter().map(|(path, text)| {
+                format!("{path} must render {:?}", text)
+            }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Runtime bootstrap already supplied the frozen requirements, Style Contract, and full editable source observations. Author every missing required route source now with fs.write, fs.patch, fs.multi_patch, or fs.commit_chunks: {}. Do not spend another turn re-reading, inventorying, or changing only tokens.",
+            missing
+        )
+    })
+}
+
+fn greenfield_lifecycle_tool_denial(
+    run: &AgentRun,
+    state: &RunProgressState,
+    call: &ToolCall,
+) -> Option<String> {
+    if run.phase != AgentPhase::Build
+        || generation_run_template_key(run) != Some("next-app")
+        || !greenfield_required_routes_authored(run, state)
+        || state.completed_steps.contains("repair_required")
+        || state.workflow_driver_blocker.is_some()
+    {
+        return None;
+    }
+    let has = |step: &str| state.completed_steps.contains(step);
+    let (required_tool, reason) = if !has("dependencies_ready") {
+        (
+            "project.ensure_dependencies",
+            "The application source is authored. Restore the frozen dependency graph now.",
+        )
+    } else if !has("project.build") {
+        (
+            "project.build",
+            "Dependencies are ready. Run the declared production build now.",
+        )
+    } else if has("preview_fallback_required") && !has("preview.start") {
+        (
+            "preview.start",
+            "Managed Dev is unavailable. Start the successful build with the supported Preview fallback.",
+        )
+    } else if has("preview_fallback_required") && !has("draft.snapshot_create") {
+        (
+            "draft.snapshot_create",
+            "The fallback Preview is running. Create its durable DraftSnapshot now.",
+        )
+    } else if has("preview_fallback_required") || has("draft_ready") {
+        (
+            "run.complete",
+            "The current source revision has a durable Draft. Complete the Run now.",
+        )
+    } else if !has("preview.dev_start") {
+        (
+            "preview.dev_start",
+            "The build passed. Start the managed Draft Preview now.",
+        )
+    } else {
+        (
+            "preview.dev_status",
+            "Wait for the current managed Preview revision to become Ready and durable.",
+        )
+    };
+    (call.name != required_tool)
+        .then(|| format!("{reason} Call {required_tool}; do not return to source inspection."))
+}
+
+fn greenfield_required_routes_authored(run: &AgentRun, state: &RunProgressState) -> bool {
+    greenfield_missing_required_route_sources(run, state).is_empty()
+        && greenfield_missing_required_route_text(run, state).is_empty()
+}
+
+fn greenfield_missing_required_route_sources(
+    run: &AgentRun,
+    state: &RunProgressState,
+) -> Vec<String> {
+    let app_root = run
+        .project_state_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.app_root.as_str())
+        .unwrap_or("project")
+        .trim_matches('/');
+    let required_routes = run
+        .generation_context
+        .as_ref()
+        .and_then(|context| context.pointer("/payload/acceptance/requiredRoutes"))
+        .and_then(Value::as_array)
+        .map(|routes| routes.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .filter(|routes| !routes.is_empty())
+        .unwrap_or_else(|| {
+            if state.required_routes.is_empty() {
+                vec!["/"]
+            } else {
+                state.required_routes.iter().map(String::as_str).collect()
+            }
+        });
+    let required_paths = required_routes
+        .into_iter()
+        .map(|route| {
+            let route = route.trim_matches('/');
+            if route.is_empty() {
+                format!("{app_root}/app/page")
+            } else {
+                format!("{app_root}/app/{route}/page")
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if state.authored_source_paths.is_empty()
+        && required_paths.len() == 1
+        && state.completed_steps.contains("source_file_authored")
+    {
+        return Vec::new();
+    }
+    required_paths
+        .into_iter()
+        .filter(|required| {
+            !state.authored_source_paths.iter().any(|authored| {
+                authored
+                    .strip_suffix(".tsx")
+                    .or_else(|| authored.strip_suffix(".jsx"))
+                    .or_else(|| authored.strip_suffix(".ts"))
+                    .or_else(|| authored.strip_suffix(".js"))
+                    == Some(required.as_str())
+            })
+        })
+        .map(|path| format!("{path}.tsx"))
+        .collect()
+}
+
+fn brief_required_routes(brief_markdown: &str) -> BTreeSet<String> {
+    brief_markdown
+        .lines()
+        .filter_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("\"route\":")
+                .map(str::trim)?
+                .trim_end_matches(',');
+            serde_json::from_str::<String>(value).ok()
+        })
+        .filter(|route| route.starts_with('/'))
+        .collect()
+}
+
+fn brief_required_route_text(brief_markdown: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let Some(page_structure) = brief_markdown
+        .split_once("## Page structure")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n## Assumptions").map(|(value, _)| value))
+        .map(str::trim)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_array().cloned())
+    else {
+        return BTreeMap::new();
+    };
+    page_structure
+        .into_iter()
+        .filter_map(|page| {
+            let route = page.get("route").and_then(Value::as_str)?.to_string();
+            let mut required = BTreeSet::new();
+            if let Some(heading) = page
+                .pointer("/hero/heading")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                required.insert(heading.to_string());
+            }
+            required.extend(
+                page.get("sections")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|section| section.get("heading").and_then(Value::as_str))
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string),
+            );
+            Some((route, required))
+        })
+        .collect()
+}
+
+fn update_authored_source_requirements(
+    state: &mut RunProgressState,
+    call: &ToolCall,
+    authored_paths: &BTreeSet<String>,
+) {
+    let fragments = match call.name.as_str() {
+        "fs.write" => call
+            .input
+            .get("text")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "fs.patch" => call
+            .input
+            .get("newStr")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        "fs.multi_patch" => call
+            .input
+            .get("patches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|patch| patch.get("newStr").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let all_required = state
+        .required_route_text
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in authored_paths {
+        if call.name == "fs.commit_chunks" {
+            let staged = state
+                .staged_source_requirements
+                .remove(path)
+                .unwrap_or_default();
+            state
+                .authored_source_requirements
+                .insert(path.clone(), staged);
+            continue;
+        }
+        let coverage = state
+            .authored_source_requirements
+            .entry(path.clone())
+            .or_default();
+        if call.name == "fs.write" {
+            coverage.clear();
+        }
+        coverage.extend(
+            all_required
+                .iter()
+                .filter(|required| {
+                    fragments
+                        .iter()
+                        .any(|text| text.contains(required.as_str()))
+                })
+                .cloned(),
+        );
+    }
+}
+
+fn update_staged_source_requirements(state: &mut RunProgressState, call: &ToolCall) {
+    let Some(path) = call
+        .input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|value| value.trim_start_matches("/workspace/").to_string())
+    else {
+        return;
+    };
+    let Some(text) = call.input.get("text").and_then(Value::as_str) else {
+        return;
+    };
+    let all_required = state
+        .required_route_text
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    state
+        .staged_source_requirements
+        .entry(path)
+        .or_default()
+        .extend(
+            all_required
+                .into_iter()
+                .filter(|required| text.contains(required)),
+        );
+}
+
+fn greenfield_missing_required_route_text(
+    run: &AgentRun,
+    state: &RunProgressState,
+) -> Vec<(String, String)> {
+    let app_root = run
+        .project_state_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.app_root.as_str())
+        .unwrap_or("project")
+        .trim_matches('/');
+    state
+        .required_route_text
+        .iter()
+        .flat_map(|(route, required)| {
+            let route = route.trim_matches('/');
+            let path = if route.is_empty() {
+                format!("{app_root}/app/page.tsx")
+            } else {
+                format!("{app_root}/app/{route}/page.tsx")
+            };
+            let covered = state
+                .authored_source_requirements
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            required
+                .iter()
+                .filter(move |text| !covered.contains(*text))
+                .cloned()
+                .map(move |text| (path.clone(), text))
+        })
+        .collect()
 }
 
 fn targeted_fumadocs_repair_tool_denial(
@@ -6802,6 +7458,13 @@ fn is_source_mutation_tool(name: &str) -> bool {
         || name == "fs.delete"
         || name.starts_with("style.")
         || name == "project.init"
+}
+
+fn is_direct_source_file_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.write" | "fs.patch" | "fs.multi_patch" | "fs.commit_chunks" | "fs.delete"
+    )
 }
 
 fn is_staged_source_progress_tool(name: &str) -> bool {
@@ -7865,6 +8528,14 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         (Some(id), None, _) => format!("\nDesignProfile: id={id}"),
         _ => String::new(),
     };
+    let runtime_bootstrap_instruction = if run.phase == AgentPhase::Build
+        && next_app
+        && !generation_context_enabled
+    {
+        "Runtime bootstrap runs before the first model turn. It has already loaded the frozen Brief, Content Sources, verified Style Contract, and bounded full sourceObservations for the editable route and styles. Treat those tool results as the completed legacy inventory and project inspection. Begin authoring immediately with a source mutation; do not call project.inspect, content tools, fs.list, fs.search, or fs.read before that first mutation."
+    } else {
+        ""
+    };
     let design_source_read_instruction = if matches!(
         run.phase,
         AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
@@ -7920,6 +8591,10 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
         PromptContextSection {
             id: "phase_workflow",
             content: phase_instruction.to_string(),
+        },
+        PromptContextSection {
+            id: "runtime_bootstrap",
+            content: runtime_bootstrap_instruction.to_string(),
         },
         PromptContextSection {
             id: "template_completion",
@@ -8284,6 +8959,518 @@ mod design_capsule_tests {
     }
 
     #[tokio::test]
+    async fn build_bootstrap_reinitializes_a_fresh_bound_workspace_in_shadow_mode() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "generation-bootstrap-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let (inspect, inspect_calls) = workflow_fixture_tool(
+            "project.inspect",
+            json!({
+                "lifecycle": { "initialized": false },
+                "nextAction": { "tool": "project.init" }
+            }),
+        );
+        let (init, init_calls) = workflow_fixture_tool(
+            "project.init",
+            json!({
+                "appRoot": "project",
+                "template": "next-app",
+                "sourceObservations": [{
+                    "path": "/workspace/project/app/page.tsx",
+                    "text": "export default function Page() { return <main />; }",
+                    "contentSha256": "a".repeat(64),
+                    "view": "full",
+                    "purpose": "source"
+                }]
+            }),
+        );
+        let (read, read_calls) = workflow_fixture_tool(
+            "fs.read",
+            json!({
+                "path": "fixture",
+                "text": "fixture context"
+            }),
+        );
+        let executor = ToolExecutor::new(
+            vec![inspect, init, read],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store, model, executor);
+        let mut state = RunProgressState::default();
+        let mut messages = Vec::new();
+
+        let results = loop_runner
+            .bootstrap_generation_project_if_needed(&run, &mut state, &mut messages)
+            .await
+            .expect("Runtime bootstrap");
+
+        assert_eq!(results.len(), 5);
+        assert_eq!(inspect_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(init_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(read_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(state.completed_steps.contains("project_inspected"));
+        assert!(state.completed_steps.contains("project_initialized"));
+        assert!(state.completed_steps.contains("project_source_read"));
+        assert!(state.completed_steps.contains("inputs_inventoried"));
+        assert!(state.completed_steps.contains("brief_loaded"));
+        assert!(state.completed_steps.contains("content_sources_loaded"));
+        assert!(messages.iter().any(|message| {
+            message
+                .get("toolCalls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get("name").and_then(Value::as_str) == Some("project.init")
+                    })
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn greenfield_bootstrap_requires_authoring_after_context_is_ready() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "greenfield-authoring-gate".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let mut run = next_app_workflow_run(run, "greenfield_static");
+        run.execution_profile = None;
+        assert!(workflow_driver_supports(&run));
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_source_read",
+                "inputs_inventoried",
+                "brief_loaded",
+                "content_sources_loaded",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        let reread = ToolCall::new(
+            "reread-page",
+            "fs.read",
+            json!({ "path": "project/app/page.tsx" }),
+        );
+        let inspect = ToolCall::new("inspect-again", "project.inspect", json!({}));
+        let write = ToolCall::new(
+            "author-page",
+            "fs.write",
+            json!({
+                "path": "project/app/page.tsx",
+                "content": "export default function Page() { return <main>Ship it</main>; }"
+            }),
+        );
+        let tokens = ToolCall::new(
+            "update-tokens",
+            "style.update_tokens",
+            json!({ "updates": { "color.primary": "#1f6fb2" } }),
+        );
+
+        assert!(greenfield_authoring_tool_denial(&run, &state, &reread).is_some());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &inspect).is_some());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &write).is_none());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &tokens).is_none());
+
+        state.completed_steps.insert("source_authored".to_string());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &reread).is_some());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &tokens).is_some());
+        state
+            .completed_steps
+            .insert("source_file_authored".to_string());
+        assert!(greenfield_authoring_tool_denial(&run, &state, &reread).is_none());
+    }
+
+    #[tokio::test]
+    async fn greenfield_lifecycle_is_strictly_ordered_after_application_authoring() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "greenfield-lifecycle-gate".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let mut state = RunProgressState::default();
+        state
+            .completed_steps
+            .insert("source_file_authored".to_string());
+        let dependencies = ToolCall::new(
+            "dependencies",
+            "project.ensure_dependencies",
+            json!({ "mode": "restore" }),
+        );
+        let build = ToolCall::new("build", "project.build", json!({}));
+        let inspect = ToolCall::new("inspect", "fs.list", json!({ "path": "project" }));
+        let dev_start = ToolCall::new("dev-start", "preview.dev_start", json!({}));
+        let dev_status = ToolCall::new("dev-status", "preview.dev_status", json!({}));
+        let preview_start = ToolCall::new("preview-start", "preview.start", json!({}));
+        let snapshot = ToolCall::new("snapshot", "draft.snapshot_create", json!({}));
+        let complete = ToolCall::new(
+            "complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "done" }),
+        );
+
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &dependencies).is_none());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &inspect).is_some());
+
+        state
+            .completed_steps
+            .insert("dependencies_ready".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &build).is_none());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &dev_start).is_some());
+
+        state.completed_steps.insert("project.build".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &dev_start).is_none());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &inspect).is_some());
+
+        state
+            .completed_steps
+            .insert("preview.dev_start".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &dev_status).is_none());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &complete).is_some());
+
+        state
+            .completed_steps
+            .insert("preview_fallback_required".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &preview_start).is_none());
+        state.completed_steps.insert("preview.start".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &snapshot).is_none());
+        state
+            .completed_steps
+            .insert("draft.snapshot_create".to_string());
+        assert!(greenfield_lifecycle_tool_denial(&run, &state, &complete).is_none());
+    }
+
+    #[tokio::test]
+    async fn greenfield_authoring_requires_every_frozen_route_source() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "greenfield-required-routes".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let mut run = next_app_workflow_run(run, "greenfield_static");
+        run.generation_context = Some(json!({
+            "payload": {
+                "acceptance": {
+                    "requiredRoutes": ["/", "/docs/"]
+                }
+            }
+        }));
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_source_read",
+                "inputs_inventoried",
+                "brief_loaded",
+                "content_sources_loaded",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        let tokens = ToolCall::new(
+            "tokens",
+            "fs.write",
+            json!({ "path": "project/app/tokens.css", "text": ":root {}" }),
+        );
+        let home = ToolCall::new(
+            "home",
+            "fs.write",
+            json!({ "path": "project/app/page.tsx", "text": "export default function Page() {}" }),
+        );
+        let docs = ToolCall::new(
+            "docs",
+            "fs.write",
+            json!({ "path": "project/app/docs/page.tsx", "text": "export default function Docs() {}" }),
+        );
+        for call in [&tokens, &home, &docs] {
+            let result = ToolResultMessage {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                is_error: false,
+                content: json!({}),
+                metadata: None,
+            };
+            update_progress_state(
+                &mut state,
+                std::slice::from_ref(call),
+                std::slice::from_ref(&result),
+            );
+            if call.id == tokens.id {
+                assert_eq!(
+                    greenfield_missing_required_route_sources(&run, &state),
+                    vec![
+                        "project/app/docs/page.tsx".to_string(),
+                        "project/app/page.tsx".to_string()
+                    ]
+                );
+            } else if call.id == home.id {
+                assert_eq!(
+                    greenfield_missing_required_route_sources(&run, &state),
+                    vec!["project/app/docs/page.tsx".to_string()]
+                );
+                assert!(greenfield_authoring_tool_denial(
+                    &run,
+                    &state,
+                    &ToolCall::new("build-early", "project.build", json!({}))
+                )
+                .is_some());
+            }
+        }
+
+        assert!(greenfield_required_routes_authored(&run, &state));
+        assert!(greenfield_authoring_tool_denial(
+            &run,
+            &state,
+            &ToolCall::new(
+                "reread",
+                "fs.read",
+                json!({ "path": "project/app/page.tsx" })
+            )
+        )
+        .is_none());
+        assert!(greenfield_lifecycle_tool_denial(
+            &run,
+            &state,
+            &ToolCall::new(
+                "dependencies",
+                "project.ensure_dependencies",
+                json!({ "mode": "restore" })
+            )
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn greenfield_authoring_uses_frozen_brief_routes_without_content_plan() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "greenfield-brief-routes".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "template_default");
+        let mut state = RunProgressState::default();
+        let read = ToolCall::new("brief", "fs.read", json!({ "path": "inputs/brief.md" }));
+        let result = ToolResultMessage {
+            tool_use_id: read.id.clone(),
+            tool_name: read.name.clone(),
+            is_error: false,
+            content: json!({
+                "text": r#"
+## Page structure
+[
+  {
+    "route": "/",
+    "hero": { "heading": "Ship the hard parts." },
+    "sections": [
+      { "heading": "Engagement Loop" }
+    ]
+  },
+  {
+    "route": "/docs/",
+    "sections": [
+      { "heading": "Getting Started" },
+      { "heading": "Security & Governance" }
+    ]
+  }
+]
+
+## Assumptions
+[]
+"#
+            }),
+            metadata: None,
+        };
+
+        update_progress_state(&mut state, &[read], &[result]);
+
+        assert_eq!(
+            state.required_routes,
+            BTreeSet::from(["/".to_string(), "/docs/".to_string()])
+        );
+        assert_eq!(
+            greenfield_missing_required_route_sources(&run, &state),
+            vec![
+                "project/app/docs/page.tsx".to_string(),
+                "project/app/page.tsx".to_string()
+            ]
+        );
+        assert_eq!(
+            state.required_route_text["/"],
+            BTreeSet::from([
+                "Engagement Loop".to_string(),
+                "Ship the hard parts.".to_string()
+            ])
+        );
+        assert_eq!(
+            state.required_route_text["/docs/"],
+            BTreeSet::from([
+                "Getting Started".to_string(),
+                "Security & Governance".to_string()
+            ])
+        );
+
+        let default_home = ToolCall::new(
+            "default-home",
+            "fs.write",
+            json!({
+                "path": "project/app/page.tsx",
+                "text": "export default function Page() { return <h1>AnyDesign</h1> }"
+            }),
+        );
+        let default_result = ToolResultMessage {
+            tool_use_id: default_home.id.clone(),
+            tool_name: default_home.name.clone(),
+            is_error: false,
+            content: json!({}),
+            metadata: None,
+        };
+        update_progress_state(&mut state, &[default_home], &[default_result]);
+        assert_eq!(
+            greenfield_missing_required_route_text(&run, &state),
+            vec![
+                (
+                    "project/app/page.tsx".to_string(),
+                    "Engagement Loop".to_string()
+                ),
+                (
+                    "project/app/page.tsx".to_string(),
+                    "Ship the hard parts.".to_string()
+                ),
+                (
+                    "project/app/docs/page.tsx".to_string(),
+                    "Getting Started".to_string()
+                ),
+                (
+                    "project/app/docs/page.tsx".to_string(),
+                    "Security & Governance".to_string()
+                )
+            ]
+        );
+
+        for (id, path, text) in [
+            (
+                "home-chunk",
+                "project/app/page.tsx",
+                "Ship the hard parts. Engagement Loop",
+            ),
+            (
+                "docs-chunk",
+                "project/app/docs/page.tsx",
+                "Getting Started Security & Governance",
+            ),
+        ] {
+            let chunk = ToolCall::new(
+                id,
+                "fs.write_chunk",
+                json!({
+                    "path": path,
+                    "sessionId": id,
+                    "index": 0,
+                    "total": 1,
+                    "text": text
+                }),
+            );
+            let chunk_result = ToolResultMessage {
+                tool_use_id: chunk.id.clone(),
+                tool_name: chunk.name.clone(),
+                is_error: false,
+                content: json!({}),
+                metadata: None,
+            };
+            update_progress_state(&mut state, &[chunk], &[chunk_result]);
+            let commit = ToolCall::new(
+                format!("{id}-commit"),
+                "fs.commit_chunks",
+                json!({ "path": path, "sessionId": id }),
+            );
+            let commit_result = ToolResultMessage {
+                tool_use_id: commit.id.clone(),
+                tool_name: commit.name.clone(),
+                is_error: false,
+                content: json!({}),
+                metadata: None,
+            };
+            update_progress_state(&mut state, &[commit], &[commit_result]);
+        }
+        assert!(greenfield_missing_required_route_text(&run, &state).is_empty());
+        assert!(greenfield_missing_required_route_sources(&run, &state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_treat_runtime_state_as_workspace_materialization() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "generation-reconcile-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        store
+            .upsert_project_runtime_state_with_template_identity(
+                &run.project_id,
+                "project".to_string(),
+                "next-app".to_string(),
+                "next-app@1".to_string(),
+                Some("a".repeat(64)),
+                "nextjs".to_string(),
+                Some("next-app".to_string()),
+                Some("0.1.0".to_string()),
+                "npm".to_string(),
+                "package-lock.json".to_string(),
+                "runtime".to_string(),
+            )
+            .await
+            .expect("Runtime project state");
+        let executor = ToolExecutor::new(Vec::new(), crate::permission::PermissionRules::default());
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store, model, executor)
+            .with_generation_context_enabled(true);
+        let mut state = RunProgressState::default();
+
+        loop_runner
+            .reconcile_workflow_progress(&run, &mut state)
+            .await;
+
+        assert!(!state.completed_steps.contains("project_initialized"));
+    }
+
+    #[tokio::test]
     async fn runtime_workflow_driver_completes_greenfield_lifecycle_without_model_tool_pairs() {
         let store = RuntimeStore::new();
         let run = store
@@ -8343,6 +9530,7 @@ mod design_capsule_tests {
                 "project_initialized",
                 "project_inspected",
                 "source_authored",
+                "source_file_authored",
             ]
             .into_iter()
             .map(str::to_string),
@@ -8434,6 +9622,7 @@ mod design_capsule_tests {
                 "project_initialized",
                 "project_inspected",
                 "source_authored",
+                "source_file_authored",
             ]
             .into_iter()
             .map(str::to_string),
@@ -8560,6 +9749,7 @@ mod design_capsule_tests {
                 "project_initialized",
                 "project_inspected",
                 "source_authored",
+                "source_file_authored",
             ]
             .into_iter()
             .map(str::to_string),
@@ -9114,6 +10304,7 @@ mod design_capsule_tests {
 
         assert!(state.completed_steps.contains("project_source_read"));
         assert!(state.completed_steps.contains("source_authored"));
+        assert!(!state.completed_steps.contains("source_file_authored"));
         let workflow = workflow_progress_snapshot(
             AgentPhase::Edit,
             Some("next-app"),
@@ -9759,6 +10950,7 @@ mod design_capsule_tests {
             vec![
                 "runtime_identity",
                 "phase_workflow",
+                "runtime_bootstrap",
                 "template_completion",
                 "source_fallback",
                 "shell_paths",
@@ -10210,6 +11402,11 @@ mod design_capsule_tests {
         });
 
         let prompt = PromptContextAssembler::for_run(&run).render();
+        assert!(prompt.contains("Runtime bootstrap runs before the first model turn"));
+        assert!(prompt.contains("Begin authoring immediately with a source mutation"));
+        assert!(prompt.contains(
+            "do not call project.inspect, content tools, fs.list, fs.search, or fs.read"
+        ));
         assert!(prompt.contains("375px navigation readability"));
         assert!(prompt.contains("never be squeezed into one-character columns"));
         assert!(prompt.contains("app/icon.svg"));
@@ -10228,6 +11425,7 @@ mod design_capsule_tests {
                 "project_initialized",
                 "project_inspected",
                 "source_authored",
+                "source_file_authored",
             ]
             .into_iter()
             .map(str::to_string),
@@ -10310,6 +11508,7 @@ mod design_capsule_tests {
                 "project_initialized",
                 "project_inspected",
                 "source_authored",
+                "source_file_authored",
                 "dependencies_ready",
                 "project.build",
                 "preview_fallback_required",
