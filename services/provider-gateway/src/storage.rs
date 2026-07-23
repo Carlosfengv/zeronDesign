@@ -5,7 +5,7 @@ use std::{fs, path::Path};
 
 use crate::{
     GatewayErrorEnvelope, GatewayTurnResponse, ModelExecutionSummary, ModelResource,
-    ModelSelectionPolicy,
+    ModelSelectionPolicy, ProviderConnection,
 };
 
 #[path = "postgres_store.rs"]
@@ -209,6 +209,44 @@ impl PersistentStore {
 
     pub fn current_model_resources(&self) -> Result<Vec<ModelResource>> {
         delegate_store!(self, current_model_resources())
+    }
+
+    pub fn provider_connections(&self) -> Result<Vec<ProviderConnection>> {
+        delegate_store!(self, provider_connections())
+    }
+
+    pub fn provider_connection(&self, id: &str) -> Result<Option<ProviderConnection>> {
+        delegate_store!(self, provider_connection(id))
+    }
+
+    pub fn save_provider_connection(
+        &self,
+        connection: ProviderConnection,
+        expected_version: Option<u64>,
+    ) -> Result<ProviderConnection> {
+        delegate_store!(self, save_provider_connection(connection, expected_version))
+    }
+
+    pub fn save_provider_connection_with_secret(
+        &self,
+        connection: ProviderConnection,
+        expected_version: Option<u64>,
+        secret_name: &str,
+        ciphertext: &str,
+    ) -> Result<ProviderConnection> {
+        delegate_store!(
+            self,
+            save_provider_connection_with_secret(
+                connection,
+                expected_version,
+                secret_name,
+                ciphertext
+            )
+        )
+    }
+
+    pub fn configuration_version(&self) -> Result<u64> {
+        delegate_store!(self, configuration_version())
     }
 
     pub fn model_resource(&self, id: &str, revision: Option<u64>) -> Result<Option<ModelResource>> {
@@ -444,6 +482,21 @@ impl SqliteStore {
                 ciphertext TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS provider_connections (
+                id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                enabled INTEGER NOT NULL,
+                connection_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS gateway_configuration_state (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                configuration_version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT OR IGNORE INTO gateway_configuration_state
+                (singleton_id, configuration_version) VALUES (1, 0);
             ",
         )?;
         let _ = connection.execute(
@@ -909,6 +962,198 @@ impl SqliteStore {
         resources
     }
 
+    pub fn provider_connections(&self) -> Result<Vec<ProviderConnection>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT connection_json FROM provider_connections ORDER BY id")?;
+        let connections = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<ProviderConnection>(&row?)?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(connections)
+    }
+
+    pub fn provider_connection(&self, id: &str) -> Result<Option<ProviderConnection>> {
+        self.connection
+            .query_row(
+                "SELECT connection_json FROM provider_connections WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn save_provider_connection(
+        &self,
+        mut connection: ProviderConnection,
+        expected_version: Option<u64>,
+    ) -> Result<ProviderConnection> {
+        let current = self
+            .connection
+            .query_row(
+                "SELECT version FROM provider_connections WHERE id = ?1",
+                params![connection.id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        match (current, expected_version) {
+            (Some(current), Some(expected)) if current == expected => {}
+            (Some(current), _) => {
+                return Err(anyhow!(
+                    "provider connection version conflict for {}: expected {:?}, current {}",
+                    connection.id,
+                    expected_version,
+                    current
+                ))
+            }
+            (None, None | Some(0)) => {}
+            (None, Some(expected)) => {
+                return Err(anyhow!(
+                    "provider connection {} does not exist at expected version {}",
+                    connection.id,
+                    expected
+                ))
+            }
+        }
+        connection.version = current.unwrap_or(0).saturating_add(1);
+        self.connection.execute(
+            "INSERT INTO provider_connections
+                (id, version, enabled, connection_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                version = excluded.version,
+                enabled = excluded.enabled,
+                connection_json = excluded.connection_json,
+                updated_at = CURRENT_TIMESTAMP",
+            params![
+                connection.id,
+                connection.version,
+                connection.enabled,
+                serde_json::to_string(&connection)?
+            ],
+        )?;
+        self.audit(
+            "provider_connection.saved",
+            &connection.id,
+            &serde_json::json!({
+                "version": connection.version,
+                "enabled": connection.enabled,
+                "kind": connection.kind,
+                "authType": connection.auth.auth_type,
+                "credentialConfigured": !connection.auth.secret_ref.trim().is_empty(),
+            }),
+        )?;
+        self.bump_configuration_version()?;
+        Ok(connection)
+    }
+
+    pub fn save_provider_connection_with_secret(
+        &self,
+        mut connection: ProviderConnection,
+        expected_version: Option<u64>,
+        secret_name: &str,
+        ciphertext: &str,
+    ) -> Result<ProviderConnection> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT version FROM provider_connections WHERE id = ?1",
+                params![connection.id],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()?;
+        match (current, expected_version) {
+            (Some(current), Some(expected)) if current == expected => {}
+            (Some(current), _) => {
+                return Err(anyhow!(
+                    "provider connection version conflict for {}: expected {:?}, current {}",
+                    connection.id,
+                    expected_version,
+                    current
+                ));
+            }
+            (None, None | Some(0)) => {}
+            (None, Some(expected)) => {
+                return Err(anyhow!(
+                    "provider connection {} does not exist at expected version {}",
+                    connection.id,
+                    expected
+                ));
+            }
+        }
+        connection.version = current.unwrap_or(0).saturating_add(1);
+        transaction.execute(
+            "INSERT INTO provider_gateway_encrypted_secrets (name, ciphertext)
+             VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET
+                ciphertext = excluded.ciphertext,
+                updated_at = CURRENT_TIMESTAMP",
+            params![secret_name, ciphertext],
+        )?;
+        transaction.execute(
+            "INSERT INTO provider_connections (id, version, enabled, connection_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                version = excluded.version,
+                enabled = excluded.enabled,
+                connection_json = excluded.connection_json,
+                updated_at = CURRENT_TIMESTAMP",
+            params![
+                connection.id,
+                connection.version,
+                connection.enabled,
+                serde_json::to_string(&connection)?
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO provider_gateway_audit_events (event_type, subject_id, metadata_json)
+             VALUES (?1, ?2, ?3)",
+            params![
+                "provider_connection.saved",
+                connection.id,
+                serde_json::to_string(&serde_json::json!({
+                    "version": connection.version,
+                    "enabled": connection.enabled,
+                    "kind": connection.kind,
+                    "authType": connection.auth.auth_type,
+                    "credentialConfigured": true,
+                }))?
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE gateway_configuration_state
+             SET configuration_version = configuration_version + 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE singleton_id = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    pub fn configuration_version(&self) -> Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT configuration_version FROM gateway_configuration_state WHERE singleton_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn bump_configuration_version(&self) -> Result<u64> {
+        self.connection.execute(
+            "UPDATE gateway_configuration_state
+             SET configuration_version = configuration_version + 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE singleton_id = 1",
+            [],
+        )?;
+        self.configuration_version()
+    }
+
     pub fn model_resource(&self, id: &str, revision: Option<u64>) -> Result<Option<ModelResource>> {
         let sql = if revision.is_some() {
             "SELECT resource_json FROM model_resource_revisions WHERE id = ?1 AND revision = ?2"
@@ -1007,6 +1252,7 @@ impl SqliteStore {
                 "secretConfigured": !resource.auth.secret_ref.trim().is_empty(),
             }),
         )?;
+        self.bump_configuration_version()?;
         Ok(resource)
     }
 
@@ -1058,6 +1304,7 @@ impl SqliteStore {
         )?;
         self.insert_policy_revision(&policy, true)?;
         self.audit("model_selection_policy.saved", &policy.id, &policy)?;
+        self.bump_configuration_version()?;
         Ok(policy)
     }
 
@@ -1100,6 +1347,7 @@ impl SqliteStore {
                 "previousRevision": expected_current_revision,
             }),
         )?;
+        self.bump_configuration_version()?;
         Ok(policy)
     }
 

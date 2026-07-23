@@ -1,6 +1,166 @@
 use super::*;
 
 #[tokio::test]
+async fn run_budget_profile_endpoint_returns_the_frozen_profile_and_not_found_is_explicit() {
+    let store = RuntimeStore::new();
+    let run = store
+        .create_run(
+            "project-budget-profile".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let frozen = run
+        .budget_profile
+        .clone()
+        .expect("new Runs must freeze a Budget Profile");
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config: public_auth_disabled_config(),
+        store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{}/budget-profile", run.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    let returned: anydesign_runtime::types::RunBudgetProfile =
+        serde_json::from_slice(&body).unwrap();
+    assert_eq!(returned, *frozen);
+    assert_eq!(returned.profile_hash, returned.identity_hash());
+
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri("/runs/run-missing/budget-profile")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn run_budget_profile_endpoint_rejects_restored_legacy_run_without_rebinding() {
+    let root = unique_temp_dir("http-run-budget-profile-legacy");
+    let checkpoint_dir = root.join("checkpoints");
+    let run_log_dir = root.join("run-log");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    let run = store
+        .create_run(
+            "project-budget-profile-legacy".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let run_state_log = store.run_state_log_path();
+    drop(store);
+
+    let mut legacy_snapshot: Value =
+        serde_json::from_str(fs::read_to_string(&run_state_log).unwrap().trim()).unwrap();
+    assert!(legacy_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("budgetProfile")
+        .is_some());
+    fs::write(
+        &run_state_log,
+        format!("{}\n", serde_json::to_string(&legacy_snapshot).unwrap()),
+    )
+    .unwrap();
+
+    let restored_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    assert!(restored_store
+        .get_run(&run.id)
+        .await
+        .unwrap()
+        .budget_profile
+        .is_none());
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config: public_auth_disabled_config(),
+        store: restored_store,
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{}/budget-profile", run.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("unavailable for restored legacy Run"));
+}
+
+#[tokio::test]
+async fn run_budget_profile_endpoint_fails_closed_for_tampered_persisted_profile() {
+    let root = unique_temp_dir("http-run-budget-profile-tampered");
+    let checkpoint_dir = root.join("checkpoints");
+    let run_log_dir = root.join("run-log");
+    let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+    let run = store
+        .create_run(
+            "project-budget-profile-tampered".to_string(),
+            AgentPhase::Build,
+            "build".to_string(),
+            "internal-balanced".to_string(),
+            vec![],
+        )
+        .await;
+    let run_state_log = store.run_state_log_path();
+    drop(store);
+
+    let mut tampered_snapshot: Value =
+        serde_json::from_str(fs::read_to_string(&run_state_log).unwrap().trim()).unwrap();
+    tampered_snapshot["budgetProfile"]["profileHash"] = Value::String("0".repeat(64));
+    fs::write(
+        &run_state_log,
+        format!("{}\n", serde_json::to_string(&tampered_snapshot).unwrap()),
+    )
+    .unwrap();
+
+    let app = http_api::router_with_state(AppState {
+        supervisor: http_api::RuntimeSupervisor::new(),
+        config: public_auth_disabled_config(),
+        store: RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir),
+        model: Arc::new(MockModelClient::new(vec![])),
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/runs/{}/budget-profile", run.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn stream_events_reconnect_uses_last_event_id_without_duplicates() {
     let store = RuntimeStore::new();
     let run = store

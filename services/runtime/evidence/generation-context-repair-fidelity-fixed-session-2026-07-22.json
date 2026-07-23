@@ -1,0 +1,130 @@
+{
+  "schemaVersion": "generation-context-repair-fidelity-fixed-session-summary@1",
+  "recordedAt": "2026-07-22T04:38:00Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro"
+  },
+  "pair": {
+    "pairId": "batch-03-agent-cloud-quickstart-repair",
+    "batchId": "batch-03",
+    "fixtureId": "agent-cloud-quickstart",
+    "bucket": "repair",
+    "templateVersion": "fumadocs-docs",
+    "lifecycleProfile": "repair_warm",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "attempts": [
+        "no_progress",
+        "accepted"
+      ],
+      "runId": "run-16309229",
+      "recordHash": "b0b8366912ed2baf50d69aa06f28a27feb3a97d19f9612d3d859d06ecd5a1048",
+      "repairVerification": {
+        "reviewFindingRecorded": true,
+        "findingFixedByCompletedRepair": true,
+        "freshVersionCreated": true,
+        "sourceMutationRecorded": true,
+        "previewPublishRecorded": true,
+        "markerPreserved": true
+      },
+      "metrics": {
+        "inputTokens": 81267,
+        "outputTokens": 1068,
+        "turns": 8,
+        "toolCalls": 12,
+        "totalDurationMs": 68994,
+        "timeToFirstSourceMutationMs": 20847,
+        "modelTurnAtFirstSourceMutation": 4,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 2,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "attempts": [
+        "accepted"
+      ],
+      "runId": "run-9603473",
+      "recordHash": "9da5e35211a1435d15e345e7dba57baf1b06d7ba155a8e9b5132bba4b93460ca",
+      "repairVerification": {
+        "reviewFindingRecorded": true,
+        "findingFixedByCompletedRepair": true,
+        "freshVersionCreated": true,
+        "sourceMutationRecorded": true,
+        "previewPublishRecorded": true,
+        "markerPreserved": true
+      },
+      "metrics": {
+        "inputTokens": 38641,
+        "outputTokens": 632,
+        "turns": 5,
+        "toolCalls": 9,
+        "totalDurationMs": 54938,
+        "timeToFirstSourceMutationMs": 14239,
+        "modelTurnAtFirstSourceMutation": 3,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -52.45,
+      "outputTokens": -40.82,
+      "turns": -37.5,
+      "toolCalls": -25.0,
+      "totalDurationMs": -20.37,
+      "timeToFirstSourceMutationMs": -31.7,
+      "modelTurnAtFirstSourceMutation": -25.0,
+      "prebuildFsReadCount": -50.0,
+      "prebuildFsSearchCount": -100.0
+    },
+    "openFindings": [
+      "both sides prove Build, isolated Setup Edit, read-only Review finding, targeted Repair, fresh Fumadocs Version, marker preservation, Provider identity, outer acceptance, and required fidelity",
+      "candidate exceeded the 50% input-token reduction target for this single pair and improved turns, tool calls, total duration, mutation latency, and prebuild exploration",
+      "candidate first mutation remained at model turn 3 instead of the target maximum of 2",
+      "one pair is insufficient for Repair bootstrap intervals; the replacement cohort needs nine more valid Repair pairs across at least three batches"
+    ]
+  },
+  "ledger": {
+    "recordCount": 7,
+    "sampleCount": 6,
+    "completePairCount": 3,
+    "pendingPairCount": 0,
+    "headRecordHash": "9da5e35211a1435d15e345e7dba57baf1b06d7ba155a8e9b5132bba4b93460ca",
+    "sha256": "6f8bc7d444009720ff90e36bdc41365c879fe4def2068a6b5affeb46b4c7e83b"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "warmStructuralPairCount": 1,
+    "coldDevPairCount": 1,
+    "repairPairCount": 1,
+    "repairMinimumPairCount": 10,
+    "repairBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "d09a265497ff5f54b66858d38711055057789645fcfe205bff7e6914e561de3c"
+  },
+  "sourceSha256": {
+    "pairSpec": "1549e35c550f52b5f37257eb9a20c38e0d04373bd1b7041c774b6199dec515b8",
+    "pairResult": "ceb46d6a6c66aaf3af7e3d88615a67f6d40d78babda045f6a45f2e555c913060",
+    "controlCase": "9415473a5cf674b646852a57b75c2275ddf9337fcfb39c4225ca26a5fbb6e6bc",
+    "candidateCase": "e8982cf6052597dff8e9413fc00c803953143452ee3f6adc64823a2465d71324",
+    "rolloutEvidence": "d09a265497ff5f54b66858d38711055057789645fcfe205bff7e6914e561de3c"
+  }
+}

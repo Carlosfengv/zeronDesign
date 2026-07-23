@@ -191,8 +191,15 @@ async fn cancel_run_rejects_terminal_run_without_reopening_it() {
     );
 }
 
-#[tokio::test]
-async fn continue_run_records_user_message_and_resumes() {
+#[test]
+fn continue_run_records_user_message_and_resumes() {
+    run_with_http_test_stack(
+        "continue-run-resume",
+        continue_run_records_user_message_and_resumes_inner(),
+    );
+}
+
+async fn continue_run_records_user_message_and_resumes_inner() {
     let store = RuntimeStore::new();
     let run = store
         .create_run(
@@ -365,8 +372,15 @@ async fn continue_run_on_running_run_queues_message_without_reentrant_session() 
     assert!(store.continue_interrupt_requested(&run.id).await);
 }
 
-#[tokio::test]
-async fn resolve_permission_allow_resumes_run() {
+#[test]
+fn resolve_permission_allow_resumes_run() {
+    run_with_http_test_stack(
+        "permission-allow-resume",
+        resolve_permission_allow_resumes_run_inner(),
+    );
+}
+
+async fn resolve_permission_allow_resumes_run_inner() {
     let store = RuntimeStore::new();
     let run = store
         .create_run(
@@ -442,8 +456,15 @@ async fn resolve_permission_allow_resumes_run() {
     );
 }
 
-#[tokio::test]
-async fn resolve_permission_after_restart_resumes_same_run() {
+#[test]
+fn resolve_permission_after_restart_resumes_same_run() {
+    run_with_http_test_stack(
+        "permission-restart-resume",
+        resolve_permission_after_restart_resumes_same_run_inner(),
+    );
+}
+
+async fn resolve_permission_after_restart_resumes_same_run_inner() {
     let checkpoint_dir = unique_temp_dir("http-permission-restart");
     let store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
     let run = store

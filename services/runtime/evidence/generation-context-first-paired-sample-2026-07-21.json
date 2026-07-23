@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "generation-context-first-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T10:47:43.909Z",
+  "sessionId": "deepseek-v4-pro-20260721T103843Z",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "fixtureManifestSha256": "f8f3d93d8ff9a8171fa23b2c8bf646934bcd04705490eb2a97229fecdc225e78",
+  "runtimeImage": {
+    "ref": "anydesign/runtime:gctx-required-text-20260721",
+    "imageId": "sha256:2469ac217fc3b41dedd391bcf63603195cb15d2408c719220a30d27b92dbdaf4",
+    "controlDeploymentRevision": "40a9dab2c9def3a5a0b256092e27cf74913860bfdd48dc89140ac7dc7518b0d4",
+    "candidateDeploymentRevision": "fbf2342293e8d91e86eb71d84a395c4c5041086069e0f454b428476988a5baeb"
+  },
+  "pair": {
+    "id": "batch-01-zenova-agent-cloud-greenfield",
+    "batchId": "batch-01",
+    "bucket": "greenfield",
+    "identity": {
+      "fixtureId": "zenova-agent-cloud",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "modelVersion": "deepseek-v4-pro",
+      "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+      "templateVersion": "next-app",
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315",
+      "phase": "build"
+    },
+    "control": {
+      "status": "completed",
+      "firstBuildSucceeded": true,
+      "requiredFidelityPassed": true,
+      "metrics": {
+        "duplicateReadTokens": 0,
+        "inputTokens": 348533,
+        "timeToFirstGreenfieldBuildMs": 161732,
+        "coldDevReadyMs": 172449,
+        "modelTurnAtFirstSourceMutation": 7,
+        "prebuildFsListCount": 3,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 500,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "status": "completed",
+      "firstBuildSucceeded": true,
+      "requiredFidelityPassed": true,
+      "metrics": {
+        "duplicateReadTokens": 0,
+        "inputTokens": 247240,
+        "timeToFirstGreenfieldBuildMs": 112921,
+        "coldDevReadyMs": 120290,
+        "timeToDurableSnapshotMs": 132599,
+        "modelTurnAtFirstSourceMutation": 3,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      },
+      "requiredTextContiguousCount": 1,
+      "pageSourceSha256": "964b5dff91eed3211f0864ed78bb5dde06daa060255829d664cadc54b17ac71a"
+    },
+    "observedReductionPercent": {
+      "inputTokens": 29.06,
+      "timeToFirstGreenfieldBuildMs": 30.18,
+      "coldDevReadyMs": 30.25,
+      "modelTurnAtFirstSourceMutation": 57.14
+    }
+  },
+  "ledger": {
+    "recordCount": 3,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "685907c9d8176ca1fab6795d83018d4bf4f34481caffaed9c028e27f66721f46",
+    "sha256": "416586f82e073e2cafe426a30f7a0aefadcc46237db996dd42ec45688679e509"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "nextTemplate": true,
+    "greenfieldPairCount": 1,
+    "greenfieldMinimumPairCount": 20,
+    "greenfieldBatchCount": 1,
+    "minimumBatchCount": 3
+  },
+  "sourceSha256": {
+    "deployment": "d8f53fe480a00791007315de80840a1e7d4b728a26952dafc30f7d5b714f5e6e",
+    "session": "9f41a66a2305a7e4d5281a9e4ce7a3855071a9762f3d424102e186009e9d19cd",
+    "sessionMeta": "a33175a074254b9c7f4bb682b84aef21f3563c82a8c6485827ba5571a2de471d",
+    "providerReconcile": "068118cb3e09798dc820ba8a4bc349a41350d19d0250ade821a5b7feb659fcda",
+    "pairResult": "f8fdd057da04d2cf4da2af86f92064f269415bfdb304a1c102a6edcda92c03b1",
+    "rolloutEvidence": "e5eb8cd4105a0ab9cefd673bdbb89db4edc70e5a9f750f377e1acb67bc42cc6b",
+    "rolloutEvaluation": "e6360ea0f82d101cb06a3b05a5f0f0120bd25898882d5f5bbd3fb3ae38419d03"
+  }
+}

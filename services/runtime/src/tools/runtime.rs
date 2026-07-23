@@ -514,6 +514,10 @@ impl ToolExecutor {
         &self.workspace_root
     }
 
+    pub fn runtime_storage_dir(&self) -> &Path {
+        &self.runtime_storage_dir
+    }
+
     pub fn is_remote_workspace(&self) -> bool {
         self.remote_workspace
     }

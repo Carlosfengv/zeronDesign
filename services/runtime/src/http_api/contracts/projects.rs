@@ -125,6 +125,8 @@ pub struct ProjectRuntimeStateResponse {
     pub source_snapshot_uri: String,
     pub app_root: String,
     pub template_key: String,
+    pub model_service_id: Option<String>,
+    pub model_service_display_name: Option<String>,
     pub style_contract_path: Option<String>,
     pub style_contract: Option<Value>,
     pub latest_build: Option<Value>,

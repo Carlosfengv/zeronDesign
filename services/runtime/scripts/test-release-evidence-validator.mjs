@@ -1,9 +1,173 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { validateReleaseEvidence } from "./validate-release-evidence.mjs";
+import crypto from "node:crypto";
+import {
+  validateProviderCacheRawBinding,
+  validateReleaseEvidence,
+} from "./validate-release-evidence.mjs";
+import { canonicalJson } from "../../../infra/generation-reliability/runtime-budget-evidence.mjs";
+import { evaluateRuntimeEfficiencyBenchmark } from "../../../infra/generation-reliability/runtime-efficiency-benchmark.mjs";
 
 const sha = "a".repeat(64);
+
+function efficiencyBenchmarkEvidence() {
+  let sequence = 1;
+  const profiles = [
+    ["greenfield-profile", "greenfield_build"],
+    ["edit-profile", "style_token_edit"],
+  ].map(([profileId, workload]) => {
+    const attempts = [];
+    for (const variant of ["baseline", "candidate"]) {
+      for (let index = 0; index < 30; index += 1) {
+        const candidate = variant === "candidate";
+        attempts.push({
+          sequence,
+          attemptId: `${profileId}-${variant}-${index}`,
+          variant,
+          promptId: `prompt-${index % 10}`,
+          status: "accepted",
+          terminalEvidenceSha256: candidate ? "b".repeat(64) : "c".repeat(64),
+          metrics: {
+            modelTurns: candidate ? (workload === "greenfield_build" ? 6 : 5) : 12,
+            grossInputTokens: candidate ? (workload === "greenfield_build" ? 100000 : 80000) : 180000,
+            uncachedInputTokens: candidate ? (workload === "greenfield_build" ? 60000 : 50000) : 120000,
+            maxPromptTokensPerTurn: candidate ? 12000 : 18000,
+            cacheHitRateBasisPoints: candidate ? 7000 : 3000,
+            firstSourceMutationTurn: candidate ? 2 : 4,
+            generationContextBytes: 12000,
+            duplicateFullContextReads: candidate ? 0 : 1,
+            outOfScopeMutations: 0,
+            requiredFidelityPassed: true,
+          },
+        });
+        sequence += 1;
+      }
+    }
+    return {
+      profileId,
+      workload,
+      designProfileHash: profileId === "greenfield-profile" ? "d".repeat(64) : "e".repeat(64),
+      templateId: workload === "greenfield_build" ? "next-app" : "next-app",
+      templateVersion: "runtime-p7",
+      modelResourceId: "deepseek-v4-pro",
+      providerResourceRevision: 7,
+      modelVersion: "deepseek-v4-pro@7",
+      providerParametersHash: sha,
+      cacheUsageCapability: "reported",
+      attempts,
+    };
+  });
+  const cohort = {
+    schemaVersion: "runtime-efficiency-benchmark-cohort@1",
+    calculatorVersion: "runtime-efficiency-benchmark-calculator@1",
+    source: { commit: "abc123", dirty: false },
+    bootstrap: { iterations: 100, seed: 42 },
+    promptSet: {
+      id: "release-benchmark-prompts",
+      version: "v1",
+      sha256: "f".repeat(64),
+      promptIds: Array.from({ length: 10 }, (_, index) => `prompt-${index}`),
+    },
+    ledger: {
+      schemaVersion: "runtime-efficiency-benchmark-ledger@1",
+      sha256: sha,
+      firstSequence: 1,
+      lastSequence: sequence - 1,
+      recordCount: sequence - 1,
+    },
+    profiles,
+  };
+  return {
+    cohort,
+    sourceLedger: {
+      schemaVersion: "runtime-efficiency-benchmark-ledger-verification@1",
+      sessionId: "release-benchmark-session",
+      recordCount: sequence,
+      attemptCount: sequence - 1,
+      headRecordHash: sha,
+      ledgerSha256: sha,
+      status: "passed",
+    },
+    sourceBinding: {
+      schemaVersion: "runtime-efficiency-benchmark-source-binding@1",
+      status: "passed",
+      pairedSessionId: "paired-session",
+      source: { commit: "abc123", dirty: false },
+      pairedLedgerSha256: "1".repeat(64),
+      pairedLedgerHeadRecordHash: "2".repeat(64),
+      mappingSha256: "3".repeat(64),
+      attemptCount: sequence - 1,
+    },
+    evaluation: evaluateRuntimeEfficiencyBenchmark(cohort),
+  };
+}
+const tokenLimits = {
+  maxTurns: 20,
+  maxToolCalls: 60,
+  maxInputTokens: 300000,
+  maxGrossInputTokens: 300000,
+  maxUncachedInputTokens: 180000,
+  maxPromptTokensPerTurn: 64000,
+  maxOutputTokens: 40000,
+};
+
+function budgetProfile(phase) {
+  const profile = {
+    schemaVersion: "run-budget-profile@1",
+    profileId: `phase-budget-v1-${phase}`,
+    phase,
+    rolloutMode: "enforced",
+    tokenBudgetMode: "split_enforced",
+    operationBudgetMode: "enforced",
+    enforcedLimits: tokenLimits,
+    phaseTargetLimits: tokenLimits,
+    operationLimits: {
+      maxGrossInputTokens: 450000,
+      maxUncachedInputTokens: 270000,
+      maxOutputTokens: 80000,
+      maxTurns: 30,
+      maxToolCalls: 100,
+    },
+  };
+  profile.profileHash = crypto.createHash("sha256").update(canonicalJson(profile)).digest("hex");
+  return profile;
+}
+
+const approvedProfiles = Object.fromEntries(
+  ["build", "edit", "review", "repair"].map((phase) => [phase, budgetProfile(phase)]),
+);
+const releaseBudgetPolicy = {
+  schemaVersion: "runtime-release-budget-policy@1",
+  releaseStage: "production",
+  requiredModes: {
+    rolloutMode: "enforced",
+    tokenBudgetMode: "split_enforced",
+    operationBudgetMode: "enforced",
+  },
+  phaseProfiles: Object.fromEntries(Object.entries(approvedProfiles).map(([phase, profile]) => [
+    phase,
+    {
+      allowedProfileHashes: [profile.profileHash],
+      maximumLimits: tokenLimits,
+      maximumOperationLimits: profile.operationLimits,
+    },
+  ])),
+};
+
+function terminalBudgetEvidence(kind, index) {
+  const phases = kind === "repair" ? ["edit", "review", "repair"] : [kind === "edit" ? "edit" : "build"];
+  return {
+    schemaVersion: "runtime-evidence-budget-profiles@1",
+    profiles: phases.map((phase, phaseIndex) => ({
+      runId: phaseIndex === phases.length - 1 ? `terminal-run-${index}` : `terminal-run-${index}-${phase}`,
+      operationId: `terminal-operation-${index}-${phaseIndex}`,
+      operationAttempt: 1,
+      phase,
+      profile: approvedProfiles[phase],
+    })),
+  };
+}
 const fixture = {
   schemaVersion: "release-evidence@1",
   releaseEligible: true,
@@ -19,7 +183,86 @@ const fixture = {
   },
   transport: { mode: "mtls", mtlsVerified: true, rotationWindowVerified: true, runtimeSanHash: sha, sandboxSanHash: sha, runtimeCertSerialHash: sha, sandboxCertSerialHash: sha, runtimeCertExpiresAt: "2026-07-13T00:00:00Z", sandboxCertExpiresAt: "2026-07-13T00:00:00Z" },
   auth: { principalMode: "required", projectOwnershipVerified: true, channelJwtVerified: true },
-  provider: { mode: "real", model: "deepseek-v4-pro", credentialPresent: true },
+  provider: {
+    mode: "real",
+    model: "deepseek-v4-pro",
+    modelResourceId: "deepseek-v4-pro",
+    providerResourceRevision: 7,
+    providerConfigSha256: sha,
+    credentialPresent: true,
+  },
+  providerCacheSmoke: {
+    schemaVersion: "provider-cache-smoke-audit@1",
+    toolSetHashVersion: "tool-definition-set@1",
+    status: "passed",
+    releaseEligible: true,
+    stableRunCount: 2,
+    auditedRunCount: 2,
+    invalidRunCount: 0,
+    grossInputTokens: 2000,
+    cachedInputTokens: 1000,
+    sourceCommit: "abc123",
+    sourceDirty: false,
+    modelResourceId: "deepseek-v4-pro",
+    providerResourceRevision: 7,
+    providerConfigSha256: sha,
+    runs: [0, 1].map(index => ({
+      runId: `cache-run-${index + 1}`,
+      compositionValid: true,
+      metricsValid: true,
+      providerIdentityValid: true,
+      buildIdentityValid: true,
+      generationContextIdentityValid: true,
+      redactionValid: true,
+      repeatedStableTurns: 2,
+      grossInputTokens: 1000,
+      cachedInputTokens: 500,
+    })),
+  },
+  providerCacheSmokeSha256: sha,
+  releaseBudgetPolicySha256: sha,
+  releaseBudgetPolicy,
+  efficiencyBenchmark: efficiencyBenchmarkEvidence(),
+  terminalBundles: {
+    schemaVersion: "runtime-terminal-bundle-index@1",
+    status: "passed",
+    setSha256: sha,
+    budgetPolicyStatus: "passed",
+    budgetPolicySha256: sha,
+    filesScanned: 40,
+    replayedCount: 5,
+    entries: ["website", "docs", "edit", "repair", "runtime_restart"].map((kind, index) => {
+      const budgetProfiles = terminalBudgetEvidence(kind, index);
+      const primary = budgetProfiles.profiles.at(-1);
+      return {
+        evidenceId: `terminal-${kind}`,
+        bundleKind: kind === "runtime_restart" ? "runtime_restart_terminal" : "real_provider_terminal",
+        kind,
+        entryRoute: kind === "docs" || kind === "repair" ? "/docs/" : "/",
+        projectId: `terminal-project-${kind}`,
+        runId: `terminal-run-${index}`,
+        operationId: primary.operationId,
+        gitSha: "abc123",
+        modelResourceId: "deepseek-v4-pro",
+        modelResourceRevision: 7,
+        providerConfigSha256: sha,
+        providerCacheSourceAuditSha256: sha,
+        budgetProfileId: primary.profile.profileId,
+        budgetProfileHash: primary.profile.profileHash,
+        budgetProfilesSha256: sha,
+        runModelUsageSha256: sha,
+        budgetProfiles,
+        budgetProfileCount: budgetProfiles.profiles.length,
+        budgetConformanceStatus: "passed",
+        releaseBudgetPolicyStatus: "passed",
+        maxTurnInputTokens: 1000,
+        checksumsSha256: sha,
+        streamSha256: sha,
+        resultStatus: "accepted",
+        replayStatus: "passed",
+      };
+    }),
+  },
   preflight: {
     schemaVersion: "runtime-rc-preflight@1", passed: true, prefetchImages: true, lockHash: sha,
     entries: [{ name: "runtime", canonicalRef: "registry.example/runtime:v1", lockedDigest: `sha256:${sha}`, lockedDigestVerified: true, mutableTagMatchesLock: true, pulled: true }],
@@ -151,6 +394,151 @@ fixture.providerDcpProject = {
 };
 
 assert.deepEqual(validateReleaseEvidence(fixture), []);
+
+const rawBoundFixture = structuredClone(fixture);
+const providerCacheRaw = `${JSON.stringify(rawBoundFixture.providerCacheSmoke, null, 2)}\n`;
+rawBoundFixture.providerCacheSmokeSha256 = crypto
+  .createHash("sha256")
+  .update(providerCacheRaw)
+  .digest("hex");
+assert.deepEqual(
+  validateProviderCacheRawBinding(rawBoundFixture, providerCacheRaw),
+  rawBoundFixture.providerCacheSmoke,
+);
+assert.throws(
+  () => validateProviderCacheRawBinding(
+    rawBoundFixture,
+    providerCacheRaw.replace('"stableRunCount": 2', '"stableRunCount": 1'),
+  ),
+  /raw SHA-256 mismatch/,
+);
+const rawWithoutToolHashVersion = JSON.parse(providerCacheRaw);
+delete rawWithoutToolHashVersion.toolSetHashVersion;
+const rawWithoutVersionText = JSON.stringify(rawWithoutToolHashVersion);
+const aggregateWithoutVersion = structuredClone(rawBoundFixture);
+aggregateWithoutVersion.providerCacheSmoke = rawWithoutToolHashVersion;
+aggregateWithoutVersion.providerCacheSmokeSha256 = crypto
+  .createHash("sha256")
+  .update(rawWithoutVersionText)
+  .digest("hex");
+assert.throws(
+  () => validateProviderCacheRawBinding(aggregateWithoutVersion, rawWithoutVersionText),
+  /raw evidence mismatch/,
+);
+
+const missingProviderCache = structuredClone(fixture);
+delete missingProviderCache.providerCacheSmoke;
+assert(validateReleaseEvidence(missingProviderCache).some(error =>
+  error.includes("stable-prefix cache smoke")
+));
+
+const legacyToolSetHash = structuredClone(fixture);
+delete legacyToolSetHash.providerCacheSmoke.toolSetHashVersion;
+assert(validateReleaseEvidence(legacyToolSetHash).some(error =>
+  error.includes("stable-prefix cache smoke")
+));
+
+const missingEfficiencyBenchmark = structuredClone(fixture);
+delete missingEfficiencyBenchmark.efficiencyBenchmark;
+assert(validateReleaseEvidence(missingEfficiencyBenchmark).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const missingEfficiencySourceBinding = structuredClone(fixture);
+delete missingEfficiencySourceBinding.efficiencyBenchmark.sourceBinding;
+assert(validateReleaseEvidence(missingEfficiencySourceBinding).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const dirtyEfficiencySourceBinding = structuredClone(fixture);
+dirtyEfficiencySourceBinding.efficiencyBenchmark.sourceBinding.source.dirty = true;
+assert(validateReleaseEvidence(dirtyEfficiencySourceBinding).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const tamperedEfficiencyEvaluation = structuredClone(fixture);
+tamperedEfficiencyEvaluation.efficiencyBenchmark.evaluation.result = "pass";
+tamperedEfficiencyEvaluation.efficiencyBenchmark.evaluation
+  .profiles["greenfield-profile"].effectSizes.grossInputTokens.value = 0.99;
+assert(validateReleaseEvidence(tamperedEfficiencyEvaluation).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const mismatchedEfficiencyProvider = structuredClone(fixture);
+mismatchedEfficiencyProvider.efficiencyBenchmark.cohort
+  .profiles[0].providerResourceRevision = 8;
+assert(validateReleaseEvidence(mismatchedEfficiencyProvider).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const insufficientEfficiencyBenchmark = structuredClone(fixture);
+insufficientEfficiencyBenchmark.efficiencyBenchmark.cohort.profiles[1].attempts.pop();
+insufficientEfficiencyBenchmark.efficiencyBenchmark.cohort.ledger.lastSequence -= 1;
+insufficientEfficiencyBenchmark.efficiencyBenchmark.cohort.ledger.recordCount -= 1;
+assert(validateReleaseEvidence(insufficientEfficiencyBenchmark).some(error =>
+  error.includes("efficiency Benchmark")
+));
+
+const providerCacheNotReported = structuredClone(fixture);
+providerCacheNotReported.providerCacheSmoke.status = "provider_not_reporting_cached_usage";
+providerCacheNotReported.providerCacheSmoke.releaseEligible = false;
+providerCacheNotReported.providerCacheSmoke.cachedInputTokens = 0;
+assert(validateReleaseEvidence(providerCacheNotReported).some(error =>
+  error.includes("stable-prefix cache smoke")
+));
+
+const mismatchedProviderCache = structuredClone(fixture);
+mismatchedProviderCache.providerCacheSmoke.providerResourceRevision = 8;
+assert(validateReleaseEvidence(mismatchedProviderCache).some(error =>
+  error.includes("stable-prefix cache smoke")
+));
+
+const missingTerminalBundles = structuredClone(fixture);
+delete missingTerminalBundles.terminalBundles;
+assert(validateReleaseEvidence(missingTerminalBundles).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const missingRestartBundle = structuredClone(fixture);
+missingRestartBundle.terminalBundles.entries = missingRestartBundle.terminalBundles.entries
+  .filter((entry) => entry.kind !== "runtime_restart");
+missingRestartBundle.terminalBundles.replayedCount = 4;
+assert(validateReleaseEvidence(missingRestartBundle).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const mismatchedTerminalProvider = structuredClone(fixture);
+mismatchedTerminalProvider.terminalBundles.entries[0].modelResourceRevision = 8;
+assert(validateReleaseEvidence(mismatchedTerminalProvider).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const mismatchedTerminalCacheAudit = structuredClone(fixture);
+mismatchedTerminalCacheAudit.terminalBundles.entries[0].providerCacheSourceAuditSha256 =
+  "b".repeat(64);
+assert(validateReleaseEvidence(mismatchedTerminalCacheAudit).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const tamperedTerminalBudgetProfile = structuredClone(fixture);
+tamperedTerminalBudgetProfile.terminalBundles.entries[0]
+  .budgetProfiles.profiles[0].profile.phaseTargetLimits.maxPromptTokensPerTurn += 1;
+assert(validateReleaseEvidence(tamperedTerminalBudgetProfile).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const missingTerminalRunModelUsage = structuredClone(fixture);
+delete missingTerminalRunModelUsage.terminalBundles.entries[0].runModelUsageSha256;
+assert(validateReleaseEvidence(missingTerminalRunModelUsage).some(error =>
+  error.includes("replayed terminal Bundles")
+));
+
+const shadowTerminalBudgetProfile = structuredClone(fixture);
+shadowTerminalBudgetProfile.terminalBundles.entries[0]
+  .budgetProfiles.profiles[0].profile.rolloutMode = "shadow";
+assert(validateReleaseEvidence(shadowTerminalBudgetProfile).some(error =>
+  error.includes("replayed terminal Bundles")
+));
 
 const publishWorkflowFixture = structuredClone(fixture);
 const website = publishWorkflowFixture.projects.find(project => project.kind === "website");

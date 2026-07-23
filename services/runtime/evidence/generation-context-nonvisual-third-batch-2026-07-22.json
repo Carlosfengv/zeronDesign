@@ -1,0 +1,164 @@
+{
+  "schemaVersion": "generation-context-nonvisual-third-batch-summary@1",
+  "recordedAt": "2026-07-22T03:36:41Z",
+  "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "visionCapable": false,
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "runtime": {
+    "image": "anydesign/runtime:6a5603c0a464-dirty-dd5b89a754a9",
+    "containerImageId": "sha256:2acb0c8afefff44e9a34cf0d66870359f85b4463d0ac319bc7d42360c1944f15",
+    "controlDeploymentRevision": "b01fdb7facd6cd5dcdae6d57177a650230b1242f16f8b95808f0c0cf0923dc13",
+    "candidateDeploymentRevision": "c7a86479eb73974053e37add83b3ebbfa93ed5156bf3318596683b16de9fa10c"
+  },
+  "providerGateway": {
+    "image": "zerondesign/provider-gateway:6a5603c0a464-dirty-997a4e0fbfbc",
+    "containerImageId": "sha256:ec3db863f752a76dc2f89417e4b7c9b5017637ef9478de0ac3a44752a8b8468c"
+  },
+  "pair": {
+    "pairId": "batch-25-oilfield-operations-dashboard-warm-copy-css",
+    "batchId": "batch-25",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "warm_copy_css",
+    "templateVersion": "next-app",
+    "phase": "edit",
+    "controlAttempts": [
+      {
+        "attempt": 1,
+        "status": "no_progress",
+        "phase": "brief"
+      },
+      {
+        "attempt": 2,
+        "status": "accepted"
+      }
+    ],
+    "candidateAttempts": [
+      {
+        "attempt": 1,
+        "status": "accepted"
+      }
+    ],
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-5605",
+      "draftSnapshotId": "draft-snapshot-5636",
+      "recordHash": "c67373188439b0771bb61f4b649797c2a6b8a192d9299a0c1f8a09f4060709e6",
+      "visualDelivery": {
+        "state": null,
+        "unavailableMetricRecorded": false,
+        "mainTaskCompleted": true
+      },
+      "metrics": {
+        "inputTokens": 74514,
+        "outputTokens": 677,
+        "turns": 6,
+        "toolCalls": 10,
+        "totalDurationMs": 24306,
+        "timeToFirstSourceMutationMs": 15593,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 1933,
+        "timeToDurableSnapshotMs": 15593,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-2670",
+      "draftSnapshotId": "draft-snapshot-2701",
+      "recordHash": "fee11e9098fad30cf320da0dd81155289932aca6453f9d161cc1ce21e073a456",
+      "visualDelivery": {
+        "state": "unavailable",
+        "visualBindingsVerified": true,
+        "visualBindingSetHash": "3286b45dc00c9e975cba9ecec700d1d6a79c48d09024e8159167656a776fbff9",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "unavailableMetricRecorded": true,
+        "gatewayVisualInputAttested": false,
+        "mainTaskCompleted": true,
+        "modelExecutionsAfterUnavailable": 4
+      },
+      "metrics": {
+        "inputTokens": 51734,
+        "outputTokens": 614,
+        "turns": 4,
+        "toolCalls": 9,
+        "totalDurationMs": 23913,
+        "timeToFirstSourceMutationMs": 14949,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3696,
+        "timeToDurableSnapshotMs": 14949,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -30.57,
+      "outputTokens": -9.31,
+      "turns": -33.33,
+      "toolCalls": -10.0,
+      "totalDurationMs": -1.62,
+      "timeToFirstSourceMutationMs": -4.13,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 91.21,
+      "timeToDurableSnapshotMs": -4.13
+    },
+    "coverage": {
+      "nextTemplate": true,
+      "nonVisualUnavailableMainTaskPassed": true,
+      "multimodalVisualDelivered": false
+    }
+  },
+  "ledger": {
+    "recordCount": 7,
+    "sampleCount": 6,
+    "completePairCount": 3,
+    "pendingPairCount": 0,
+    "warmCopyCssBatchCount": 3,
+    "headRecordHash": "fee11e9098fad30cf320da0dd81155289932aca6453f9d161cc1ce21e073a456",
+    "sha256": "4771505d56e1e76248e470132af163b77f7277598df18b8dc9a8322b280612a7"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 3,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 3,
+    "minimumBatchCount": 3,
+    "minimumBatchCountSatisfied": true,
+    "minimumPairCountSatisfied": false,
+    "threeConsecutiveProviderBatchesPassed": false,
+    "rolloutEvidenceSha256": "7860a8cf8846bd68277d04f174b45218e5aaee9a5aa3fb9f89e9b8bc5aca258e"
+  },
+  "openFindings": [
+    "Warm Copy/CSS now spans the required three batch identities, but still needs seventeen additional valid pairs before statistical gates can be evaluated",
+    "batch-23 failed between accepted batches, so the separate stability requirement for three consecutive real Provider batches remains unmet",
+    "candidate input tokens improved by 30.57%, still below the 50% median target, and first mutation remained at model turn 3 instead of at most 2",
+    "candidate iframe acknowledgement was 3696ms and durable snapshot was 14949ms, both above their P95 targets",
+    "a separately governed vision-capable Provider Resource remains required for real multimodalVisualDelivered coverage"
+  ],
+  "sourceSha256": {
+    "pairSpec": "6ddd042d27c70202b7d2a3f8b9e831576b7cf3d49aba27fea62d2400e0111a97",
+    "pairResult": "34ed0a19bc9f0cd7654ad551a465cf8756083ce3cdaa29f4a133362876c3f06f",
+    "controlCase": "6b0c5b234ac2bae37f43b0668e107731c29dc7ad8195584df3da59f263a905b6",
+    "candidateCase": "a7559cb41d64f34c52102a70cedfa9c34aef502b6f6b61896109f279dd189300",
+    "rolloutEvidence": "7860a8cf8846bd68277d04f174b45218e5aaee9a5aa3fb9f89e9b8bc5aca258e"
+  }
+}

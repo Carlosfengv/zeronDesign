@@ -191,8 +191,12 @@ async fn runtime_gateway_provider_round_trip_preserves_governed_selection_bounda
         schema_version: MODEL_RESOURCE_SCHEMA.to_string(),
         id: "edit-model".to_string(),
         display_name: "Governed edit model".to_string(),
+        description: String::new(),
+        sort_order: 0,
+        provider_connection_id: None,
         kind: ModelResourceKind::OpenaiCompatible,
         enabled: true,
+        published: true,
         revision: 3,
         endpoint: ProviderEndpoint {
             base_url: provider_url,

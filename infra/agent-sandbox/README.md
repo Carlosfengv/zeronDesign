@@ -78,6 +78,34 @@ the Runtime OCI image and drive Website plus Docs through the cluster service:
 bash infra/agent-sandbox/run-runtime-rc-gate.sh
 ```
 
+Release mode additionally requires governed real-provider evidence and a passing stable-prefix cache audit for the
+same clean source commit, `modelResourceId`, Provider Resource revision, and Provider configuration SHA-256; audit mode
+may omit them:
+
+```bash
+RUNTIME_RC_MODE=release \
+RUNTIME_RC_PROVIDER_EVIDENCE=/absolute/path/real-provider-examples-summary.json \
+RUNTIME_RC_PROVIDER_CACHE_EVIDENCE=/absolute/path/provider-cache-smoke-audit.json \
+RUNTIME_RC_TERMINAL_BUNDLE_SET=/absolute/path/runtime-terminal-bundle-set.json \
+RUNTIME_RC_BUDGET_POLICY=infra/generation-reliability/release-budget-policy.json \
+bash infra/agent-sandbox/run-runtime-rc-gate.sh
+```
+
+Use the accepted suite's `real-provider-examples-summary.json` as Provider evidence. Its
+`provider.realProviderVerified=true` assertion proves real credential-backed execution, while `modelResourceId`,
+`provenance.providerResourceRevision`, and `provenance.providerConfigSha256` freeze the Provider identity. A cache audit
+from an older model revision, a different Provider configuration, a different source commit, or a dirty worktree fails
+closed. `provider_not_reporting_cached_usage` is not release-eligible and cannot be substituted for a passing cache
+audit.
+
+Release Budget Policy is independent from the terminal Bundles. The aggregator hashes the exact policy bytes, replays
+every Bundle, validates every frozen `RunBudgetProfile@1`, and requires Production `enforced/split_enforced/enforced`
+modes plus approved per-Phase and Operation ceilings. A Shadow Profile remains useful readiness evidence but cannot
+become release-eligible by setting a pass boolean in the Bundle.
+
+The release aggregator and final validator recompute `auditedRunCount`, `stableRunCount`, Gross Input, and Cached Input
+from the audit's per-Run records; editing only `status` or `releaseEligible` cannot promote incomplete evidence.
+
 The runner vendors locked Rust dependencies into the ignored Runtime `target`
 directory, builds offline in Docker, imports the image into k3d, deploys the
 Runtime and deterministic HTTP model gateway, then cross-checks `/version`, Pod

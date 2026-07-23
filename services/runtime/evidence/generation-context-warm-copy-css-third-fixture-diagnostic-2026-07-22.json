@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "generation-context-warm-copy-css-third-fixture-diagnostic@1",
+  "recordedAt": "2026-07-22T06:04:00Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pairIntent": {
+    "pairId": "batch-09-ai-governance-console-warm-copy-css",
+    "batchId": "batch-09",
+    "fixtureId": "ai-governance-console",
+    "bucket": "warm_copy_css",
+    "templateVersion": "next-app"
+  },
+  "control": {
+    "outerCaseStatus": "failed",
+    "attempts": [
+      "no_progress",
+      "no_progress",
+      "no_progress"
+    ],
+    "lifecycleEvidenceAvailable": false,
+    "sandboxReleaseVerifiedForEveryAttempt": true,
+    "terminalClassification": "no_progress"
+  },
+  "candidate": {
+    "outerCaseStatus": "rejected",
+    "outerClassification": "acceptance_rejected",
+    "outerReason": "Draft Preview omitted the frozen required text",
+    "lifecycleStatus": "accepted",
+    "nonVisualReference": {
+      "state": "unavailable",
+      "visualBindingsVerified": true,
+      "unavailableMetricRecorded": true,
+      "mainTaskCompleted": true,
+      "gatewayAcceptedImageCount": 0
+    },
+    "sandboxReleaseVerified": true
+  },
+  "collector": {
+    "result": "rejected",
+    "reason": "paired lifecycle evidence missing: control",
+    "pairResultCreated": false,
+    "ledgerAppended": false,
+    "requiredFidelityFabricated": false
+  },
+  "ledgerAfterDiagnostic": {
+    "recordCount": 17,
+    "sampleCount": 16,
+    "completePairCount": 8,
+    "pendingPairCount": 0,
+    "headRecordHash": "ba2b504bd51035d6afbd0b910106145517258bcc740bc9c424614d3f59c7c6e7",
+    "sha256": "0a0f591002fc9e7d6cc8f28a51f6c5ad5a071f97073ce8dbb9ff5baacf9f25cd"
+  },
+  "clusterAfterDiagnostic": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "nextAction": "retry the third Warm Copy/CSS batch under a new immutable batch id; do not overwrite or append batch-09",
+  "sourceSha256": {
+    "pairSpec": "64199ae66cd6f77f6ff3bfc17b9a89b8024daf4714bad0c5230cdc2919e1e48b",
+    "controlCase": "33e5f10de9410263c559d836b80fd50d7cfea0d15b6776dc78a3282110854cb2",
+    "candidateCase": "b699886f746d333b022b96e9cc1ecf1904cdeee3a1babe3f7e075156f78e062b",
+    "controlRunnerStatus": "a2e81cc63210bbb0dd1ad97b9a617e74bba56317136545f6e3144a1185994545",
+    "candidateRunnerStatus": "5bdd463c99d8fc5f989a8223a514fb56060610874cc1f578a7defa615df7f038"
+  }
+}

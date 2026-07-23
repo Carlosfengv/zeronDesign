@@ -28,7 +28,7 @@ function mappedStatus(metadata, efficiency) {
   throw new Error(`metadata.status is required for non-terminal Runtime status: ${efficiency.status}`);
 }
 
-export function createPairedCohortSample(metadata, efficiency) {
+export function createPairedCohortSample(metadata, efficiency, promptEfficiency = null) {
   if (metadata?.schemaVersion !== "generation-context-paired-cohort-sample-metadata@1") {
     throw new Error("unsupported paired-cohort sample metadata schema");
   }
@@ -45,6 +45,12 @@ export function createPairedCohortSample(metadata, efficiency) {
   }
   if (efficiency.phase !== metadata.identity?.phase) {
     throw new Error("Runtime efficiency phase must equal metadata.identity.phase");
+  }
+  if (promptEfficiency !== null && (
+    promptEfficiency?.schemaVersion !== "run-prompt-efficiency@1" ||
+    promptEfficiency.runId !== efficiency.runId
+  )) {
+    throw new Error("prompt efficiency must match the selected Runtime Run");
   }
   if (!SHA256.test(metadata.acceptanceEvidenceSha256 || "")) {
     throw new Error("metadata.acceptanceEvidenceSha256 must be sha256");
@@ -82,7 +88,19 @@ export function createPairedCohortSample(metadata, efficiency) {
       prebuildFsListCount: optionalMetric(efficiency.prebuildFsListCount),
       prebuildFsSearchCount: optionalMetric(efficiency.prebuildFsSearchCount),
       duplicateFullReadRateBasisPoints: optionalMetric(efficiency.duplicateFullReadRateBasisPoints),
+      duplicateFullReadDeliveries: optionalMetric(efficiency.duplicateFullReadDeliveries),
       outOfScopeMutationCount: optionalMetric(efficiency.outOfScopeMutationCount),
+      modelTurns: optionalMetric(promptEfficiency?.turnCount),
+      grossInputTokens: optionalMetric(promptEfficiency?.grossInputTokens),
+      uncachedInputTokens: optionalMetric(promptEfficiency?.uncachedInputTokens),
+      maxTurnInputTokens: optionalMetric(promptEfficiency?.maxTurnInputTokens),
+      cacheHitRateBasisPoints: optionalMetric(promptEfficiency?.cacheHitRateBasisPoints),
+      generationContextBytes: optionalMetric(
+        promptEfficiency?.generationContextEstimatedTokens === undefined
+          ? undefined
+          : promptEfficiency.generationContextEstimatedTokens * 4,
+      ),
+      caseAttemptCount: optionalMetric(metadata.caseAttemptCount),
     }),
   };
 }

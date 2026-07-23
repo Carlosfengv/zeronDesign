@@ -1,0 +1,133 @@
+{
+  "schemaVersion": "generation-context-warm-copy-css-second-batch-summary@1",
+  "recordedAt": "2026-07-22T05:47:22Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-08-oilfield-operations-dashboard-warm-copy-css",
+    "batchId": "batch-08",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "warm_copy_css",
+    "templateVersion": "next-app",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-16311515",
+      "recordHash": "c129f3bcaddfcf202906970f2122f2d3a7fcd47fe85d759ec156efc36da07faa",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 73505,
+        "outputTokens": 717,
+        "toolCalls": 10,
+        "totalDurationMs": 29042,
+        "timeToFirstSourceMutationMs": 17015,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3455,
+        "timeToDurableSnapshotMs": 17015,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-9604489",
+      "recordHash": "ba2b504bd51035d6afbd0b910106145517258bcc740bc9c424614d3f59c7c6e7",
+      "sandboxReleaseVerified": true,
+      "nonVisualReference": {
+        "state": "unavailable",
+        "providerVisionCapable": false,
+        "visualBindingsVerified": true,
+        "unavailableMetricRecorded": true,
+        "mainTaskCompleted": true,
+        "gatewayVisualInputAttested": false,
+        "gatewayAcceptedImageCount": 0,
+        "visualBindingSetHash": "df66b8fcb53f26f82832590d5970e640ed8424a351b734635458ab6687f09df9",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "referenceArtifactSha256": "431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460",
+        "referenceMediaType": "image/png",
+        "modelExecutionCountAfterFallback": 5
+      },
+      "metrics": {
+        "inputTokens": 66566,
+        "outputTokens": 703,
+        "toolCalls": 10,
+        "totalDurationMs": 29238,
+        "timeToFirstSourceMutationMs": 18052,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3855,
+        "timeToDurableSnapshotMs": 18052,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -9.44,
+      "outputTokens": -1.95,
+      "toolCalls": 0.0,
+      "totalDurationMs": 0.67,
+      "timeToFirstSourceMutationMs": 6.09,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 11.58,
+      "timeToDurableSnapshotMs": 6.09,
+      "prebuildFsReadCount": 0.0,
+      "prebuildFsSearchCount": 0.0
+    },
+    "openFindings": [
+      "the candidate reduced input and output tokens while preserving tool count and mutation turn, but duration and all measured edit-lifecycle latencies regressed",
+      "candidate iframe applied at 3855ms, above the 3000ms Warm Copy/CSS P95 target",
+      "candidate durable snapshot at 18052ms remains far above the 5000ms P95 target",
+      "the two-pair candidate median input tokens are approximately 1.13% higher than control",
+      "two pairs across two batches cannot establish the required twenty-pair or three-batch gates"
+    ]
+  },
+  "ledger": {
+    "recordCount": 17,
+    "sampleCount": 16,
+    "completePairCount": 8,
+    "pendingPairCount": 0,
+    "headRecordHash": "ba2b504bd51035d6afbd0b910106145517258bcc740bc9c424614d3f59c7c6e7",
+    "sha256": "0a0f591002fc9e7d6cc8f28a51f6c5ad5a071f97073ce8dbb9ff5baacf9f25cd"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 2,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 2,
+    "warmCopyCssMinimumBatchCount": 3,
+    "warmCopyCssControlMedianInputTokens": 71636.5,
+    "warmCopyCssCandidateMedianInputTokens": 72449.5,
+    "warmCopyCssCandidateMedianIframeAppliedMs": 3396,
+    "warmCopyCssCandidateP95IframeAppliedMs": 3809.1,
+    "warmCopyCssCandidateP95DurableSnapshotMs": 18020.4,
+    "rolloutEvidenceSha256": "ab4a1f4e6b28d146427140500840d2d5a37ccc2f4f6380f4bbe592fd76e276e6"
+  },
+  "clusterAfterPair": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "sourceSha256": {
+    "pairSpec": "ba65852533deae26eeee16a464c9df868db3a5bd6bb9d429e3fd9f3e05d43e72",
+    "pairResult": "7e7640442ae38eb040971047cbfa8d3335389b7b3c70f44e7bff290ead604a04",
+    "controlCase": "ac64de569daa537607070ff9be9dc641bf4d2b382cd95df63fdf0ddb3faf87f0",
+    "candidateCase": "bccc66b5dc95d07edd596c86d5c1cd033d2ce64fbd425434b3f503e37565a97a",
+    "rolloutEvidence": "ab4a1f4e6b28d146427140500840d2d5a37ccc2f4f6380f4bbe592fd76e276e6"
+  }
+}

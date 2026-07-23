@@ -4,6 +4,13 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  extractBuildEvidence,
+  redactEvidenceObject,
+  sanitizeModelExecutionEvent,
+  sanitizePersistedRuntimeEvent,
+} from "./runtime-evidence-redaction.mjs";
+import { confirmSandboxRelease } from "./sandbox-release-confirmation.mjs";
 
 const [
   casesFile,
@@ -118,7 +125,9 @@ if (
   requestedCaseLimit < 1 ||
   requestedCaseLimit > manifest.cases.length
 ) {
-  throw new Error("GENERATION_REAL_CASE_LIMIT must be between 1 and 5");
+  throw new Error(
+    `GENERATION_REAL_CASE_LIMIT must be between 1 and ${manifest.cases.length}`,
+  );
 }
 if (requestedCaseIds.length > 0 && process.env.GENERATION_REAL_CASE_LIMIT) {
   throw new Error(
@@ -207,6 +216,8 @@ for (const [index, testCase] of selectedCases.entries()) {
     workspaceNamespace,
     expectedRoute: testCase.expectedRoute,
     expectedText: testCase.expectedText,
+    promptSha256: sha256(testCase.prompt),
+    promptBytes: Buffer.byteLength(testCase.prompt),
     startedAt: caseStartedAt,
     finishedAt: null,
     status: "failed",
@@ -492,11 +503,12 @@ for (const [index, testCase] of selectedCases.entries()) {
   }
 
   result.finishedAt = new Date().toISOString();
+  const persistedResult = redactEvidenceObject(result);
   fs.writeFileSync(
     path.join(suiteDirectory, `real-provider-case-${testCase.id}.json`),
-    `${JSON.stringify(result, null, 2)}\n`,
+    `${JSON.stringify(persistedResult, null, 2)}\n`,
   );
-  caseResults.push(result);
+  caseResults.push(persistedResult);
   process.stdout.write(
     `[${caseNumber}/${selectedCases.length}] ${testCase.id}: ${result.status}\n`,
   );
@@ -676,8 +688,17 @@ function validateManifest(value) {
       throw new Error(`per-run budget ${field} must be an integer`);
     }
   }
-  if (!Array.isArray(value.cases) || value.cases.length !== 5) {
-    throw new Error("real-provider suite must contain exactly five cases");
+  const suiteKind = value.suiteKind ?? "functional_canary";
+  if (!new Set(["functional_canary", "efficiency_benchmark"]).has(suiteKind)) {
+    throw new Error("real-provider suiteKind is unsupported");
+  }
+  const expectedCaseCount = suiteKind === "efficiency_benchmark" ? 10 : 5;
+  if (!Array.isArray(value.cases) || value.cases.length !== expectedCaseCount) {
+    throw new Error(`real-provider ${suiteKind} suite must contain exactly ${expectedCaseCount} cases`);
+  }
+  if (suiteKind === "efficiency_benchmark"
+    && value.cases.some((testCase) => testCase.kind !== "website")) {
+    throw new Error("efficiency Benchmark suite currently requires Website cases");
   }
   const ids = new Set();
   for (const testCase of value.cases) {
@@ -775,15 +796,15 @@ async function runRepairCanary(
   const marker = repairMarker();
   const startedAt = new Date().toISOString();
   const evidence = {
-    schemaVersion: "generation-real-provider-repair-evidence@1",
+    schemaVersion: "generation-real-provider-repair-evidence@2",
     startedAt,
     finishedAt: null,
     status: "failed",
     projectId,
-    prompt: [
+    promptSha256: sha256([
       `Review the deliberate inaccessible contrast defect on ${marker}.`,
       "Create a repairable blocking finding through the read-only Review run, then repair only that scoped finding and publish a fresh validated Version.",
-    ].join(" "),
+    ].join(" ")),
     lifecycleProfile: "repair_warm",
     repairMarker: marker,
     initialBuildRunId: buildRunId,
@@ -838,6 +859,19 @@ async function runRepairCanary(
     evidence.reviewRun.efficiency = await fetchRunEfficiencyMetrics(
       projectId,
       reviewStarted.runId,
+    );
+    evidence.reviewRun.promptEfficiency = await fetchRunPromptEfficiency(
+      projectId,
+      reviewStarted.runId,
+    );
+    evidence.reviewRun.generationContextStatus = await fetchGenerationContextStatus(
+      projectId,
+      reviewStarted.runId,
+    );
+    evidence.reviewRun.budgetProfile = await fetchRunBudgetProfile(
+      projectId,
+      reviewStarted.runId,
+      "review",
     );
     addUsage(evidence.reviewRun.usage);
     assertActualBudget();
@@ -907,9 +941,23 @@ async function runRepairCanary(
       repairEvents,
       repairStream.evidence,
     );
+    evidence.run.generationContextStatus = evidence.generationContextStatus;
+    evidence.run.designProfileIdentity = await fetchRunDesignProfileIdentity(
+      projectId,
+      repairStarted.runId,
+    );
     evidence.run.efficiency = await fetchRunEfficiencyMetrics(
       projectId,
       repairStarted.runId,
+    );
+    evidence.run.promptEfficiency = await fetchRunPromptEfficiency(
+      projectId,
+      repairStarted.runId,
+    );
+    evidence.run.budgetProfile = await fetchRunBudgetProfile(
+      projectId,
+      repairStarted.runId,
+      "repair",
     );
     addUsage(evidence.run.usage);
     assertActualBudget();
@@ -919,7 +967,10 @@ async function runRepairCanary(
       );
     }
     evidence.repairedVersionId = extractCandidateVersionId(repairEvents);
-    const artifactBody = await readCurrentArtifactBody(projectId, testCase.expectedRoute);
+    const artifactProbe = await readCurrentArtifactProbe(
+      projectId,
+      testCase.expectedRoute,
+    );
     evidence.repairVerification = {
       reviewFindingRecorded: true,
       findingFixedByCompletedRepair: true,
@@ -932,8 +983,11 @@ async function runRepairCanary(
       previewPublishRecorded: repairEvents.some(
         (event) => event.type === "tool.completed" && event.tool === "preview.publish",
       ),
-      markerPreserved: artifactBody.includes(marker),
-      artifactBodySha256: sha256(artifactBody),
+      markerPreserved: artifactProbe.body.includes(marker),
+      artifactRoute: testCase.expectedRoute,
+      artifactHttpStatus: artifactProbe.httpStatus,
+      artifactBodySha256: artifactProbe.bodySha256,
+      artifactBodyBytes: artifactProbe.bodyBytes,
     };
     evidence.providerVerified = [evidence.reviewRun, evidence.run].every(
       (run) =>
@@ -947,8 +1001,17 @@ async function runRepairCanary(
     if (
       !evidence.providerVerified ||
       Object.entries(evidence.repairVerification)
-        .filter(([key]) => key !== "artifactBodySha256")
-        .some(([, value]) => value !== true)
+        .filter(([key]) => !new Set([
+          "artifactRoute",
+          "artifactHttpStatus",
+          "artifactBodySha256",
+          "artifactBodyBytes",
+        ]).has(key))
+        .some(([, value]) => value !== true) ||
+      evidence.repairVerification.artifactHttpStatus !== 200 ||
+      !/^[a-f0-9]{64}$/.test(evidence.repairVerification.artifactBodySha256) ||
+      !Number.isSafeInteger(evidence.repairVerification.artifactBodyBytes) ||
+      evidence.repairVerification.artifactBodyBytes <= 0
     ) {
       throw new Error("Repair lifecycle evidence did not satisfy its acceptance contract");
     }
@@ -1052,7 +1115,55 @@ async function fetchGenerationContextStatus(projectId, runId) {
   return JSON.parse(body);
 }
 
-async function readCurrentArtifactBody(projectId, route) {
+async function fetchRunDesignProfileIdentity(projectId, runId) {
+  const response = await fetchWithTimeout(
+    new URL(`/runs/${encodeURIComponent(runId)}/design-context-manifest`, baseUrl),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`run Design Context Manifest returned ${response.status}: ${body.slice(0, 500)}`);
+  }
+  const manifest = JSON.parse(body);
+  if (manifest.runId !== runId
+    || !/^[a-f0-9]{64}$/.test(manifest.package?.effectiveProfileHash || "")) {
+    throw new Error("run Design Profile identity or schema mismatch");
+  }
+  return {
+    schemaVersion: "run-design-profile-identity@1",
+    runId,
+    designProfileId: manifest.package.designProfileId ?? null,
+    designProfileVersion: manifest.package.designProfileVersion ?? null,
+    effectiveProfileHash: manifest.package.effectiveProfileHash,
+  };
+}
+
+async function fetchRunBudgetProfile(projectId, runId, phase) {
+  const response = await fetchWithTimeout(
+    new URL(`/runs/${encodeURIComponent(runId)}/budget-profile`, baseUrl),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`run budget profile returned ${response.status}: ${body.slice(0, 500)}`);
+  }
+  const profile = JSON.parse(body);
+  if (profile.schemaVersion !== "run-budget-profile@1"
+    || profile.phase !== phase
+    || typeof profile.profileId !== "string"
+    || !/^[a-f0-9]{64}$/.test(profile.profileHash || "")) {
+    throw new Error("run budget profile identity or schema mismatch");
+  }
+  return profile;
+}
+
+async function readCurrentArtifactProbe(projectId, route) {
   const response = await fetchWithTimeout(
     new URL(
       `/artifacts/${encodeURIComponent(projectId)}/current${route}`,
@@ -1069,7 +1180,12 @@ async function readCurrentArtifactBody(projectId, route) {
       `repaired artifact route returned ${response.status}: ${body.slice(0, 500)}`,
     );
   }
-  return body;
+  return {
+    body,
+    httpStatus: response.status,
+    bodySha256: sha256(body),
+    bodyBytes: Buffer.byteLength(body),
+  };
 }
 
 function runDraftLifecycleEditCanary(projectId, briefId, contentPlan) {
@@ -1536,6 +1652,8 @@ async function runBrief(projectId, prompt) {
     eventStream.evidence,
   );
   evidence.efficiency = await fetchRunEfficiencyMetrics(projectId, started.runId);
+  evidence.promptEfficiency = await fetchRunPromptEfficiency(projectId, started.runId);
+  evidence.budgetProfile = await fetchRunBudgetProfile(projectId, started.runId, "brief");
   if (evidence.status !== "completed") {
     const error = new Error(
       `brief run ${started.runId} ended with status ${evidence.status}`,
@@ -1569,6 +1687,16 @@ async function runBuild(projectId, briefId, contentPlan) {
     eventStream.evidence,
   );
   run.efficiency = await fetchRunEfficiencyMetrics(projectId, started.runId);
+  run.promptEfficiency = await fetchRunPromptEfficiency(projectId, started.runId);
+  run.budgetProfile = await fetchRunBudgetProfile(projectId, started.runId, "build");
+  run.generationContextStatus = await fetchGenerationContextStatus(
+    projectId,
+    started.runId,
+  );
+  run.designProfileIdentity = await fetchRunDesignProfileIdentity(
+    projectId,
+    started.runId,
+  );
   run.attempt = 1;
   if (run.status === "completed") {
     return {
@@ -1787,10 +1915,13 @@ async function readRunEvents(projectId, runId, phase) {
             `run ${runId} emitted invalid SSE JSON`,
           );
         }
-        event = sanitizeEvidenceEvent(event);
+        event = sanitizeModelExecutionEvent(event);
         events.push(event);
         resetIdleTimer();
-        fs.writeSync(eventFileDescriptor, `${JSON.stringify(event)}\n`);
+        fs.writeSync(
+          eventFileDescriptor,
+          `${JSON.stringify(sanitizePersistedRuntimeEvent(event))}\n`,
+        );
         terminalSeen = event.type === "run.completed";
         if (terminalSeen) {
           await reader.cancel();
@@ -1881,6 +2012,30 @@ async function fetchRunEfficiencyMetrics(projectId, runId) {
   return metrics;
 }
 
+async function fetchRunPromptEfficiency(projectId, runId) {
+  const response = await fetchWithTimeout(
+    new URL(`/runs/${encodeURIComponent(runId)}/prompt-efficiency`, baseUrl),
+    {
+      headers: { authorization: `Bearer ${issuePrincipalToken(projectId)}` },
+    },
+    120_000,
+  );
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `run prompt efficiency returned ${response.status}: ${body.slice(0, 500)}`,
+    );
+  }
+  const metrics = JSON.parse(body);
+  if (
+    metrics.schemaVersion !== "run-prompt-efficiency@1" ||
+    metrics.runId !== runId
+  ) {
+    throw new Error("run prompt efficiency identity or schema mismatch");
+  }
+  return metrics;
+}
+
 function summarizeRun(phase, runId, events, eventEvidence = null) {
   const terminal = [...events]
     .reverse()
@@ -1902,15 +2057,29 @@ function summarizeRun(phase, runId, events, eventEvidence = null) {
     },
   );
   usage.totalTokens = usage.inputTokens + usage.outputTokens;
+  const terminalClassification = terminal?.status === "completed"
+    ? "completed"
+    : classifyTerminalRunFailure({ summary: terminal?.summary }).classification;
   return {
     phase,
     runId,
     status: terminal?.status || "unknown",
     summary: terminal?.summary || null,
+    terminalClassification,
+    buildEvidence: extractBuildEvidence(events),
     usage,
     modelExecutions: events
       .filter((event) => event.type === "model.execution")
       .map((event) => event.snapshot),
+    promptCompositions: events
+      .filter((event) => event.type === "prompt.composition")
+      .map((event) => ({
+        turn: event.turn,
+        staticPrefixHash: event.staticPrefixHash,
+        toolSetHashVersion: event.toolSetHashVersion,
+        toolSetHash: event.toolSetHash,
+        estimatedInputTokens: event.estimatedInputTokens,
+      })),
     turns: usageEvents.length,
     toolCalls: events.filter((event) => event.type === "tool.started").length,
     terminalToolFailures: events.filter(
@@ -1918,19 +2087,6 @@ function summarizeRun(phase, runId, events, eventEvidence = null) {
         event.type === "tool.failed" && event.recoverable !== true,
     ).length,
     eventStream: eventEvidence,
-  };
-}
-
-function sanitizeEvidenceEvent(event) {
-  if (event?.type !== "model.execution" || !event.snapshot) return event;
-  const { providerRequestId, ...snapshot } = event.snapshot;
-  return {
-    ...event,
-    snapshot: {
-      ...snapshot,
-      providerRequestIdPresent:
-        typeof providerRequestId === "string" && providerRequestId.length > 0,
-    },
   };
 }
 
@@ -2026,34 +2182,13 @@ async function releaseSandboxOnce(projectId) {
 }
 
 async function releaseSandboxWithRetry(projectId) {
-  const attempts = [];
-  let successfulResponses = 0;
-  for (let attempt = 1; attempt <= sandboxReleaseMaxAttempts; attempt += 1) {
-    const release = await releaseSandboxOnce(projectId);
-    attempts.push({ attempt, ...release });
-    if (release.ok) {
-      successfulResponses += 1;
-      if (successfulResponses >= 2) {
-        return {
-          required: true,
-          released: true,
-          attempts,
-          maxAttempts: sandboxReleaseMaxAttempts,
-          requiredSuccessfulResponses: 2,
-        };
-      }
-    }
-    if (attempt < sandboxReleaseMaxAttempts) {
-      await delay(sandboxReleaseRetryCooldownMs);
-    }
-  }
-  return {
-    required: true,
-    released: false,
-    attempts,
+  return confirmSandboxRelease({
+    requestRelease: () => releaseSandboxOnce(projectId),
     maxAttempts: sandboxReleaseMaxAttempts,
+    retryCooldownMs: sandboxReleaseRetryCooldownMs,
     requiredSuccessfulResponses: 2,
-  };
+    delay,
+  });
 }
 
 function sanitizeReleaseEvidence(evidence) {

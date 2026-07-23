@@ -1,5 +1,6 @@
 use crate::{
     acceptance_contract::{AcceptanceContract, AcceptanceContractDraft},
+    artifact_publisher::{source_snapshot_fingerprint, FileArtifactPublisher},
     content_plan_approval::ContentPlanApprovalStore,
     control_plane_persistence::PostgresControlPlaneMirror,
     design_context::{
@@ -23,13 +24,14 @@ use crate::{
     types::{
         canonical_json_hash, sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun,
         AgentRunStatus, ArtifactPublishRecord, ArtifactPublishStatus, AuditRecord, Brief,
-        BriefStatus, ChannelLeaseRecord, ChannelLeaseStatus, ContentSource, ConversationItem,
-        DesignContextEnforcementBinding, DesignContextEnforcementPolicy, DesignProfile,
-        DesignProfileConversionReport, DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex,
-        OutboxDeliveryStatus, PendingPermission, PreviewLeaseMode, PreviewLeaseRecord,
-        PreviewLeaseStatus, ProjectAccessRecord, ProjectRuntimeState, ProjectVersion,
-        ProjectVersionStatus, ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence,
-        ReviewFindingSeverity, ReviewFindingStatus, RuntimeOutboxEvent, SandboxBinding,
+        BriefStatus, ChannelLeaseRecord, ChannelLeaseStatus, ContentSource,
+        ContinuationEligibilityDecision, ConversationItem, DesignContextEnforcementBinding,
+        DesignContextEnforcementPolicy, DesignProfile, DesignProfileConversionReport,
+        DesignProfileDraft, DesignSourceArtifact, DesignSourceIndex, OutboxDeliveryStatus,
+        PendingPermission, PreviewLeaseMode, PreviewLeaseRecord, PreviewLeaseStatus,
+        ProjectAccessRecord, ProjectRuntimeState, ProjectVersion, ProjectVersionStatus,
+        ReviewFinding, ReviewFindingCategory, ReviewFindingEvidence, ReviewFindingSeverity,
+        ReviewFindingStatus, RunContinuationSnapshot, RuntimeOutboxEvent, SandboxBinding,
         SandboxBindingStatus, SandboxChannelProtocol, ToolExecutionRecord, ToolExecutionStatus,
         MAX_DESIGN_SOURCE_BYTES,
     },
@@ -68,6 +70,45 @@ fn normalize_edit_target(path: &str) -> String {
         .trim_start_matches("./")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn source_snapshot_id_from_uri(uri: &str) -> Result<&str> {
+    let relative = uri
+        .strip_prefix("runtime://source-snapshots/")
+        .ok_or_else(|| anyhow!("continuation source snapshot URI is not Runtime-owned"))?;
+    let mut segments = relative.split('/');
+    let project_segment = segments.next().unwrap_or_default();
+    let snapshot_id = segments.next().unwrap_or_default();
+    if project_segment.is_empty()
+        || snapshot_id.is_empty()
+        || segments.next().is_some()
+        || !snapshot_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(anyhow!("continuation source snapshot URI is invalid"));
+    }
+    Ok(snapshot_id)
+}
+
+fn validate_remaining_operation_budget(value: &Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("remaining operation budget must be an object"))?;
+    if object.get("schemaVersion").and_then(Value::as_str) != Some("remaining-operation-budget@1")
+        || [
+            "grossInputTokens",
+            "uncachedInputTokens",
+            "outputTokens",
+            "turns",
+            "toolCalls",
+        ]
+        .into_iter()
+        .any(|field| object.get(field).and_then(Value::as_u64).is_none())
+    {
+        return Err(anyhow!("remaining operation budget is invalid"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -738,6 +779,212 @@ impl RuntimeStore {
         .await
     }
 
+    pub async fn create_continuation_successor_run(
+        &self,
+        snapshot: &RunContinuationSnapshot,
+        content_sources: Vec<ContentSource>,
+    ) -> Result<(AgentRun, bool)> {
+        let now = Utc::now();
+        let run_id = self.next_id("run");
+        let session_id = self.next_id("session");
+        let input_message_id = self.next_id("message");
+        let project_state_snapshot = self.get_project_runtime_state(&snapshot.project_id).await;
+        if project_state_snapshot.as_ref().map(|state| state.revision)
+            != snapshot.workspace_revision
+        {
+            return Err(anyhow!(
+                "continuation workspace revision changed before successor creation"
+            ));
+        }
+
+        let mut inner = self.inner.write().await;
+        self.hydrate_persisted_runs(&mut inner)?;
+        if let Some(existing_id) = inner
+            .runs
+            .get(&snapshot.predecessor_run_id)
+            .and_then(|run| run.successor_run_id.clone())
+        {
+            let existing = inner
+                .runs
+                .get(&existing_id)
+                .ok_or_else(|| anyhow!("continuation successor Run is missing: {existing_id}"))?;
+            if existing.continuation_snapshot_id.as_deref() == Some(snapshot.snapshot_id.as_str()) {
+                return Ok((existing.clone(), false));
+            }
+            return Err(anyhow!(
+                "continuation predecessor already has a different successor Run"
+            ));
+        }
+        let predecessor = inner
+            .runs
+            .get(&snapshot.predecessor_run_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "continuation predecessor Run is missing: {}",
+                    snapshot.predecessor_run_id
+                )
+            })?;
+        if predecessor.status != AgentRunStatus::Partial
+            || predecessor.project_id != snapshot.project_id
+            || predecessor.phase != snapshot.phase
+            || predecessor.operation_id.as_deref() != Some(snapshot.operation_id.as_str())
+            || predecessor.operation_attempt.max(1) != snapshot.attempt
+            || predecessor.continuation_snapshot_id.as_deref()
+                != Some(snapshot.snapshot_id.as_str())
+            || predecessor.checkpoint_id.as_deref() != Some(snapshot.checkpoint_id.as_str())
+            || predecessor.generation_context_content_hash
+                != snapshot.generation_context_content_hash
+            || predecessor.content_plan_hash != snapshot.content_plan_hash
+            || predecessor.design_profile_effective_hash != snapshot.design_profile_effective_hash
+            || predecessor
+                .budget_profile
+                .as_ref()
+                .map(|profile| &profile.profile_hash)
+                != snapshot.budget_profile_hash.as_ref()
+            || predecessor.edit_impact_plan_hash != snapshot.edit_impact_plan_hash
+            || predecessor.base_version_id != snapshot.base_version_id
+        {
+            return Err(anyhow!(
+                "continuation predecessor identity changed before successor creation"
+            ));
+        }
+
+        let mut successor = predecessor.clone();
+        successor.id = run_id.clone();
+        successor.session_id = session_id;
+        successor.parent_run_id = None;
+        successor.triggered_by_event_id = None;
+        successor.status = AgentRunStatus::Queued;
+        successor.predecessor_run_id = Some(predecessor.id.clone());
+        successor.successor_run_id = None;
+        successor.continuation_snapshot_id = Some(snapshot.snapshot_id.clone());
+        successor.operation_id = Some(snapshot.operation_id.clone());
+        successor.operation_attempt = predecessor.operation_attempt.max(1).saturating_add(1);
+        successor.design_source_bytes_read = 0;
+        successor.design_source_read_section_hashes.clear();
+        successor.design_context_read_files.clear();
+        successor.design_context_materialization_hash = None;
+        successor.design_context_style_contract_verified = None;
+        successor.run_contract_version = Some("legacy@1".to_string());
+        successor.content_plan_id = None;
+        successor.content_plan_revision = None;
+        successor.content_plan_hash = None;
+        successor.content_plan_approval_id = None;
+        successor.content_plan_approval_state = None;
+        successor.generation_context_status = None;
+        successor.generation_context_runtime_mode = None;
+        successor.generation_context_schema_version = None;
+        successor.generation_context_compiler_version = None;
+        successor.generation_context_content_hash = None;
+        successor.generation_context_binding_hash = None;
+        successor.generation_context_runtime_attestation_hash = None;
+        successor.visual_binding_set_hash = None;
+        successor.visual_delivery_state = None;
+        successor.workflow_state = None;
+        successor.context_window_epoch = 0;
+        successor.context_injected_turn = None;
+        successor.generation_context = None;
+        successor.edit_mutation_preflight_completed = false;
+        successor.output_version_id = None;
+        successor.input_message_ids = vec![input_message_id];
+        successor.checkpoint_id = None;
+        successor.project_state_snapshot = project_state_snapshot;
+        successor.profile_snapshot =
+            policy::snapshot_for_profile(successor.phase, &successor.agent_profile, None);
+        successor.started_at = now;
+        successor.updated_at = now;
+        successor.completed_at = None;
+
+        let predecessor_snapshot = {
+            let predecessor = inner
+                .runs
+                .get_mut(&snapshot.predecessor_run_id)
+                .expect("continuation predecessor was hydrated");
+            predecessor.successor_run_id = Some(run_id.clone());
+            predecessor.updated_at = now;
+            predecessor.clone()
+        };
+        inner.runs.insert(run_id.clone(), successor.clone());
+        inner.events.insert(run_id.clone(), Vec::new());
+        inner
+            .content_sources
+            .insert(run_id.clone(), content_sources.clone());
+        drop(inner);
+
+        self.append_run_snapshot(&predecessor_snapshot)?;
+        self.append_run_snapshot(&successor)?;
+        self.append_content_source_snapshot(&RunContentSourcesSnapshot {
+            run_id: run_id.clone(),
+            project_id: snapshot.project_id.clone(),
+            sources: content_sources,
+        })?;
+        self.append_event(AgentEvent::RunContinuationCreated {
+            run_id: run_id.clone(),
+            operation_id: snapshot.operation_id.clone(),
+            predecessor_run_id: snapshot.predecessor_run_id.clone(),
+            continuation_snapshot_id: snapshot.snapshot_id.clone(),
+            attempt: successor.operation_attempt,
+            automatic: true,
+            timestamp: now,
+        })
+        .await?;
+        self.append_event(AgentEvent::RunProgressFingerprint {
+            run_id: run_id.clone(),
+            turn: 0,
+            fingerprint: snapshot.progress_fingerprint.clone(),
+            consecutive_no_progress: 0,
+            evidence: snapshot.progress_ledger.clone(),
+            timestamp: now,
+        })
+        .await?;
+        self.append_event(AgentEvent::RunWorkflowProgress {
+            run_id: run_id.clone(),
+            turn: 0,
+            stage: snapshot
+                .workflow_progress
+                .get("stage")
+                .and_then(Value::as_str)
+                .unwrap_or("continuation_restored")
+                .to_string(),
+            completed_steps: snapshot
+                .workflow_progress
+                .get("completedSteps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            next_action: snapshot
+                .workflow_progress
+                .get("nextAction")
+                .cloned()
+                .unwrap_or(Value::Null),
+            budgets: snapshot
+                .workflow_progress
+                .get("budgets")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            timestamp: now,
+        })
+        .await?;
+        self.append_event(AgentEvent::MetricRecorded {
+            run_id: snapshot.predecessor_run_id.clone(),
+            name: "run.successor_created".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "successorRunId": successor.id,
+                "phase": successor.phase,
+                "reason": "automatic_continuation",
+                "continuationSnapshotId": snapshot.snapshot_id,
+            })),
+            timestamp: now,
+        })
+        .await?;
+        Ok((successor, true))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_run_with_context_internal(
         &self,
@@ -753,12 +1000,28 @@ impl RuntimeStore {
         let now = Utc::now();
         let run_id = self.next_id("run");
         let project_state_snapshot = self.get_project_runtime_state(&project_id).await;
+        let predecessor_run = if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
+            self.get_run(predecessor_run_id).await
+        } else {
+            None
+        };
+        let operation_id = predecessor_run
+            .as_ref()
+            .and_then(|run| run.operation_id.clone())
+            .or_else(|| Some(self.next_id("operation")));
+        let operation_attempt = predecessor_run
+            .as_ref()
+            .map_or(1, |run| run.operation_attempt.max(1).saturating_add(1));
         let predecessor_events = if let Some(predecessor_run_id) = predecessor_run_id.as_deref() {
             self.events(predecessor_run_id).await
         } else {
             Vec::new()
         };
         let profile_snapshot = policy::snapshot_for_profile(phase, &agent_profile, None);
+        let budget_profile = predecessor_run
+            .as_ref()
+            .and_then(|run| run.budget_profile.clone())
+            .unwrap_or_else(|| Box::new(crate::agent_loop::phase_budget_profile_from_env(phase)));
         let run = AgentRun {
             id: run_id.clone(),
             project_id: project_id.clone(),
@@ -767,6 +1030,7 @@ impl RuntimeStore {
             triggered_by_event_id: None,
             phase,
             agent_profile,
+            budget_profile: Some(budget_profile),
             status: AgentRunStatus::Queued,
             model,
             sandbox_id: None,
@@ -827,8 +1091,11 @@ impl RuntimeStore {
             workflow_state: None,
             context_window_epoch: 0,
             context_injected_turn: None,
+            operation_id,
+            operation_attempt,
             predecessor_run_id: predecessor_run_id.clone(),
             successor_run_id: None,
+            continuation_snapshot_id: None,
             generation_context: None,
             base_version_id,
             edit_base: None,
@@ -965,6 +1232,9 @@ impl RuntimeStore {
             triggered_by_event_id,
             phase,
             agent_profile,
+            budget_profile: Some(Box::new(crate::agent_loop::phase_budget_profile_from_env(
+                phase,
+            ))),
             status: AgentRunStatus::Queued,
             model,
             sandbox_id: parent.sandbox_id.clone(),
@@ -1048,8 +1318,14 @@ impl RuntimeStore {
             workflow_state: None,
             context_window_epoch: 0,
             context_injected_turn: None,
+            operation_id: parent
+                .operation_id
+                .clone()
+                .or_else(|| Some(self.next_id("operation"))),
+            operation_attempt: parent.operation_attempt.max(1).saturating_add(1),
             predecessor_run_id: Some(parent.id.clone()),
             successor_run_id: None,
+            continuation_snapshot_id: None,
             generation_context: None,
             base_version_id: parent
                 .output_version_id
@@ -1440,12 +1716,17 @@ impl RuntimeStore {
         finding_id: &str,
         triggered_by_event_id: Option<String>,
     ) -> Result<AgentRun> {
+        let parent_model = self
+            .get_run(parent_run_id)
+            .await
+            .ok_or_else(|| anyhow!("parent run not found: {parent_run_id}"))?
+            .model;
         self.create_repair_run_for_findings(
             parent_run_id,
             &[finding_id.to_string()],
             triggered_by_event_id,
             "repair".to_string(),
-            "internal-balanced".to_string(),
+            parent_model,
         )
         .await
     }
@@ -3408,6 +3689,9 @@ impl RuntimeStore {
                 start_index: 0,
                 end_index_exclusive: 1,
                 retained_count: 1,
+                projection_version: None,
+                projection_hash: None,
+                protected_exchange_ids: Vec::new(),
             }),
             task_list: Vec::new(),
             workspace_snapshot_uri: None,
@@ -3542,6 +3826,9 @@ impl RuntimeStore {
                 start_index: 0,
                 end_index_exclusive: 1,
                 retained_count: 1,
+                projection_version: None,
+                projection_hash: None,
+                protected_exchange_ids: Vec::new(),
             }),
             task_list: Vec::new(),
             workspace_snapshot_uri: None,
@@ -5103,6 +5390,392 @@ impl RuntimeStore {
         self.set_run_checkpoint(&checkpoint.run_id, checkpoint.id.clone())
             .await?;
         Ok(())
+    }
+
+    pub async fn create_run_continuation_snapshot(
+        &self,
+        runtime_storage_dir: &Path,
+        run_id: &str,
+        source_snapshot_uri: &str,
+        expected_source_hash: &str,
+        remaining_operation_budget: Value,
+        compact_summary: &str,
+    ) -> Result<RunContinuationSnapshot> {
+        validate_remaining_operation_budget(&remaining_operation_budget)?;
+        if expected_source_hash.len() != 64
+            || !expected_source_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(anyhow!("continuation source hash is invalid"));
+        }
+        if compact_summary.trim().is_empty() {
+            return Err(anyhow!("continuation compact summary must not be empty"));
+        }
+        let run = self
+            .get_run(run_id)
+            .await
+            .ok_or_else(|| anyhow!("run not found for continuation snapshot: {run_id}"))?;
+        if run.status != AgentRunStatus::Partial {
+            return Err(anyhow!(
+                "continuation snapshot requires a Partial predecessor"
+            ));
+        }
+        if run.successor_run_id.is_some() {
+            return Err(anyhow!(
+                "continuation snapshot predecessor already has a successor Run"
+            ));
+        }
+        let operation_id = run
+            .operation_id
+            .clone()
+            .ok_or_else(|| anyhow!("continuation snapshot requires operationId"))?;
+        let checkpoint = self
+            .latest_checkpoint_for_run(run_id)
+            .await
+            .filter(|checkpoint| checkpoint.run_id == run_id)
+            .ok_or_else(|| anyhow!("continuation snapshot requires a final Run checkpoint"))?;
+        let source_snapshot_id = source_snapshot_id_from_uri(source_snapshot_uri)?;
+        if FileArtifactPublisher::source_snapshot_uri(&run.project_id, source_snapshot_id)
+            != source_snapshot_uri
+        {
+            return Err(anyhow!(
+                "continuation source snapshot URI belongs to a different project"
+            ));
+        }
+        let source_files = FileArtifactPublisher::read_source_snapshot(
+            runtime_storage_dir,
+            &run.project_id,
+            source_snapshot_id,
+        )?;
+        let verified_source_hash = source_snapshot_fingerprint(&source_files)?;
+        if verified_source_hash != expected_source_hash {
+            return Err(anyhow!(
+                "continuation source snapshot hash mismatch: expected {expected_source_hash}, got {verified_source_hash}"
+            ));
+        }
+        let events = self.events(run_id).await;
+        let workflow_progress = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentEvent::RunWorkflowProgress {
+                    turn,
+                    stage,
+                    completed_steps,
+                    next_action,
+                    budgets,
+                    ..
+                } => Some(json!({
+                    "turn": turn,
+                    "stage": stage,
+                    "completedSteps": completed_steps,
+                    "nextAction": next_action,
+                    "budgets": budgets,
+                })),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("continuation snapshot requires workflow progress"))?;
+        let workflow_progress_hash = canonical_json_hash(&workflow_progress);
+        let (progress_fingerprint, progress_ledger) = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentEvent::RunProgressFingerprint {
+                    fingerprint,
+                    evidence,
+                    ..
+                } => Some((fingerprint.clone(), evidence.clone())),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("continuation snapshot requires a progress ledger"))?;
+        if crate::agent_loop::progress_ledger_fingerprint(&progress_ledger).as_deref()
+            != Some(progress_fingerprint.as_str())
+        {
+            return Err(anyhow!("continuation progress ledger is invalid"));
+        }
+        let operation_runs = self.project_runs(&run.project_id).await?;
+        let mut operation_run_events = Vec::new();
+        for operation_run in operation_runs
+            .into_iter()
+            .filter(|candidate| candidate.operation_id.as_deref() == Some(operation_id.as_str()))
+        {
+            let operation_events = self.events(&operation_run.id).await;
+            operation_run_events.push((operation_run, operation_events));
+        }
+        let operation_usage = crate::run_metrics::calculate_generation_operation_usage(
+            &run.project_id,
+            &operation_id,
+            &operation_run_events,
+        )
+        .ok_or_else(|| anyhow!("continuation operation usage is unavailable"))?;
+        let workspace_revision = self
+            .get_project_runtime_state(&run.project_id)
+            .await
+            .map(|state| state.revision);
+        let snapshot_identity_hash = canonical_json_hash(&json!({
+            "schemaVersion": "run-continuation-snapshot@2",
+            "operationId": operation_id,
+            "attempt": run.operation_attempt.max(1),
+            "automaticContinuationCount": operation_usage.automatic_continuation_count,
+            "predecessorRunId": run.id,
+            "sourceSnapshotUri": source_snapshot_uri,
+            "sourceHash": verified_source_hash,
+            "workspaceRevision": workspace_revision,
+            "checkpointId": checkpoint.id,
+            "workflowProgressHash": workflow_progress_hash,
+            "progressFingerprint": progress_fingerprint,
+            "progressLedgerHash": canonical_json_hash(&progress_ledger),
+            "generationContextContentHash": run.generation_context_content_hash,
+            "contentPlanHash": run.content_plan_hash,
+            "designProfileEffectiveHash": run.design_profile_effective_hash,
+            "budgetProfileHash": run.budget_profile.as_ref().map(|profile| &profile.profile_hash),
+            "editImpactPlanHash": run.edit_impact_plan_hash,
+            "baseVersionId": run.base_version_id,
+        }));
+        let snapshot_id = format!("continuation-{}", &snapshot_identity_hash[..24]);
+        let directory = self.checkpoint_dir.join("continuations");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{snapshot_id}.json"));
+        if path.exists() {
+            let existing: RunContinuationSnapshot = serde_json::from_slice(&fs::read(&path)?)?;
+            if existing.source_hash != verified_source_hash
+                || existing.predecessor_run_id != run.id
+                || existing.checkpoint_id != checkpoint.id
+                || existing.workflow_progress_hash != workflow_progress_hash
+                || existing.progress_fingerprint != progress_fingerprint
+                || existing.progress_ledger != progress_ledger
+            {
+                return Err(anyhow!(
+                    "immutable continuation snapshot identity conflict: {snapshot_id}"
+                ));
+            }
+            self.bind_run_continuation_snapshot(&existing).await?;
+            return Ok(existing);
+        }
+        let snapshot = RunContinuationSnapshot {
+            schema_version: "run-continuation-snapshot@2".to_string(),
+            snapshot_id: snapshot_id.clone(),
+            operation_id: operation_id.clone(),
+            attempt: run.operation_attempt.max(1),
+            automatic_continuation_count: operation_usage.automatic_continuation_count,
+            predecessor_run_id: run.id.clone(),
+            project_id: run.project_id.clone(),
+            phase: run.phase,
+            source_snapshot_uri: source_snapshot_uri.to_string(),
+            source_hash: verified_source_hash,
+            workspace_revision,
+            checkpoint_id: checkpoint.id,
+            workflow_progress_hash,
+            workflow_progress,
+            progress_fingerprint,
+            progress_ledger,
+            generation_context_content_hash: run.generation_context_content_hash.clone(),
+            content_plan_hash: run.content_plan_hash.clone(),
+            design_profile_effective_hash: run.design_profile_effective_hash.clone(),
+            budget_profile_hash: run
+                .budget_profile
+                .as_ref()
+                .map(|profile| profile.profile_hash.clone()),
+            edit_impact_plan_hash: run.edit_impact_plan_hash.clone(),
+            base_version_id: run.base_version_id.clone(),
+            accumulated_input_tokens: operation_usage.input_tokens,
+            accumulated_cached_input_tokens: operation_usage.cached_input_tokens,
+            accumulated_output_tokens: operation_usage.output_tokens,
+            remaining_operation_budget,
+            compact_summary: compact_summary.chars().take(4_096).collect(),
+            created_at: Utc::now(),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(&serde_json::to_vec_pretty(&snapshot)?)?;
+        file.sync_all()?;
+        self.sync_control_plane_file(&path)?;
+
+        self.bind_run_continuation_snapshot(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    async fn bind_run_continuation_snapshot(
+        &self,
+        snapshot: &RunContinuationSnapshot,
+    ) -> Result<()> {
+        let run_snapshot = {
+            let mut inner = self.inner.write().await;
+            self.hydrate_persisted_runs(&mut inner)?;
+            let current = inner
+                .runs
+                .get_mut(&snapshot.predecessor_run_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "run not found for continuation binding: {}",
+                        snapshot.predecessor_run_id
+                    )
+                })?;
+            if current.continuation_snapshot_id.as_deref() == Some(snapshot.snapshot_id.as_str()) {
+                return Ok(());
+            }
+            if current.status != AgentRunStatus::Partial
+                || current.successor_run_id.is_some()
+                || current.checkpoint_id.as_deref() != Some(snapshot.checkpoint_id.as_str())
+            {
+                return Err(anyhow!(
+                    "continuation predecessor changed while freezing snapshot"
+                ));
+            }
+            current.continuation_snapshot_id = Some(snapshot.snapshot_id.clone());
+            current.updated_at = Utc::now();
+            current.clone()
+        };
+        self.append_run_snapshot(&run_snapshot)?;
+        self.append_event(AgentEvent::MetricRecorded {
+            run_id: snapshot.predecessor_run_id.clone(),
+            name: "run.continuation_snapshot_ready".to_string(),
+            value: 1,
+            metadata: Some(json!({
+                "operationId": snapshot.operation_id,
+                "continuationSnapshotId": snapshot.snapshot_id,
+                "sourceHash": snapshot.source_hash,
+                "workflowProgressHash": snapshot.workflow_progress_hash,
+            })),
+            timestamp: Utc::now(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub fn get_run_continuation_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<RunContinuationSnapshot>> {
+        let Some(suffix) = snapshot_id.strip_prefix("continuation-") else {
+            return Err(anyhow!("invalid continuation snapshot id"));
+        };
+        if suffix.len() != 24 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!("invalid continuation snapshot id"));
+        }
+        let path = self
+            .checkpoint_dir
+            .join("continuations")
+            .join(format!("{snapshot_id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    pub async fn evaluate_run_continuation_snapshot(
+        &self,
+        runtime_storage_dir: &Path,
+        snapshot_id: &str,
+    ) -> Result<ContinuationEligibilityDecision> {
+        let snapshot = self
+            .get_run_continuation_snapshot(snapshot_id)?
+            .ok_or_else(|| anyhow!("continuation snapshot not found: {snapshot_id}"))?;
+        let mut reasons = Vec::new();
+        if snapshot.schema_version != "run-continuation-snapshot@2"
+            || canonical_json_hash(&snapshot.workflow_progress) != snapshot.workflow_progress_hash
+            || crate::agent_loop::progress_ledger_fingerprint(&snapshot.progress_ledger).as_deref()
+                != Some(snapshot.progress_fingerprint.as_str())
+        {
+            reasons.push("continuation_progress_unverifiable".to_string());
+        }
+        let run = self.get_run(&snapshot.predecessor_run_id).await;
+        if let Some(run) = run.as_ref() {
+            if run.status != AgentRunStatus::Partial {
+                reasons.push("predecessor_not_partial".to_string());
+            }
+            if run.successor_run_id.is_some() {
+                reasons.push("successor_already_exists".to_string());
+            }
+            if run.operation_id.as_deref() != Some(snapshot.operation_id.as_str())
+                || run.operation_attempt.max(1) != snapshot.attempt
+            {
+                reasons.push("operation_identity_changed".to_string());
+            }
+            if snapshot.automatic_continuation_count >= 1 {
+                reasons.push("automatic_continuation_limit_reached".to_string());
+            }
+            if run.continuation_snapshot_id.as_deref() != Some(snapshot.snapshot_id.as_str())
+                || run.checkpoint_id.as_deref() != Some(snapshot.checkpoint_id.as_str())
+            {
+                reasons.push("checkpoint_identity_changed".to_string());
+            }
+            if run.generation_context_content_hash != snapshot.generation_context_content_hash
+                || run.content_plan_hash != snapshot.content_plan_hash
+                || run.design_profile_effective_hash != snapshot.design_profile_effective_hash
+                || run
+                    .budget_profile
+                    .as_ref()
+                    .map(|profile| &profile.profile_hash)
+                    != snapshot.budget_profile_hash.as_ref()
+                || run.edit_impact_plan_hash != snapshot.edit_impact_plan_hash
+                || run.base_version_id != snapshot.base_version_id
+            {
+                reasons.push("frozen_run_identity_changed".to_string());
+            }
+            let current_workspace_revision = self
+                .get_project_runtime_state(&run.project_id)
+                .await
+                .map(|state| state.revision);
+            if current_workspace_revision != snapshot.workspace_revision {
+                reasons.push("workspace_revision_changed".to_string());
+            }
+        } else {
+            reasons.push("predecessor_missing".to_string());
+        }
+        let source_snapshot_id = source_snapshot_id_from_uri(&snapshot.source_snapshot_uri);
+        match source_snapshot_id.and_then(|source_snapshot_id| {
+            if FileArtifactPublisher::source_snapshot_uri(&snapshot.project_id, source_snapshot_id)
+                != snapshot.source_snapshot_uri
+            {
+                return Err(anyhow!("source snapshot project identity mismatch"));
+            }
+            let files = FileArtifactPublisher::read_source_snapshot(
+                runtime_storage_dir,
+                &snapshot.project_id,
+                source_snapshot_id,
+            )?;
+            let hash = source_snapshot_fingerprint(&files)?;
+            if hash != snapshot.source_hash {
+                return Err(anyhow!("source snapshot hash mismatch"));
+            }
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(_) => reasons.push("source_snapshot_unverifiable".to_string()),
+        }
+        if [
+            "grossInputTokens",
+            "uncachedInputTokens",
+            "outputTokens",
+            "turns",
+            "toolCalls",
+        ]
+        .into_iter()
+        .any(|field| {
+            snapshot
+                .remaining_operation_budget
+                .get(field)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        }) {
+            reasons.push("operation_budget_exhausted".to_string());
+        }
+        reasons.sort();
+        reasons.dedup();
+        Ok(ContinuationEligibilityDecision {
+            schema_version: "continuation-eligibility-decision@1".to_string(),
+            snapshot_id: snapshot.snapshot_id,
+            operation_id: snapshot.operation_id,
+            predecessor_run_id: snapshot.predecessor_run_id,
+            eligible: reasons.is_empty(),
+            reasons,
+            checked_at: Utc::now(),
+        })
     }
 
     pub async fn ensure_initial_checkpoint(&self, run_id: &str) -> Result<AgentCheckpoint> {
@@ -7810,6 +8483,194 @@ fn channel_lease_transition_allowed(from: ChannelLeaseStatus, to: ChannelLeaseSt
 #[cfg(test)]
 mod cache_fast_path_tests {
     use super::*;
+    use crate::artifact_publisher::ArtifactFile;
+
+    #[tokio::test]
+    async fn new_run_budget_profile_survives_store_restart_without_rebinding() {
+        let root = std::env::temp_dir().join(format!(
+            "anydesign-run-budget-profile-test-{}",
+            rand::random::<u64>()
+        ));
+        let checkpoint_dir = root.join("checkpoints");
+        let run_log_dir = root.join("run-log");
+        let store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
+        let run = store
+            .create_run(
+                "project-budget-profile".to_string(),
+                AgentPhase::Edit,
+                "edit".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let profile = run.budget_profile.clone().unwrap();
+        profile.validate(AgentPhase::Edit).unwrap();
+        drop(store);
+
+        let recovered = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir)
+            .get_run(&run.id)
+            .await
+            .unwrap();
+        assert_eq!(recovered.budget_profile, Some(profile));
+    }
+
+    #[tokio::test]
+    async fn continuation_snapshot_binds_verified_immutable_source_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "anydesign-continuation-snapshot-test-{}",
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let checkpoint_dir = root.join("checkpoints");
+        let runtime_storage_dir = root.join("runtime-storage");
+        let store = RuntimeStore::with_checkpoint_dir(&checkpoint_dir);
+        let run = store
+            .create_run(
+                "project-1".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let files = vec![ArtifactFile {
+            path: PathBuf::from("app/page.tsx"),
+            bytes: b"export default function Page() { return <main /> }".to_vec(),
+        }];
+        let source_hash = source_snapshot_fingerprint(&files).unwrap();
+        let source_snapshot_uri = FileArtifactPublisher::new(&runtime_storage_dir)
+            .publish_source_snapshot("project-1", "build-failed-1", files)
+            .await
+            .unwrap();
+        store.ensure_initial_checkpoint(&run.id).await.unwrap();
+        store
+            .append_event(AgentEvent::RunProgressFingerprint {
+                run_id: run.id.clone(),
+                turn: 2,
+                fingerprint: crate::agent_loop::progress_ledger_fingerprint(&json!({
+                    "state": {}
+                }))
+                .unwrap(),
+                consecutive_no_progress: 0,
+                evidence: json!({
+                    "schemaVersion": "substantive-progress-ledger@1",
+                    "state": {}
+                }),
+                timestamp: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .append_event(AgentEvent::RunWorkflowProgress {
+                run_id: run.id.clone(),
+                turn: 2,
+                stage: "validation_failed".to_string(),
+                completed_steps: vec!["source_authored".to_string()],
+                next_action: json!({ "tool": "fs.patch" }),
+                budgets: json!({ "turnsRemaining": 0 }),
+                timestamp: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .update_run_status(&run.id, AgentRunStatus::Partial)
+            .await
+            .unwrap();
+
+        let first = store
+            .create_run_continuation_snapshot(
+                &runtime_storage_dir,
+                &run.id,
+                &source_snapshot_uri,
+                &source_hash,
+                json!({
+                    "schemaVersion": "remaining-operation-budget@1",
+                    "grossInputTokens": 1000,
+                    "uncachedInputTokens": 800,
+                    "outputTokens": 200,
+                    "turns": 5,
+                    "toolCalls": 10
+                }),
+                "Continue from the frozen failed build snapshot.",
+            )
+            .await
+            .unwrap();
+        let second = store
+            .create_run_continuation_snapshot(
+                &runtime_storage_dir,
+                &run.id,
+                &source_snapshot_uri,
+                &source_hash,
+                json!({
+                    "schemaVersion": "remaining-operation-budget@1",
+                    "grossInputTokens": 1000,
+                    "uncachedInputTokens": 800,
+                    "outputTokens": 200,
+                    "turns": 5,
+                    "toolCalls": 10
+                }),
+                "Continue from the frozen failed build snapshot.",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            store
+                .get_run(&run.id)
+                .await
+                .and_then(|run| run.continuation_snapshot_id),
+            Some(first.snapshot_id.clone())
+        );
+        assert_eq!(
+            store
+                .get_run_continuation_snapshot(&first.snapshot_id)
+                .unwrap(),
+            Some(first.clone())
+        );
+        let eligible = store
+            .evaluate_run_continuation_snapshot(&runtime_storage_dir, &first.snapshot_id)
+            .await
+            .unwrap();
+        assert!(eligible.eligible, "{:?}", eligible.reasons);
+        fs::write(
+            FileArtifactPublisher::source_snapshot_root(
+                &runtime_storage_dir,
+                "project-1",
+                "build-failed-1",
+            )
+            .join("app/page.tsx"),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(store
+            .create_run_continuation_snapshot(
+                &runtime_storage_dir,
+                &run.id,
+                &source_snapshot_uri,
+                &source_hash,
+                json!({
+                    "schemaVersion": "remaining-operation-budget@1",
+                    "grossInputTokens": 1000,
+                    "uncachedInputTokens": 800,
+                    "outputTokens": 200,
+                    "turns": 5,
+                    "toolCalls": 10
+                }),
+                "Continue from the frozen failed build snapshot.",
+            )
+            .await
+            .is_err());
+        let rejected = store
+            .evaluate_run_continuation_snapshot(&runtime_storage_dir, &first.snapshot_id)
+            .await
+            .unwrap();
+        assert!(!rejected.eligible);
+        assert!(rejected
+            .reasons
+            .contains(&"source_snapshot_unverifiable".to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn release_evidence_lookups_use_live_memory_before_persistence_hydration() {

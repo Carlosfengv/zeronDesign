@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "generation-context-cohort-deployments@2",
+  "recordedAt": "2026-07-21T10:00:58.779Z",
+  "deployments": [
+    {
+      "side": "control",
+      "deployment": "anydesign-runtime-generation-control",
+      "uid": "507c8f2b-3800-4c77-9178-8c429f809fc5",
+      "generation": 5,
+      "observedGeneration": 5,
+      "podUid": "b104fd39-0d0b-4a89-9713-9df15285ff55",
+      "image": "anydesign/runtime:wave1-producer-20260721",
+      "imageId": "sha256:9bc64d518098154379f74abeffbd9c647ba786aa5ce95ee53fcb6af3cf38c982",
+      "generationContextMode": "off",
+      "publicBaseUrl": "http://anydesign-runtime-generation-control.anydesign-runtime.svc.cluster.local:8080",
+      "gatewayUrl": "http://provider-gateway.provider-system.svc.cluster.local:9000",
+      "workloadTokenSecretRef": "provider-gateway-runtime-auth",
+      "databaseSecretRef": "anydesign-runtime-postgres-generation-control",
+      "objectStorageUrl": "s3://anydesign-runtime/generation-control",
+      "publicPrincipalSecretRef": "anydesign-runtime-public-principal-generation-control",
+      "contentPlanAttestationMode": "shadow",
+      "approvalProducerRequired": "false"
+    },
+    {
+      "side": "candidate",
+      "deployment": "anydesign-runtime-generation-candidate",
+      "uid": "9e376cbf-ceeb-441d-b24f-d218ac24456d",
+      "generation": 5,
+      "observedGeneration": 5,
+      "podUid": "897ad9f9-8b8f-43ff-bd79-13781d2595df",
+      "image": "anydesign/runtime:wave1-producer-20260721",
+      "imageId": "sha256:9bc64d518098154379f74abeffbd9c647ba786aa5ce95ee53fcb6af3cf38c982",
+      "generationContextMode": "enabled",
+      "publicBaseUrl": "http://anydesign-runtime-generation-candidate.anydesign-runtime.svc.cluster.local:8080",
+      "gatewayUrl": "http://provider-gateway.provider-system.svc.cluster.local:9000",
+      "workloadTokenSecretRef": "provider-gateway-runtime-auth",
+      "databaseSecretRef": "anydesign-runtime-postgres-generation-candidate",
+      "objectStorageUrl": "s3://anydesign-runtime/generation-candidate",
+      "publicPrincipalSecretRef": "anydesign-runtime-public-principal-generation-candidate",
+      "contentPlanAttestationMode": "shadow",
+      "approvalProducerRequired": "true"
+    }
+  ],
+  "identitySha256": "bf33b38096f5457dc998362c875476180509016ae83bb3f8d2a950f9f050adb9"
+}

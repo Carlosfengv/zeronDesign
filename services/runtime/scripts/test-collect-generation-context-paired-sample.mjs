@@ -61,6 +61,13 @@ function evidence(side) {
         physicalModel: "deepseek-v4-pro",
         capabilitySnapshotHash: HASH_C,
       }],
+      designProfileIdentity: {
+        schemaVersion: "run-design-profile-identity@1",
+        runId,
+        designProfileId: "fixture-design-profile",
+        designProfileVersion: 1,
+        effectiveProfileHash: HASH_C,
+      },
       efficiency: {
         schemaVersion: "run-efficiency-metrics@1",
         calculatorVersion: "run-efficiency-calculator@1",
@@ -81,6 +88,25 @@ function evidence(side) {
         firstBuildSucceeded: true,
         requiredFidelityPassed: true,
       },
+      promptEfficiency: {
+        schemaVersion: "run-prompt-efficiency@1",
+        runId,
+        grossInputTokens: side === "control" ? 1000 : 400,
+        cachedInputTokens: side === "control" ? 100 : 200,
+        uncachedInputTokens: side === "control" ? 900 : 200,
+        outputTokens: 100,
+        turnCount: side === "control" ? 5 : 2,
+        maxTurnInputTokens: side === "control" ? 300 : 220,
+        averageTurnInputTokens: 200,
+        cacheHitRateBasisPoints: side === "control" ? 1000 : 5000,
+        generationContextEstimatedTokens: 100,
+        generationContextRepeatedEstimatedTokens: 200,
+        promptCompactionCount: 0,
+        promptTokensRemovedByCompaction: 0,
+        largeToolArgumentTokensRetainedPeak: 0,
+        retryAmplificationBasisPoints: null,
+        estimated: false,
+      },
     }],
   };
 }
@@ -93,6 +119,9 @@ assert.deepEqual(samples.control.coverage, []);
 assert.deepEqual(samples.candidate.coverage, ["nextTemplate"]);
 assert.equal(samples.candidate.metrics.timeToFirstGreenfieldBuildMs, 40_000);
 assert.equal(samples.candidate.requiredFidelityPassed, true);
+assert.equal(samples.candidate.metrics.modelTurns, 2);
+assert.equal(samples.candidate.metrics.generationContextBytes, 400);
+assert.equal(samples.candidate.metrics.caseAttemptCount, 1);
 
 const retriedControl = evidence("control");
 const failedBuild = structuredClone(retriedControl.runs[0]);
@@ -131,6 +160,13 @@ assert.throws(
   /intent hash mismatch/,
 );
 
+const designProfileDrifted = evidence("candidate");
+designProfileDrifted.runs[0].designProfileIdentity.effectiveProfileHash = HASH_A;
+assert.throws(
+  () => collectPairedSamples(session, spec, evidence("control"), designProfileDrifted),
+  /Design Profile identity mismatch/,
+);
+
 function warmEvidence(side) {
   const value = evidence(side);
   const run = structuredClone(value.runs[0]);
@@ -138,12 +174,12 @@ function warmEvidence(side) {
   run.efficiency.phase = "edit";
   run.efficiency.timeToIframeAppliedMs = side === "control" ? 30_000 : 12_000;
   value.warmEdit = {
-    schemaVersion: "generation-real-provider-edit-evidence@1",
+    schemaVersion: "generation-real-provider-edit-evidence@2",
     startedAt: "2026-07-20T00:01:00.000Z",
     finishedAt: "2026-07-20T00:02:00.000Z",
     status: "accepted",
     projectId: value.projectId,
-    prompt: "Add the exact marker PAIRED_WARM_MARKER and make a small CSS change.",
+    promptSha256: HASH_A,
     warmEditKind: "copy_css",
     editImpactPlanHash: HASH_A,
     run,
@@ -348,7 +384,7 @@ assert.throws(
 );
 
 const warmPromptDrift = warmEvidence("candidate");
-warmPromptDrift.warmEdit.prompt += " drift";
+warmPromptDrift.warmEdit.promptSha256 = HASH_B;
 assert.throws(
   () => collectPairedSamples(session, warmSpec, warmEvidence("control"), warmPromptDrift),
   /prompt hash mismatch/,
@@ -410,8 +446,7 @@ function coldDevEvidence(side) {
   value.warmEdit = null;
   value.coldDevEdit.lifecycleProfile = "cold_dev";
   value.coldDevEdit.warmEditKind = null;
-  value.coldDevEdit.prompt =
-    "Add exact marker PAIRED_WARM_MARKER, restore dependencies, and restart Dev.";
+  value.coldDevEdit.promptSha256 = HASH_B;
   value.coldDevEdit.run.efficiency.timeToIframeAppliedMs = null;
   value.coldDevEdit.run.efficiency.coldDevReadyMs =
     side === "control" ? 25_000 : 14_000;
@@ -451,12 +486,12 @@ function repairEvidence(side) {
   run.efficiency.phase = "repair";
   run.efficiency.timeToFirstSourceMutationMs = side === "control" ? 30_000 : 18_000;
   value.repair = {
-    schemaVersion: "generation-real-provider-repair-evidence@1",
+    schemaVersion: "generation-real-provider-repair-evidence@2",
     startedAt: "2026-07-20T00:03:00.000Z",
     finishedAt: "2026-07-20T00:04:00.000Z",
     status: "accepted",
     projectId: value.projectId,
-    prompt: "Repair the scoped inaccessible contrast finding and preserve the exact marker.",
+    promptSha256: HASH_A,
     lifecycleProfile: "repair_warm",
     repairMarker: "PAIR_REPAIR_MARKER",
     run,
@@ -518,6 +553,9 @@ function restartEvidence(side) {
         contextContentHash: HASH_A,
         runContextBindingHash: HASH_B,
         runtimeAttestationHash: HASH_C,
+        budgetProfileId: "phase-budget-v1-build",
+        budgetProfileHash: HASH_A,
+        budgetProfileRolloutMode: "shadow",
         workflowState: "completed",
       }
     : {
@@ -529,6 +567,9 @@ function restartEvidence(side) {
         contextContentHash: null,
         runContextBindingHash: null,
         runtimeAttestationHash: null,
+        budgetProfileId: "phase-budget-v1-build",
+        budgetProfileHash: HASH_A,
+        budgetProfileRolloutMode: "shadow",
         workflowState: null,
       };
   const snapshot = {

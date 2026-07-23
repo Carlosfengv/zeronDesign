@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const SNAPSHOT_SCHEMA = "generation-context-runtime-restart-snapshot@1";
 const EVIDENCE_SCHEMA = "generation-context-runtime-restart-evidence@1";
+const EVIDENCE_SCHEMA_V2 = "generation-context-runtime-restart-evidence@2";
 const HASH = /^[a-f0-9]{64}$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const SENSITIVE_VALUE = /(?:\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}|data:image\/)/i;
@@ -31,6 +32,75 @@ function positiveInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
+function exactKeys(value, expected, label) {
+  const actual = Object.keys(value || {}).sort();
+  const wanted = [...expected].sort();
+  if (canonical(actual) !== canonical(wanted)) {
+    throw new Error(`${label} fields do not match the frozen schema`);
+  }
+}
+
+function validateBudgetProfile(profile, status, efficiency, label) {
+  exactKeys(profile, [
+    "schemaVersion",
+    "profileId",
+    "phase",
+    "rolloutMode",
+    "tokenBudgetMode",
+    "operationBudgetMode",
+    "enforcedLimits",
+    "phaseTargetLimits",
+    "operationLimits",
+    "profileHash",
+  ], label);
+  if (profile.schemaVersion !== "run-budget-profile@1"
+    || !hasText(profile.profileId)
+    || profile.phase !== efficiency?.phase
+    || !new Set(["off", "shadow", "enforced"]).has(profile.rolloutMode)
+    || !new Set(["legacy", "split_shadow", "split_enforced"]).has(profile.tokenBudgetMode)
+    || !new Set(["shadow", "enforced"]).has(profile.operationBudgetMode)) {
+    throw new Error(`${label} identity or mode is invalid`);
+  }
+  const tokenFields = [
+    "maxTurns",
+    "maxToolCalls",
+    "maxInputTokens",
+    "maxGrossInputTokens",
+    "maxUncachedInputTokens",
+    "maxPromptTokensPerTurn",
+    "maxOutputTokens",
+  ];
+  for (const [limitsLabel, limits] of [
+    ["enforcedLimits", profile.enforcedLimits],
+    ["phaseTargetLimits", profile.phaseTargetLimits],
+  ]) {
+    exactKeys(limits, tokenFields, `${label}.${limitsLabel}`);
+    if (tokenFields.some((field) => !positiveInteger(limits[field]))) {
+      throw new Error(`${label}.${limitsLabel} must contain positive integers`);
+    }
+  }
+  const operationFields = [
+    "maxGrossInputTokens",
+    "maxUncachedInputTokens",
+    "maxOutputTokens",
+    "maxTurns",
+    "maxToolCalls",
+  ];
+  exactKeys(profile.operationLimits, operationFields, `${label}.operationLimits`);
+  if (operationFields.some((field) => !positiveInteger(profile.operationLimits[field]))) {
+    throw new Error(`${label}.operationLimits must contain positive integers`);
+  }
+  const { profileHash, ...identity } = profile;
+  if (!HASH.test(profileHash || "") || sha256(canonical(identity)) !== profileHash) {
+    throw new Error(`${label}.profileHash does not match the canonical profile`);
+  }
+  if (status?.budgetProfileId !== profile.profileId
+    || status?.budgetProfileHash !== profile.profileHash
+    || status?.budgetProfileRolloutMode !== profile.rolloutMode) {
+    throw new Error(`${label} does not match Generation Context Budget identity`);
+  }
+}
+
 function rejectSensitiveValues(value, location = "restartEvidence") {
   if (typeof value === "string") {
     if (SENSITIVE_VALUE.test(value)) {
@@ -48,7 +118,7 @@ function rejectSensitiveValues(value, location = "restartEvidence") {
   }
 }
 
-function validateSnapshot(snapshot, label, side) {
+function validateSnapshot(snapshot, label, side, requireBudgetProfile) {
   if (snapshot?.schemaVersion !== SNAPSHOT_SCHEMA) {
     throw new Error(`${label}.schemaVersion must be ${SNAPSHOT_SCHEMA}`);
   }
@@ -63,6 +133,11 @@ function validateSnapshot(snapshot, label, side) {
     throw new Error(`${label} Generation Context Run identity mismatch`);
   }
   const status = snapshot.generationContextStatus;
+  if (!hasText(status?.budgetProfileId)
+    || !HASH.test(status?.budgetProfileHash || "")
+    || !new Set(["off", "shadow", "enforced"]).has(status?.budgetProfileRolloutMode)) {
+    throw new Error(`${label} must freeze a valid Run Budget Profile identity`);
+  }
   if (side === "candidate") {
     if (status.runContractVersion !== "generation-context@1"
       || status.status !== "compiled"
@@ -91,6 +166,21 @@ function validateSnapshot(snapshot, label, side) {
     || snapshot.efficiency.projectId !== snapshot.projectId
     || snapshot.efficiency.status !== "completed") {
     throw new Error(`${label} Run efficiency evidence is incomplete or mismatched`);
+  }
+  if (requireBudgetProfile) {
+    validateBudgetProfile(
+      snapshot.budgetProfile,
+      status,
+      snapshot.efficiency,
+      `${label}.budgetProfile`,
+    );
+  } else if (snapshot.budgetProfile !== undefined) {
+    validateBudgetProfile(
+      snapshot.budgetProfile,
+      status,
+      snapshot.efficiency,
+      `${label}.budgetProfile`,
+    );
   }
   const projectState = snapshot.projectState;
   const stateKind = projectState?.stateKind || "published_version";
@@ -165,8 +255,13 @@ function stableSnapshot(snapshot) {
 }
 
 export function createRuntimeRestartEvidence(metadata, before, after) {
+  const beforeSnapshot = structuredClone(before);
+  const afterSnapshot = structuredClone(after);
+  const cleanup = afterSnapshot.sandboxRelease || null;
+  delete beforeSnapshot.sandboxRelease;
+  delete afterSnapshot.sandboxRelease;
   const evidence = {
-    schemaVersion: EVIDENCE_SCHEMA,
+    schemaVersion: cleanup ? EVIDENCE_SCHEMA_V2 : EVIDENCE_SCHEMA,
     recordedAt: metadata.recordedAt,
     side: metadata.side,
     deployment: metadata.deployment,
@@ -177,8 +272,9 @@ export function createRuntimeRestartEvidence(metadata, before, after) {
     restartDurationMs: metadata.restartDurationMs,
     podBefore: metadata.podBefore,
     podAfter: metadata.podAfter,
-    before,
-    after,
+    before: beforeSnapshot,
+    after: afterSnapshot,
+    cleanup,
     verification: {
       podUidChanged: metadata.podBefore?.uid !== metadata.podAfter?.uid,
       deploymentIdentityPreserved: metadata.deploymentUid === metadata.deploymentUidAfter
@@ -187,6 +283,13 @@ export function createRuntimeRestartEvidence(metadata, before, after) {
       runtimeReadyAfterRestart: after?.healthReady === true,
       generationContextIdentityPreserved:
         canonical(before?.generationContextStatus) === canonical(after?.generationContextStatus),
+      budgetProfileIdentityPreserved:
+        before?.generationContextStatus?.budgetProfileId
+          === after?.generationContextStatus?.budgetProfileId
+        && before?.generationContextStatus?.budgetProfileHash
+          === after?.generationContextStatus?.budgetProfileHash
+        && before?.generationContextStatus?.budgetProfileRolloutMode
+          === after?.generationContextStatus?.budgetProfileRolloutMode,
       workflowStatePreserved:
         before?.generationContextStatus?.workflowState === after?.generationContextStatus?.workflowState,
       runMetricsPreserved: canonical(before?.efficiency) === canonical(after?.efficiency),
@@ -223,8 +326,16 @@ export function createRuntimeRestartEvidence(metadata, before, after) {
 
 export function validateRuntimeRestartEvidence(evidence, expected) {
   rejectSensitiveValues(evidence);
-  if (evidence?.schemaVersion !== EVIDENCE_SCHEMA) {
-    throw new Error(`restart evidence schema must be ${EVIDENCE_SCHEMA}`);
+  if (!new Set([EVIDENCE_SCHEMA, EVIDENCE_SCHEMA_V2]).has(evidence?.schemaVersion)) {
+    throw new Error(`restart evidence schema must be ${EVIDENCE_SCHEMA} or ${EVIDENCE_SCHEMA_V2}`);
+  }
+  if (evidence.schemaVersion === EVIDENCE_SCHEMA_V2
+    && (evidence.cleanup?.required !== true
+      || evidence.cleanup?.released !== true
+      || evidence.cleanup?.requiredSuccessfulResponses !== 2
+      || !Array.isArray(evidence.cleanup?.attempts)
+      || evidence.cleanup.attempts.filter((attempt) => attempt.ok === true).length < 2)) {
+    throw new Error("restart evidence v2 must prove confirmed Sandbox release");
   }
   if (!ISO_TIMESTAMP.test(evidence.recordedAt || "")) {
     throw new Error("restart evidence recordedAt must be an ISO UTC timestamp");
@@ -252,8 +363,9 @@ export function validateRuntimeRestartEvidence(evidence, expected) {
   if (evidence.podBefore.uid === evidence.podAfter.uid) {
     throw new Error("restart evidence must replace the Runtime Pod UID");
   }
-  validateSnapshot(evidence.before, "restartEvidence.before", evidence.side);
-  validateSnapshot(evidence.after, "restartEvidence.after", evidence.side);
+  const requireBudgetProfile = evidence.schemaVersion === EVIDENCE_SCHEMA_V2;
+  validateSnapshot(evidence.before, "restartEvidence.before", evidence.side, requireBudgetProfile);
+  validateSnapshot(evidence.after, "restartEvidence.after", evidence.side, requireBudgetProfile);
   if (evidence.before.projectId !== expected.projectId
     || evidence.after.projectId !== expected.projectId
     || evidence.before.runId !== expected.runId
@@ -268,6 +380,7 @@ export function validateRuntimeRestartEvidence(evidence, expected) {
     "deploymentIdentityPreserved",
     "runtimeReadyAfterRestart",
     "generationContextIdentityPreserved",
+    "budgetProfileIdentityPreserved",
     "workflowStatePreserved",
     "runMetricsPreserved",
     "projectStatePreserved",

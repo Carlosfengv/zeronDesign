@@ -6,8 +6,10 @@
   "properties": {
     "schemaVersion": { "const": "model-resource@1" },
     "id": { "type": "string" },
+    "providerConnectionId": { "type": "string" },
     "kind": { "enum": ["openai_compatible", "fixture"] },
     "enabled": { "type": "boolean" },
+    "published": { "type": "boolean", "default": true },
     "revision": { "type": "integer", "minimum": 1 },
     "endpoint": { "type": "object" },
     "auth": { "type": "object", "required": ["type", "secretRef"] },

@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { confirmSandboxRelease } from "./sandbox-release-confirmation.mjs";
 
 const [
   baseUrl,
@@ -236,7 +237,7 @@ async function readProjectState(history) {
   };
 }
 
-async function releaseSandbox() {
+async function releaseSandboxOnce() {
   const response = await fetch(
     new URL(`/internal/projects/${encodeURIComponent(projectId)}/release-sandbox`, baseUrl),
     {
@@ -250,8 +251,10 @@ async function releaseSandbox() {
   );
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`release sandbox returned ${response.status}: ${body.slice(0, 300)}`);
+    return { ok: false, status: response.status, error: `http_${response.status}` };
   }
+  await response.text();
+  return { ok: true, status: response.status, error: null };
 }
 
 async function main() {
@@ -260,9 +263,10 @@ async function main() {
   });
   if (!healthResponse.ok) throw new Error(`Runtime health returned ${healthResponse.status}`);
 
-  const [generationContextStatus, efficiency, history, releaseEvidence, artifact] =
+  const [generationContextStatus, budgetProfile, efficiency, history, releaseEvidence, artifact] =
     await Promise.all([
       readJson(`/runs/${encodeURIComponent(runId)}/generation-context-status`),
+      readJson(`/runs/${encodeURIComponent(runId)}/budget-profile`),
       readJson(`/runs/${encodeURIComponent(runId)}/efficiency-metrics`),
       readJson(`/projects/${encodeURIComponent(projectId)}/history`),
       readReleaseEvidence(),
@@ -277,6 +281,7 @@ async function main() {
     runId,
     healthReady: true,
     generationContextStatus,
+    budgetProfile,
     efficiency,
     projectState,
     history: {
@@ -287,15 +292,26 @@ async function main() {
     artifact,
   };
 
+  if (process.env.GENERATION_RUNTIME_RESTART_RELEASE_SANDBOX === "1") {
+    snapshot.sandboxRelease = await confirmSandboxRelease({
+      requestRelease: releaseSandboxOnce,
+      maxAttempts: 4,
+      retryCooldownMs: 1_000,
+      requiredSuccessfulResponses: 2,
+    });
+    if (!snapshot.sandboxRelease.released) {
+      throw new Error(
+        `release sandbox failed after ${snapshot.sandboxRelease.attempts.length} attempts`,
+      );
+    }
+  }
+
   fs.mkdirSync(path.dirname(path.resolve(outputFile)), { recursive: true });
   const descriptor = fs.openSync(outputFile, "wx", 0o600);
   try {
     fs.writeFileSync(descriptor, `${JSON.stringify(snapshot, null, 2)}\n`);
   } finally {
     fs.closeSync(descriptor);
-  }
-  if (process.env.GENERATION_RUNTIME_RESTART_RELEASE_SANDBOX === "1") {
-    await releaseSandbox();
   }
 }
 

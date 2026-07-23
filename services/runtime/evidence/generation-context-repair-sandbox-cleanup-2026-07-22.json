@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "generation-context-repair-sandbox-cleanup-summary@1",
+  "recordedAt": "2026-07-22T04:58:34Z",
+  "sourceCommit": "6a5603c0a4649856855e799cff50ea271fe88e7d",
+  "sourceDirty": true,
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "incident": {
+    "pairId": "batch-03-agent-cloud-quickstart-repair",
+    "classification": "sandbox_release_result_ignored",
+    "finding": "the real-provider runner made one best-effort release request in finally, discarded a false result, and could preserve an accepted case while Sandbox resources remained",
+    "residualResources": [
+      {
+        "kind": "SandboxClaim",
+        "namespace": "ws-runtime-rc",
+        "name": "project-real-20260722042345-agent-cloud-quicks-sandbox-16308995",
+        "deleted": true
+      },
+      {
+        "kind": "SandboxClaim",
+        "namespace": "ws-runtime-rc",
+        "name": "project-real-20260722043249-agent-cloud-quickst-sandbox-9603305",
+        "deleted": true
+      }
+    ],
+    "persistentPairEvidenceModified": false,
+    "paidProviderRerunRequired": false
+  },
+  "remediation": {
+    "maximumReleaseAttempts": 3,
+    "defaultRetryCooldownMs": 1000,
+    "retryIsBounded": true,
+    "transientFailureBehavior": "retry release in the same cleanup phase without rerunning the paid model case",
+    "terminalFailureBehavior": "record sandboxRelease attempts and cleanupError; convert an otherwise accepted case to failed with sandbox_release_failed",
+    "primaryFailurePreservation": "when the case already failed or was rejected, preserve its primary error and record cleanupError separately",
+    "keepSandboxBehavior": "explicitly records required=false and performs no release request"
+  },
+  "validation": {
+    "targetedTest": {
+      "command": "node infra/generation-reliability/run-real-provider-examples.test.mjs",
+      "passed": true,
+      "scenarios": [
+        {
+          "name": "sandbox-release-transient-retry",
+          "releaseResponses": [503, 200],
+          "expectedSuiteStatus": "accepted",
+          "passed": true
+        },
+        {
+          "name": "sandbox-release-failure",
+          "releaseResponses": [503, 503, 503],
+          "expectedSuiteStatus": "failed",
+          "expectedClassification": "sandbox_release_failed",
+          "passed": true
+        }
+      ]
+    },
+    "fullContractGate": {
+      "command": "infra/generation-reliability/check-contract.sh",
+      "passed": true
+    },
+    "clusterAfterCleanup": {
+      "context": "k3d-zerondesign-e2e",
+      "sandboxClaimCount": 0,
+      "sandboxCount": 0,
+      "passed": true
+    }
+  },
+  "sourceSha256": {
+    "runner": "fbc25a3a792c8eb641f1540c33d7de6ec4b4a8d9108df27c73daba97a4d31164",
+    "runnerTest": "fb85982065c77878a3319f2410853b0dd01034fd17c77d084405186b550c1439"
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "schemaVersion": "generation-context-first-warm-structural-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T21:58:09.620Z",
+  "sessionId": "deepseek-v4-pro-20260722-runtime-restart-003",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:6a5603c0a464-dirty-bb6cdfe816f4",
+    "dockerImageId": "sha256:03a941f9388064f8c067cf5ed0c38cf888db4e0fb348bb8cb0d9950d07608b75",
+    "controlDeploymentRevision": "9d587988965fa71f6bef35f4e8d0d88c4051526b547035111fa037c416179ab3",
+    "candidateDeploymentRevision": "ada9037081666d450ebddef7bba319918009bc53f578570229db9c3533ec7840"
+  },
+  "pair": {
+    "id": "batch-15-oilfield-operations-dashboard-warm-structural",
+    "batchId": "batch-15",
+    "bucket": "warm_structural",
+    "identity": {
+      "fixtureId": "oilfield-operations-dashboard",
+      "templateVersion": "next-app",
+      "phase": "edit",
+      "lifecycleProfile": "warm_hmr",
+      "warmEditKind": "structural",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "runId": "run-1872",
+      "baseDraftSnapshotId": "draft-snapshot-1856",
+      "durableSnapshotId": "draft-snapshot-1911",
+      "recordHash": "7dcbc88221c9fec294f3bd9bb96827bed3581ba81505efd696c524ec464459b0",
+      "metrics": {
+        "inputTokens": 105275,
+        "outputTokens": 1447,
+        "turns": 7,
+        "toolCalls": 14,
+        "recoverableToolFailures": 1,
+        "totalDurationMs": 36748,
+        "timeToFirstSourceMutationMs": 24358,
+        "modelTurnAtFirstSourceMutation": 4,
+        "timeToIframeAppliedMs": 3827,
+        "timeToDurableSnapshotMs": 24358,
+        "prebuildFsReadCount": 5,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "runId": "run-694",
+      "baseDraftSnapshotId": "draft-snapshot-674",
+      "durableSnapshotId": "draft-snapshot-723",
+      "recordHash": "89b49f242b5c9043010045b2174fed488a3920b2ce65424591c25654fdba28a6",
+      "metrics": {
+        "inputTokens": 64930,
+        "outputTokens": 1201,
+        "turns": 5,
+        "toolCalls": 10,
+        "recoverableToolFailures": 0,
+        "totalDurationMs": 31990,
+        "timeToFirstSourceMutationMs": 19146,
+        "modelTurnAtFirstSourceMutation": 2,
+        "timeToIframeAppliedMs": 3762,
+        "timeToDurableSnapshotMs": 19146,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -38.32,
+      "totalDurationMs": -12.95,
+      "timeToFirstSourceMutationMs": -21.4,
+      "modelTurnAtFirstSourceMutation": -50.0,
+      "timeToIframeAppliedMs": -1.7,
+      "timeToDurableSnapshotMs": -21.4,
+      "prebuildFsReadCount": -80.0
+    },
+    "openFindings": [
+      "candidate timeToIframeAppliedMs was 3762ms, above the Warm Structural P50 target of 2000ms but below the P95 target of 5000ms",
+      "candidate timeToDurableSnapshotMs was 19146ms, above the 5000ms P95 target",
+      "candidate input tokens decreased by 38.32%, below the 50% target, although mutation turn and prebuild read targets improved",
+      "one Warm Structural pair from one batch is below the required 20 pairs across at least three batches"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "pairId": "batch-14-zenova-agent-cloud-warm-structural",
+      "result": "control_base_build_no_progress_candidate_structural_edit_accepted",
+      "findings": [
+        "the control base Build stopped for no_progress before producing lifecycle evidence",
+        "the candidate base Build and Structural Edit completed, but the collector correctly rejected the incomplete pair"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 7,
+    "sampleCount": 6,
+    "completePairCount": 3,
+    "pendingPairCount": 0,
+    "headRecordHash": "89b49f242b5c9043010045b2174fed488a3920b2ce65424591c25654fdba28a6",
+    "sha256": "60dad11882e1edfb479f5d37af06dc4162c428412e531447d1e9d994359ca58e"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmStructuralPairCount": 1,
+    "warmStructuralMinimumPairCount": 20,
+    "warmStructuralBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "58af25f80afa432ed02ef63a449b4473c652a4a1d21d27ccadeb50b43d3a7d6f"
+  },
+  "sourceSha256": {
+    "session": "ff74b14febc2459a491811d123fadea6d232210b1590b10f5fa48ac4454c3a1b",
+    "sessionMeta": "890a7e8ec4a04209f53977b6306b7b36147086771b5ca771c4db9e9bd4dae7fd",
+    "providerReconcile": "fa8e89d1353d6a5ad26cd8b7b8064749e06294ca6d5056d662915638f67be6e3",
+    "controlCase": "95061aaabe15aa73ebc0563ce7a1e6e23922b389e84e8de689fe353d26eb7466",
+    "candidateCase": "95358e3f3a3e1e36969cbd5e99239a4f4e3d74f90c2b92ea3da68d3f11f6b6ac",
+    "pairSpec": "b3fdbffbf481ab4a672c578eb1f731c1d2e228e69afbcec3a6a92c57c2f7a3c1",
+    "pairResult": "b0539d610547c5d8ce35ce1f43b0454c668f57a19d34de42acdecb94729e7ca2",
+    "rolloutEvidence": "58af25f80afa432ed02ef63a449b4473c652a4a1d21d27ccadeb50b43d3a7d6f"
+  }
+}

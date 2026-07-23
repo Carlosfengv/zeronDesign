@@ -25,6 +25,7 @@ const HASH_D = "d".repeat(64);
 const HASH_E = "e".repeat(64);
 const HASH_F = "f".repeat(64);
 const TIMESTAMP = "2026-07-14T00:00:00.000Z";
+const WORKSPACE_NAMESPACE = "ws-bff-smoke";
 
 try {
   runtime = realRuntimeFixtureUrl
@@ -37,18 +38,34 @@ try {
       ...process.env,
       NODE_ENV: "development",
       ZERONDESIGN_DEV_USER_ID: "bff-smoke-owner",
+      ZERONDESIGN_PLATFORM_ADMIN_IDS: "bff-smoke-owner",
       ZERONDESIGN_PRODUCT_DB_PATH: path.join(temporary, "product.sqlite"),
       RUNTIME_BASE_URL: runtime.baseUrl,
+      RUNTIME_INTERNAL_ADMIN_TOKEN:
+        process.env.RUNTIME_INTERNAL_ADMIN_TOKEN || "bff-smoke-internal-token",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const baseUrl = `http://127.0.0.1:${webPort}`;
   await waitFor(`${baseUrl}/api/projects`);
+  await requestJson(`${baseUrl}/api/admin/workspaces`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      namespace: WORKSPACE_NAMESPACE,
+      name: "BFF Smoke",
+      ownerPrincipalId: "bff-smoke-owner",
+    }),
+  });
 
   const created = await requestJson(`${baseUrl}/api/projects`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "DCP BFF smoke", kind: "website" }),
+    body: JSON.stringify({
+      name: "DCP BFF smoke",
+      kind: "website",
+      workspaceNamespace: WORKSPACE_NAMESPACE,
+    }),
   });
   const projectId = created.project.id;
   smokeRuntimeProjectId = projectId;
@@ -62,9 +79,30 @@ try {
     const started = await requestJson(`${baseUrl}/api/projects/${projectId}/build-runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ briefId: "brief-1" }),
+      body: JSON.stringify({ briefId: "brief-1", modelServiceId: "model-service-1" }),
     });
     assert(started.runId === "run-1", "BFF did not record the mocked Build Run");
+    const runtimeStart = runtimeRequests.find(
+      (request) => request.method === "POST" && request.path === "/runs",
+    );
+    assert(
+      runtimeStart?.body?.inputContext?.modelResourceId === "model-service-1",
+      "BFF did not map modelServiceId to Runtime modelResourceId",
+    );
+    const edited = await requestJson(`${baseUrl}/api/projects/${projectId}/edit-runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Use another model", modelServiceId: "model-service-2" }),
+    });
+    assert(edited.runId === "run-edit-1", "BFF did not start the mocked Edit Run");
+    const runtimeEdit = runtimeRequests.find(
+      (request) => request.method === "POST" && request.path === "/runs"
+        && request.body?.phase === "edit",
+    );
+    assert(
+      runtimeEdit?.body?.inputContext?.modelResourceId === "model-service-2",
+      "BFF did not map the replacement modelServiceId for Edit",
+    );
   }
 
   const context = await requestJson(
@@ -141,7 +179,7 @@ try {
     ok: true,
     baseUrl,
     projectId,
-    checks: ["ownership", "dcp-diagnostics", "server-derived-sync-plan", "sync-confirm", "sync-child-run-ownership", ...(realRuntimeFixtureUrl ? ["runtime-writeback", "conflict-resolution", "confirm-replay", "confirm-mismatch-rejected"] : []), ...(browserEvidence ? ["browser-real-runtime-profile-sync"] : [])],
+    checks: ["ownership", "dcp-diagnostics", "server-derived-sync-plan", "sync-confirm", "sync-child-run-ownership", ...(!realRuntimeFixtureUrl ? ["build-model-selection", "edit-model-switch"] : []), ...(realRuntimeFixtureUrl ? ["runtime-writeback", "conflict-resolution", "confirm-replay", "confirm-mismatch-rejected"] : []), ...(browserEvidence ? ["browser-real-runtime-profile-sync"] : [])],
     ...(browserEvidence ? { browserEvidence } : {}),
   }, null, 2));
   if (holdOpenForBrowser) {
@@ -232,10 +270,78 @@ async function startRuntimeMock(requests) {
       return;
     }
     let payload;
-    if (url.pathname === "/briefs/brief-1") {
+    if (request.method === "PUT" && /^\/internal\/projects\/[^/]+\/access$/.test(url.pathname)) {
+      payload = {
+        projectAccess: {
+          projectId,
+          ownerPrincipalId: body.ownerPrincipalId,
+          workspaceNamespace: body.workspaceNamespace,
+          createdAt: TIMESTAMP,
+          updatedAt: TIMESTAMP,
+        },
+      };
+    } else if (request.method === "GET" && url.pathname.endsWith("/model-services")) {
+      payload = {
+        items: [
+          {
+            id: "model-service-1",
+            displayName: "Smoke Model A",
+            description: "BFF model selection fixture",
+            capabilities: {
+              toolCalls: true,
+              strictToolSchema: false,
+              streaming: true,
+              vision: false,
+              visionInput: false,
+              supportedImageMediaTypes: [],
+              maxImageBytes: 0,
+              maxImageCount: 0,
+            },
+            availability: "available",
+          },
+          {
+            id: "model-service-2",
+            displayName: "Smoke Model B",
+            description: "BFF edit model replacement fixture",
+            capabilities: {
+              toolCalls: true,
+              strictToolSchema: false,
+              streaming: true,
+              vision: false,
+              visionInput: false,
+              supportedImageMediaTypes: [],
+              maxImageBytes: 0,
+              maxImageCount: 0,
+            },
+            availability: "available",
+          },
+        ],
+      };
+    } else if (request.method === "GET" && url.pathname.endsWith("/runtime-state")) {
+      payload = {
+        projectId,
+        currentVersionId: "version-1",
+        sandboxBindingId: "sandbox-1",
+        sourceSnapshotUri: "snapshot://version-1",
+        appRoot: "project",
+        templateKey: "next-app",
+        modelServiceId: "model-service-1",
+        modelServiceDisplayName: "Smoke Model A",
+        styleContractPath: null,
+        styleContract: null,
+        latestBuild: null,
+        dependencyState: null,
+        preview: null,
+      };
+    } else if (url.pathname === "/briefs/brief-1") {
       payload = { briefId: "brief-1", projectId: smokeRuntimeProjectId, runId: "brief-run-1", status: "confirmed", runStatus: "completed", brief: { projectType: "website", audience: "test", contentHierarchy: ["hero"], pageStructure: [], visualDirection: "clear", recommendedTemplate: "next-app", assumptions: [], missingInformation: [] } };
     } else if (url.pathname === "/runs" && request.method === "POST") {
-      payload = { runId: "run-1", status: "queued" };
+      payload = {
+        runId: body?.phase === "edit" ? "run-edit-1" : "run-1",
+        status: "queued",
+      };
+    } else if (url.pathname === "/runs/run-edit-1/continue" && request.method === "POST") {
+      payload = { runId: "run-edit-1", status: "running" };
     } else if (url.pathname.endsWith("/design-context-manifest")) {
       payload = { runId: "run-1", package: packageSummary(), artifacts: [] };
     } else if (url.pathname.endsWith("/design-context-diagnostics")) {
@@ -337,7 +443,11 @@ async function exerciseConflictThroughBff({ baseUrl, runtimeBaseUrl, productDbPa
   const created = await requestJson(`${baseUrl}/api/projects`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "DCP BFF conflict", kind: "website" }),
+    body: JSON.stringify({
+      name: "DCP BFF conflict",
+      kind: "website",
+      workspaceNamespace: WORKSPACE_NAMESPACE,
+    }),
   });
   const projectId = created.project.id;
   const seeded = await seedRealRuntime(runtimeBaseUrl, projectId, "conflict");
@@ -390,7 +500,11 @@ async function exerciseConflictThroughBrowser({ baseUrl, runtimeBaseUrl, product
   const created = await requestJson(`${baseUrl}/api/projects`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "DCP browser + real Runtime", kind: "website" }),
+    body: JSON.stringify({
+      name: "DCP browser + real Runtime",
+      kind: "website",
+      workspaceNamespace: WORKSPACE_NAMESPACE,
+    }),
   });
   const projectId = created.project.id;
   const seeded = await seedRealRuntime(runtimeBaseUrl, projectId, "conflict");

@@ -1,4 +1,5 @@
 use anydesign_runtime::{
+    artifact_routes::{ArtifactRouteContract, ArtifactRouteFile, ArtifactRouteManifest},
     config::RuntimePolicyProfile,
     conversation::RuntimeStore,
     draft_preview::StartDraftPreview,
@@ -754,6 +755,51 @@ async fn fs_read_directory_failure_has_structured_metadata() {
     assert!(results[0].result.is_error);
     assert_error_kind(&results[0].result, "fs.read_failed");
     assert!(tool_result_error_text(&results[0].result).contains("/workspace/project/subdir"));
+}
+
+#[tokio::test]
+async fn fs_read_rejects_full_validation_report_but_allows_bounded_repair_context() {
+    let workspace = setup_workspace();
+    fs::write(
+        workspace.join("state/validation-report.json"),
+        json!({ "candidateManifest": { "files": vec!["large"; 100] } }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("state/repair-context.json"),
+        json!({ "schemaVersion": "generation-repair-context@1", "targetFiles": ["project/app/page.tsx"] }).to_string(),
+    )
+    .unwrap();
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = sandbox_executor(&workspace);
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "read-repair-context",
+                    "fs.read",
+                    json!({ "path": "state/repair-context.json" }),
+                ),
+                ToolCall::new(
+                    "read-full-validation",
+                    "fs.read",
+                    json!({ "path": "state/validation-report.json" }),
+                ),
+            ],
+        )
+        .await;
+
+    assert!(!results[0].result.is_error);
+    assert!(results[0].result.content["text"]
+        .as_str()
+        .unwrap()
+        .contains("generation-repair-context@1"));
+    assert!(results[1].result.is_error);
+    assert_error_kind(&results[1].result, "generation.repair_context_required");
 }
 
 #[tokio::test]
@@ -2416,6 +2462,12 @@ async fn project_init_fumadocs_docs_writes_docs_source_contract() {
         serde_json::from_str(&fs::read_to_string(workspace.join("state/project.json")).unwrap())
             .unwrap();
     assert_eq!(state["templateKey"], "fumadocs-docs");
+    assert_eq!(state["templateVersion"], "fumadocs-docs@runtime-p7");
+    assert!(
+        fs::read_to_string(workspace.join("project/next.config.mjs"))
+            .unwrap()
+            .contains("trailingSlash: true")
+    );
     let global_css = fs::read_to_string(workspace.join("project/app/global.css")).unwrap();
     assert!(global_css.contains("@import 'tailwindcss'"));
     assert!(global_css.contains("@import './tokens.css'"));
@@ -2755,6 +2807,24 @@ async fn project_build_accepts_valid_fumadocs_docs_source_contract() {
     assert!(results[1].result.content["candidateManifestHash"]
         .as_str()
         .is_some_and(|hash| hash.len() == 64));
+    assert!(results[1].result.content["artifactRouteManifestHash"]
+        .as_str()
+        .is_some_and(|hash| hash.len() == 64));
+    let route_manifest_path = results[1].result.content["artifactRouteManifestPath"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("/workspace/");
+    let route_manifest: Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join(route_manifest_path)).unwrap())
+            .unwrap();
+    assert_eq!(route_manifest["schemaVersion"], "artifact-route-manifest@1");
+    assert_eq!(route_manifest["entryRoute"], "/docs/");
+    assert_eq!(route_manifest["canonicalPolicy"], "trailing_slash");
+    assert_eq!(
+        route_manifest["routes"]["/docs/"]["file"],
+        "docs/index.html"
+    );
+    assert_eq!(route_manifest["aliases"]["/docs"], "/docs/");
     let requests = transport.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| {
         request.op == "process.exec"
@@ -2763,6 +2833,57 @@ async fn project_build_accepts_valid_fumadocs_docs_source_contract() {
                 .as_array()
                 .is_some_and(|argv| argv[0] == "npm" && argv[1] == "run" && argv[2] == "build")
     }));
+}
+
+#[tokio::test]
+async fn project_build_rejects_ambiguous_fumadocs_artifact_routes() {
+    let workspace = setup_workspace();
+    fs::create_dir_all(workspace.join("project/out/docs")).unwrap();
+    fs::write(workspace.join("project/out/docs.html"), "legacy docs").unwrap();
+    fs::write(
+        workspace.join("project/out/docs/index.html"),
+        "canonical docs",
+    )
+    .unwrap();
+    let transport = RecordingChannelTransport::default();
+    let command_backend = JsonWorkspaceChannelCommandBackend::new(transport, &workspace);
+    let store = RuntimeStore::new();
+    let run_id = create_run(&store).await;
+    let executor = StreamingToolExecutor::new(ToolExecutor::new_with_workspace_root(
+        sandbox_tools_with_backends(Arc::new(LocalWorkspaceBackend), Arc::new(command_backend)),
+        Default::default(),
+        &workspace,
+    ));
+
+    let results = executor
+        .execute_calls(
+            store,
+            &run_id,
+            vec![
+                ToolCall::new(
+                    "tool-init-docs-ambiguous",
+                    "project.init",
+                    json!({ "template": "fumadocs-docs" }),
+                ),
+                ToolCall::new(
+                    "tool-build-docs-ambiguous",
+                    "project.build",
+                    json!({ "cwd": "project" }),
+                ),
+            ],
+        )
+        .await;
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].result.is_error);
+    assert!(results[1].result.is_error);
+    assert_error_kind(&results[1].result, "artifact.route_ambiguous");
+    assert_eq!(
+        fs::read_dir(workspace.join("outputs/candidates"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -4178,18 +4299,44 @@ async fn static_preview_server_serves_only_frozen_candidate_snapshots() {
     let workspace = setup_workspace();
     let candidate = workspace.join("outputs/candidates/build-preview-test");
     fs::create_dir_all(candidate.join("docs")).unwrap();
-    fs::write(
-        candidate.join("index.html"),
-        "<!doctype html><h1>Frozen candidate</h1>",
+    let root_bytes = b"<!doctype html><h1>Frozen candidate</h1>";
+    let docs_bytes = b"<h1>Docs route</h1>";
+    fs::write(candidate.join("index.html"), root_bytes).unwrap();
+    fs::write(candidate.join("docs/index.html"), docs_bytes).unwrap();
+    let route_manifest = ArtifactRouteManifest::build(
+        "build-preview-test",
+        &ArtifactRouteContract {
+            entry_route: "/".to_string(),
+            canonical_policy: anydesign_runtime::artifact_routes::RoutePolicy::TrailingSlash,
+        },
+        [
+            ArtifactRouteFile {
+                path: "index.html".to_string(),
+                sha256: sha256_hex(root_bytes),
+            },
+            ArtifactRouteFile {
+                path: "docs/index.html".to_string(),
+                sha256: sha256_hex(docs_bytes),
+            },
+        ],
     )
     .unwrap();
-    fs::write(candidate.join("docs/index.html"), "<h1>Docs route</h1>").unwrap();
+    let route_manifest_text = serde_json::to_string_pretty(&route_manifest).unwrap();
+    let route_manifest_hash = sha256_hex(route_manifest_text.as_bytes());
+    fs::write(
+        candidate.join(".anydesign-artifact-routes.json"),
+        &route_manifest_text,
+    )
+    .unwrap();
     let manifest = serde_json::to_string_pretty(&json!({
         "schemaVersion": "candidate-manifest@1",
         "buildId": "build-preview-test",
+        "artifactRouteManifestPath": ".anydesign-artifact-routes.json",
+        "artifactRouteManifestHash": route_manifest_hash,
         "files": [
-            { "path": "docs/index.html", "bytes": 19, "sha256": "fixture" },
-            { "path": "index.html", "bytes": 40, "sha256": "fixture" }
+            { "path": ".anydesign-artifact-routes.json", "bytes": route_manifest_text.len(), "sha256": route_manifest_hash },
+            { "path": "docs/index.html", "bytes": docs_bytes.len(), "sha256": sha256_hex(docs_bytes) },
+            { "path": "index.html", "bytes": root_bytes.len(), "sha256": sha256_hex(root_bytes) }
         ]
     }))
     .unwrap();
@@ -4235,7 +4382,23 @@ async fn static_preview_server_serves_only_frozen_candidate_snapshots() {
         .await
         .unwrap();
     assert_eq!(docs.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        docs.headers()["x-anydesign-artifact-path"],
+        "docs/index.html"
+    );
     assert!(docs.text().await.unwrap().contains("Docs route"));
+    let docs_slash = client
+        .head(format!(
+            "http://127.0.0.1:{port}/candidates/build-preview-test/docs/"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(docs_slash.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        docs_slash.headers()["x-anydesign-artifact-sha256"],
+        sha256_hex(docs_bytes)
+    );
     let mutable_project = client
         .get(format!("http://127.0.0.1:{port}/project/index.html"))
         .send()
@@ -6018,13 +6181,15 @@ async fn next_app_p1_registry_and_project_assets_are_hash_pinned_and_local() {
 #[tokio::test]
 async fn preview_start_spawns_static_server_from_dist() {
     let workspace = setup_workspace();
-    write_successful_build_state(&workspace);
-    fs::create_dir_all(workspace.join("project/dist")).unwrap();
-    fs::write(
-        workspace.join("project/dist/index.html"),
-        "<!doctype html><title>Preview</title><h1>Ready</h1>",
-    )
-    .unwrap();
+    write_frozen_candidate_build_state(
+        &workspace,
+        "build-preview-dist",
+        ArtifactRouteContract::website(),
+        &[(
+            "index.html",
+            "<!doctype html><title>Preview</title><h1>Ready</h1>",
+        )],
+    );
     let port = free_tcp_port();
     let preview_url = format!("http://127.0.0.1:{port}");
     let store = RuntimeStore::new();
@@ -6057,9 +6222,12 @@ async fn preview_start_spawns_static_server_from_dist() {
 #[tokio::test]
 async fn managed_preview_restart_uses_fresh_port_and_latest_static_output() {
     let workspace = setup_workspace();
-    write_successful_build_state(&workspace);
-    fs::create_dir_all(workspace.join("project/dist")).unwrap();
-    fs::write(workspace.join("project/dist/index.html"), "first build").unwrap();
+    write_frozen_candidate_build_state(
+        &workspace,
+        "build-preview-first",
+        ArtifactRouteContract::website(),
+        &[("index.html", "first build")],
+    );
     let store = RuntimeStore::new();
     let run_id = create_run(&store).await;
     let executor = sandbox_executor(&workspace);
@@ -6083,7 +6251,12 @@ async fn managed_preview_restart_uses_fresh_port_and_latest_static_output() {
         "first build"
     );
 
-    fs::write(workspace.join("project/dist/index.html"), "second build").unwrap();
+    write_frozen_candidate_build_state(
+        &workspace,
+        "build-preview-second",
+        ArtifactRouteContract::website(),
+        &[("index.html", "second build")],
+    );
     let second = executor
         .execute_calls(
             store.clone(),
@@ -6120,7 +6293,6 @@ async fn managed_preview_restart_uses_fresh_port_and_latest_static_output() {
 #[tokio::test]
 async fn preview_start_spawns_static_server_from_fumadocs_out() {
     let workspace = setup_workspace();
-    write_successful_build_state(&workspace);
     fs::write(
         workspace.join("state/project.json"),
         json!({
@@ -6131,12 +6303,15 @@ async fn preview_start_spawns_static_server_from_fumadocs_out() {
         .to_string(),
     )
     .unwrap();
-    fs::create_dir_all(workspace.join("project/out")).unwrap();
-    fs::write(
-        workspace.join("project/out/index.html"),
-        "<!doctype html><title>Docs</title><h1>Docs Ready</h1>",
-    )
-    .unwrap();
+    write_frozen_candidate_build_state(
+        &workspace,
+        "build-preview-docs",
+        ArtifactRouteContract::docs(),
+        &[(
+            "docs/index.html",
+            "<!doctype html><title>Docs</title><h1>Docs Ready</h1>",
+        )],
+    );
     let port = free_tcp_port();
     let preview_url = format!("http://127.0.0.1:{port}");
     let store = RuntimeStore::new();
@@ -6163,13 +6338,13 @@ async fn preview_start_spawns_static_server_from_fumadocs_out() {
     assert_eq!(results[0].result.content["accessible"], true);
     assert_eq!(
         results[0].result.content["staticOutputPath"],
-        "/workspace/project/out"
+        "/workspace/outputs/candidates/build-preview-docs"
     );
     assert_eq!(results[1].result.content["status"], "stopped");
 }
 
 #[tokio::test]
-async fn preview_start_requires_dist_when_it_must_manage_server() {
+async fn preview_start_requires_frozen_candidate_when_it_must_manage_server() {
     let workspace = setup_workspace();
     write_successful_build_state(&workspace);
     let store = RuntimeStore::new();
@@ -6189,7 +6364,7 @@ async fn preview_start_requires_dist_when_it_must_manage_server() {
         .await;
 
     assert!(results[0].result.is_error);
-    assert!(tool_result_error_text(&results[0].result).contains("missing dist"));
+    assert!(tool_result_error_text(&results[0].result).contains("buildId evidence"));
     assert!(!workspace.join("state/preview.json").exists());
 }
 
@@ -6479,6 +6654,76 @@ fn write_successful_build_state(workspace: &Path) {
             "logPath": "/workspace/outputs/build/build.log"
         })
         .to_string(),
+    )
+    .unwrap();
+}
+
+fn write_frozen_candidate_build_state(
+    workspace: &Path,
+    build_id: &str,
+    contract: ArtifactRouteContract,
+    files: &[(&str, &str)],
+) {
+    let candidate = workspace.join("outputs/candidates").join(build_id);
+    fs::create_dir_all(&candidate).unwrap();
+    let mut route_files = Vec::new();
+    let mut manifest_files = Vec::new();
+    for (path, content) in files {
+        let output = candidate.join(path);
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, content).unwrap();
+        let hash = sha256_hex(content.as_bytes());
+        route_files.push(ArtifactRouteFile {
+            path: (*path).to_string(),
+            sha256: hash.clone(),
+        });
+        manifest_files.push(json!({
+            "path": path,
+            "bytes": content.len(),
+            "sha256": hash,
+        }));
+    }
+    let route_manifest = ArtifactRouteManifest::build(build_id, &contract, route_files).unwrap();
+    let route_manifest_text = serde_json::to_string_pretty(&route_manifest).unwrap();
+    let route_manifest_hash = sha256_hex(route_manifest_text.as_bytes());
+    fs::write(
+        candidate.join(".anydesign-artifact-routes.json"),
+        &route_manifest_text,
+    )
+    .unwrap();
+    manifest_files.push(json!({
+        "path": ".anydesign-artifact-routes.json",
+        "bytes": route_manifest_text.len(),
+        "sha256": route_manifest_hash,
+    }));
+    manifest_files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    let candidate_manifest = serde_json::to_string_pretty(&json!({
+        "schemaVersion": "candidate-manifest@1",
+        "buildId": build_id,
+        "artifactRouteManifestPath": ".anydesign-artifact-routes.json",
+        "artifactRouteManifestHash": route_manifest_hash,
+        "files": manifest_files,
+    }))
+    .unwrap();
+    let candidate_manifest_hash = sha256_hex(candidate_manifest.as_bytes());
+    fs::write(
+        candidate.join(".anydesign-candidate-manifest.json"),
+        candidate_manifest,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("outputs/build/latest.json"),
+        serde_json::to_string_pretty(&json!({
+            "buildId": build_id,
+            "status": "success",
+            "success": true,
+            "cwd": "/workspace/project",
+            "candidateOutputPath": format!("/workspace/outputs/candidates/{build_id}"),
+            "candidateManifestHash": candidate_manifest_hash,
+            "artifactRouteManifestPath": format!("/workspace/outputs/candidates/{build_id}/.anydesign-artifact-routes.json"),
+            "artifactRouteManifestHash": route_manifest_hash,
+        }))
+        .unwrap(),
     )
     .unwrap();
 }

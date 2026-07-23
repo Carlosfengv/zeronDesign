@@ -1,0 +1,183 @@
+{
+  "schemaVersion": "generation-context-first-next-runtime-restart-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T21:42:29.275Z",
+  "sessionId": "deepseek-v4-pro-20260722-runtime-restart-003",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:6a5603c0a464-dirty-bb6cdfe816f4",
+    "dockerImageId": "sha256:03a941f9388064f8c067cf5ed0c38cf888db4e0fb348bb8cb0d9950d07608b75",
+    "controlDeploymentRevision": "9d587988965fa71f6bef35f4e8d0d88c4051526b547035111fa037c416179ab3",
+    "candidateDeploymentRevision": "ada9037081666d450ebddef7bba319918009bc53f578570229db9c3533ec7840"
+  },
+  "pair": {
+    "id": "batch-13-oilfield-operations-dashboard-greenfield",
+    "batchId": "batch-13",
+    "bucket": "greenfield",
+    "identity": {
+      "fixtureId": "oilfield-operations-dashboard",
+      "templateVersion": "next-app",
+      "phase": "build",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-1236",
+      "recordHash": "981d70bfaa42dea59e2b29b4b6b730175155a1dc025f50b9fac3f496cbf03046",
+      "metrics": {
+        "inputTokens": 257624,
+        "totalDurationMs": 145173,
+        "timeToFirstGreenfieldBuildMs": 132093,
+        "timeToFirstSourceMutationMs": 37509,
+        "modelTurnAtFirstSourceMutation": 8,
+        "prebuildFsReadCount": 8,
+        "prebuildFsListCount": 3,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 834,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": true
+      },
+      "runtimeRestart": {
+        "status": "accepted",
+        "stateKind": "durable_draft",
+        "restartDurationMs": 3376,
+        "runContractVersion": "legacy@1",
+        "generationContextStatus": "not_compiled",
+        "workflowState": "draft_ready",
+        "podUidChanged": true,
+        "durableDraftIdentityPreserved": true,
+        "semanticArtifactPreserved": true,
+        "artifactBodySha256Preserved": false,
+        "allRecoveryInvariantsPassed": true,
+        "evidenceSha256": "73907de482fd7f8e35165fe52321fe6e843267b6eff6d34e612510b249c431e2"
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-220",
+      "contextContentHash": "5b59cc23a2baa8caee164d73058acd24a231f9d96e500486c4c23662028b1666",
+      "runContextBindingHash": "2d6d88a5dab4bd81740918af9b8d9ab2278714c78e7ebb213da9d769db892026",
+      "runtimeAttestationHash": "96d3e0e140dce3ccfd301f639bd332808c4aec81743075c9842c53c6ed3f2e17",
+      "recordHash": "a463f85e3f568a25fcafe06e6e7f75d53843e76bb832a125aae61e87232e00e9",
+      "metrics": {
+        "inputTokens": 214595,
+        "totalDurationMs": 153550,
+        "timeToFirstGreenfieldBuildMs": 138380,
+        "timeToDurableSnapshotMs": 145655,
+        "timeToFirstSourceMutationMs": 25489,
+        "modelTurnAtFirstSourceMutation": 3,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": true
+      },
+      "runtimeRestart": {
+        "status": "accepted",
+        "stateKind": "durable_draft",
+        "restartDurationMs": 2326,
+        "runContractVersion": "generation-context@1",
+        "generationContextStatus": "compiled",
+        "runtimeMode": "enabled",
+        "executionProfile": "greenfield_static",
+        "workflowState": "draft_ready",
+        "podUidChanged": true,
+        "durableDraftIdentityPreserved": true,
+        "semanticArtifactPreserved": true,
+        "artifactBodySha256Preserved": true,
+        "allRecoveryInvariantsPassed": true,
+        "evidenceSha256": "9afa36a5e9cf53c3c59ce593d998ccad438d48f7752611176f722a4ce63e6db4"
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -16.7,
+      "totalDurationMs": 5.77,
+      "timeToFirstGreenfieldBuildMs": 4.76,
+      "timeToFirstSourceMutationMs": -32.05,
+      "modelTurnAtFirstSourceMutation": -62.5,
+      "prebuildFsReadCount": -87.5,
+      "prebuildFsListCount": -100.0,
+      "duplicateFullReadRateBasisPoints": -100.0
+    },
+    "coverage": {
+      "nextTemplate": true,
+      "runtimeRestart": true
+    },
+    "cleanup": {
+      "sandboxClaimAbsent": true,
+      "sandboxPodAbsent": true
+    },
+    "openFindings": [
+      "the first accepted Next Runtime Restart pair proves Durable DraftSnapshot and Preview Lease recovery, but one Next restart pair from one batch is below the required multi-batch stability evidence",
+      "candidate input tokens, mutation turn, mutation latency, reads, lists, and duplicate-read rate improved, but total duration increased by 5.77% and time to first Greenfield Build increased by 4.76%",
+      "candidate input-token reduction was 16.70%, below the 50% target, and its durable snapshot took 145655ms, above the 5000ms P95 target",
+      "Next Dev HTML can contain dynamic Runtime fragments; Published Version evidence remains byte-exact, while Draft Preview recovery binds the frozen source snapshot, DraftSnapshot, Preview Lease, history, HTTP 200, and acceptance marker and records body SHA equality as a non-blocking observation"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "pairId": "batch-11-zenova-agent-cloud-greenfield",
+      "result": "control_acceptance_rejected_candidate_not_run",
+      "findings": [
+        "the real legacy Build and Dev Preview completed but retained the default landing page and omitted the frozen acceptance marker"
+      ]
+    },
+    {
+      "pairId": "batch-12-oilfield-operations-dashboard-greenfield",
+      "result": "control_restart_semantic_reclassification_candidate_not_run",
+      "findings": [
+        "the durable DraftSnapshot, Preview Lease, history, marker, and response size were stable while only the live Next Dev HTML body SHA changed across requests"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 5,
+    "sampleCount": 4,
+    "completePairCount": 2,
+    "pendingPairCount": 0,
+    "headRecordHash": "a463f85e3f568a25fcafe06e6e7f75d53843e76bb832a125aae61e87232e00e9",
+    "sha256": "c250f66b54b8c7410be696eae0b2e2aaea16de040ea48f6721f9a3b0d03b3cc1"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "nextTemplate": true,
+    "fumadocsTemplate": true,
+    "runtimeRestart": true,
+    "multimodalVisualDelivered": false,
+    "nonVisualUnavailableMainTaskPassed": false,
+    "greenfieldPairCount": 2,
+    "greenfieldMinimumPairCount": 20,
+    "greenfieldBatchCount": 2,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "cb0d2efa5229e465f58bdb77e2a857b0ba77ede8978257b6576a7638fabac9c9"
+  },
+  "sourceSha256": {
+    "session": "ff74b14febc2459a491811d123fadea6d232210b1590b10f5fa48ac4454c3a1b",
+    "sessionMeta": "890a7e8ec4a04209f53977b6306b7b36147086771b5ca771c4db9e9bd4dae7fd",
+    "providerReconcile": "fa8e89d1353d6a5ad26cd8b7b8064749e06294ca6d5056d662915638f67be6e3",
+    "controlCase": "481c777b2811be61971465bbcebfb2808dcba00194ba5b0f2ad3e1e7e8b88223",
+    "candidateCase": "e859353f4a6fc693f09c9fde94d2e1f1f1340f9c97877bb8e7ef47f90fafd63f",
+    "pairSpec": "76060555f36d2a54523d50b608ad2e2232018471f7ca36625fa713a6e0579f63",
+    "pairResult": "7be4e6d23cc302a6abd4530ca8b83f5116bdd19495f37ac53a420b127a0e657f",
+    "controlRuntimeRestart": "e335fe4566550275db76218dfcc9198d1d78c0b3be3c2dc49beddec89275b7f9",
+    "candidateRuntimeRestart": "abafdc3ec69a47a3214b64295144bd72663f5a6302988fe1f16ca7cdc033c9fb",
+    "rolloutEvidence": "cb0d2efa5229e465f58bdb77e2a857b0ba77ede8978257b6576a7638fabac9c9"
+  }
+}

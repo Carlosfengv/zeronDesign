@@ -2,6 +2,7 @@
 
 import {
   AgentEventSchema,
+  type AvailableModelService,
   type BriefResponse,
   type ConversationItem,
   type DeploymentStateResponse,
@@ -12,6 +13,8 @@ import {
   type ProfileTokenSyncOperationResponse,
   type ProjectDesignProfileResponse,
   type ReleasePackagingResponse,
+  type RunModelUsage,
+  type RunPromptEfficiency,
   type WorkRelease,
 } from "@zerondesign/shared";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
@@ -125,6 +128,10 @@ export function ProjectShell() {
   const [designContext, setDesignContext] = useState<DesignContextSnapshot | null>(null);
   const [designProfiles, setDesignProfiles] = useState<DesignProfileRecord[]>([]);
   const [boundDesignProfile, setBoundDesignProfile] = useState<DesignProfile | null>(null);
+  const [modelServices, setModelServices] = useState<AvailableModelService[]>([]);
+  const [modelServiceId, setModelServiceId] = useState("");
+  const [runModelUsage, setRunModelUsage] = useState<RunModelUsage | null>(null);
+  const [runPromptEfficiency, setRunPromptEfficiency] = useState<RunPromptEfficiency | null>(null);
   const [profileSync, setProfileSync] = useState<ProfileTokenSyncOperationResponse | null>(null);
   const [conflictDecisions, setConflictDecisions] = useState<Record<string, "keep_current" | "apply_target">>({});
   const [publishing, setPublishing] = useState(false);
@@ -192,6 +199,46 @@ export function ProjectShell() {
     }
   }, []);
 
+  const loadModelServices = useCallback(async (project: Project, phase: "build" | "edit") => {
+    const response = await fetch(
+      `/api/projects/${project.id}/model-services?phase=${phase}`,
+      { cache: "no-store" },
+    );
+    if (!response.ok) {
+      setModelServices([]);
+      setModelServiceId("");
+      return;
+    }
+    const payload = await response.json() as {
+      items: AvailableModelService[];
+      defaultModelServiceId: string | null;
+    };
+    setModelServices(payload.items);
+    setModelServiceId((current) => {
+      if (phase === "edit") {
+        const inherited = payload.defaultModelServiceId;
+        return inherited && payload.items.some((item) => item.id === inherited) ? inherited : "";
+      }
+      if (current && payload.items.some((item) => item.id === current)) return current;
+      return payload.items[0]?.id ?? "";
+    });
+  }, []);
+
+  const loadRunModelUsage = useCallback(async (project: Project, runId: string) => {
+    const [usageResponse, efficiencyResponse] = await Promise.all([
+      fetch(
+        `/api/projects/${project.id}/runs/${encodeURIComponent(runId)}/model-usage`,
+        { cache: "no-store" },
+      ),
+      fetch(
+        `/api/projects/${project.id}/runs/${encodeURIComponent(runId)}/prompt-efficiency`,
+        { cache: "no-store" },
+      ),
+    ]);
+    if (usageResponse.ok) setRunModelUsage(await usageResponse.json());
+    if (efficiencyResponse.ok) setRunPromptEfficiency(await efficiencyResponse.json());
+  }, []);
+
   const connectEvents = useCallback((project: Project, runId: string) => {
     eventSource.current?.close();
     setActiveRunId(runId);
@@ -220,11 +267,12 @@ export function ProjectShell() {
         setMessage(event.summary || `Run ${event.status}`);
         setActiveRunId(null);
         source.close();
+        void loadRunModelUsage(project, runId);
       }
       void loadConversation(project);
     };
     source.onerror = () => setMessage("事件流已断开，正在自动重连…");
-  }, [loadConversation, loadPreview, loadVersions]);
+  }, [loadConversation, loadPreview, loadRunModelUsage, loadVersions]);
 
   useEffect(() => {
     void Promise.all([
@@ -253,6 +301,10 @@ export function ProjectShell() {
     setDesignContext(null);
     setDesignProfiles([]);
     setBoundDesignProfile(null);
+    setModelServices([]);
+    setModelServiceId("");
+    setRunModelUsage(null);
+    setRunPromptEfficiency(null);
     setProfileSync(null);
     setConflictDecisions({});
     if (!selected) return;
@@ -263,7 +315,13 @@ export function ProjectShell() {
     void loadDesignProfiles(selected);
     if (selected.latestRunId) connectEvents(selected, selected.latestRunId);
     if (selected.latestRunId) void loadDesignContext(selected, selected.latestRunId);
-  }, [connectEvents, loadConversation, loadDesignContext, loadDesignProfiles, loadPreview, loadPublication, loadVersions, selected]);
+    if (selected.latestRunId) void loadRunModelUsage(selected, selected.latestRunId);
+  }, [connectEvents, loadConversation, loadDesignContext, loadDesignProfiles, loadPreview, loadPublication, loadRunModelUsage, loadVersions, selected]);
+
+  useEffect(() => {
+    if (!selected) return;
+    void loadModelServices(selected, preview ? "edit" : "build");
+  }, [loadModelServices, preview, selected]);
 
   useEffect(() => {
     if (!selected || !activeRunId) return;
@@ -348,12 +406,12 @@ export function ProjectShell() {
   }
 
   async function startBuild() {
-    if (!brief || !selected) return;
+    if (!brief || !selected || !modelServiceId) return;
     setMessage("正在启动 Build Run…");
     const response = await fetch(`/api/projects/${selected.id}/build-runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ briefId: brief.briefId }),
+      body: JSON.stringify({ briefId: brief.briefId, modelServiceId }),
     });
     const payload = await response.json();
     if (!response.ok) return setMessage(payload.error);
@@ -365,12 +423,12 @@ export function ProjectShell() {
 
   async function startEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selected || !preview) return;
+    if (!selected || !preview || !modelServiceId) return;
     setMessage("正在恢复当前版本并启动 Edit Run…");
     const response = await fetch(`/api/projects/${selected.id}/edit-runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: prompt }),
+      body: JSON.stringify({ message: prompt, modelServiceId }),
     });
     const payload = await response.json();
     if (!response.ok) return setMessage(payload.error);
@@ -650,7 +708,22 @@ export function ProjectShell() {
               {conversation.map((item) => item.kind === "permission_requested" && !resolvedPermissionIds.has(permissionIdFromItem(item) ?? "") && selected
                 ? <PermissionCard item={item} key={item.id} projectId={selected.id} onResolved={permissionResolved} />
                 : <article className={`message ${item.role ?? "system"}`} key={item.id}><small>{item.role ?? item.kind}</small><p>{item.text}</p></article>)}
-              {brief && <article className="brief-card"><small>STRUCTURED BRIEF · {brief.status}</small><h3>{brief.brief.projectType} / {brief.brief.recommendedTemplate}</h3><p>{brief.brief.visualDirection}</p><p>受众：{brief.brief.audience}</p>{brief.status === "draft" && <button disabled={Boolean(activeRunId && activeRunId !== brief.runId)} onClick={confirmBrief}>确认 Brief</button>}{brief.status === "confirmed" && <button disabled={Boolean(activeRunId)} onClick={startBuild}>开始 Build</button>}</article>}
+              {brief && <article className="brief-card"><small>STRUCTURED BRIEF · {brief.status}</small><h3>{brief.brief.projectType} / {brief.brief.recommendedTemplate}</h3><p>{brief.brief.visualDirection}</p><p>受众：{brief.brief.audience}</p>{brief.status === "draft" && <button disabled={Boolean(activeRunId && activeRunId !== brief.runId)} onClick={confirmBrief}>确认 Brief</button>}{brief.status === "confirmed" && <button disabled={Boolean(activeRunId) || !modelServiceId} onClick={startBuild}>开始 Build</button>}</article>}
+              {selected && (brief?.status === "confirmed" || preview) && <ModelServiceSelector
+                items={modelServices}
+                value={modelServiceId}
+                phase={preview ? "edit" : "build"}
+                disabled={Boolean(activeRunId)}
+                onChange={setModelServiceId}
+              />}
+              {runModelUsage && <article className="model-usage-card" data-testid="run-model-usage">
+                <small>RUN MODEL USAGE · {runModelUsage.estimated ? "ESTIMATED" : "ACTUAL"}</small>
+                <h3>{runModelUsage.modelDisplayName ?? runModelUsage.modelServiceId ?? "未知模型"}</h3>
+                <p>{runModelUsage.totalTokens.toLocaleString()} tokens · 输入 {runModelUsage.inputTokens.toLocaleString()} · 输出 {runModelUsage.outputTokens.toLocaleString()}</p>
+                {runPromptEfficiency && <p>
+                  Gross {runPromptEfficiency.grossInputTokens.toLocaleString()} · Cached {runPromptEfficiency.cachedInputTokens.toLocaleString()} · Uncached {runPromptEfficiency.uncachedInputTokens.toLocaleString()} · 命中率 {(runPromptEfficiency.cacheHitRateBasisPoints / 100).toFixed(2)}% · 单轮峰值 {runPromptEfficiency.maxTurnInputTokens.toLocaleString()}
+                </p>}
+              </article>}
               {selected && <DesignProfileBindingCard
                 profiles={designProfiles}
                 boundProfile={boundDesignProfile}
@@ -668,7 +741,7 @@ export function ProjectShell() {
                 onConfirm={confirmProfileSync}
               />}
             </div>
-            <form onSubmit={preview ? startEdit : startBrief}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={preview ? "描述要修改的文字、布局或视觉样式…" : "例如：为一个面向开发者的 API 平台创建简洁、专业的文档站…"} required disabled={!selected || Boolean(activeRunId)} /><div className="run-actions"><button type="submit" disabled={!selected || Boolean(activeRunId)}>{preview ? "应用修改" : "生成 Brief"}</button>{activeRunId && <button className="stop-run" type="button" onClick={cancelActiveRun}>停止当前 Run</button>}</div></form>
+            <form onSubmit={preview ? startEdit : startBrief}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={preview ? "描述要修改的文字、布局或视觉样式…" : "例如：为一个面向开发者的 API 平台创建简洁、专业的文档站…"} required disabled={!selected || Boolean(activeRunId)} /><div className="run-actions"><button type="submit" disabled={!selected || Boolean(activeRunId) || Boolean(preview && !modelServiceId)}>{preview ? "应用修改" : "生成 Brief"}</button>{activeRunId && <button className="stop-run" type="button" onClick={cancelActiveRun}>停止当前 Run</button>}</div></form>
           </section>
           <section className="preview">
             <div className="preview-bar"><span>Preview</span><div className="publication-actions">{publication?.deployment?.publicUrl && <a href={publication.deployment.publicUrl} target="_blank" rel="noreferrer">访问线上作品</a>}<button disabled={!preview || publishing || Boolean(activeRunId)} onClick={publishCurrent}>{currentReleaseId ? "发布更新" : "发布"}</button>{rollbackRelease && <button disabled={publishing} onClick={() => mutatePublication("rollback", rollbackRelease.id)}>回滚</button>}{currentReleaseId && <button disabled={publishing} onClick={() => mutatePublication("unpublish")}>取消发布</button>}</div><div className="version-links">{versions.slice(0, 5).map((version) => <a className={version.current ? "current" : ""} href={version.reviewUrl} key={version.versionId} target="_blank" rel="noreferrer">{version.versionId}</a>)}<span>{preview?.versionId ?? "等待首个 promoted version"}</span></div></div>
@@ -678,6 +751,36 @@ export function ProjectShell() {
       </section>
     </main>
   );
+}
+
+function ModelServiceSelector({
+  items,
+  value,
+  phase,
+  disabled,
+  onChange,
+}: {
+  items: AvailableModelService[];
+  value: string;
+  phase: "build" | "edit";
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  const selected = items.find((item) => item.id === value);
+  return <article className="model-service-card" data-testid="model-service-selector">
+    <small>MODEL SERVICE · {phase.toUpperCase()}</small>
+    <h3>{selected?.displayName ?? "暂无可用模型"}</h3>
+    <p>{selected?.description || (phase === "edit" ? "默认沿用当前版本的模型，也可以重新选择。" : "请管理员先发布一个可用模型服务。")}</p>
+    <select
+      aria-label="生成模型"
+      value={value}
+      disabled={disabled || items.length === 0}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <option value="">{items.length === 0 ? "暂无可用模型" : "选择模型"}</option>
+      {items.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}
+    </select>
+  </article>;
 }
 
 function DesignProfileBindingCard({

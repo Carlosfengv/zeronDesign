@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "runtime-evidence-usage@1",
+  "turns": [
+    {
+      "turn": 1,
+      "inputTokens": 700,
+      "cachedInputTokens": 200,
+      "uncachedInputTokens": 500,
+      "outputTokens": 120
+    },
+    {
+      "turn": 2,
+      "inputTokens": 800,
+      "cachedInputTokens": 200,
+      "uncachedInputTokens": 600,
+      "outputTokens": 80
+    }
+  ],
+  "aggregate": {
+    "modelCalls": 2,
+    "inputTokens": 1500,
+    "cachedInputTokens": 400,
+    "uncachedInputTokens": 1100,
+    "outputTokens": 200
+  }
+}

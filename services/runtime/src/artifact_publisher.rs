@@ -130,6 +130,14 @@ impl FileArtifactPublisher {
             .join(safe_segment(snapshot_id))
     }
 
+    pub fn source_snapshot_uri(project_id: &str, snapshot_id: &str) -> String {
+        format!(
+            "runtime://source-snapshots/{}/{}",
+            safe_segment(project_id),
+            safe_segment(snapshot_id)
+        )
+    }
+
     pub async fn publish_source_snapshot(
         &self,
         project_id: &str,
@@ -187,22 +195,14 @@ impl FileArtifactPublisher {
             }
             fs::remove_dir_all(&temporary)?;
             sync_object_tree(&self.runtime_storage_dir, &target)?;
-            return Ok(format!(
-                "runtime://source-snapshots/{}/{}",
-                safe_segment(project_id),
-                safe_segment(snapshot_id)
-            ));
+            return Ok(Self::source_snapshot_uri(project_id, snapshot_id));
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::rename(temporary, &target)?;
         sync_object_tree(&self.runtime_storage_dir, &target)?;
-        Ok(format!(
-            "runtime://source-snapshots/{}/{}",
-            safe_segment(project_id),
-            safe_segment(snapshot_id)
-        ))
+        Ok(Self::source_snapshot_uri(project_id, snapshot_id))
     }
 
     pub fn read_source_snapshot(

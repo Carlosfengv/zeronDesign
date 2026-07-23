@@ -1,0 +1,7 @@
+{"sequence":1,"type":"workflow.progress","stage":"building","digest":"source-a","substantive":true}
+{"sequence":2,"type":"model.usage","turn":1,"inputTokens":700,"cachedInputTokens":200,"outputTokens":120,"estimated":false}
+{"sequence":3,"type":"route.probe","requestPath":"/docs","status":200,"resolvedFile":"docs.html","resolvedSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+{"sequence":4,"type":"route.probe","requestPath":"/docs/","status":200,"resolvedFile":"docs.html","resolvedSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+{"sequence":5,"type":"workflow.progress","stage":"validating","digest":"candidate-a","substantive":true}
+{"sequence":6,"type":"model.usage","turn":2,"inputTokens":800,"cachedInputTokens":200,"outputTokens":80,"estimated":false}
+{"sequence":7,"type":"validation.check","id":"metadata","status":"failed","owner":"source","diagnosticRef":"runtime://validation/metadata"}

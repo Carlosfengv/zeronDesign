@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "generation-context-cohort-deployments@2",
+  "recordedAt": "2026-07-21T10:38:33.724Z",
+  "deployments": [
+    {
+      "side": "control",
+      "deployment": "anydesign-runtime-generation-control",
+      "uid": "507c8f2b-3800-4c77-9178-8c429f809fc5",
+      "generation": 11,
+      "observedGeneration": 11,
+      "podUid": "3e0d0837-edb6-4da9-b0cc-cf1a001b7a4d",
+      "image": "anydesign/runtime:gctx-required-text-20260721",
+      "imageId": "sha256:2469ac217fc3b41dedd391bcf63603195cb15d2408c719220a30d27b92dbdaf4",
+      "generationContextMode": "off",
+      "publicBaseUrl": "http://anydesign-runtime-generation-control.anydesign-runtime.svc.cluster.local:8080",
+      "gatewayUrl": "http://provider-gateway.provider-system.svc.cluster.local:9000",
+      "workloadTokenSecretRef": "provider-gateway-runtime-auth",
+      "databaseSecretRef": "anydesign-runtime-postgres-generation-control",
+      "objectStorageUrl": "s3://anydesign-runtime/generation-control",
+      "publicPrincipalSecretRef": "anydesign-runtime-public-principal-generation-control",
+      "contentPlanAttestationMode": "shadow",
+      "approvalProducerRequired": "false"
+    },
+    {
+      "side": "candidate",
+      "deployment": "anydesign-runtime-generation-candidate",
+      "uid": "9e376cbf-ceeb-441d-b24f-d218ac24456d",
+      "generation": 11,
+      "observedGeneration": 11,
+      "podUid": "de9556df-a240-4269-ba86-0d466ab4668c",
+      "image": "anydesign/runtime:gctx-required-text-20260721",
+      "imageId": "sha256:2469ac217fc3b41dedd391bcf63603195cb15d2408c719220a30d27b92dbdaf4",
+      "generationContextMode": "enabled",
+      "publicBaseUrl": "http://anydesign-runtime-generation-candidate.anydesign-runtime.svc.cluster.local:8080",
+      "gatewayUrl": "http://provider-gateway.provider-system.svc.cluster.local:9000",
+      "workloadTokenSecretRef": "provider-gateway-runtime-auth",
+      "databaseSecretRef": "anydesign-runtime-postgres-generation-candidate",
+      "objectStorageUrl": "s3://anydesign-runtime/generation-candidate",
+      "publicPrincipalSecretRef": "anydesign-runtime-public-principal-generation-candidate",
+      "contentPlanAttestationMode": "shadow",
+      "approvalProducerRequired": "true"
+    }
+  ],
+  "identitySha256": "eef99cb69e8cf6c3a5da8b87e5d31a29b1606392e569c0a16833e39ccc5cadca"
+}

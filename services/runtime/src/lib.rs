@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod artifact_access;
 pub mod artifact_manifest;
 pub mod artifact_publisher;
+pub mod artifact_routes;
 pub mod authorization;
 pub mod channel_manager;
 pub mod component_registry;

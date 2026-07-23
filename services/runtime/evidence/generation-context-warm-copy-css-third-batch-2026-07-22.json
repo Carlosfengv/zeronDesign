@@ -1,0 +1,134 @@
+{
+  "schemaVersion": "generation-context-warm-copy-css-third-batch-summary@1",
+  "recordedAt": "2026-07-22T06:13:12Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-10-zenova-agent-cloud-warm-copy-css",
+    "batchId": "batch-10",
+    "fixtureId": "zenova-agent-cloud",
+    "bucket": "warm_copy_css",
+    "templateVersion": "next-app",
+    "control": {
+      "outerCaseStatus": "rejected",
+      "outerClassification": "acceptance_rejected",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": false,
+      "attempts": [
+        "acceptance_rejected"
+      ],
+      "selectedFinalEditRunId": "run-16312916",
+      "recordHash": "905347e866ac632556e4d322a21371c7c33dab4b3f2cf606312a2a0eafa456c2",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 57647,
+        "outputTokens": 671,
+        "toolCalls": 10,
+        "totalDurationMs": 26037,
+        "timeToFirstSourceMutationMs": 15337,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3022,
+        "timeToDurableSnapshotMs": 15337,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-9604931",
+      "recordHash": "c64f62881a36a6e51e3fffdd80b99f25f281bf0309b1766fefbb7ce66fda34b9",
+      "sandboxReleaseVerified": true,
+      "nonVisualReference": {
+        "state": "unavailable",
+        "providerVisionCapable": false,
+        "visualBindingsVerified": true,
+        "unavailableMetricRecorded": true,
+        "mainTaskCompleted": true,
+        "gatewayAcceptedImageCount": 0,
+        "visualBindingSetHash": "a3900dedb11e677d57777713d8038015925d35990565051dcf690464d2b9674a",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "referenceArtifactSha256": "431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460",
+        "referenceMediaType": "image/png",
+        "modelExecutionCountAfterFallback": 6
+      },
+      "metrics": {
+        "inputTokens": 77784,
+        "outputTokens": 814,
+        "toolCalls": 11,
+        "totalDurationMs": 37549,
+        "timeToFirstSourceMutationMs": 17773,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3870,
+        "timeToDurableSnapshotMs": 17773,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": 34.93,
+      "outputTokens": 21.31,
+      "toolCalls": 10.0,
+      "totalDurationMs": 44.21,
+      "timeToFirstSourceMutationMs": 15.88,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 28.06,
+      "timeToDurableSnapshotMs": 15.88,
+      "prebuildFsReadCount": 100.0,
+      "prebuildFsSearchCount": 0.0
+    },
+    "interpretation": [
+      "both lifecycle runs completed, so the pair is valid for efficiency and fidelity-rate analysis",
+      "outer acceptance is mapped independently: control required fidelity is false and candidate required fidelity is true",
+      "the candidate improved required fidelity in this pair but every non-zero measured efficiency point estimate except mutation turn regressed",
+      "candidate iframe applied at 3870ms and durable snapshot at 17773ms, both above their P95 targets"
+    ]
+  },
+  "ledger": {
+    "recordCount": 19,
+    "sampleCount": 18,
+    "completePairCount": 9,
+    "pendingPairCount": 0,
+    "headRecordHash": "c64f62881a36a6e51e3fffdd80b99f25f281bf0309b1766fefbb7ce66fda34b9",
+    "sha256": "7d63bfd8a2ca1fa4aacddd6ee2c60cba66e849054d2190064185063c0781c350"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 3,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 3,
+    "warmCopyCssMinimumBatchCount": 3,
+    "warmCopyCssControlRequiredFidelityPassedCount": 2,
+    "warmCopyCssCandidateRequiredFidelityPassedCount": 3,
+    "warmCopyCssControlMedianInputTokens": 69768,
+    "warmCopyCssCandidateMedianInputTokens": 77784,
+    "warmCopyCssCandidateMedianIframeAppliedMs": 3855,
+    "warmCopyCssCandidateP95IframeAppliedMs": 3868.5,
+    "warmCopyCssCandidateP95DurableSnapshotMs": 18024.1,
+    "rolloutEvidenceSha256": "9355599778f26b659380f2050361c144c6bf2bbcb2939ad7c91373bbe05d36c3"
+  },
+  "clusterAfterPair": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "sourceSha256": {
+    "pairSpec": "123944227b6e008d1109e2717857cea94be0dc60af0b196f07bb9e31b5b9a082",
+    "pairResult": "8df124d24123f96c232565201bd476e6d4335af3fedb86978153553fa104ffb2",
+    "controlCase": "e6f4eb17251d4077f7fd7f503b77fd43842078a8a841b09eb3458d9eeaab2809",
+    "candidateCase": "ae4f1ef78c3ba6eee27b7c489c1eeb99b08128eca02db5e1e68e809b45f9f4fc",
+    "rolloutEvidence": "9355599778f26b659380f2050361c144c6bf2bbcb2939ad7c91373bbe05d36c3"
+  }
+}

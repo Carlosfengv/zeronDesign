@@ -51,6 +51,72 @@ spec:
               value: "60"
             - name: RUNTIME_AGENT_MAX_INPUT_TOKENS
               value: "200000"
+            - name: RUNTIME_AGENT_TOKEN_BUDGET_MODE
+              value: "legacy"
+            - name: RUNTIME_AGENT_PHASE_BUDGET_MODE
+              value: shadow
+            - name: RUNTIME_AGENT_PHASE_BRIEF_MAX_GROSS_INPUT_TOKENS
+              value: "80000"
+            - name: RUNTIME_AGENT_PHASE_BRIEF_MAX_UNCACHED_INPUT_TOKENS
+              value: "40000"
+            - name: RUNTIME_AGENT_PHASE_BRIEF_MAX_PROMPT_TOKENS_PER_TURN
+              value: "24000"
+            - name: RUNTIME_AGENT_PHASE_BRIEF_MAX_TURNS
+              value: "6"
+            - name: RUNTIME_AGENT_PHASE_BUILD_MAX_GROSS_INPUT_TOKENS
+              value: "300000"
+            - name: RUNTIME_AGENT_PHASE_BUILD_MAX_UNCACHED_INPUT_TOKENS
+              value: "180000"
+            - name: RUNTIME_AGENT_PHASE_BUILD_MAX_PROMPT_TOKENS_PER_TURN
+              value: "64000"
+            - name: RUNTIME_AGENT_PHASE_BUILD_MAX_TURNS
+              value: "16"
+            - name: RUNTIME_AGENT_PHASE_EDIT_MAX_GROSS_INPUT_TOKENS
+              value: "220000"
+            - name: RUNTIME_AGENT_PHASE_EDIT_MAX_UNCACHED_INPUT_TOKENS
+              value: "120000"
+            - name: RUNTIME_AGENT_PHASE_EDIT_MAX_PROMPT_TOKENS_PER_TURN
+              value: "48000"
+            - name: RUNTIME_AGENT_PHASE_EDIT_MAX_TURNS
+              value: "12"
+            - name: RUNTIME_AGENT_PHASE_REPAIR_MAX_GROSS_INPUT_TOKENS
+              value: "180000"
+            - name: RUNTIME_AGENT_PHASE_REPAIR_MAX_UNCACHED_INPUT_TOKENS
+              value: "100000"
+            - name: RUNTIME_AGENT_PHASE_REPAIR_MAX_PROMPT_TOKENS_PER_TURN
+              value: "48000"
+            - name: RUNTIME_AGENT_PHASE_REPAIR_MAX_TURNS
+              value: "10"
+            - name: RUNTIME_AGENT_MAX_GROSS_INPUT_TOKENS
+              value: "300000"
+            - name: RUNTIME_AGENT_MAX_UNCACHED_INPUT_TOKENS
+              value: "180000"
+            - name: RUNTIME_AGENT_MAX_PROMPT_TOKENS_PER_TURN
+              value: "64000"
+            - name: RUNTIME_AGENT_OPERATION_BUDGET_MODE
+              value: shadow
+            - name: RUNTIME_AGENT_CONTINUATION_MODE
+              value: shadow
+            - name: RUNTIME_AGENT_CONTINUATION_ALLOWLIST_JSON
+              value: "[]"
+            - name: RUNTIME_AGENT_MAX_OPERATION_GROSS_INPUT_TOKENS
+              value: "450000"
+            - name: RUNTIME_AGENT_MAX_OPERATION_UNCACHED_INPUT_TOKENS
+              value: "270000"
+            - name: RUNTIME_AGENT_MAX_OPERATION_OUTPUT_TOKENS
+              value: "80000"
+            - name: RUNTIME_AGENT_MAX_OPERATION_TURNS
+              value: "30"
+            - name: RUNTIME_AGENT_MAX_OPERATION_TOOL_CALLS
+              value: "100"
+            - name: RUNTIME_AGENT_WORKFLOW_DRIVER_MODE
+              value: shadow
+            - name: RUNTIME_AGENT_WORKFLOW_DRIVER_MAX_ACTIONS
+              value: "8"
+            - name: RUNTIME_AGENT_WORKFLOW_DRIVER_WAIT_TIMEOUT_MS
+              value: "30000"
+            - name: RUNTIME_AGENT_WORKFLOW_DRIVER_POLL_INTERVAL_MS
+              value: "500"
             - name: RUNTIME_AGENT_MAX_OUTPUT_TOKENS
               value: "40000"
             - name: RUNTIME_AGENT_MAX_CONSECUTIVE_PROTOCOL_ERRORS

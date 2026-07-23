@@ -81,6 +81,20 @@ impl SandboxKubeClient for FakeSandboxClient {
             .push((namespace.to_string(), claim_name.to_string()));
         Ok(())
     }
+
+    async fn sandbox_resources_absent(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        _sandbox_name: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|deleted| deleted == &(namespace.to_string(), claim_name.to_string())))
+    }
 }
 
 #[test]

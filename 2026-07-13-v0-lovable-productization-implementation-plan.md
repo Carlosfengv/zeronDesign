@@ -67,7 +67,7 @@ Published Runtime、稳定 Host、Blue/Green、Rollback 和恢复能力。本方
 - 让浏览器直接访问 Sandbox Service；
 - 让 Agent/Sandbox 获得 Registry push credential。
 
-MVP 发布范围保持 `static_web_v1`，覆盖 Astro Website 和 Fumadocs Docs。
+MVP 发布范围保持 `static_web_v1`，覆盖 `next-app` 和 Fumadocs Docs。
 
 ## 3. 当前能力基线
 
@@ -533,7 +533,7 @@ TemplateRuntimeCapabilities
 示例：
 
 ```text
-astro-website
+next-app
   devCommand = ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
   devPort = 4321
 
@@ -932,7 +932,7 @@ live_url_availability
 - Dev Server crash 可自动恢复且不丢源码；
 - Draft 永远不能直接成为 Published target；
 - Production Build/Gate 仍是 promotion 必经路径；
-- Astro/Fumadocs HMR 与完整 Build 结果通过一致性测试。
+- `next-app`/Fumadocs HMR 与完整 Build 结果通过一致性测试。
 
 ### Wave P4：SaaS 持久化与多副本
 

@@ -28,6 +28,7 @@ const session = {
   createdAt: "2026-07-20T00:00:00.000Z",
   calculatorVersion: "generation-context-rollout-calculator@1",
   bootstrap: { iterations: 100, seed: 42 },
+  source: { commit: "abc123", dirty: false },
   sourcePolicy: "hashes_only",
   fixtureManifestSha256: crypto
     .createHash("sha256")
@@ -67,6 +68,8 @@ fs.writeFileSync(
     sessionId: session.sessionId,
     context: "k3d-offline-test",
     workspaceNamespace: "ws-offline-test",
+    sourceCommit: session.source.commit,
+    sourceDirty: session.source.dirty,
     deployments: [
       { side: "control", deployment: "runtime-control" },
       { side: "candidate", deployment: "runtime-candidate" },
@@ -111,6 +114,13 @@ const run = (phase, suffix) => ({
     physicalModel: "deepseek-v4-pro",
     capabilitySnapshotHash: "${HASH_C}",
   }],
+  designProfileIdentity: {
+    schemaVersion: "run-design-profile-identity@1",
+    runId: side + "-" + suffix,
+    designProfileId: "fixture-design-profile",
+    designProfileVersion: 1,
+    effectiveProfileHash: "${HASH_C}",
+  },
   efficiency: {
     schemaVersion: "run-efficiency-metrics@1",
     calculatorVersion: "run-efficiency-calculator@1",
@@ -270,6 +280,9 @@ const generationContextStatus = side === "candidate" ? {
   contextContentHash: "${HASH_A}",
   runContextBindingHash: "${HASH_B}",
   runtimeAttestationHash: "${HASH_C}",
+  budgetProfileId: "phase-budget-v1-build",
+  budgetProfileHash: "${HASH_A}",
+  budgetProfileRolloutMode: "shadow",
   workflowState: "completed",
 } : {
   schemaVersion: "generation-context-status@1",
@@ -280,6 +293,9 @@ const generationContextStatus = side === "candidate" ? {
   contextContentHash: null,
   runContextBindingHash: null,
   runtimeAttestationHash: null,
+  budgetProfileId: "phase-budget-v1-build",
+  budgetProfileHash: "${HASH_A}",
+  budgetProfileRolloutMode: "shadow",
   workflowState: null,
 };
 const snapshot = {
@@ -621,6 +637,8 @@ fs.writeFileSync(
     sessionId: visionSession.sessionId,
     context: "k3d-offline-test",
     workspaceNamespace: "ws-offline-test",
+    sourceCommit: visionSession.source.commit,
+    sourceDirty: visionSession.source.dirty,
     deployments: [
       { side: "control", deployment: "runtime-control" },
       { side: "candidate", deployment: "runtime-candidate" },

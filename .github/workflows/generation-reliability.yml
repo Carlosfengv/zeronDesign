@@ -48,8 +48,12 @@ jobs:
       - name: Verify generation gate contract
         run: bash infra/generation-reliability/check-contract.sh
       - name: Verify Run token budgets
+        env:
+          RUST_MIN_STACK: "8388608"
         run: cargo test --manifest-path services/runtime/Cargo.toml --test agent_loop token_budget
       - name: Verify protocol fuse
+        env:
+          RUST_MIN_STACK: "8388608"
         run: cargo test --manifest-path services/runtime/Cargo.toml --test agent_loop protocol
       - name: Verify failed Candidate repair convergence
         run: |

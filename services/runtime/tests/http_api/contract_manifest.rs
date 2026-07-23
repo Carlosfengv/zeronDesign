@@ -13,6 +13,8 @@ const DESIGN_PROFILES_ROUTES_SOURCE: &str =
 const DRAFT_PREVIEW_EVENTS_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/draft_preview_events.rs");
 const PROJECTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/projects.rs");
+const MODEL_SERVICES_ROUTES_SOURCE: &str =
+    include_str!("../../src/http_api/routes/model_services.rs");
 const PREVIEWS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/previews.rs");
 const PUBLICATION_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/publication.rs");
 const RUN_EVENTS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/run_events.rs");
@@ -22,6 +24,7 @@ const RUN_CONTINUE_ROUTES_SOURCE: &str =
 const RUN_CANCEL_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/cancel.rs");
 const RUN_DESIGN_CONTEXT_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/runs/design_context.rs");
+const RUN_METRICS_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/runs/metrics.rs");
 const RUN_PERMISSION_ROUTES_SOURCE: &str =
     include_str!("../../src/http_api/routes/runs/permission.rs");
 const SYSTEM_ROUTES_SOURCE: &str = include_str!("../../src/http_api/routes/system.rs");
@@ -119,7 +122,8 @@ fn route_calls(source: &str) -> Vec<&str> {
 }
 
 fn declared_routes(surface: &str, source: &str) -> BTreeSet<String> {
-    route_calls(source)
+    let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+    route_calls(production_source)
         .into_iter()
         .flat_map(|route| {
             let first_quote = route
@@ -191,6 +195,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
             .as_path(),
     ));
     actual.extend(declared_routes("public", PROJECTS_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", MODEL_SERVICES_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PREVIEWS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", PUBLICATION_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_EVENTS_ROUTES_SOURCE));
@@ -198,6 +203,7 @@ fn executable_route_manifest_matches_every_router_declaration() {
     actual.extend(declared_routes("public", RUN_CONTINUE_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_CANCEL_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_DESIGN_CONTEXT_ROUTES_SOURCE));
+    actual.extend(declared_routes("public", RUN_METRICS_ROUTES_SOURCE));
     actual.extend(declared_routes("public", RUN_PERMISSION_ROUTES_SOURCE));
     actual.extend(declared_routes("public", SYSTEM_ROUTES_SOURCE));
     actual.extend(declared_routes("capture", CAPTURE_ROUTES_SOURCE));

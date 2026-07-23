@@ -507,6 +507,169 @@ describe("runtime client", () => {
     expect(calls).toEqual(["http://runtime.local/runs/run%2F1/efficiency-metrics"]);
   });
 
+  it("reads the sanitized model service catalog", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              items: [{
+                id: "model-service-1",
+                displayName: "Balanced Model",
+                description: "General generation model",
+                capabilities: {
+                  toolCalls: true,
+                  strictToolSchema: false,
+                  streaming: true,
+                  vision: false,
+                  visionInput: false,
+                  supportedImageMediaTypes: [],
+                  maxImageBytes: 0,
+                  maxImageCount: 0,
+                },
+                availability: "available",
+              }],
+            };
+          },
+        };
+      },
+    });
+
+    const catalog = await client.listModelServices("project/1", "build", "build");
+    expect(catalog.items[0]?.displayName).toBe("Balanced Model");
+    expect(calls).toEqual([
+      "http://runtime.local/projects/project%2F1/model-services?phase=build&agentProfile=build",
+    ]);
+  });
+
+  it("reads deduplicated known model usage", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "run-model-usage@1",
+              runId: "run/1",
+              modelServiceId: "model-service-1",
+              modelDisplayName: "Balanced Model",
+              inputTokens: 500,
+              outputTokens: 50,
+              cachedInputTokens: 25,
+              totalTokens: 550,
+              estimated: false,
+              turnCount: 2,
+            };
+          },
+        };
+      },
+    });
+
+    expect((await client.getRunModelUsage("run/1")).totalTokens).toBe(550);
+    expect(calls).toEqual(["http://runtime.local/runs/run%2F1/model-usage"]);
+  });
+
+  it("aggregates usage across one generation operation", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "generation-operation-usage@1",
+              projectId: "project/1",
+              operationId: "operation/1",
+              attempts: [{
+                runId: "run/1",
+                attempt: 1,
+                status: "completed",
+                inputTokens: 500,
+                outputTokens: 50,
+                cachedInputTokens: 25,
+                totalTokens: 550,
+                turnCount: 2,
+                estimated: false,
+                startedAt: timestamp,
+                completedAt: timestamp,
+              }],
+              inputTokens: 500,
+              uncachedInputTokens: 475,
+              outputTokens: 50,
+              cachedInputTokens: 25,
+              totalTokens: 550,
+              turnCount: 2,
+              automaticContinuationCount: 0,
+              retryAmplificationBasisPoints: null,
+              estimated: false,
+              startedAt: timestamp,
+              completedAt: timestamp,
+              latencyMs: 0,
+              status: "completed",
+            };
+          },
+        };
+      },
+    });
+
+    expect(
+      (await client.getGenerationOperationUsage("project/1", "operation/1")).totalTokens,
+    ).toBe(550);
+    expect(calls).toEqual([
+      "http://runtime.local/projects/project%2F1/generation-operations/operation%2F1/usage",
+    ]);
+  });
+
+  it("reads prompt efficiency without exposing prompt content", async () => {
+    const calls: string[] = [];
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "run-prompt-efficiency@1",
+              runId: "run/1",
+              grossInputTokens: 500,
+              cachedInputTokens: 200,
+              uncachedInputTokens: 300,
+              outputTokens: 50,
+              turnCount: 2,
+              maxTurnInputTokens: 300,
+              averageTurnInputTokens: 250,
+              cacheHitRateBasisPoints: 4000,
+              generationContextEstimatedTokens: 20,
+              generationContextRepeatedEstimatedTokens: 40,
+              promptCompactionCount: 0,
+              promptTokensRemovedByCompaction: 0,
+              largeToolArgumentTokensRetainedPeak: 0,
+              retryAmplificationBasisPoints: null,
+              estimated: false,
+            };
+          },
+        };
+      },
+    });
+
+    expect((await client.getRunPromptEfficiency("run/1")).uncachedInputTokens).toBe(300);
+    expect(calls).toEqual(["http://runtime.local/runs/run%2F1/prompt-efficiency"]);
+  });
+
   it("reads hash-only GenerationContext status", async () => {
     const calls: string[] = [];
     const client = createRuntimeClient({
@@ -533,8 +696,14 @@ describe("runtime client", () => {
               workflowState: "context_ready",
               contextWindowEpoch: 0,
               contextInjectedTurn: null,
+              operationId: "operation-1",
+              operationAttempt: 1,
+              budgetProfileId: "phase-budget-v1-build",
+              budgetProfileHash: "a".repeat(64),
+              budgetProfileRolloutMode: "shadow",
               predecessorRunId: null,
               successorRunId: null,
+              continuationSnapshotId: null,
               contentPlan: {
                 planId: "plan-1",
                 revision: 2,
@@ -553,6 +722,52 @@ describe("runtime client", () => {
     expect(calls).toEqual([
       "http://runtime.local/runs/run%2F1/generation-context-status",
     ]);
+  });
+
+  it("reads the complete frozen Run Budget Profile", async () => {
+    const calls: string[] = [];
+    const tokenLimits = {
+      maxTurns: 16,
+      maxToolCalls: 60,
+      maxInputTokens: 300000,
+      maxGrossInputTokens: 300000,
+      maxUncachedInputTokens: 180000,
+      maxPromptTokensPerTurn: 64000,
+      maxOutputTokens: 40000,
+    };
+    const client = createRuntimeClient({
+      baseUrl: "http://runtime.local",
+      fetch: async (url) => {
+        calls.push(url.toString());
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              schemaVersion: "run-budget-profile@1",
+              profileId: "phase-budget-v1-build",
+              phase: "build",
+              rolloutMode: "enforced",
+              tokenBudgetMode: "split_enforced",
+              operationBudgetMode: "enforced",
+              enforcedLimits: tokenLimits,
+              phaseTargetLimits: tokenLimits,
+              operationLimits: {
+                maxGrossInputTokens: 450000,
+                maxUncachedInputTokens: 270000,
+                maxOutputTokens: 80000,
+                maxTurns: 30,
+                maxToolCalls: 100,
+              },
+              profileHash: "a".repeat(64),
+            };
+          },
+        };
+      },
+    });
+
+    expect((await client.getRunBudgetProfile("run/1")).phase).toBe("build");
+    expect(calls).toEqual(["http://runtime.local/runs/run%2F1/budget-profile"]);
   });
 
   it("continues and cancels runs with project principal authorization", async () => {

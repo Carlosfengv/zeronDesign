@@ -4,6 +4,7 @@ import { createMDX } from 'fumadocs-mdx/next';
 const nextConfig = {
   output: 'export',
   reactStrictMode: true,
+  trailingSlash: true,
 };
 
 const withMDX = createMDX();

@@ -39,6 +39,7 @@ pub(super) fn router_with_services(state: AppState) -> Router {
         .merge(routes::design_sources::router())
         .merge(routes::draft_preview_events::router())
         .merge(routes::design_profiles::router())
+        .merge(routes::model_services::router())
         .merge(routes::projects::router())
         .merge(routes::previews::router())
         .merge(routes::publication::router())

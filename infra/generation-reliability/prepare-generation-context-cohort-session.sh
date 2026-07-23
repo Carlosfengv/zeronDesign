@@ -15,6 +15,11 @@ PROVIDER_POLICY_ID="${GENERATION_COHORT_PROVIDER_POLICY_ID:-local-deepseek-v4-pr
 PROVIDER_CONFIG_FILE="${GENERATION_COHORT_PROVIDER_CONFIG:-${ROOT_DIR}/infra/provider-gateway/model-resources.deepseek-v4-pro.json}"
 SESSION_ID="${GENERATION_COHORT_SESSION_ID:-${PROVIDER_RESOURCE_ID}-$(date -u +%Y%m%dT%H%M%SZ)}"
 SESSION_DIR="${GENERATION_COHORT_SESSION_DIR:-${ROOT_DIR}/services/runtime/target/e2e-evidence/generation-context-cohort/${SESSION_ID}}"
+SOURCE_COMMIT="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)"
+SOURCE_DIRTY=false
+if [[ -n "$(git -C "${ROOT_DIR}" status --porcelain 2>/dev/null || true)" ]]; then
+  SOURCE_DIRTY=true
+fi
 
 for command in "${KUBECTL}" "${OPENSSL_BIN}" node base64; do
   command -v "${command}" >/dev/null || {
@@ -127,11 +132,11 @@ done
 
 node - "${SESSION_DIR}" "${SESSION_ID}" "${CONTEXT}" "${WORKSPACE_NAMESPACE}" \
   "${CASES_FILE}" "${provider_evidence}" "${work_dir}/control.json" "${work_dir}/candidate.json" \
-  "${PROVIDER_RESOURCE_ID}" <<'NODE'
+  "${PROVIDER_RESOURCE_ID}" "${SOURCE_COMMIT}" "${SOURCE_DIRTY}" <<'NODE'
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const [sessionDir, sessionId, context, workspaceNamespace, casesFile, providerFile, controlFile, candidateFile, expectedProviderResourceId] = process.argv.slice(2);
+const [sessionDir, sessionId, context, workspaceNamespace, casesFile, providerFile, controlFile, candidateFile, expectedProviderResourceId, sourceCommit, sourceDirty] = process.argv.slice(2);
 const sha256 = value => crypto.createHash("sha256").update(value).digest("hex");
 const canonical = value => {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -183,6 +188,7 @@ const session = {
   createdAt: new Date().toISOString(),
   calculatorVersion: "generation-context-rollout-calculator@1",
   bootstrap: { iterations: 2_000, seed: 20260720 },
+  source: { commit: sourceCommit, dirty: sourceDirty === "true" },
   sourcePolicy: "hashes_only",
   fixtureManifestSha256: sha256(fs.readFileSync(casesFile)),
   providers: [{
@@ -206,6 +212,8 @@ const meta = {
   sessionId,
   context,
   workspaceNamespace,
+  sourceCommit,
+  sourceDirty: sourceDirty === "true",
   providerConfigSha256: providerEvidence.source.sha256,
   providerModelResourceId: resource.id,
   providerResourceRevision: resource.revision,

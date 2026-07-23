@@ -220,11 +220,17 @@ pub struct GenerationContextStatus {
     pub visual_binding_set_hash: Option<String>,
     pub visual_delivery_state: Option<String>,
     pub execution_profile: Option<String>,
+    pub budget_profile_id: Option<String>,
+    pub budget_profile_hash: Option<String>,
+    pub budget_profile_rollout_mode: Option<String>,
     pub workflow_state: Option<String>,
     pub context_window_epoch: u64,
     pub context_injected_turn: Option<u32>,
+    pub operation_id: Option<String>,
+    pub operation_attempt: u32,
     pub predecessor_run_id: Option<String>,
     pub successor_run_id: Option<String>,
+    pub continuation_snapshot_id: Option<String>,
     pub content_plan: Option<ContentPlanIdentity>,
     pub approval_id: Option<String>,
     pub approval_state: Option<String>,
@@ -975,11 +981,26 @@ pub fn status_for_run(run: &AgentRun) -> GenerationContextStatus {
         visual_binding_set_hash: run.visual_binding_set_hash.clone(),
         visual_delivery_state: run.visual_delivery_state.clone(),
         execution_profile: run.execution_profile.clone(),
+        budget_profile_id: run
+            .budget_profile
+            .as_ref()
+            .map(|profile| profile.profile_id.clone()),
+        budget_profile_hash: run
+            .budget_profile
+            .as_ref()
+            .map(|profile| profile.profile_hash.clone()),
+        budget_profile_rollout_mode: run
+            .budget_profile
+            .as_ref()
+            .map(|profile| profile.rollout_mode.clone()),
         workflow_state: run.workflow_state.clone(),
         context_window_epoch: run.context_window_epoch,
         context_injected_turn: run.context_injected_turn,
+        operation_id: run.operation_id.clone(),
+        operation_attempt: run.operation_attempt.max(1),
         predecessor_run_id: run.predecessor_run_id.clone(),
         successor_run_id: run.successor_run_id.clone(),
+        continuation_snapshot_id: run.continuation_snapshot_id.clone(),
         content_plan: match (
             run.content_plan_id.clone(),
             run.content_plan_revision,

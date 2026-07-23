@@ -12,3 +12,5 @@ coverage/
 claude-code-main/
 .runtime-evidence/
 .foglamp/
+.playwright-cli/
+/output/

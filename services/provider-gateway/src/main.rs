@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
     let config = GatewayConfig::from_env()?;
     let listen: SocketAddr = config.listen.parse()?;
     let service = GatewayService::new(config)?;
+    service.start_configuration_refresh_task(Duration::from_secs(2));
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, router(service.clone()))
         .with_graceful_shutdown(shutdown_signal(service))

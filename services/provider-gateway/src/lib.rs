@@ -33,7 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -48,6 +48,8 @@ pub const TURN_REQUEST_SCHEMA: &str = "provider-gateway-turn-request@1";
 pub const TURN_RESPONSE_SCHEMA: &str = "provider-gateway-turn-response@1";
 pub const ERROR_SCHEMA: &str = "provider-gateway-error@1";
 pub const MODEL_RESOURCE_SCHEMA: &str = "model-resource@1";
+pub const PROVIDER_CONNECTION_SCHEMA: &str = "provider-connection@1";
+pub const MODEL_SERVICE_SCHEMA: &str = "model-service@1";
 pub const MODEL_SELECTION_POLICY_SCHEMA: &str = "model-selection-policy@1";
 pub const MODEL_EXECUTION_SNAPSHOT_SCHEMA: &str = "model-execution-snapshot@1";
 
@@ -221,8 +223,16 @@ pub struct ModelResource {
     pub schema_version: String,
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub sort_order: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_connection_id: Option<String>,
     pub kind: ModelResourceKind,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub published: bool,
     pub revision: u64,
     pub endpoint: ProviderEndpoint,
     pub auth: ProviderAuth,
@@ -231,6 +241,10 @@ pub struct ModelResource {
     pub capabilities: ProviderCapabilities,
     #[serde(default)]
     pub defaults: ModelDefaults,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,6 +260,23 @@ pub struct ProviderEndpoint {
     pub base_url: String,
     #[serde(default = "default_chat_completions_path")]
     pub chat_completions_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConnection {
+    pub schema_version: String,
+    pub id: String,
+    pub name: String,
+    pub kind: ModelResourceKind,
+    pub endpoint: ProviderEndpoint,
+    pub auth: ProviderAuth,
+    pub enabled: bool,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tested_at: Option<String>,
 }
 
 fn default_chat_completions_path() -> String {
@@ -440,6 +471,8 @@ pub struct ModelExecutionSummary {
     pub id: String,
     pub model_resource_id: String,
     pub model_resource_revision: u64,
+    #[serde(default)]
+    pub display_name: String,
     pub provider_id: String,
     pub physical_model: String,
     pub selection_policy_id: String,
@@ -594,8 +627,8 @@ pub struct GatewayService {
 struct GatewayInner {
     config: GatewayConfig,
     gitops_config_file: Option<PathBuf>,
-    resources: RwLock<BTreeMap<String, ModelResource>>,
-    policies: RwLock<Vec<ModelSelectionPolicy>>,
+    configuration: RwLock<GatewayConfigurationSnapshot>,
+    configuration_version: AtomicU64,
     idempotency: Mutex<HashMap<String, IdempotencyEntry>>,
     bulkheads: Mutex<HashMap<String, Arc<Semaphore>>>,
     metrics: Mutex<GatewayMetrics>,
@@ -603,6 +636,13 @@ struct GatewayInner {
     storage: Mutex<PersistentStore>,
     cipher: DataCipher,
     client: Client,
+}
+
+#[derive(Clone)]
+struct GatewayConfigurationSnapshot {
+    resources: BTreeMap<String, ModelResource>,
+    provider_connections: BTreeMap<String, ProviderConnection>,
+    policies: Vec<ModelSelectionPolicy>,
 }
 
 enum IdempotencyEntry {
@@ -855,6 +895,7 @@ impl GatewayService {
             None => DataCipher::development(),
         };
         let storage = PersistentStore::open(database_url)?;
+        let configuration_version = storage.configuration_version()?;
         let (persisted_resources, persisted_policies) =
             storage.initialize_configuration(&config.resources, &config.policies)?;
         for resource in &persisted_resources {
@@ -863,9 +904,13 @@ impl GatewayService {
         for policy in &persisted_policies {
             validate_model_selection_policy(policy, &persisted_resources)?;
         }
-        let resources = persisted_resources
-            .iter()
-            .cloned()
+        let provider_connections = storage
+            .provider_connections()?
+            .into_iter()
+            .map(|connection| (connection.id.clone(), connection))
+            .collect::<BTreeMap<_, _>>();
+        let resources = resolve_provider_connections(persisted_resources, &provider_connections)?
+            .into_iter()
             .map(|resource| (resource.id.clone(), resource))
             .collect();
         Ok(Self {
@@ -874,8 +919,12 @@ impl GatewayService {
                     .ok()
                     .filter(|path| !path.trim().is_empty())
                     .map(PathBuf::from),
-                resources: RwLock::new(resources),
-                policies: RwLock::new(persisted_policies),
+                configuration: RwLock::new(GatewayConfigurationSnapshot {
+                    resources,
+                    provider_connections,
+                    policies: persisted_policies,
+                }),
+                configuration_version: AtomicU64::new(configuration_version),
                 config,
                 idempotency: Mutex::new(HashMap::new()),
                 bulkheads: Mutex::new(HashMap::new()),
@@ -1286,17 +1335,20 @@ impl GatewayService {
         &self,
         request: &GatewayTurnRequest,
     ) -> std::result::Result<GatewayTurnResponse, GatewayApiError> {
-        let policy = self.resolve_policy(&request.scope).await.ok_or_else(|| {
-            GatewayApiError::new(
-                StatusCode::FORBIDDEN,
-                request.request_id.clone(),
-                "model_resource_not_allowed",
-                "No active model selection policy allows this scope",
-                false,
-            )
-        })?;
+        let configuration = self.inner.configuration.read().await;
+        let policy = self
+            .resolve_policy(&configuration.policies, &request.scope)
+            .ok_or_else(|| {
+                GatewayApiError::new(
+                    StatusCode::FORBIDDEN,
+                    request.request_id.clone(),
+                    "model_resource_not_allowed",
+                    "No active model selection policy allows this scope",
+                    false,
+                )
+            })?;
 
-        let resources = self.inner.resources.read().await;
+        let resources = &configuration.resources;
         let (candidates, selection_reason) =
             if let Some(resource_id) = &request.routing.model_resource_id {
                 if !policy
@@ -1325,11 +1377,11 @@ impl GatewayService {
                 (vec![resource], "explicit_resource".to_string())
             } else {
                 (
-                    ordered_automatic_candidates(&policy, &resources, &request.idempotency_key),
+                    ordered_automatic_candidates(&policy, resources, &request.idempotency_key),
                     "automatic_selection".to_string(),
                 )
             };
-        drop(resources);
+        drop(configuration);
 
         let capability_compatible = candidates
             .into_iter()
@@ -1756,8 +1808,11 @@ impl GatewayService {
             })
     }
 
-    async fn resolve_policy(&self, scope: &TurnScope) -> Option<ModelSelectionPolicy> {
-        let policies = self.inner.policies.read().await;
+    fn resolve_policy(
+        &self,
+        policies: &[ModelSelectionPolicy],
+        scope: &TurnScope,
+    ) -> Option<ModelSelectionPolicy> {
         policies
             .iter()
             .filter(|policy| policy_matches_turn(policy, scope))
@@ -2299,6 +2354,36 @@ impl GatewayService {
 }
 
 impl GatewayService {
+    pub fn start_configuration_refresh_task(
+        &self,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = service.refresh_configuration_if_stale().await {
+                    tracing::warn!(error = %error, "Provider Gateway configuration refresh failed");
+                }
+            }
+        })
+    }
+
+    pub async fn refresh_configuration_if_stale(&self) -> Result<bool> {
+        let durable_version = self.inner.storage.lock().await.configuration_version()?;
+        if durable_version <= self.inner.configuration_version.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        refresh_configuration(self).await?;
+        Ok(true)
+    }
+
+    pub fn observed_configuration_version(&self) -> u64 {
+        self.inner.configuration_version.load(Ordering::Acquire)
+    }
+
     async fn resolve_secret_ref(&self, secret_ref: &str) -> Result<String> {
         if let Some(name) = secret_ref.strip_prefix("db:") {
             validate_database_secret_name(name)?;
@@ -2465,10 +2550,55 @@ pub fn router(service: GatewayService) -> Router {
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/v1/model-services", get(list_available_model_services))
         .route("/v1/agent/turn", post(turn_handler))
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections",
+            get(list_provider_connections).post(create_provider_connection),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections/{id}",
+            get(get_provider_connection).patch(update_provider_connection),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections/{id}/test",
+            post(test_provider_connection),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections/{id}/enable",
+            post(enable_provider_connection),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections/{id}/disable",
+            post(disable_provider_connection),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/provider-connections/{id}/rotate-credential",
+            post(rotate_provider_connection_credential),
+        )
         .route(
             "/internal/provider-gateway/admin/v1/model-resources",
             get(list_model_resources).post(create_model_resource),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/model-services",
+            get(list_model_services).post(create_model_service),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/model-services/{id}",
+            get(get_model_service).patch(update_model_service),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/model-services/{id}/test",
+            post(test_model_service),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/model-services/{id}/publish",
+            post(publish_model_service),
+        )
+        .route(
+            "/internal/provider-gateway/admin/v1/model-services/{id}/unpublish",
+            post(unpublish_model_service),
         )
         .route(
             "/internal/provider-gateway/admin/v1/model-resources/{id}",
@@ -2531,6 +2661,57 @@ struct AdminModelResourceWrite {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AdminProviderConnectionWrite {
+    schema_version: String,
+    id: String,
+    name: String,
+    #[serde(rename = "providerType")]
+    kind: ModelResourceKind,
+    base_url: String,
+    #[serde(default = "default_chat_completions_path")]
+    chat_completions_path: String,
+    enabled: bool,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminProviderCredentialRotation {
+    api_key: String,
+    expected_version: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminProviderVersionRequest {
+    expected_version: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminModelServiceWrite {
+    schema_version: String,
+    id: String,
+    provider_connection_id: String,
+    display_name: String,
+    #[serde(default)]
+    description: String,
+    physical_model: String,
+    #[serde(default)]
+    capabilities: ProviderCapabilities,
+    #[serde(default)]
+    defaults: ModelDefaults,
+    #[serde(default)]
+    sort_order: i32,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AdminModelSelectionPolicyWrite {
     #[serde(flatten)]
     policy: ModelSelectionPolicy,
@@ -2563,14 +2744,106 @@ struct AdminModelResourceView {
     schema_version: String,
     id: String,
     display_name: String,
+    provider_connection_id: Option<String>,
     kind: ModelResourceKind,
     enabled: bool,
+    published: bool,
     revision: u64,
     endpoint: ProviderEndpoint,
     auth: AdminModelResourceAuthView,
     physical_model: String,
     capabilities: ProviderCapabilities,
     defaults: ModelDefaults,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminProviderConnectionView {
+    schema_version: String,
+    id: String,
+    name: String,
+    #[serde(rename = "providerType")]
+    kind: ModelResourceKind,
+    base_url: String,
+    chat_completions_path: String,
+    enabled: bool,
+    version: u64,
+    credential_configured: bool,
+    last_test_status: Option<String>,
+    last_tested_at: Option<String>,
+}
+
+impl From<&ProviderConnection> for AdminProviderConnectionView {
+    fn from(connection: &ProviderConnection) -> Self {
+        Self {
+            schema_version: connection.schema_version.clone(),
+            id: connection.id.clone(),
+            name: connection.name.clone(),
+            kind: connection.kind.clone(),
+            base_url: connection.endpoint.base_url.clone(),
+            chat_completions_path: connection.endpoint.chat_completions_path.clone(),
+            enabled: connection.enabled,
+            version: connection.version,
+            credential_configured: !connection.auth.secret_ref.trim().is_empty(),
+            last_test_status: connection.last_test_status.clone(),
+            last_tested_at: connection.last_tested_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderConnectionTestResponse {
+    provider_connection_id: String,
+    version: u64,
+    status: String,
+    tested_at: String,
+    checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminModelServiceView {
+    schema_version: String,
+    id: String,
+    provider_connection_id: String,
+    display_name: String,
+    description: String,
+    physical_model: String,
+    capabilities: ProviderCapabilities,
+    defaults: ModelDefaults,
+    published: bool,
+    sort_order: i32,
+    revision: u64,
+}
+
+impl TryFrom<&ModelResource> for AdminModelServiceView {
+    type Error = GatewayApiError;
+
+    fn try_from(resource: &ModelResource) -> std::result::Result<Self, Self::Error> {
+        let provider_connection_id = resource.provider_connection_id.clone().ok_or_else(|| {
+            GatewayApiError::new(
+                StatusCode::NOT_FOUND,
+                "admin",
+                "model_service_not_found",
+                "Model Service does not exist",
+                false,
+            )
+        })?;
+        Ok(Self {
+            schema_version: MODEL_SERVICE_SCHEMA.to_string(),
+            id: resource.id.clone(),
+            provider_connection_id,
+            display_name: resource.display_name.clone(),
+            description: resource.description.clone(),
+            physical_model: resource.physical_model.clone(),
+            capabilities: resource.capabilities.clone(),
+            defaults: resource.defaults.clone(),
+            published: resource.published,
+            sort_order: resource.sort_order,
+            revision: resource.revision,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2587,8 +2860,10 @@ impl From<&ModelResource> for AdminModelResourceView {
             schema_version: resource.schema_version.clone(),
             id: resource.id.clone(),
             display_name: resource.display_name.clone(),
+            provider_connection_id: resource.provider_connection_id.clone(),
             kind: resource.kind.clone(),
             enabled: resource.enabled,
+            published: resource.published,
             revision: resource.revision,
             endpoint: resource.endpoint.clone(),
             auth: AdminModelResourceAuthView {
@@ -2626,6 +2901,31 @@ struct AuditEventsQuery {
     before_id: Option<i64>,
     #[serde(default)]
     limit: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableModelServicesQuery {
+    workspace_id: String,
+    project_id: String,
+    phase: String,
+    agent_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModelService {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub capabilities: ProviderCapabilities,
+    pub availability: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableModelServicesResponse {
+    pub items: Vec<AvailableModelService>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2780,6 +3080,933 @@ async fn discard_admin_write(service: &GatewayService, key: &str) {
         .discard_admin_operation(key);
 }
 
+async fn list_provider_connections(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<AdminProviderConnectionView>>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    let connections = service
+        .inner
+        .storage
+        .lock()
+        .await
+        .provider_connections()
+        .map_err(admin_storage_error)?;
+    Ok(Json(
+        connections
+            .iter()
+            .map(AdminProviderConnectionView::from)
+            .collect(),
+    ))
+}
+
+async fn get_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    let connection = load_provider_connection(&service, &id).await?;
+    Ok(Json(AdminProviderConnectionView::from(&connection)))
+}
+
+async fn create_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Json(write): Json<AdminProviderConnectionWrite>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let reservation = reserve_admin_write::<AdminProviderConnectionView>(
+        &service,
+        &headers,
+        "provider-connection.create",
+        &write,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let api_key = write.api_key.as_deref().ok_or_else(|| {
+            invalid_provider_connection("Creating a Provider Connection requires apiKey")
+        })?;
+        let connection = provider_connection_from_write(&write, None)?;
+        let secret_name = connection
+            .auth
+            .secret_ref
+            .strip_prefix("db:")
+            .ok_or_else(|| invalid_provider_connection("Provider credential storage is invalid"))?
+            .to_string();
+        validate_database_secret_name(&secret_name)
+            .map_err(|_| invalid_provider_connection("Provider credential storage is invalid"))?;
+        let ciphertext = service
+            .inner
+            .cipher
+            .encrypt(api_key.as_bytes())
+            .map_err(|_| {
+                invalid_provider_connection("Provider credential could not be encrypted")
+            })?;
+        let connection = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection_with_secret(
+                connection,
+                write.expected_version,
+                &secret_name,
+                &ciphertext,
+            )
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(
+            &service,
+            "provider_connection.created",
+            &connection.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        Ok(AdminProviderConnectionView::from(&connection))
+    }
+    .await;
+    finish_admin_provider_write(&service, &key, result).await
+}
+
+async fn update_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(write): Json<AdminProviderConnectionWrite>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    if write.id != id {
+        return Err(invalid_provider_connection(
+            "Provider Connection path id and payload id must match",
+        ));
+    }
+    if write.api_key.is_some() {
+        return Err(invalid_provider_connection(
+            "Use rotate-credential to replace a Provider credential",
+        ));
+    }
+    let reservation = reserve_admin_write::<AdminProviderConnectionView>(
+        &service,
+        &headers,
+        &format!("provider-connection.update.{id}"),
+        &write,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let existing = load_provider_connection(&service, &id).await?;
+        let connection = provider_connection_from_write(&write, Some(&existing))?;
+        let connection = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection(connection, write.expected_version)
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(
+            &service,
+            "provider_connection.updated",
+            &connection.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        Ok(AdminProviderConnectionView::from(&connection))
+    }
+    .await;
+    finish_admin_provider_write(&service, &key, result).await
+}
+
+async fn enable_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminProviderVersionRequest>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    set_provider_connection_enabled(service, headers, id, request, true).await
+}
+
+async fn disable_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminProviderVersionRequest>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    set_provider_connection_enabled(service, headers, id, request, false).await
+}
+
+async fn set_provider_connection_enabled(
+    service: GatewayService,
+    headers: HeaderMap,
+    id: String,
+    request: AdminProviderVersionRequest,
+    enabled: bool,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let operation = format!(
+        "provider-connection.{}.{}",
+        if enabled { "enable" } else { "disable" },
+        id
+    );
+    let reservation = reserve_admin_write::<AdminProviderConnectionView>(
+        &service, &headers, &operation, &request,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let mut connection = load_provider_connection(&service, &id).await?;
+        connection.enabled = enabled;
+        let connection = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection(connection, Some(request.expected_version))
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(
+            &service,
+            if enabled {
+                "provider_connection.enabled"
+            } else {
+                "provider_connection.disabled"
+            },
+            &connection.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        Ok(AdminProviderConnectionView::from(&connection))
+    }
+    .await;
+    finish_admin_provider_write(&service, &key, result).await
+}
+
+async fn rotate_provider_connection_credential(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(rotation): Json<AdminProviderCredentialRotation>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let reservation = reserve_admin_write::<AdminProviderConnectionView>(
+        &service,
+        &headers,
+        &format!("provider-connection.rotate-credential.{id}"),
+        &rotation,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        if rotation.api_key.trim().is_empty() {
+            return Err(invalid_provider_connection("apiKey must not be empty"));
+        }
+        let connection = load_provider_connection(&service, &id).await?;
+        if connection.version != rotation.expected_version {
+            return Err(admin_storage_error(anyhow!(
+                "provider connection version conflict for {id}: expected {}, current {}",
+                rotation.expected_version,
+                connection.version
+            )));
+        }
+        let secret_name = connection
+            .auth
+            .secret_ref
+            .strip_prefix("db:")
+            .ok_or_else(|| invalid_provider_connection("Provider credential storage is invalid"))?
+            .to_string();
+        validate_database_secret_name(&secret_name)
+            .map_err(|_| invalid_provider_connection("Provider credential storage is invalid"))?;
+        let ciphertext = service
+            .inner
+            .cipher
+            .encrypt(rotation.api_key.as_bytes())
+            .map_err(|_| {
+                invalid_provider_connection("Provider credential could not be encrypted")
+            })?;
+        let connection = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection_with_secret(
+                connection,
+                Some(rotation.expected_version),
+                &secret_name,
+                &ciphertext,
+            )
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(
+            &service,
+            "provider_connection.credential_rotated",
+            &connection.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        Ok(AdminProviderConnectionView::from(&connection))
+    }
+    .await;
+    finish_admin_provider_write(&service, &key, result).await
+}
+
+async fn test_provider_connection(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminProviderVersionRequest>,
+) -> std::result::Result<Json<ProviderConnectionTestResponse>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let reservation = reserve_admin_write::<ProviderConnectionTestResponse>(
+        &service,
+        &headers,
+        &format!("provider-connection.test.{id}"),
+        &request,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let mut connection = load_provider_connection(&service, &id).await?;
+        if connection.version != request.expected_version {
+            return Err(admin_storage_error(anyhow!(
+                "provider connection version conflict for {id}: expected {}, current {}",
+                request.expected_version,
+                connection.version
+            )));
+        }
+        validate_provider_connection(&connection).map_err(|_| {
+            invalid_provider_connection("Provider Connection configuration is invalid")
+        })?;
+        service
+            .resolve_secret_ref(&connection.auth.secret_ref)
+            .await
+            .map_err(|_| invalid_provider_connection("Provider credential is unavailable"))?;
+        validate_resource_endpoint_dns(&connection.endpoint.base_url)
+            .await
+            .map_err(|_| invalid_provider_connection("Provider endpoint DNS validation failed"))?;
+        let tested_at = Utc::now().to_rfc3339();
+        connection.last_test_status = Some("ready".to_string());
+        connection.last_tested_at = Some(tested_at.clone());
+        let connection = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection(connection, Some(request.expected_version))
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(
+            &service,
+            "provider_connection.test_succeeded",
+            &connection.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        Ok(ProviderConnectionTestResponse {
+            provider_connection_id: connection.id,
+            version: connection.version,
+            status: "ready".to_string(),
+            tested_at,
+            checks: vec![
+                "schema".to_string(),
+                "url".to_string(),
+                "dns".to_string(),
+                "credential".to_string(),
+            ],
+        })
+    }
+    .await;
+    match result {
+        Ok(response) => {
+            complete_admin_write(&service, &key, &response).await?;
+            Ok(Json(response))
+        }
+        Err(error) => {
+            // Test state is operator-facing diagnostics, not a readiness lease.
+            // Persist a failed result when the tested revision is still current;
+            // conflicts deliberately leave the newer revision untouched.
+            if let Ok(mut connection) = load_provider_connection(&service, &id).await {
+                if connection.version == request.expected_version {
+                    connection.last_test_status = Some("failed".to_string());
+                    connection.last_tested_at = Some(Utc::now().to_rfc3339());
+                    let saved =
+                        {
+                            service.inner.storage.lock().await.save_provider_connection(
+                                connection,
+                                Some(request.expected_version),
+                            )
+                        };
+                    if let Ok(connection) = saved {
+                        let _ = audit_provider_admin_change(
+                            &service,
+                            "provider_connection.test_failed",
+                            &connection.id,
+                            &change,
+                        )
+                        .await;
+                        let _ = refresh_configuration(&service).await;
+                    }
+                }
+            }
+            discard_admin_write(&service, &key).await;
+            Err(error)
+        }
+    }
+}
+
+fn provider_connection_from_write(
+    write: &AdminProviderConnectionWrite,
+    existing: Option<&ProviderConnection>,
+) -> std::result::Result<ProviderConnection, GatewayApiError> {
+    if write.schema_version != PROVIDER_CONNECTION_SCHEMA {
+        return Err(invalid_provider_connection(
+            "Unsupported Provider Connection schemaVersion",
+        ));
+    }
+    validate_database_secret_name(&write.id)
+        .map_err(|_| invalid_provider_connection("Provider Connection id is invalid"))?;
+    let connection = ProviderConnection {
+        schema_version: PROVIDER_CONNECTION_SCHEMA.to_string(),
+        id: write.id.clone(),
+        name: write.name.clone(),
+        kind: write.kind.clone(),
+        endpoint: ProviderEndpoint {
+            base_url: write.base_url.clone(),
+            chat_completions_path: ensure_leading_slash(&write.chat_completions_path),
+        },
+        auth: ProviderAuth {
+            auth_type: "bearer".to_string(),
+            secret_ref: existing
+                .map(|connection| connection.auth.secret_ref.clone())
+                .unwrap_or_else(|| format!("db:provider-connection-{}", write.id)),
+        },
+        enabled: write.enabled,
+        version: existing.map(|connection| connection.version).unwrap_or(0),
+        last_test_status: existing.and_then(|connection| connection.last_test_status.clone()),
+        last_tested_at: existing.and_then(|connection| connection.last_tested_at.clone()),
+    };
+    validate_provider_connection(&connection)
+        .map_err(|_| invalid_provider_connection("Provider Connection configuration is invalid"))?;
+    Ok(connection)
+}
+
+async fn load_provider_connection(
+    service: &GatewayService,
+    id: &str,
+) -> std::result::Result<ProviderConnection, GatewayApiError> {
+    service
+        .inner
+        .storage
+        .lock()
+        .await
+        .provider_connection(id)
+        .map_err(admin_storage_error)?
+        .ok_or_else(|| {
+            GatewayApiError::new(
+                StatusCode::NOT_FOUND,
+                "admin",
+                "provider_connection_not_found",
+                "Provider Connection does not exist",
+                false,
+            )
+        })
+}
+
+async fn audit_provider_admin_change(
+    service: &GatewayService,
+    event_type: &str,
+    subject_id: &str,
+    change: &AdminChangeContext,
+) -> std::result::Result<(), GatewayApiError> {
+    service
+        .inner
+        .storage
+        .lock()
+        .await
+        .audit_admin_operation(
+            event_type,
+            subject_id,
+            &change.operator_id,
+            &change.reason,
+            &change.change_reference,
+        )
+        .map_err(admin_storage_error)
+}
+
+async fn finish_admin_provider_write(
+    service: &GatewayService,
+    key: &str,
+    result: std::result::Result<AdminProviderConnectionView, GatewayApiError>,
+) -> std::result::Result<Json<AdminProviderConnectionView>, GatewayApiError> {
+    match result {
+        Ok(response) => {
+            complete_admin_write(service, key, &response).await?;
+            Ok(Json(response))
+        }
+        Err(error) => {
+            discard_admin_write(service, key).await;
+            Err(error)
+        }
+    }
+}
+
+fn invalid_provider_connection(message: &str) -> GatewayApiError {
+    GatewayApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "admin",
+        "invalid_provider_connection",
+        message,
+        false,
+    )
+}
+
+async fn list_model_services(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<Vec<AdminModelServiceView>>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    let resources = service
+        .inner
+        .storage
+        .lock()
+        .await
+        .current_model_resources()
+        .map_err(admin_storage_error)?;
+    let mut services = resources
+        .iter()
+        .filter(|resource| resource.provider_connection_id.is_some())
+        .map(AdminModelServiceView::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    services.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(services))
+}
+
+async fn get_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    let resource = load_raw_model_service(&service, &id).await?;
+    Ok(Json(AdminModelServiceView::try_from(&resource)?))
+}
+
+async fn create_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Json(write): Json<AdminModelServiceWrite>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let reservation = reserve_admin_write::<AdminModelServiceView>(
+        &service,
+        &headers,
+        "model-service.create",
+        &write,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let resource = model_service_from_write(&service, &write, None).await?;
+        let resource = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_model_resource(resource, write.expected_revision)
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(&service, "model_service.created", &resource.id, &change)
+            .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        AdminModelServiceView::try_from(&resource)
+    }
+    .await;
+    finish_admin_model_service_write(&service, &key, result).await
+}
+
+async fn update_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(write): Json<AdminModelServiceWrite>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    if write.id != id {
+        return Err(invalid_model_service(
+            "Model Service path id and payload id must match",
+        ));
+    }
+    let reservation = reserve_admin_write::<AdminModelServiceView>(
+        &service,
+        &headers,
+        &format!("model-service.update.{id}"),
+        &write,
+    )
+    .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let existing = load_raw_model_service(&service, &id).await?;
+        let resource = model_service_from_write(&service, &write, Some(&existing)).await?;
+        let resource = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_model_resource(resource, write.expected_revision)
+            .map_err(admin_storage_error)?;
+        audit_provider_admin_change(&service, "model_service.updated", &resource.id, &change)
+            .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        AdminModelServiceView::try_from(&resource)
+    }
+    .await;
+    finish_admin_model_service_write(&service, &key, result).await
+}
+
+async fn publish_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminRevisionRequest>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    set_model_service_published(service, headers, id, request, true).await
+}
+
+async fn unpublish_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminRevisionRequest>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    set_model_service_published(service, headers, id, request, false).await
+}
+
+async fn set_model_service_published(
+    service: GatewayService,
+    headers: HeaderMap,
+    id: String,
+    request: AdminRevisionRequest,
+    published: bool,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    authorize_admin(&service.inner.config, &headers)?;
+    require_admin_idempotency(&headers)?;
+    let change = require_admin_change_context(&headers)?;
+    let operation = format!(
+        "model-service.{}.{}",
+        if published { "publish" } else { "unpublish" },
+        id
+    );
+    let reservation =
+        reserve_admin_write::<AdminModelServiceView>(&service, &headers, &operation, &request)
+            .await?;
+    let AdminWriteReservation::Reserved { key } = reservation else {
+        let AdminWriteReservation::Completed(response) = reservation else {
+            unreachable!()
+        };
+        return Ok(Json(response));
+    };
+    let result = async {
+        let mut resource = load_raw_model_service(&service, &id).await?;
+        if resource.revision != request.expected_revision {
+            return Err(admin_storage_error(anyhow!(
+                "resource revision conflict for {id}: expected {}, current {}",
+                request.expected_revision,
+                resource.revision
+            )));
+        }
+        if published {
+            let connection_id = resource
+                .provider_connection_id
+                .as_deref()
+                .ok_or_else(|| invalid_model_service("Model Service has no Provider Connection"))?;
+            let connection = load_provider_connection(&service, connection_id).await?;
+            if !connection.enabled {
+                return Err(invalid_model_service(
+                    "Provider Connection must be enabled before publishing a Model Service",
+                ));
+            }
+            // Authorize the stable ID first while the resource is still
+            // unpublished (and therefore fail-closed). Only expose it in the
+            // product catalog after every current Policy projection succeeds.
+            sync_published_model_policy_projection(&service, Some(&id)).await?;
+        }
+        resource.published = published;
+        let resource = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_model_resource(resource, Some(request.expected_revision))
+            .map_err(admin_storage_error)?;
+        if !published {
+            sync_published_model_policy_projection(&service, None).await?;
+        }
+        audit_provider_admin_change(
+            &service,
+            if published {
+                "model_service.published"
+            } else {
+                "model_service.unpublished"
+            },
+            &resource.id,
+            &change,
+        )
+        .await?;
+        refresh_configuration(&service)
+            .await
+            .map_err(admin_storage_error)?;
+        AdminModelServiceView::try_from(&resource)
+    }
+    .await;
+    finish_admin_model_service_write(&service, &key, result).await
+}
+
+async fn test_model_service(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminRevisionRequest>,
+) -> std::result::Result<Json<ModelResourceReadinessResponse>, GatewayApiError> {
+    load_raw_model_service(&service, &id).await?;
+    readiness_model_resource(State(service), headers, Path(id), Json(request)).await
+}
+
+async fn model_service_from_write(
+    service: &GatewayService,
+    write: &AdminModelServiceWrite,
+    existing: Option<&ModelResource>,
+) -> std::result::Result<ModelResource, GatewayApiError> {
+    if write.schema_version != MODEL_SERVICE_SCHEMA {
+        return Err(invalid_model_service(
+            "Unsupported Model Service schemaVersion",
+        ));
+    }
+    validate_database_secret_name(&write.id)
+        .map_err(|_| invalid_model_service("Model Service id is invalid"))?;
+    let connection = load_provider_connection(service, &write.provider_connection_id).await?;
+    if existing.is_some_and(|resource| resource.published) && !connection.enabled {
+        return Err(invalid_model_service(
+            "A published Model Service must use an enabled Provider Connection",
+        ));
+    }
+    let resource = ModelResource {
+        schema_version: MODEL_RESOURCE_SCHEMA.to_string(),
+        id: write.id.clone(),
+        display_name: write.display_name.clone(),
+        description: write.description.clone(),
+        sort_order: write.sort_order,
+        provider_connection_id: Some(connection.id),
+        kind: connection.kind,
+        enabled: existing.map(|resource| resource.enabled).unwrap_or(true),
+        published: existing.map(|resource| resource.published).unwrap_or(false),
+        revision: existing.map(|resource| resource.revision).unwrap_or(0),
+        endpoint: connection.endpoint,
+        auth: connection.auth,
+        physical_model: write.physical_model.clone(),
+        capabilities: write.capabilities.clone(),
+        defaults: write.defaults.clone(),
+    };
+    validate_model_resource(&resource)
+        .map_err(|_| invalid_model_service("Model Service configuration is invalid"))?;
+    Ok(resource)
+}
+
+async fn load_raw_model_service(
+    service: &GatewayService,
+    id: &str,
+) -> std::result::Result<ModelResource, GatewayApiError> {
+    let resource = service
+        .inner
+        .storage
+        .lock()
+        .await
+        .model_resource(id, None)
+        .map_err(admin_storage_error)?
+        .ok_or_else(model_service_not_found)?;
+    if resource.provider_connection_id.is_none() {
+        return Err(model_service_not_found());
+    }
+    Ok(resource)
+}
+
+async fn sync_published_model_policy_projection(
+    service: &GatewayService,
+    publishing_id: Option<&str>,
+) -> std::result::Result<(), GatewayApiError> {
+    let (resources, connections, policies) = {
+        let storage = service.inner.storage.lock().await;
+        (
+            storage
+                .current_model_resources()
+                .map_err(admin_storage_error)?,
+            storage
+                .provider_connections()
+                .map_err(admin_storage_error)?,
+            storage
+                .current_model_selection_policies()
+                .map_err(admin_storage_error)?,
+        )
+    };
+    let enabled_connections = connections
+        .into_iter()
+        .filter(|connection| connection.enabled)
+        .map(|connection| connection.id)
+        .collect::<HashSet<_>>();
+    if policies.is_empty() {
+        return Err(invalid_model_service(
+            "At least one active Model Selection Policy is required before publishing",
+        ));
+    }
+    let product_ids = resources
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .provider_connection_id
+                .as_ref()
+                .map(|_| resource.id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut published_ids = resources
+        .iter()
+        .filter(|resource| {
+            (resource.published || publishing_id == Some(resource.id.as_str()))
+                && resource.enabled
+                && resource
+                    .provider_connection_id
+                    .as_ref()
+                    .is_some_and(|id| enabled_connections.contains(id))
+        })
+        .map(|resource| resource.id.clone())
+        .collect::<Vec<_>>();
+    published_ids.sort();
+    for mut policy in policies {
+        let mut allowed = policy
+            .direct_selection
+            .allowed_model_resource_ids
+            .into_iter()
+            .filter(|id| !product_ids.contains(id))
+            .collect::<Vec<_>>();
+        allowed.extend(published_ids.iter().cloned());
+        allowed.sort();
+        allowed.dedup();
+        policy.direct_selection.allowed_model_resource_ids = allowed;
+        let expected_revision = policy.revision;
+        service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_model_selection_policy(policy, Some(expected_revision))
+            .map_err(admin_storage_error)?;
+    }
+    Ok(())
+}
+
+async fn finish_admin_model_service_write(
+    service: &GatewayService,
+    key: &str,
+    result: std::result::Result<AdminModelServiceView, GatewayApiError>,
+) -> std::result::Result<Json<AdminModelServiceView>, GatewayApiError> {
+    match result {
+        Ok(response) => {
+            complete_admin_write(service, key, &response).await?;
+            Ok(Json(response))
+        }
+        Err(error) => {
+            discard_admin_write(service, key).await;
+            Err(error)
+        }
+    }
+}
+
+fn invalid_model_service(message: &str) -> GatewayApiError {
+    GatewayApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "admin",
+        "invalid_model_service",
+        message,
+        false,
+    )
+}
+
+fn model_service_not_found() -> GatewayApiError {
+    GatewayApiError::new(
+        StatusCode::NOT_FOUND,
+        "admin",
+        "model_service_not_found",
+        "Model Service does not exist",
+        false,
+    )
+}
+
 async fn list_model_resources(
     State(service): State<GatewayService>,
     headers: HeaderMap,
@@ -2822,6 +4049,16 @@ async fn get_model_resource(
                 false,
             )
         })?;
+    let configuration = service.inner.configuration.read().await.clone();
+    let resource =
+        resolve_provider_connections(vec![resource], &configuration.provider_connections)
+            .map_err(admin_storage_error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                admin_storage_error(anyhow!("model resource resolution returned no value"))
+            })?;
+    drop(configuration);
     Ok(Json(AdminModelResourceView::from(&resource)))
 }
 
@@ -2915,6 +4152,16 @@ async fn readiness_model_resource(
                 false,
             )
         })?;
+    let configuration = service.inner.configuration.read().await;
+    let resource =
+        resolve_provider_connections(vec![resource], &configuration.provider_connections)
+            .map_err(admin_storage_error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                admin_storage_error(anyhow!("model resource resolution returned no value"))
+            })?;
+    drop(configuration);
     let reservation = reserve_admin_write::<ModelResourceReadinessResponse>(
         &service,
         &headers,
@@ -3538,20 +4785,79 @@ fn redact_audit_metadata(value: Value) -> Value {
 }
 
 async fn refresh_configuration(service: &GatewayService) -> Result<()> {
-    let (resources, policies) = {
-        let storage = service.inner.storage.lock().await;
-        (
-            storage.current_model_resources()?,
-            storage.current_model_selection_policies()?,
-        )
-    };
+    let mut snapshot = None;
+    for _ in 0..3 {
+        let candidate = {
+            let storage = service.inner.storage.lock().await;
+            let before = storage.configuration_version()?;
+            let resources = storage.current_model_resources()?;
+            let connections = storage.provider_connections()?;
+            let policies = storage.current_model_selection_policies()?;
+            let after = storage.configuration_version()?;
+            (resources, connections, policies, before, after)
+        };
+        if candidate.3 == candidate.4 {
+            snapshot = Some(candidate);
+            break;
+        }
+    }
+    let (resources, connections, policies, _, version) = snapshot.ok_or_else(|| {
+        anyhow!("Provider Gateway configuration changed repeatedly while loading")
+    })?;
+    let connections = connections
+        .into_iter()
+        .map(|connection| (connection.id.clone(), connection))
+        .collect::<BTreeMap<_, _>>();
+    let resources = resolve_provider_connections(resources, &connections)?;
+    for resource in &resources {
+        validate_model_resource(resource)?;
+    }
+    for policy in &policies {
+        validate_model_selection_policy(policy, &resources)?;
+    }
     let resources = resources
         .into_iter()
         .map(|resource| (resource.id.clone(), resource))
         .collect();
-    *service.inner.resources.write().await = resources;
-    *service.inner.policies.write().await = policies;
+    *service.inner.configuration.write().await = GatewayConfigurationSnapshot {
+        resources,
+        provider_connections: connections,
+        policies,
+    };
+    service
+        .inner
+        .configuration_version
+        .store(version, Ordering::Release);
     Ok(())
+}
+
+fn resolve_provider_connections(
+    resources: Vec<ModelResource>,
+    connections: &BTreeMap<String, ProviderConnection>,
+) -> Result<Vec<ModelResource>> {
+    resources
+        .into_iter()
+        .map(|mut resource| {
+            if let Some(connection_id) = resource.provider_connection_id.as_deref() {
+                let connection = connections.get(connection_id).ok_or_else(|| {
+                    anyhow!(
+                        "model resource {} references missing provider connection {}",
+                        resource.id,
+                        connection_id
+                    )
+                })?;
+                validate_provider_connection(connection)?;
+                resource.kind = connection.kind.clone();
+                resource.endpoint = connection.endpoint.clone();
+                resource.auth = connection.auth.clone();
+                resource.enabled = resource.enabled && resource.published && connection.enabled;
+            } else {
+                resource.enabled = resource.enabled && resource.published;
+            }
+            validate_model_resource(&resource)?;
+            Ok(resource)
+        })
+        .collect()
 }
 
 fn write_file_secret_ref(secret_ref: &str, api_key: &str) -> Result<()> {
@@ -3658,7 +4964,8 @@ fn require_admin_change_context(
 }
 
 fn admin_storage_error(error: anyhow::Error) -> GatewayApiError {
-    let conflict = error.to_string().contains("revision conflict");
+    let message = error.to_string();
+    let conflict = message.contains("revision conflict") || message.contains("version conflict");
     GatewayApiError::new(
         if conflict {
             StatusCode::CONFLICT
@@ -3692,11 +4999,21 @@ async fn ready_handler(State(service): State<GatewayService>) -> StatusCode {
     if !storage_ready {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    let resources = service.inner.resources.read().await.clone();
-    let policies = service.inner.policies.read().await.clone();
-    for policy in &policies {
-        for candidate in &policy.candidates {
-            if let Some(resource) = resources.get(&candidate.model_resource_id) {
+    let configuration = service.inner.configuration.read().await.clone();
+    for policy in &configuration.policies {
+        let configured_resources = policy
+            .candidates
+            .iter()
+            .map(|candidate| candidate.model_resource_id.as_str())
+            .chain(
+                policy
+                    .direct_selection
+                    .allowed_model_resource_ids
+                    .iter()
+                    .map(String::as_str),
+            );
+        for resource_id in configured_resources {
+            if let Some(resource) = configuration.resources.get(resource_id) {
                 if resource.enabled
                     && service
                         .resolve_secret_ref(&resource.auth.secret_ref)
@@ -3731,7 +5048,8 @@ async fn metrics_handler(State(service): State<GatewayService>) -> Response {
             )
         })
         .collect::<HashMap<String, ResourceHealthState>>();
-    let resources = service.inner.resources.read().await;
+    let configuration = service.inner.configuration.read().await.clone();
+    let resources = &configuration.resources;
     let bulkheads = service.inner.bulkheads.lock().await;
     for resource in resources.values() {
         let key = format!("{}:{}", resource.id, resource.revision);
@@ -3775,6 +5093,71 @@ async fn metrics_handler(State(service): State<GatewayService>) -> Response {
         body,
     )
         .into_response()
+}
+
+async fn list_available_model_services(
+    State(service): State<GatewayService>,
+    headers: HeaderMap,
+    Query(query): Query<AvailableModelServicesQuery>,
+) -> std::result::Result<Json<AvailableModelServicesResponse>, GatewayApiError> {
+    authorize(&service.inner.config, &headers, "model-services")?;
+    let scope = TurnScope {
+        workspace_id: query.workspace_id,
+        project_id: query.project_id,
+        run_id: "model-service-catalog".to_string(),
+        turn: 0,
+        phase: query.phase,
+        agent_profile: query.agent_profile,
+    };
+    let configuration = service.inner.configuration.read().await;
+    let policy = service
+        .resolve_policy(&configuration.policies, &scope)
+        .ok_or_else(|| {
+            GatewayApiError::new(
+                StatusCode::FORBIDDEN,
+                "model-services",
+                "model_resource_not_allowed",
+                "No active model selection policy allows this scope",
+                false,
+            )
+        })?;
+    let allowed = policy
+        .direct_selection
+        .allowed_model_resource_ids
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let resources = &configuration.resources;
+    let mut items = resources
+        .values()
+        .filter(|resource| {
+            resource.provider_connection_id.is_some()
+                && resource.published
+                && resource.enabled
+                && allowed.contains(&resource.id)
+        })
+        .map(|resource| AvailableModelService {
+            id: resource.id.clone(),
+            display_name: resource.display_name.clone(),
+            description: resource.description.clone(),
+            capabilities: resource.capabilities.clone(),
+            availability: "available".to_string(),
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_order = resources
+            .get(&left.id)
+            .map(|resource| resource.sort_order)
+            .unwrap_or_default();
+        let right_order = resources
+            .get(&right.id)
+            .map(|resource| resource.sort_order)
+            .unwrap_or_default();
+        left_order
+            .cmp(&right_order)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(AvailableModelServicesResponse { items }))
 }
 
 async fn turn_handler(
@@ -3909,6 +5292,50 @@ fn validate_model_resource(resource: &ModelResource) -> Result<()> {
         || (!allow_loopback && unsafe_endpoint_host(host))
     {
         return Err(anyhow!("model resource endpoint violates network policy"));
+    }
+    Ok(())
+}
+
+fn validate_provider_connection(connection: &ProviderConnection) -> Result<()> {
+    if connection.schema_version != PROVIDER_CONNECTION_SCHEMA
+        || connection.id.trim().is_empty()
+        || connection.name.trim().is_empty()
+        || connection.auth.auth_type != "bearer"
+        || connection.auth.secret_ref.trim().is_empty()
+    {
+        return Err(anyhow!("provider connection has invalid required fields"));
+    }
+    if let Some(name) = connection.auth.secret_ref.strip_prefix("db:") {
+        validate_database_secret_name(name)?;
+    } else if !connection.auth.secret_ref.starts_with("file:")
+        && !connection.auth.secret_ref.starts_with("env:")
+    {
+        return Err(anyhow!(
+            "provider connection secret reference backend is unsupported"
+        ));
+    }
+    let url = reqwest::Url::parse(&connection.endpoint.base_url)
+        .context("provider connection base URL is invalid")?;
+    let local_test_host = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
+    let allow_loopback = cfg!(test)
+        || env::var("PROVIDER_GATEWAY_ALLOW_LOOPBACK")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("provider connection endpoint host is required"))?;
+    if (url.scheme() != "https" && !local_test_host)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || connection.endpoint.chat_completions_path.trim().is_empty()
+        || !connection.endpoint.chat_completions_path.starts_with('/')
+        || (!allow_loopback && unsafe_endpoint_host(host))
+    {
+        return Err(anyhow!(
+            "provider connection endpoint violates network policy"
+        ));
     }
     Ok(())
 }
@@ -4359,7 +5786,11 @@ fn build_turn_response(
             id: format!("model-execution-{}", request.request_id),
             model_resource_id: resource.id.clone(),
             model_resource_revision: resource.revision,
-            provider_id: resource.id.clone(),
+            display_name: resource.display_name.clone(),
+            provider_id: resource
+                .provider_connection_id
+                .clone()
+                .unwrap_or_else(|| resource.id.clone()),
             physical_model: resource.physical_model.clone(),
             selection_policy_id: policy.id.clone(),
             selection_policy_revision: policy.revision,
@@ -5308,8 +6739,12 @@ mod tests {
             schema_version: MODEL_RESOURCE_SCHEMA.to_string(),
             id: id.to_string(),
             display_name: id.to_string(),
+            description: String::new(),
+            sort_order: 0,
+            provider_connection_id: None,
             kind: ModelResourceKind::OpenaiCompatible,
             enabled: true,
+            published: true,
             revision: 1,
             endpoint: ProviderEndpoint {
                 base_url: endpoint,
@@ -5409,8 +6844,10 @@ mod tests {
         vision_resource.capabilities.max_image_count = 8;
         assert!(validate_model_resource(&vision_resource).is_ok());
 
-        let mut required = RequiredCapabilities::default();
-        required.vision = true;
+        let required = RequiredCapabilities {
+            vision: true,
+            ..RequiredCapabilities::default()
+        };
         assert!(capabilities_match(&vision_resource, &required));
     }
 
@@ -6024,8 +7461,12 @@ mod tests {
             schema_version: MODEL_RESOURCE_SCHEMA.to_string(),
             id: "deepseek-v4-pro-real-gate".to_string(),
             display_name: "DeepSeek V4 Pro real gate".to_string(),
+            description: String::new(),
+            sort_order: 0,
+            provider_connection_id: None,
             kind: ModelResourceKind::OpenaiCompatible,
             enabled: true,
+            published: true,
             revision: 1,
             endpoint: ProviderEndpoint {
                 base_url: "https://api.deepseek.com".to_string(),
@@ -6788,6 +8229,386 @@ mod tests {
         assert_eq!(first_result, second_result);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn separate_gateway_instances_converge_on_configuration_version() {
+        let database_path = std::env::temp_dir().join(format!(
+            "provider-gateway-config-refresh-{}-{}.db",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let config = GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(database_path.display().to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: None,
+            resources: vec![resource("allowed", "http://localhost:1".to_string())],
+            policies: vec![policy()],
+        };
+        let first = GatewayService::new(config.clone()).unwrap();
+        let second = GatewayService::new(config).unwrap();
+        let refresh_task = second.start_configuration_refresh_task(Duration::from_millis(10));
+
+        let mut changed = first
+            .inner
+            .storage
+            .lock()
+            .await
+            .model_resource("allowed", None)
+            .unwrap()
+            .unwrap();
+        changed.display_name = "Updated on another Pod".to_string();
+        first
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_model_resource(changed, Some(1))
+            .unwrap();
+        refresh_configuration(&first).await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if second
+                .inner
+                .configuration
+                .read()
+                .await
+                .resources
+                .get("allowed")
+                .is_some_and(|resource| resource.display_name == "Updated on another Pod")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "second Gateway instance did not observe the configuration update"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(first.observed_configuration_version(), 1);
+        assert_eq!(second.observed_configuration_version(), 1);
+        refresh_task.abort();
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn admin_manages_provider_connections_without_returning_credentials() {
+        let service = GatewayService::new(GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(":memory:".to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: Some("admin-token".to_string()),
+            resources: vec![resource("allowed", "http://localhost:1".to_string())],
+            policies: vec![policy()],
+        })
+        .unwrap();
+        let app = router(service.clone());
+        let create_payload = json!({
+            "schemaVersion": PROVIDER_CONNECTION_SCHEMA,
+            "id": "deepseek-primary",
+            "name": "DeepSeek Primary",
+            "providerType": "openai_compatible",
+            "baseUrl": "http://localhost:1",
+            "chatCompletionsPath": "/v1/chat/completions",
+            "enabled": true,
+            "apiKey": "provider-secret-value"
+        });
+        let create = || {
+            Request::post("/internal/provider-gateway/admin/v1/provider-connections")
+                .header("authorization", "Bearer admin-token")
+                .header("idempotency-key", "provider-create-1")
+                .header("x-operator-id", "platform-admin-1")
+                .header("x-change-reason", "configure provider")
+                .header("x-change-reference", "CHG-PC-1")
+                .header("content-type", "application/json")
+                .body(Body::from(create_payload.to_string()))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(create()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("credentialConfigured"));
+        assert!(!body.contains("provider-secret-value"));
+        assert!(!body.contains("provider-connection-deepseek-primary"));
+        assert_eq!(
+            service
+                .resolve_secret_ref("db:provider-connection-deepseek-primary")
+                .await
+                .unwrap(),
+            "provider-secret-value"
+        );
+
+        let replay = app.clone().oneshot(create()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = String::from_utf8(
+            to_bytes(replay.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(body, replay_body);
+
+        let conflicting_create =
+            Request::post("/internal/provider-gateway/admin/v1/provider-connections")
+                .header("authorization", "Bearer admin-token")
+                .header("idempotency-key", "provider-create-conflict")
+                .header("x-operator-id", "platform-admin-2")
+                .header("x-change-reason", "conflicting provider create")
+                .header("x-change-reference", "CHG-PC-CONFLICT")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "schemaVersion": PROVIDER_CONNECTION_SCHEMA,
+                        "id": "deepseek-primary",
+                        "name": "Conflicting Provider",
+                        "providerType": "openai_compatible",
+                        "baseUrl": "http://localhost:2",
+                        "enabled": true,
+                        "apiKey": "must-not-overwrite-winning-secret"
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+        let response = app.clone().oneshot(conflicting_create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            service
+                .resolve_secret_ref("db:provider-connection-deepseek-primary")
+                .await
+                .unwrap(),
+            "provider-secret-value"
+        );
+
+        let update_payload = json!({
+            "schemaVersion": PROVIDER_CONNECTION_SCHEMA,
+            "id": "deepseek-primary",
+            "name": "DeepSeek Production",
+            "providerType": "openai_compatible",
+            "baseUrl": "http://localhost:1",
+            "chatCompletionsPath": "/v1/chat/completions",
+            "enabled": true,
+            "expectedVersion": 1
+        });
+        let update = Request::patch(
+            "/internal/provider-gateway/admin/v1/provider-connections/deepseek-primary",
+        )
+        .header("authorization", "Bearer admin-token")
+        .header("idempotency-key", "provider-update-1")
+        .header("x-operator-id", "platform-admin-1")
+        .header("x-change-reason", "rename provider")
+        .header("x-change-reference", "CHG-PC-2")
+        .header("content-type", "application/json")
+        .body(Body::from(update_payload.to_string()))
+        .unwrap();
+        let response = app.clone().oneshot(update).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(updated["name"], "DeepSeek Production");
+        assert_eq!(updated["version"], 2);
+
+        let rotation = Request::post(
+            "/internal/provider-gateway/admin/v1/provider-connections/deepseek-primary/rotate-credential",
+        )
+        .header("authorization", "Bearer admin-token")
+        .header("idempotency-key", "provider-rotate-1")
+        .header("x-operator-id", "platform-admin-1")
+        .header("x-change-reason", "rotate credential")
+        .header("x-change-reference", "CHG-PC-3")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "apiKey": "rotated-secret", "expectedVersion": 2 }).to_string(),
+        ))
+        .unwrap();
+        let response = app.clone().oneshot(rotation).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            service
+                .resolve_secret_ref("db:provider-connection-deepseek-primary")
+                .await
+                .unwrap(),
+            "rotated-secret"
+        );
+
+        let test = Request::post(
+            "/internal/provider-gateway/admin/v1/provider-connections/deepseek-primary/test",
+        )
+        .header("authorization", "Bearer admin-token")
+        .header("idempotency-key", "provider-test-1")
+        .header("x-operator-id", "platform-admin-1")
+        .header("x-change-reason", "validate provider")
+        .header("x-change-reference", "CHG-PC-4")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "expectedVersion": 3 }).to_string()))
+        .unwrap();
+        let response = app.oneshot(test).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let tested: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(tested["status"], "ready");
+        assert_eq!(tested["version"], 4);
+    }
+
+    #[tokio::test]
+    async fn admin_creates_and_publishes_a_model_service_from_a_provider_connection() {
+        let service = GatewayService::new(GatewayConfig {
+            listen: default_listen(),
+            database_url: Some(":memory:".to_string()),
+            runtime_bearer_token: None,
+            admin_bearer_token: Some("admin-token".to_string()),
+            resources: vec![resource("allowed", "http://localhost:1".to_string())],
+            policies: vec![policy()],
+        })
+        .unwrap();
+        service
+            .write_secret_ref("db:provider-connection-product-provider", "secret")
+            .await
+            .unwrap();
+        service
+            .inner
+            .storage
+            .lock()
+            .await
+            .save_provider_connection(
+                ProviderConnection {
+                    schema_version: PROVIDER_CONNECTION_SCHEMA.to_string(),
+                    id: "product-provider".to_string(),
+                    name: "Product Provider".to_string(),
+                    kind: ModelResourceKind::OpenaiCompatible,
+                    endpoint: ProviderEndpoint {
+                        base_url: "http://localhost:43210".to_string(),
+                        chat_completions_path: "/v1/chat/completions".to_string(),
+                    },
+                    auth: ProviderAuth {
+                        auth_type: "bearer".to_string(),
+                        secret_ref: "db:provider-connection-product-provider".to_string(),
+                    },
+                    enabled: true,
+                    version: 0,
+                    last_test_status: None,
+                    last_tested_at: None,
+                },
+                None,
+            )
+            .unwrap();
+        refresh_configuration(&service).await.unwrap();
+        let app = router(service.clone());
+        let create = Request::post("/internal/provider-gateway/admin/v1/model-services")
+            .header("authorization", "Bearer admin-token")
+            .header("idempotency-key", "model-service-create-1")
+            .header("x-operator-id", "platform-admin-1")
+            .header("x-change-reason", "publish product model")
+            .header("x-change-reference", "CHG-MS-1")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "schemaVersion": MODEL_SERVICE_SCHEMA,
+                    "id": "product-model",
+                    "providerConnectionId": "product-provider",
+                    "displayName": "Product Model",
+                    "description": "User-selectable model",
+                    "physicalModel": "provider-model-v1",
+                    "capabilities": {
+                        "toolCalls": true,
+                        "strictToolSchema": false,
+                        "streaming": false,
+                        "vision": false
+                    },
+                    "sortOrder": 10
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(created["published"], false);
+        assert_eq!(created["revision"], 1);
+        assert_eq!(created["providerConnectionId"], "product-provider");
+
+        let publish = Request::post(
+            "/internal/provider-gateway/admin/v1/model-services/product-model/publish",
+        )
+        .header("authorization", "Bearer admin-token")
+        .header("idempotency-key", "model-service-publish-1")
+        .header("x-operator-id", "platform-admin-1")
+        .header("x-change-reason", "make model selectable")
+        .header("x-change-reference", "CHG-MS-2")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "expectedRevision": 1 }).to_string()))
+        .unwrap();
+        let response = app.clone().oneshot(publish).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let published: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(published["published"], true);
+        assert_eq!(published["revision"], 2);
+
+        let policy = service
+            .inner
+            .storage
+            .lock()
+            .await
+            .model_selection_policy("policy-1", None)
+            .unwrap()
+            .unwrap();
+        assert!(policy
+            .direct_selection
+            .allowed_model_resource_ids
+            .contains(&"product-model".to_string()));
+        {
+            let configuration = service.inner.configuration.read().await;
+            let resolved = configuration.resources.get("product-model").unwrap();
+            assert_eq!(
+                resolved.endpoint.base_url,
+                "http://localhost:43210".to_string()
+            );
+            assert_eq!(
+                resolved.provider_connection_id.as_deref(),
+                Some("product-provider")
+            );
+            assert!(resolved.enabled);
+        }
+
+        let catalog = app
+            .oneshot(
+                Request::get(
+                    "/v1/model-services?workspaceId=ws-one&projectId=project-1&phase=build&agentProfile=build",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let catalog_body = String::from_utf8(
+            to_bytes(catalog.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(catalog_body.contains("product-model"));
+        assert!(catalog_body.contains("User-selectable model"));
+        assert!(!catalog_body.contains("product-provider"));
+        assert!(!catalog_body.contains("localhost"));
+        assert!(!catalog_body.contains("secret"));
     }
 
     #[tokio::test]

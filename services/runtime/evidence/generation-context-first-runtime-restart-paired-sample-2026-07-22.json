@@ -1,0 +1,176 @@
+{
+  "schemaVersion": "generation-context-first-runtime-restart-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T21:23:15.000Z",
+  "sessionId": "deepseek-v4-pro-20260722-runtime-restart-003",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:6a5603c0a464-dirty-bb6cdfe816f4",
+    "dockerImageId": "sha256:03a941f9388064f8c067cf5ed0c38cf888db4e0fb348bb8cb0d9950d07608b75",
+    "controlDeploymentRevision": "9d587988965fa71f6bef35f4e8d0d88c4051526b547035111fa037c416179ab3",
+    "candidateDeploymentRevision": "ada9037081666d450ebddef7bba319918009bc53f578570229db9c3533ec7840"
+  },
+  "pair": {
+    "id": "batch-10-agent-cloud-quickstart-greenfield",
+    "batchId": "batch-10",
+    "bucket": "greenfield",
+    "identity": {
+      "fixtureId": "agent-cloud-quickstart",
+      "templateVersion": "fumadocs-docs",
+      "phase": "build",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-597",
+      "recordHash": "5ba50cd7940a9e18af97b60ec4ad28ad54947e38b268a803caea59b834169f9e",
+      "metrics": {
+        "inputTokens": 255788,
+        "totalDurationMs": 178260,
+        "timeToFirstSourceMutationMs": 60812,
+        "modelTurnAtFirstSourceMutation": 7,
+        "prebuildFsReadCount": 16,
+        "prebuildFsListCount": 2,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      },
+      "runtimeRestart": {
+        "status": "accepted",
+        "restartDurationMs": 2338,
+        "runContractVersion": "legacy@1",
+        "generationContextStatus": "not_compiled",
+        "workflowState": "draft_ready",
+        "podUidChanged": true,
+        "allRecoveryInvariantsPassed": true,
+        "evidenceSha256": "530cbf939fbbc4282fa4da92898728c96174e1b073ba8f1938626b12b3492448"
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-50",
+      "contextContentHash": "1792446541e77603b3e867a4cacfff4cd8dfa8e15a1f4fca35400b595abe11a2",
+      "runContextBindingHash": "64661b31f3398562d21ae8d65d31e534ef0a3356513bf337983c69e9869c7d7b",
+      "runtimeAttestationHash": "9442029d71eada2b7660cfcda5d76c1f41c2fdd4b9bbd641dbb4b42151adb414",
+      "recordHash": "361ec68892e49ab768f454b6d2e0d188c6f12d528958b8fc670baf9c0b78a0ac",
+      "metrics": {
+        "inputTokens": 182366,
+        "totalDurationMs": 145615,
+        "timeToFirstSourceMutationMs": 38459,
+        "modelTurnAtFirstSourceMutation": 3,
+        "prebuildFsReadCount": 5,
+        "prebuildFsListCount": 1,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      },
+      "runtimeRestart": {
+        "status": "accepted",
+        "restartDurationMs": 2313,
+        "runContractVersion": "generation-context@1",
+        "generationContextStatus": "compiled",
+        "runtimeMode": "enabled",
+        "executionProfile": "greenfield_static",
+        "workflowState": "draft_ready",
+        "podUidChanged": true,
+        "allRecoveryInvariantsPassed": true,
+        "evidenceSha256": "635403e8ac6da803b001de8c6bef5650d21e728d25fffa920d22c9b34dffdba5"
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -28.7,
+      "totalDurationMs": -18.31,
+      "timeToFirstSourceMutationMs": -36.76,
+      "modelTurnAtFirstSourceMutation": -57.14,
+      "prebuildFsReadCount": -68.75,
+      "prebuildFsListCount": -50.0
+    },
+    "coverage": {
+      "fumadocsTemplate": true,
+      "runtimeRestart": true
+    },
+    "cleanup": {
+      "sandboxClaimAbsent": true,
+      "sandboxPodAbsent": true
+    },
+    "openFindings": [
+      "this first Runtime Restart pair proves restart recovery and paired evidence collection, but one Greenfield pair from one batch is below the required 20 pairs across at least three batches",
+      "both sides required an acceptance repair and neither passed its first Build, so the pair does not prove the first-Build-success or stability gates",
+      "the isolated session proves Fumadocs and Runtime Restart coverage only; Next, visual delivery, non-visual degradation, Warm Structural, and multi-batch coverage remain open"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "sessionId": "deepseek-v4-pro-20260722-runtime-restart-001",
+      "pairId": "batch-07-agent-cloud-quickstart-greenfield",
+      "result": "control_brief_failed_candidate_not_run",
+      "findings": [
+        "the Runtime Gateway bearer token contained a trailing newline and reqwest rejected the authorization header before the Provider request"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260722-runtime-restart-002",
+      "pairId": "batch-08-agent-cloud-quickstart-greenfield",
+      "result": "control_build_no_progress_candidate_not_run",
+      "findings": [
+        "the Fumadocs RepairSource stage omitted fs.search, so the model could not locate acceptance-forbidden text after observation compaction"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260722-runtime-restart-003",
+      "pairId": "batch-09-agent-cloud-quickstart-greenfield",
+      "result": "control_completed_restart_probe_failed_candidate_not_run",
+      "findings": [
+        "the base real-provider runner released the SandboxClaim before the restart probe read project runtime state"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "361ec68892e49ab768f454b6d2e0d188c6f12d528958b8fc670baf9c0b78a0ac",
+    "sha256": "efe0c6d5135673062e2f7fc28ad08cf1bb4fd1773aadc671b3cc03e9cc1a5c7b"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "runtimeRestart": true,
+    "fumadocsTemplate": true,
+    "greenfieldPairCount": 1,
+    "greenfieldMinimumPairCount": 20,
+    "greenfieldBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "5fbc964ac3be763ff6ddfc2c64deef8fb8514f10883219cfb3068557a9896bc8"
+  },
+  "sourceSha256": {
+    "session": "ff74b14febc2459a491811d123fadea6d232210b1590b10f5fa48ac4454c3a1b",
+    "sessionMeta": "890a7e8ec4a04209f53977b6306b7b36147086771b5ca771c4db9e9bd4dae7fd",
+    "providerReconcile": "fa8e89d1353d6a5ad26cd8b7b8064749e06294ca6d5056d662915638f67be6e3",
+    "controlCase": "c91c7720ca1d0a5f626428d97b491666b41ce6652a1b6b8407f655f4050e75b7",
+    "candidateCase": "204f181db6b3eccf05faca8e86c78987344e1bc6cff5f7f09ef04f26e97396eb",
+    "pairSpec": "335e3e4ad5253173d888d215650545fb5d5a2f0f2aac5f0259fdf8bf12d61584",
+    "pairResult": "ba31983c0be7337c325446d0ca2807a324d6aa2ae8fa50370dffc3399cfe1a7e",
+    "controlRuntimeRestart": "308fbb172d3cbdb1cb878c5758d64d08fe4b81f0220d2d31a6ac5ceb751d64eb",
+    "candidateRuntimeRestart": "7e56fe3249cec3093cf7d32da1222637614e2c584f2d5ff788c8c29ac988d2f7",
+    "rolloutEvidence": "5fbc964ac3be763ff6ddfc2c64deef8fb8514f10883219cfb3068557a9896bc8"
+  }
+}

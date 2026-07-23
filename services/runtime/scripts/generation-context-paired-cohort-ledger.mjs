@@ -90,6 +90,9 @@ function validateIdentity(identity, label) {
   for (const field of ["providerParametersHash", "capabilitySnapshotHash"]) {
     if (!SHA256.test(identity?.[field] || "")) throw new Error(`${label}.${field} must be sha256`);
   }
+  if (!SHA256.test(identity?.designProfileHash || "")) {
+    throw new Error(`${label}.designProfileHash must be sha256`);
+  }
   if (!positiveInteger(identity?.providerResourceRevision)) {
     throw new Error(`${label}.providerResourceRevision must be a positive integer`);
   }
@@ -107,6 +110,9 @@ function validateSession(session) {
     throw new Error("session.bootstrap.iterations must be at least 100");
   }
   if (!Number.isSafeInteger(session.bootstrap?.seed)) throw new Error("session.bootstrap.seed must be an integer");
+  if (!hasText(session.source?.commit) || typeof session.source?.dirty !== "boolean") {
+    throw new Error("session.source must freeze commit and dirty state");
+  }
   if (!SHA256.test(session.fixtureManifestSha256 || "")) {
     throw new Error("session.fixtureManifestSha256 must be sha256");
   }
@@ -354,7 +360,18 @@ export function verifyPairedCohortLedger(ledgerFile) {
   const ledger = parseLedger(ledgerFile);
   const pendingPairs = [];
   const sidesByPair = new Map();
+  const identityByPair = new Map();
   for (const sample of ledger.samples) {
+    const identity = identityByPair.get(sample.pairId);
+    if (identity && (identity.batchId !== sample.batchId || identity.bucket !== sample.bucket
+      || canonical(identity.value) !== canonical(sample.identity))) {
+      throw new Error(`pair ${sample.pairId} control/candidate identity mismatch`);
+    }
+    identityByPair.set(sample.pairId, {
+      batchId: sample.batchId,
+      bucket: sample.bucket,
+      value: sample.identity,
+    });
     const sides = sidesByPair.get(sample.pairId) || new Set();
     sides.add(sample.side);
     sidesByPair.set(sample.pairId, sides);
@@ -418,6 +435,7 @@ export function assemblePairedCohortEvidence(ledgerFile) {
     provenance: {
       sourcePolicy: ledger.session.sourcePolicy,
       sessionId: ledger.session.sessionId,
+      source: ledger.session.source,
       fixtureManifestSha256: ledger.session.fixtureManifestSha256,
       ledgerSha256: sha256(fs.readFileSync(ledgerFile)),
       ledgerHeadRecordHash: ledger.headRecordHash,

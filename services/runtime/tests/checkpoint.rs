@@ -701,12 +701,14 @@ async fn runtime_restart_advances_id_counter_from_persisted_state() {
     let first = create_run(&store).await;
     let second = create_run(&store).await;
     assert_eq!(first, "run-1");
-    assert_eq!(second, "run-4");
+    // Each initial Run now freezes Run, Operation, Session, and input Message
+    // identities from the shared monotonic counter.
+    assert_eq!(second, "run-5");
 
     let reloaded_store = RuntimeStore::with_storage_dirs(&checkpoint_dir, &run_log_dir);
     let third = create_run(&reloaded_store).await;
 
-    assert_eq!(third, "run-7");
+    assert_eq!(third, "run-9");
     assert_eq!(reloaded_store.get_run(&first).await.unwrap().id, first);
     assert_eq!(reloaded_store.get_run(&second).await.unwrap().id, second);
 }

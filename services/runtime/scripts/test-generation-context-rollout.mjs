@@ -23,6 +23,7 @@ for (const [bucket, count] of Object.entries(bucketCounts)) {
         providerParametersHash: "a".repeat(64),
         templateVersion: bucket === "repair" ? "fumadocs-docs@runtime-p6" : "next-app@2",
         capabilitySnapshotHash: "b".repeat(64),
+        designProfileHash: "c".repeat(64),
         phase: bucket,
       },
       control: {

@@ -17,6 +17,7 @@ run_step "Rust runtime formatting" \
   cargo fmt --manifest-path services/runtime/Cargo.toml -- --check
 
 run_step "Rust runtime tests" \
+  env RUST_MIN_STACK=8388608 \
   cargo test --manifest-path services/runtime/Cargo.toml
 
 run_step "Shared package tests" \

@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "generation-context-cohort-session-invalidation-summary@1",
+  "recordedAt": "2026-07-22T03:59:10Z",
+  "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+  "status": "invalidated",
+  "reason": "collector_fidelity_mapping_invalid",
+  "contaminatedPair": {
+    "pairId": "batch-27-zenova-agent-cloud-warm-structural",
+    "controlOuterCaseStatus": "rejected",
+    "candidateOuterCaseStatus": "rejected",
+    "outerCaseClassification": "acceptance_rejected",
+    "lifecycleStatus": "accepted",
+    "incorrectRecordedStatus": "completed",
+    "incorrectRequiredFidelityPassed": true,
+    "actualRequiredFidelityPassed": false,
+    "finding": "both generated base Draft Previews omitted the frozen fixture required text; the Structural Edit marker was present, but marker-only lifecycle acceptance cannot override failed base acceptance"
+  },
+  "impact": {
+    "ledgerRecordCount": 11,
+    "ledgerSampleCount": 10,
+    "ledgerCompletePairCount": 5,
+    "contaminatedRecordCount": 2,
+    "priorPairsKnownAffected": false,
+    "rolloutEligible": false,
+    "replacementSessionRequired": true
+  },
+  "remediation": {
+    "collectorRequiresOuterCaseAccepted": true,
+    "lifecycleAcceptanceHashBindsOuterCase": true,
+    "failedExecutionRemainsRecorded": true,
+    "failedExecutionRequiredFidelityPassed": false,
+    "invalidatedSessionRunnerPreflightRejected": true,
+    "regressionTestsPassed": true,
+    "ledgerRewritten": false
+  },
+  "ledger": {
+    "headRecordHash": "e3009d694713db9fec0ad10c05f0e1f203bada36446104ffeeee9781d1c163ac",
+    "sha256": "1cdfc3e3c4295927c6139786f0cf74c96e477586e065089b923d7061aebf6622"
+  },
+  "sourceSha256": {
+    "session": "f62d8fc511cf6a3e9bf11566d5eded9b1caffd169497ece0f48d9359be404d26",
+    "pairSpec": "b4482a451c2c0cc166f8823b28550c2e747f0546fcb963f9d12c3111cf387a48",
+    "pairResult": "a87a8cb4e71b33b7b7cbc03cdde1e1ccf95e2df841ae36c65b4f4bb535cea08c",
+    "controlCase": "882dad3f4a4467a3bd15a483a28d806d4f994538f9cc1188639a6e5e4cf741ea",
+    "candidateCase": "c0a7b07d1c9ed5b7f28749551ee38e1b86a7312947a77f49de2d3394c7b107eb",
+    "collector": "b3d8a5e7ea4fdedc7331c18610a15f724dadba4acc7385e9d1ea9d25b10e54c3",
+    "collectorTest": "89548ad0b9a54843a33515e4d82e44a8ff20e02cbac634d8f484798f53470752",
+    "pairRunner": "c3c077efe1621753ab1ccec4c31f36c97f9e20fccbd7b6a198b1f7ba1eeb0f69",
+    "pairRunnerTest": "fd84c5b95b7fa79e1a7e5c3f808255671a9dc882c72fa4142b3dd539ad7935f6"
+  }
+}

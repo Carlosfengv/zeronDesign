@@ -1,0 +1,184 @@
+{
+  "schemaVersion": "generation-context-nonvisual-sample-expansion-summary@1",
+  "recordedAt": "2026-07-22T03:23:02Z",
+  "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "visionCapable": false,
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "runtime": {
+    "image": "anydesign/runtime:6a5603c0a464-dirty-dd5b89a754a9",
+    "containerImageId": "sha256:2acb0c8afefff44e9a34cf0d66870359f85b4463d0ac319bc7d42360c1944f15",
+    "controlDeploymentRevision": "b01fdb7facd6cd5dcdae6d57177a650230b1242f16f8b95808f0c0cf0923dc13",
+    "candidateDeploymentRevision": "c7a86479eb73974053e37add83b3ebbfa93ed5156bf3318596683b16de9fa10c"
+  },
+  "providerGateway": {
+    "image": "zerondesign/provider-gateway:6a5603c0a464-dirty-997a4e0fbfbc",
+    "containerImageId": "sha256:ec3db863f752a76dc2f89417e4b7c9b5017637ef9478de0ac3a44752a8b8468c"
+  },
+  "acceptedPairs": [
+    {
+      "pairId": "batch-22-oilfield-operations-dashboard-warm-copy-css",
+      "batchId": "batch-22",
+      "fixtureId": "oilfield-operations-dashboard",
+      "bucket": "warm_copy_css",
+      "controlAttempts": [
+        "no_progress",
+        "no_progress",
+        "accepted"
+      ],
+      "candidateAttempts": [
+        "accepted"
+      ],
+      "candidateVisualDelivery": "unavailable_main_task_completed"
+    },
+    {
+      "pairId": "batch-24-zenova-agent-cloud-warm-copy-css",
+      "batchId": "batch-24",
+      "fixtureId": "zenova-agent-cloud",
+      "bucket": "warm_copy_css",
+      "controlAttempts": [
+        "accepted"
+      ],
+      "candidateAttempts": [
+        "accepted"
+      ],
+      "control": {
+        "status": "completed",
+        "requiredFidelityPassed": true,
+        "providerVerified": true,
+        "runId": "run-5344",
+        "draftSnapshotId": "draft-snapshot-5373",
+        "recordHash": "5920ecabcdb48682a87ad4fe5fd3e3cdcaeb670f185a5dec4de4bb07f99c547c",
+        "metrics": {
+          "inputTokens": 53341,
+          "outputTokens": 662,
+          "turns": 5,
+          "toolCalls": 10,
+          "totalDurationMs": 52770,
+          "timeToFirstSourceMutationMs": 12309,
+          "modelTurnAtFirstSourceMutation": 2,
+          "timeToIframeAppliedMs": 33676,
+          "timeToDurableSnapshotMs": 12309,
+          "prebuildFsReadCount": 1,
+          "duplicateFullReadRateBasisPoints": 0,
+          "outOfScopeMutationCount": 0
+        }
+      },
+      "candidate": {
+        "status": "completed",
+        "requiredFidelityPassed": true,
+        "providerVerified": true,
+        "runId": "run-2485",
+        "draftSnapshotId": "draft-snapshot-2516",
+        "recordHash": "9ed8f1f4d24507894c4c4ce52e693030b5f39c9624f7ebcb602cdd39cbc2ff94",
+        "visualDelivery": {
+          "state": "unavailable",
+          "visualBindingsVerified": true,
+          "visualBindingSetHash": "548b6782458e336fcfce3d66535ca803bf237cde0382b8103eb9ca154a054753",
+          "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+          "unavailableMetricRecorded": true,
+          "mainTaskCompleted": true,
+          "modelExecutionsAfterUnavailable": 4
+        },
+        "metrics": {
+          "inputTokens": 45988,
+          "outputTokens": 695,
+          "turns": 4,
+          "toolCalls": 9,
+          "totalDurationMs": 24593,
+          "timeToFirstSourceMutationMs": 16199,
+          "modelTurnAtFirstSourceMutation": 3,
+          "timeToIframeAppliedMs": 3829,
+          "timeToDurableSnapshotMs": 16199,
+          "prebuildFsReadCount": 1,
+          "duplicateFullReadRateBasisPoints": 0,
+          "outOfScopeMutationCount": 0
+        }
+      },
+      "observedCandidateChangePercent": {
+        "inputTokens": -13.78,
+        "outputTokens": 4.98,
+        "turns": -20.0,
+        "toolCalls": -10.0,
+        "totalDurationMs": -53.4,
+        "timeToFirstSourceMutationMs": 31.6,
+        "modelTurnAtFirstSourceMutation": 50.0,
+        "timeToIframeAppliedMs": -88.63,
+        "timeToDurableSnapshotMs": 31.6
+      }
+    }
+  ],
+  "diagnosticPairs": [
+    {
+      "pairId": "batch-23-ai-governance-console-warm-copy-css",
+      "result": "incomplete_pair_not_appended",
+      "control": {
+        "attempts": [
+          "no_progress",
+          "no_progress",
+          "no_progress"
+        ],
+        "buildToolCalls": [
+          45,
+          71,
+          138
+        ],
+        "prebuildFsReadCounts": [
+          20,
+          27,
+          40
+        ]
+      },
+      "candidate": {
+        "attempts": [
+          "accepted"
+        ],
+        "buildToolCalls": 25,
+        "prebuildFsReadCount": 1,
+        "warmEditAccepted": true
+      },
+      "finding": "the failure is a reproducible legacy-control Build exploration failure rather than a Docker or Provider outage; the candidate completed the same fixture, but missing control Warm lifecycle evidence prevents paired append"
+    }
+  ],
+  "ledger": {
+    "recordCount": 5,
+    "sampleCount": 4,
+    "completePairCount": 2,
+    "pendingPairCount": 0,
+    "batchCount": 2,
+    "headRecordHash": "9ed8f1f4d24507894c4c4ce52e693030b5f39c9624f7ebcb602cdd39cbc2ff94",
+    "sha256": "5e14a92f52ddecdc6c7fd050d66d7efb014e883ec91473d4b76bb0a47c1fd498"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 2,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 2,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "0fa405954740be65bf42cbc60ff8113ffc25d2c51132ec92a03e4043b17725a8"
+  },
+  "openFindings": [
+    "the current frozen cohort still needs at least one additional batch and eighteen additional Warm Copy/CSS pairs before bucket evaluation can run",
+    "both accepted candidate pairs remain above the 3000ms iframe P95 and 5000ms durable snapshot P95 targets",
+    "batch-23 demonstrates a reliability advantage for Generation Context, but the rollout calculator cannot treat a missing control Warm lifecycle as a completed Warm pair",
+    "a governed vision-capable Provider Resource is still required for real multimodalVisualDelivered coverage"
+  ],
+  "sourceSha256": {
+    "batch23PairSpec": "5a714b9c68b6b6e03c3e852abf13b8d56a60bf05950e92ec8efcf402df3b68e1",
+    "batch23ControlStatus": "4e90df9855cf50d1ad39ce354df09a197189155ff5f920a2d23ae021325b5ecd",
+    "batch23CandidateStatus": "f480fe4675975436236396b6e08ec117310967331e24021118c94e2e893127f9",
+    "batch23ControlCase": "60d8cb0f01aaa4e4666a7d671ddc37f9d88733146788f9d96a5e7fe2164d86de",
+    "batch23CandidateCase": "6967d4159cfcccf75e014500b9b4590dca34ef48f03acbf2787ca4da6f2aa2e2",
+    "batch24PairSpec": "ccca20729b9b457ec922c9b95aa944f459f7487bb4ca64d75488c30ea1b70ba4",
+    "batch24PairResult": "0f381187c25876cd103f78d6ef3d660a3a721148b846287ff229a614bfd7ca32",
+    "batch24ControlCase": "335beba12b3b431004ad6ad2c1673486df433fc964bff9a35e2409bb114e8b69",
+    "batch24CandidateCase": "307cfa9c5f97ff11be9e48ccb7a7956e60975ea7f7eb1d4e63bff0fee587f27c",
+    "rolloutEvidence": "0fa405954740be65bf42cbc60ff8113ffc25d2c51132ec92a03e4043b17725a8"
+  }
+}

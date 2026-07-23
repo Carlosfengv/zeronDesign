@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Provider Connection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "providerType", "baseUrl", "enabled"],
+  "properties": {
+    "schemaVersion": { "const": "provider-connection@1" },
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "name": { "type": "string", "minLength": 1 },
+    "providerType": { "enum": ["openai_compatible", "fixture"] },
+    "baseUrl": { "type": "string", "format": "uri" },
+    "chatCompletionsPath": { "type": "string", "default": "/chat/completions" },
+    "enabled": { "type": "boolean" },
+    "apiKey": { "type": "string", "minLength": 1 },
+    "expectedVersion": { "type": "integer", "minimum": 0 }
+  }
+}

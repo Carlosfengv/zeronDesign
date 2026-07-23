@@ -6,7 +6,10 @@ import { runtimeClient } from "@/lib/runtime";
 
 export const runtime = "nodejs";
 
-const StartEditSchema = z.object({ message: z.string().trim().min(1).max(100_000) });
+const StartEditSchema = z.object({
+  message: z.string().trim().min(1).max(100_000),
+  modelServiceId: z.string().trim().min(1).max(128).optional(),
+});
 
 export async function POST(
   request: Request,
@@ -17,13 +20,23 @@ export async function POST(
     const { projectId } = await context.params;
     const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
-    const { message } = StartEditSchema.parse(await request.json());
+    const { message, modelServiceId } = StartEditSchema.parse(await request.json());
     const readClient = runtimeClient({
       userId: ownerId,
       projectId: project.runtimeProjectId,
       operations: ["project.read"],
     });
-    const state = await readClient.getProjectRuntimeState(project.runtimeProjectId);
+    const [state, catalog] = await Promise.all([
+      readClient.getProjectRuntimeState(project.runtimeProjectId),
+      readClient.listModelServices(project.runtimeProjectId, "edit", "edit"),
+    ]);
+    const selectedModelServiceId = modelServiceId ?? state.modelServiceId;
+    if (!selectedModelServiceId || !catalog.items.some((item) => item.id === selectedModelServiceId)) {
+      return Response.json(
+        { error: "current version model service is unavailable; select a model service" },
+        { status: 409 },
+      );
+    }
     const writeClient = runtimeClient({
       userId: ownerId,
       projectId: project.runtimeProjectId,
@@ -36,6 +49,7 @@ export async function POST(
       inputContext: {
         baseVersionId: state.currentVersionId,
         sandboxBindingId: state.sandboxBindingId,
+        modelResourceId: selectedModelServiceId,
       },
     });
     await recordProjectRun({ runId: started.runId, projectId: project.id, phase: "edit" });

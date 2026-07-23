@@ -1,4 +1,7 @@
-use crate::types::sha256_hex;
+use crate::{
+    artifact_routes::{ArtifactRouteManifest, ARTIFACT_ROUTE_MANIFEST_FILE},
+    types::sha256_hex,
+};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -79,6 +82,10 @@ pub struct ArtifactManifest {
     pub candidate_manifest_hash: String,
     pub template_id: String,
     pub template_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_route_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_route_manifest_hash: Option<String>,
     pub mounts: Vec<ArtifactManifestMount>,
     pub files: Vec<ArtifactManifestFile>,
 }
@@ -103,6 +110,9 @@ impl ArtifactManifest {
             })
             .collect::<Vec<_>>();
         mounts.sort_by(|left, right| left.url_prefix.cmp(&right.url_prefix));
+        let route_manifest_entry = files
+            .iter()
+            .find(|file| file.path == ARTIFACT_ROUTE_MANIFEST_FILE);
         let manifest = Self {
             schema_version: ARTIFACT_MANIFEST_SCHEMA.to_string(),
             project_id: project_id.to_string(),
@@ -110,6 +120,9 @@ impl ArtifactManifest {
             candidate_manifest_hash: candidate_manifest_hash.to_string(),
             template_id: template_id.to_string(),
             template_version: template_version.to_string(),
+            artifact_route_manifest_path: route_manifest_entry
+                .map(|_| ARTIFACT_ROUTE_MANIFEST_FILE.to_string()),
+            artifact_route_manifest_hash: route_manifest_entry.map(|entry| entry.sha256.clone()),
             mounts,
             files,
         };
@@ -132,6 +145,26 @@ impl ArtifactManifest {
             }
         }
         validate_sha256(&self.candidate_manifest_hash, "candidate manifest hash")?;
+        match (
+            self.artifact_route_manifest_path.as_deref(),
+            self.artifact_route_manifest_hash.as_deref(),
+        ) {
+            (Some(path), Some(hash)) => {
+                if path != ARTIFACT_ROUTE_MANIFEST_FILE {
+                    return Err(anyhow!("artifact route manifest path is invalid"));
+                }
+                validate_sha256(hash, "artifact route manifest hash")?;
+                if !self
+                    .files
+                    .iter()
+                    .any(|file| file.path == path && file.sha256 == hash)
+                {
+                    return Err(anyhow!("artifact route manifest binding is invalid"));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(anyhow!("artifact route manifest binding is incomplete")),
+        }
         if self.mounts.is_empty() {
             return Err(anyhow!("artifact manifest requires at least one mount"));
         }
@@ -195,6 +228,7 @@ pub struct ResolvedArtifact {
 pub struct ArtifactResolver {
     root: PathBuf,
     manifest: ArtifactManifest,
+    route_manifest: Option<ArtifactRouteManifest>,
 }
 
 impl ArtifactResolver {
@@ -209,9 +243,11 @@ impl ArtifactResolver {
         if manifest.sha256()? != expected_manifest_hash {
             return Err(anyhow!("artifact manifest integrity check failed"));
         }
+        let route_manifest = load_route_manifest(root, &manifest)?;
         Ok(Some(Self {
             root: root.to_path_buf(),
             manifest,
+            route_manifest,
         }))
     }
 
@@ -233,6 +269,9 @@ impl ArtifactResolver {
     }
 
     pub fn resolve(&self, request_path: &str) -> Result<Option<ResolvedArtifact>> {
+        if let Some(route_manifest) = &self.route_manifest {
+            return self.resolve_manifest_route(request_path, route_manifest);
+        }
         let request_path = normalize_request_path(request_path)?;
         let Some(relative) = self.mount_relative_path(&request_path) else {
             return Ok(None);
@@ -246,24 +285,7 @@ impl ArtifactResolver {
             else {
                 continue;
             };
-            let path = self.root.join(&entry.path);
-            let canonical_root = fs::canonicalize(&self.root)?;
-            let canonical_path = fs::canonicalize(&path)?;
-            if !canonical_path.starts_with(&canonical_root) || !canonical_path.is_file() {
-                return Err(anyhow!("artifact path escapes immutable root"));
-            }
-            let bytes = fs::read(canonical_path)?;
-            if bytes.len() as u64 != entry.bytes || sha256_hex(&bytes) != entry.sha256 {
-                return Err(anyhow!(
-                    "artifact file integrity check failed for {}",
-                    entry.path
-                ));
-            }
-            return Ok(Some(ResolvedArtifact {
-                path: entry.path.clone(),
-                content_type: entry.content_type.clone(),
-                bytes,
-            }));
+            return self.read_entry(entry).map(Some);
         }
         Ok(None)
     }
@@ -271,22 +293,67 @@ impl ArtifactResolver {
     pub fn verify_all(&self) -> Result<Vec<ResolvedArtifact>> {
         let mut verified = Vec::with_capacity(self.manifest.files.len());
         for entry in &self.manifest.files {
-            let artifact = self.resolve(&entry.path)?.ok_or_else(|| {
-                anyhow!("artifact manifest file cannot be resolved: {}", entry.path)
-            })?;
-            if artifact.path != entry.path {
-                return Err(anyhow!(
-                    "artifact manifest path resolved ambiguously: {}",
-                    entry.path
-                ));
-            }
-            verified.push(artifact);
+            verified.push(self.read_entry(entry)?);
         }
         Ok(verified)
     }
 
     pub fn manifest(&self) -> &ArtifactManifest {
         &self.manifest
+    }
+
+    fn resolve_manifest_route(
+        &self,
+        request_path: &str,
+        route_manifest: &ArtifactRouteManifest,
+    ) -> Result<Option<ResolvedArtifact>> {
+        let route = normalize_manifest_request_route(request_path)?;
+        if let Some(target) = route_manifest.resolve(&route) {
+            let entry = self
+                .manifest
+                .files
+                .iter()
+                .find(|entry| entry.path == target.file && entry.sha256 == target.sha256)
+                .ok_or_else(|| {
+                    anyhow!("artifact route target is not bound to the artifact manifest")
+                })?;
+            return self.read_entry(entry).map(Some);
+        }
+
+        let relative = route.trim_start_matches('/');
+        if relative.is_empty() || relative.ends_with('/') {
+            return Ok(None);
+        }
+        validate_artifact_path(relative)?;
+        let Some(entry) = self.manifest.files.iter().find(|entry| {
+            entry.path == relative
+                && entry.path != ARTIFACT_ROUTE_MANIFEST_FILE
+                && !entry.content_type.starts_with("text/html")
+        }) else {
+            return Ok(None);
+        };
+        self.read_entry(entry).map(Some)
+    }
+
+    fn read_entry(&self, entry: &ArtifactManifestFile) -> Result<ResolvedArtifact> {
+        let path = self.root.join(&entry.path);
+        let canonical_root = fs::canonicalize(&self.root)?;
+        let canonical_path = fs::canonicalize(&path)?;
+        if !canonical_path.starts_with(&canonical_root) || !canonical_path.is_file() {
+            return Err(anyhow!("artifact path escapes immutable root"));
+        }
+        let bytes = fs::read(canonical_path)?;
+        if bytes.len() as u64 != entry.bytes || sha256_hex(&bytes) != entry.sha256 {
+            return Err(anyhow!(
+                "artifact file integrity check failed for {}",
+                entry.path
+            ));
+        }
+        Ok(ResolvedArtifact {
+            path: entry.path.clone(),
+            content_type: entry.content_type.clone(),
+            bytes,
+        })
     }
 
     fn mount_relative_path(&self, request_path: &str) -> Option<String> {
@@ -312,6 +379,65 @@ impl ArtifactResolver {
             .max_by_key(|(prefix_len, _)| *prefix_len)
             .map(|(_, relative)| relative)
     }
+}
+
+fn load_route_manifest(
+    root: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<Option<ArtifactRouteManifest>> {
+    let (Some(path), Some(expected_hash)) = (
+        manifest.artifact_route_manifest_path.as_deref(),
+        manifest.artifact_route_manifest_hash.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(root.join(path))?;
+    if sha256_hex(&bytes) != expected_hash {
+        return Err(anyhow!("artifact route manifest integrity check failed"));
+    }
+    let route_manifest: ArtifactRouteManifest = serde_json::from_slice(&bytes)?;
+    route_manifest
+        .validate()
+        .map_err(|error| anyhow!(error.to_string()))?;
+    for target in route_manifest.routes.values() {
+        let bound = manifest.files.iter().any(|entry| {
+            entry.path == target.file
+                && entry.sha256 == target.sha256
+                && entry.content_type == target.content_type
+        });
+        if !bound {
+            return Err(anyhow!(
+                "artifact route target is not bound to the artifact manifest: {}",
+                target.file
+            ));
+        }
+    }
+    Ok(Some(route_manifest))
+}
+
+fn normalize_manifest_request_route(path: &str) -> Result<String> {
+    let path = path.trim();
+    if path.contains('?')
+        || path.contains('#')
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains('%')
+        || path.contains("//")
+    {
+        return Err(anyhow!("artifact request route is invalid"));
+    }
+    let route = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", path.trim_start_matches('/'))
+    };
+    if route
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(anyhow!("artifact request route is invalid"));
+    }
+    Ok(route)
 }
 
 pub fn manifest_file(path: &Path, bytes: u64, sha256: String) -> Result<ArtifactManifestFile> {
@@ -440,6 +566,7 @@ fn validate_sha256(value: &str, field: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_routes::{ArtifactRouteContract, ArtifactRouteFile};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -550,5 +677,60 @@ mod tests {
             schema_types,
             ARTIFACT_CONTENT_TYPES.iter().copied().collect()
         );
+    }
+
+    #[test]
+    fn published_resolver_uses_the_bound_route_manifest_without_html_fallbacks() {
+        let root = temp_root("route-oracle");
+        let docs = b"<h1>legacy docs artifact</h1>";
+        fs::write(root.join("docs.html"), docs).unwrap();
+        let route_manifest = ArtifactRouteManifest::build(
+            "build-docs",
+            &ArtifactRouteContract::docs(),
+            [ArtifactRouteFile {
+                path: "docs.html".to_string(),
+                sha256: sha256_hex(docs),
+            }],
+        )
+        .unwrap();
+        let route_bytes = serde_json::to_vec_pretty(&route_manifest).unwrap();
+        fs::write(root.join(ARTIFACT_ROUTE_MANIFEST_FILE), &route_bytes).unwrap();
+        let manifest = ArtifactManifest::build(
+            "project-1",
+            "version-1",
+            &"a".repeat(64),
+            "fumadocs-docs",
+            "fumadocs-docs@runtime-p6",
+            ArtifactDeliverySpec::HOST_ROOT,
+            vec![
+                manifest_file(
+                    Path::new(ARTIFACT_ROUTE_MANIFEST_FILE),
+                    route_bytes.len() as u64,
+                    sha256_hex(&route_bytes),
+                )
+                .unwrap(),
+                manifest_file(Path::new("docs.html"), docs.len() as u64, sha256_hex(docs)).unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::write(
+            root.join(ARTIFACT_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resolver = ArtifactResolver::load(&root, &manifest.sha256().unwrap())
+            .unwrap()
+            .unwrap();
+        let clean = resolver.resolve("docs").unwrap().unwrap();
+        let trailing = resolver.resolve("docs/").unwrap().unwrap();
+        assert_eq!(clean.path, "docs.html");
+        assert_eq!(clean.bytes, trailing.bytes);
+        assert!(resolver.resolve("docs.html").unwrap().is_none());
+        assert!(resolver
+            .resolve(ARTIFACT_ROUTE_MANIFEST_FILE)
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

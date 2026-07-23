@@ -1,8 +1,9 @@
-use crate::types::canonical_json_hash;
+use crate::{artifact_routes::ArtifactRouteContract, types::canonical_json_hash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-pub const GENERATION_CONTRACT_SCHEMA: &str = "generation-contract@1";
+pub const GENERATION_CONTRACT_SCHEMA_V1: &str = "generation-contract@1";
+pub const GENERATION_CONTRACT_SCHEMA: &str = "generation-contract@2";
 pub const VALIDATION_REPORT_SCHEMA: &str = "validation-report@2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub struct GenerationContract {
     pub artifact_type: ArtifactType,
     pub template_key: String,
     pub build: BuildContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_contract: Option<ArtifactRouteContract>,
     pub required_checks: Vec<String>,
 }
 
@@ -39,6 +42,7 @@ impl GenerationContract {
                 command: vec!["npm".to_string(), "run".to_string(), "build".to_string()],
                 output_directory: output_directory.into(),
             },
+            route_contract: Some(ArtifactRouteContract::website()),
             required_checks: required_checks(&[
                 "build",
                 "artifact-integrity",
@@ -63,6 +67,7 @@ impl GenerationContract {
                 command: vec!["npm".to_string(), "run".to_string(), "build".to_string()],
                 output_directory: output_directory.into(),
             },
+            route_contract: Some(ArtifactRouteContract::docs()),
             required_checks: required_checks(&[
                 "build",
                 "artifact-integrity",
@@ -83,11 +88,22 @@ impl GenerationContract {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != GENERATION_CONTRACT_SCHEMA {
+        if !matches!(
+            self.schema_version.as_str(),
+            GENERATION_CONTRACT_SCHEMA | GENERATION_CONTRACT_SCHEMA_V1
+        ) {
             return Err(format!(
                 "unsupported generation contract schema: {}",
                 self.schema_version
             ));
+        }
+        if self.schema_version == GENERATION_CONTRACT_SCHEMA && self.route_contract.is_none() {
+            return Err("generation-contract@2 requires routeContract".to_string());
+        }
+        if let Some(route_contract) = &self.route_contract {
+            route_contract
+                .validate()
+                .map_err(|error| error.to_string())?;
         }
         if self.template_key.trim().is_empty() {
             return Err("templateKey is required".to_string());
@@ -113,6 +129,17 @@ impl GenerationContract {
             }
         }
         Ok(())
+    }
+
+    pub fn effective_route_contract(&self) -> Result<ArtifactRouteContract, String> {
+        self.validate()?;
+        Ok(self
+            .route_contract
+            .clone()
+            .unwrap_or_else(|| match self.artifact_type {
+                ArtifactType::Website => ArtifactRouteContract::website(),
+                ArtifactType::Docs => ArtifactRouteContract::docs(),
+            }))
     }
 
     pub fn digest(&self) -> Result<String, String> {
@@ -311,6 +338,41 @@ mod tests {
         assert!(website
             .required_checks
             .contains(&"responsive-layout".to_string()));
+    }
+
+    #[test]
+    fn legacy_v1_contract_infers_the_frozen_route_contract_without_rewriting_digest_input() {
+        let contract: GenerationContract = serde_json::from_value(serde_json::json!({
+            "schemaVersion": "generation-contract@1",
+            "artifactType": "docs",
+            "templateKey": "fumadocs-docs",
+            "build": {
+                "command": ["npm", "run", "build"],
+                "outputDirectory": "out"
+            },
+            "requiredChecks": ["build"]
+        }))
+        .unwrap();
+
+        assert!(contract.validate().is_ok());
+        assert_eq!(
+            contract.effective_route_contract().unwrap(),
+            ArtifactRouteContract::docs()
+        );
+        let serialized = serde_json::to_value(&contract).unwrap();
+        assert!(serialized.get("routeContract").is_none());
+        assert_eq!(contract.digest().unwrap(), canonical_json_hash(&serialized));
+    }
+
+    #[test]
+    fn v2_contract_requires_an_explicit_route_contract() {
+        let mut contract = GenerationContract::website("next-app", "dist");
+        contract.route_contract = None;
+
+        assert_eq!(
+            contract.validate().unwrap_err(),
+            "generation-contract@2 requires routeContract"
+        );
     }
 
     #[test]

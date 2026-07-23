@@ -41,10 +41,16 @@ function selectedRun(caseEvidence, selection, side) {
   }
   if (source !== "runs") {
     const lifecycle = caseEvidence[source];
-    const expectedSchema = source === "repair"
-      ? "generation-real-provider-repair-evidence@1"
-      : "generation-real-provider-edit-evidence@1";
-    if (lifecycle?.schemaVersion !== expectedSchema) {
+    const supportedSchemas = source === "repair"
+      ? new Set([
+          "generation-real-provider-repair-evidence@1",
+          "generation-real-provider-repair-evidence@2",
+        ])
+      : new Set([
+          "generation-real-provider-edit-evidence@1",
+          "generation-real-provider-edit-evidence@2",
+        ]);
+    if (!supportedSchemas.has(lifecycle?.schemaVersion)) {
       throw new Error(`${side} evidence has no ${source} evidence`);
     }
     const run = lifecycle.run;
@@ -88,6 +94,17 @@ function validateSelectedRun(caseEvidence, run, selection, side) {
   if (!HASH.test(run.eventStream?.sha256 || "")) {
     throw new Error(`${side} selected Run has no hashed event stream`);
   }
+  if (run.promptEfficiency !== undefined && (
+    run.promptEfficiency?.schemaVersion !== "run-prompt-efficiency@1" ||
+    run.promptEfficiency.runId !== run.runId
+  )) {
+    throw new Error(`${side} Prompt efficiency identity mismatch`);
+  }
+  if (run.designProfileIdentity?.schemaVersion !== "run-design-profile-identity@1"
+    || run.designProfileIdentity.runId !== run.runId
+    || !HASH.test(run.designProfileIdentity.effectiveProfileHash || "")) {
+    throw new Error(`${side} selected Run has no frozen Design Profile identity`);
+  }
 }
 
 function executionIdentity(run, side) {
@@ -115,6 +132,8 @@ function executionIdentity(run, side) {
 
 function terminalStatus(sourceEvidence, run) {
   if (run.status === "completed") return "completed";
+  if (run.terminalClassification === "runtime_idle_timeout"
+    || run.terminalClassification === "runtime_total_timeout") return "timeout";
   const message = `${run.summary || ""} ${sourceEvidence.error?.message || ""}`.toLowerCase();
   if (message.includes("timeout") || message.includes("watchdog")) return "timeout";
   if (message.includes("fallback")) return "fallback";
@@ -164,7 +183,16 @@ function validatePairIntent(control, candidate, spec) {
         throw new Error(`paired lifecycle evidence missing: ${side}`);
       }
     }
-    if (!hasText(controlLifecycle?.prompt) || sha256(controlLifecycle.prompt) !== sha256(candidateLifecycle?.prompt || "")) {
+    const promptHash = (lifecycle) => {
+      if (HASH.test(lifecycle?.promptSha256 || "")) return lifecycle.promptSha256;
+      if (lifecycle?.schemaVersion?.endsWith("@1") && hasText(lifecycle?.prompt)) {
+        return sha256(lifecycle.prompt);
+      }
+      return null;
+    };
+    const controlPromptHash = promptHash(controlLifecycle);
+    const candidatePromptHash = promptHash(candidateLifecycle);
+    if (!controlPromptHash || controlPromptHash !== candidatePromptHash) {
       throw new Error("paired lifecycle prompt hash mismatch");
     }
     if (controlSource === "warmEdit") {
@@ -330,6 +358,10 @@ export function collectPairedSamples(
     throw new Error("paired template version mismatch");
   }
   if (controlRun.phase !== candidateRun.phase) throw new Error("paired phase mismatch");
+  if (controlRun.designProfileIdentity.effectiveProfileHash
+    !== candidateRun.designProfileIdentity.effectiveProfileHash) {
+    throw new Error("paired Design Profile identity mismatch");
+  }
   const identity = {
     fixtureId: controlEvidence.id,
     modelResource: controlExecution.modelResource,
@@ -337,6 +369,7 @@ export function collectPairedSamples(
     modelVersion: controlExecution.modelVersion,
     providerParametersHash: provider.providerParametersHash,
     templateVersion,
+    designProfileHash: controlRun.designProfileIdentity.effectiveProfileHash,
     capabilitySnapshotHash: controlExecution.capabilitySnapshotHash,
     phase: controlRun.phase,
   };
@@ -371,7 +404,9 @@ export function collectPairedSamples(
                 lifecycleProfile: selected.evidence.lifecycleProfile,
                 warmEditKind: selected.evidence.warmEditKind,
                 repairMarker: selected.evidence.repairMarker,
-                promptSha256: sha256(selected.evidence.prompt),
+                promptSha256: HASH.test(selected.evidence.promptSha256 || "")
+                  ? selected.evidence.promptSha256
+                  : sha256(selected.evidence.prompt),
                 editImpactPlanHash: selected.evidence.editImpactPlanHash,
                 draftPreview: selected.evidence.draftPreview,
                 repairVerification: selected.evidence.repairVerification,
@@ -395,10 +430,14 @@ export function collectPairedSamples(
             ? restartEvidence[side].evidenceSha256
             : null,
         })),
+        caseAttemptCount: Array.isArray(caseEvidence.attempts)
+          ? caseEvidence.attempts.length
+          : 1,
         requiredFidelityPassed: passed,
         coverage: side === "candidate" ? spec.coverage || [] : [],
       },
       { ...run.efficiency, requiredFidelityPassed: passed },
+      run.promptEfficiency ?? null,
     );
   };
   return {

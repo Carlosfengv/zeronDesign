@@ -182,6 +182,95 @@ pub struct RunProfileSnapshot {
     pub mcp_server_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunTokenBudgetLimits {
+    pub max_turns: u32,
+    pub max_tool_calls: u32,
+    pub max_input_tokens: u64,
+    pub max_gross_input_tokens: u64,
+    pub max_uncached_input_tokens: u64,
+    pub max_prompt_tokens_per_turn: u64,
+    pub max_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunOperationBudgetLimits {
+    pub max_gross_input_tokens: u64,
+    pub max_uncached_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_turns: u32,
+    pub max_tool_calls: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunBudgetProfile {
+    pub schema_version: String,
+    pub profile_id: String,
+    pub phase: AgentPhase,
+    pub rollout_mode: String,
+    pub token_budget_mode: String,
+    pub operation_budget_mode: String,
+    pub enforced_limits: RunTokenBudgetLimits,
+    pub phase_target_limits: RunTokenBudgetLimits,
+    pub operation_limits: RunOperationBudgetLimits,
+    pub profile_hash: String,
+}
+
+impl RunBudgetProfile {
+    pub fn identity_hash(&self) -> String {
+        canonical_json_hash(&serde_json::json!({
+            "schemaVersion": self.schema_version,
+            "profileId": self.profile_id,
+            "phase": self.phase,
+            "rolloutMode": self.rollout_mode,
+            "tokenBudgetMode": self.token_budget_mode,
+            "operationBudgetMode": self.operation_budget_mode,
+            "enforcedLimits": self.enforced_limits,
+            "phaseTargetLimits": self.phase_target_limits,
+            "operationLimits": self.operation_limits,
+        }))
+    }
+
+    pub fn validate(&self, expected_phase: AgentPhase) -> Result<(), String> {
+        if self.schema_version != "run-budget-profile@1"
+            || self.profile_id.trim().is_empty()
+            || self.phase != expected_phase
+            || !matches!(self.rollout_mode.as_str(), "off" | "shadow" | "enforced")
+            || !matches!(
+                self.token_budget_mode.as_str(),
+                "legacy" | "split_shadow" | "split_enforced"
+            )
+            || !matches!(self.operation_budget_mode.as_str(), "shadow" | "enforced")
+            || self.profile_hash != self.identity_hash()
+        {
+            return Err("RunBudgetProfile identity is invalid".to_string());
+        }
+        let token_limits_valid = |limits: &RunTokenBudgetLimits| {
+            limits.max_turns > 0
+                && limits.max_tool_calls > 0
+                && limits.max_input_tokens > 0
+                && limits.max_gross_input_tokens > 0
+                && limits.max_uncached_input_tokens > 0
+                && limits.max_prompt_tokens_per_turn > 0
+                && limits.max_output_tokens > 0
+        };
+        if !token_limits_valid(&self.enforced_limits)
+            || !token_limits_valid(&self.phase_target_limits)
+            || self.operation_limits.max_gross_input_tokens == 0
+            || self.operation_limits.max_uncached_input_tokens == 0
+            || self.operation_limits.max_output_tokens == 0
+            || self.operation_limits.max_turns == 0
+            || self.operation_limits.max_tool_calls == 0
+        {
+            return Err("RunBudgetProfile limits must be positive".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRun {
@@ -192,6 +281,8 @@ pub struct AgentRun {
     pub triggered_by_event_id: Option<String>,
     pub phase: AgentPhase,
     pub agent_profile: String,
+    #[serde(default)]
+    pub budget_profile: Option<Box<RunBudgetProfile>>,
     pub status: AgentRunStatus,
     pub model: String,
     pub sandbox_id: Option<String>,
@@ -313,9 +404,15 @@ pub struct AgentRun {
     #[serde(default)]
     pub context_injected_turn: Option<u32>,
     #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub operation_attempt: u32,
+    #[serde(default)]
     pub predecessor_run_id: Option<String>,
     #[serde(default)]
     pub successor_run_id: Option<String>,
+    #[serde(default)]
+    pub continuation_snapshot_id: Option<String>,
     #[serde(default)]
     pub generation_context: Option<Value>,
     pub base_version_id: Option<String>,
@@ -1624,6 +1721,7 @@ pub struct ConversationItem {
 }
 
 pub const OBSERVATION_RECEIPT_SCHEMA: &str = "observation-receipt@1";
+pub const TOOL_SET_HASH_VERSION: &str = "tool-definition-set@1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1807,6 +1905,95 @@ pub enum AgentEvent {
         estimated: bool,
         timestamp: DateTime<Utc>,
     },
+    #[serde(rename = "prompt.composition", rename_all = "camelCase")]
+    PromptComposition {
+        run_id: String,
+        turn: u32,
+        estimated_input_tokens: u64,
+        system_tokens: u64,
+        message_tokens: u64,
+        tool_definition_tokens: u64,
+        generation_context_tokens: u64,
+        static_prefix_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_set_hash_version: Option<String>,
+        tool_set_hash: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "token.budget_decision", rename_all = "camelCase")]
+    TokenBudgetDecision {
+        run_id: String,
+        turn: u32,
+        mode: String,
+        budget_kind: String,
+        used: u64,
+        limit: u64,
+        exhausted: bool,
+        enforced: bool,
+        gross_input_tokens: u64,
+        cached_input_tokens: u64,
+        uncached_input_tokens: u64,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "token.usage_contract_violation", rename_all = "camelCase")]
+    TokenUsageContractViolation {
+        run_id: String,
+        turn: u32,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        normalized_cached_input_tokens: u64,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "workflow.lifecycle_started", rename_all = "camelCase")]
+    WorkflowLifecycleStarted {
+        run_id: String,
+        driver_id: String,
+        action: String,
+        sequence: u32,
+        attempt: u32,
+        idempotency_key: String,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "workflow.lifecycle_completed", rename_all = "camelCase")]
+    WorkflowLifecycleCompleted {
+        run_id: String,
+        driver_id: String,
+        action: String,
+        sequence: u32,
+        attempt: u32,
+        idempotency_key: String,
+        outcome: String,
+        progress_evidence: Value,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "workflow.lifecycle_failed", rename_all = "camelCase")]
+    WorkflowLifecycleFailed {
+        run_id: String,
+        driver_id: String,
+        action: String,
+        sequence: u32,
+        attempt: u32,
+        idempotency_key: String,
+        error_kind: String,
+        recoverable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostic_ref: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_snapshot_uri: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_hash: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    #[serde(rename = "run.continuation_created", rename_all = "camelCase")]
+    RunContinuationCreated {
+        run_id: String,
+        operation_id: String,
+        predecessor_run_id: String,
+        continuation_snapshot_id: String,
+        attempt: u32,
+        automatic: bool,
+        timestamp: DateTime<Utc>,
+    },
     #[serde(rename = "model.turn_started", rename_all = "camelCase")]
     ModelTurnStarted {
         run_id: String,
@@ -1970,6 +2157,13 @@ impl AgentEvent {
             | Self::MetricRecorded { run_id, .. }
             | Self::ModelExecution { run_id, .. }
             | Self::ModelUsage { run_id, .. }
+            | Self::PromptComposition { run_id, .. }
+            | Self::TokenBudgetDecision { run_id, .. }
+            | Self::TokenUsageContractViolation { run_id, .. }
+            | Self::WorkflowLifecycleStarted { run_id, .. }
+            | Self::WorkflowLifecycleCompleted { run_id, .. }
+            | Self::WorkflowLifecycleFailed { run_id, .. }
+            | Self::RunContinuationCreated { run_id, .. }
             | Self::ModelTurnStarted { run_id, .. }
             | Self::ObservationReceipt { run_id, .. }
             | Self::GenerationContextCompiled { run_id, .. }
@@ -2067,6 +2261,12 @@ pub struct CheckpointConversationRange {
     pub start_index: u64,
     pub end_index_exclusive: u64,
     pub retained_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_exchange_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2118,6 +2318,56 @@ pub struct AgentCheckpoint {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunContinuationSnapshot {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub operation_id: String,
+    pub attempt: u32,
+    #[serde(default)]
+    pub automatic_continuation_count: u32,
+    pub predecessor_run_id: String,
+    pub project_id: String,
+    pub phase: AgentPhase,
+    pub source_snapshot_uri: String,
+    pub source_hash: String,
+    pub workspace_revision: Option<u64>,
+    pub checkpoint_id: String,
+    pub workflow_progress_hash: String,
+    #[serde(default)]
+    pub workflow_progress: Value,
+    #[serde(default)]
+    pub progress_fingerprint: String,
+    #[serde(default)]
+    pub progress_ledger: Value,
+    pub generation_context_content_hash: Option<String>,
+    pub content_plan_hash: Option<String>,
+    pub design_profile_effective_hash: Option<String>,
+    #[serde(default)]
+    pub budget_profile_hash: Option<String>,
+    pub edit_impact_plan_hash: Option<String>,
+    pub base_version_id: Option<String>,
+    pub accumulated_input_tokens: u64,
+    pub accumulated_cached_input_tokens: u64,
+    pub accumulated_output_tokens: u64,
+    pub remaining_operation_budget: Value,
+    pub compact_summary: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuationEligibilityDecision {
+    pub schema_version: String,
+    pub snapshot_id: String,
+    pub operation_id: String,
+    pub predecessor_run_id: String,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+    pub checked_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectVersion {
@@ -2152,6 +2402,89 @@ pub struct SandboxBinding {
     pub status: SandboxBindingStatus,
     pub channel_protocol: SandboxChannelProtocol,
     pub last_seen_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod budget_profile_policy_tests {
+    use super::*;
+
+    fn production_profile(
+        phase: AgentPhase,
+        target_turns: u32,
+        target_gross: u64,
+        target_uncached: u64,
+        target_prompt: u64,
+        phase_overridden: bool,
+    ) -> RunBudgetProfile {
+        let enforced_limits = RunTokenBudgetLimits {
+            max_turns: 20,
+            max_tool_calls: 60,
+            max_input_tokens: 200_000,
+            max_gross_input_tokens: 300_000,
+            max_uncached_input_tokens: 180_000,
+            max_prompt_tokens_per_turn: 64_000,
+            max_output_tokens: 40_000,
+        };
+        let phase_target_limits = if phase_overridden {
+            RunTokenBudgetLimits {
+                max_turns: target_turns,
+                max_input_tokens: target_gross,
+                max_gross_input_tokens: target_gross,
+                max_uncached_input_tokens: target_uncached,
+                max_prompt_tokens_per_turn: target_prompt,
+                ..enforced_limits.clone()
+            }
+        } else {
+            enforced_limits.clone()
+        };
+        let phase_name = serde_json::to_value(phase)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut profile = RunBudgetProfile {
+            schema_version: "run-budget-profile@1".to_string(),
+            profile_id: format!("phase-budget-v1-{phase_name}"),
+            phase,
+            rollout_mode: "enforced".to_string(),
+            token_budget_mode: "split_enforced".to_string(),
+            operation_budget_mode: "enforced".to_string(),
+            enforced_limits,
+            phase_target_limits,
+            operation_limits: RunOperationBudgetLimits {
+                max_gross_input_tokens: 450_000,
+                max_uncached_input_tokens: 270_000,
+                max_output_tokens: 80_000,
+                max_turns: 30,
+                max_tool_calls: 100,
+            },
+            profile_hash: String::new(),
+        };
+        profile.profile_hash = profile.identity_hash();
+        profile
+    }
+
+    #[test]
+    fn production_policy_hashes_match_rust_canonical_profiles() {
+        let policy: Value = serde_json::from_str(include_str!(
+            "../../../infra/generation-reliability/release-budget-policy.json"
+        ))
+        .unwrap();
+        let profiles = [
+            production_profile(AgentPhase::Build, 16, 300_000, 180_000, 64_000, true),
+            production_profile(AgentPhase::Edit, 12, 220_000, 120_000, 48_000, true),
+            production_profile(AgentPhase::Review, 20, 300_000, 180_000, 64_000, false),
+            production_profile(AgentPhase::Repair, 10, 180_000, 100_000, 48_000, true),
+        ];
+        for profile in profiles {
+            profile.validate(profile.phase).unwrap();
+            let phase = serde_json::to_value(profile.phase).unwrap();
+            let allowed = policy["phaseProfiles"][phase.as_str().unwrap()]["allowedProfileHashes"]
+                .as_array()
+                .unwrap();
+            assert_eq!(allowed, &vec![Value::String(profile.profile_hash)]);
+        }
+    }
 }
 
 #[cfg(test)]

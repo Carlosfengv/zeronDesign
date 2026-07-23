@@ -1,0 +1,108 @@
+{
+  "schemaVersion": "generation-context-multimodal-canary-readiness@1",
+  "recordedAt": "2026-07-22T02:29:26Z",
+  "status": "implementation_ready_provider_sample_pending",
+  "deliveryProof": {
+    "runtimeStateRequired": "delivered",
+    "gatewayExecutionStateRequired": "verified_and_provider_accepted",
+    "gatewayRevalidates": [
+      "run-bound-artifact",
+      "bytes-sha256",
+      "media-type",
+      "width",
+      "height"
+    ],
+    "persistedFields": [
+      "imageCount",
+      "artifactSha256s",
+      "mediaTypes"
+    ],
+    "forbiddenEvidence": [
+      "image-bytes",
+      "data-url",
+      "storage-url",
+      "provider-request-body",
+      "credential"
+    ],
+    "providerAcceptedResponseRequired": true
+  },
+  "cohortContract": {
+    "preparedSessionProviderParameterized": true,
+    "caseManifestMustMatchProviderResource": true,
+    "caseManifestHashFrozen": true,
+    "visionCapabilitySnapshotRequired": true,
+    "boundedPngCapabilityRequired": true,
+    "nonVisualAndMultimodalModesMutuallyExclusive": true,
+    "multimodalCoverage": "multimodalVisualDelivered",
+    "collectorIndependentlyChecksModelExecution": true,
+    "mainTaskCompletionRequired": true
+  },
+  "verification": {
+    "providerGatewayTests": {
+      "passed": 49,
+      "failed": 0,
+      "environmentSkipped": 2
+    },
+    "runtimeModelGatewayTests": {
+      "passed": 19,
+      "failed": 0,
+      "environmentSkipped": 1
+    },
+    "collectorContractTestsPassed": true,
+    "pairedRunnerContractTestsPassed": true,
+    "realProviderEvidenceStreamingTestsPassed": true,
+    "generationReliabilityContractPassed": true
+  },
+  "deployment": {
+    "cluster": "k3d-zerondesign-e2e",
+    "nodeReady": true,
+    "unhealthyPodCount": 0,
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0,
+    "runtime": {
+      "image": "anydesign/runtime:6a5603c0a464-dirty-dd5b89a754a9",
+      "dockerManifestListId": "sha256:3cfd6313f11989d01c57ba5558f5cf38484c5cc82c5aa83bdaace05306209e17",
+      "containerImageId": "sha256:2acb0c8afefff44e9a34cf0d66870359f85b4463d0ac319bc7d42360c1944f15",
+      "controlReady": true,
+      "controlGenerationContextMode": "off",
+      "candidateReady": true,
+      "candidateGenerationContextMode": "enabled",
+      "modelProvider": "internal_gateway"
+    },
+    "providerGateway": {
+      "image": "zerondesign/provider-gateway:6a5603c0a464-dirty-997a4e0fbfbc",
+      "dockerManifestListId": "sha256:44ff136ba210e3c6f067d7ca11dfe3dc3014d56338d6fdc206cbe8e2071f13c2",
+      "containerImageId": "sha256:ec3db863f752a76dc2f89417e4b7c9b5017637ef9478de0ac3a44752a8b8468c",
+      "ready": true
+    }
+  },
+  "currentProviderResource": {
+    "id": "deepseek-v4-pro",
+    "revision": 4,
+    "physicalModel": "deepseek-v4-pro",
+    "enabled": true,
+    "credentialReferenceConfigured": true,
+    "vision": false,
+    "visionInput": false
+  },
+  "remainingExternalEvidence": {
+    "visionProviderResourceConfigured": false,
+    "realMultimodalPairAccepted": false,
+    "multimodalVisualDelivered": false,
+    "reason": "The current frozen DeepSeek resource is intentionally non-visual; a separately governed vision-capable resource and credential are required."
+  },
+  "sourceSha256": {
+    "providerGatewayImplementation": "b2fab60ca4d94f6438ca9e7cf0906794a4a80938485788973b605dc8c6936008",
+    "providerGatewayResponseSchema": "77137661ea022ae0cbdf07502e31d46d277e55fd7d92a623cf5b444abee37d9b",
+    "runtimeModelGateway": "dd5b89a754a965c8f67850e8b8275a157c1e41ecc85f80b6af5801d946e33f4d",
+    "realProviderEdit": "1eaaadb29283ddc050dca1bc688f951f488198f584a362881029f321a1eaf3c0",
+    "realProviderSuite": "556d7b493548237a604454908c8d473267750d396851e6f85e3f9aebca9cf786",
+    "realProviderShell": "f96425c009177405430886e6d638a930dc976f18a9f067e9fb0122bcfae7bf16",
+    "prepareSession": "b1f750b56383b1c34642d9e2b1015dd4b86f84431d2ebad24d355d2625856e0f",
+    "pairedRunner": "33177ca49410095607899561c4c15cae12874aec49f137f3fec27be21bf61f3a",
+    "collector": "07b51893790a3e0fad60e2b5b49c0ad8430389338a243de0d9920bab26d9d101",
+    "collectorTests": "46b8a3bbcfe1934bea5107170280e56a9e8a59b0b6e6b7336ecb0fb9ec9ccf28",
+    "pairedRunnerTests": "3d425612d33cf7875d2c3a2ae3b2e2a9daf4c835f10f64e72940b6a380e8dfb2",
+    "runbook": "91e9aada48351926cbbb9d87d69c936f1d78d428f29e6fa06493c96531af0376"
+  }
+}

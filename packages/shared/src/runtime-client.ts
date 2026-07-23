@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   ActivateDesignProfileRequest,
   ActivateDesignProfileResponseSchema,
+  AvailableModelServicesResponseSchema,
   CancelRunResponseSchema,
   ConfirmDesignProfileSyncRequest,
   ConfirmDesignProfileSyncRequestSchema,
@@ -40,9 +41,11 @@ import {
   ElementObservationResponseSchema,
   HealthResponseSchema,
   GenerationContextStatusSchema,
+  GenerationOperationUsageSchema,
   ImportDesignProfileRequest,
   ImportDesignProfileResponseSchema,
   ListDesignProfilesResponseSchema,
+  ModelServicePhase,
   PlanDesignProfileSyncRequest,
   PlanDesignProfileSyncRequestSchema,
   PreviewCurrentResponseSchema,
@@ -66,6 +69,8 @@ import {
   RunVisualBindingListResponseSchema,
   RunVisualBindingResponseSchema,
   RunEfficiencyMetricsSchema,
+  RunModelUsageSchema,
+  RunPromptEfficiencySchema,
   ScheduleVisualReviewRequest,
   StartRunRequest,
   StartRunResponseSchema,
@@ -76,7 +81,7 @@ import {
   VisualArtifactResponseSchema,
   VisualReviewResultSchema,
 } from "./api-types.js";
-import { DraftPreviewSessionSchema } from "./schemas.js";
+import { DraftPreviewSessionSchema, RunBudgetProfileSchema } from "./schemas.js";
 import { AgentEventSchema, type AgentEvent } from "./events.js";
 
 export type RuntimeFetch = (
@@ -147,6 +152,11 @@ export type RunEventSubscription = {
 
 export type RuntimeClient = {
   health(): Promise<z.output<typeof HealthResponseSchema>>;
+  listModelServices(
+    projectId: string,
+    phase: ModelServicePhase,
+    agentProfile: string,
+  ): Promise<z.output<typeof AvailableModelServicesResponseSchema>>;
   startRun(request: StartRunRequest): Promise<z.output<typeof StartRunResponseSchema>>;
   continueRun(
     runId: string,
@@ -162,6 +172,13 @@ export type RuntimeClient = {
   getRunEfficiencyMetrics(
     runId: string,
   ): Promise<z.output<typeof RunEfficiencyMetricsSchema>>;
+  getRunModelUsage(runId: string): Promise<z.output<typeof RunModelUsageSchema>>;
+  getRunBudgetProfile(runId: string): Promise<z.output<typeof RunBudgetProfileSchema>>;
+  getGenerationOperationUsage(
+    projectId: string,
+    operationId: string,
+  ): Promise<z.output<typeof GenerationOperationUsageSchema>>;
+  getRunPromptEfficiency(runId: string): Promise<z.output<typeof RunPromptEfficiencySchema>>;
   getRunGenerationContextStatus(
     runId: string,
   ): Promise<z.output<typeof GenerationContextStatusSchema>>;
@@ -417,6 +434,11 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
 
   return {
     health: () => get("/health", HealthResponseSchema),
+    listModelServices: (projectId, phase, agentProfile) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/model-services?phase=${encodeURIComponent(phase)}&agentProfile=${encodeURIComponent(agentProfile)}`,
+        AvailableModelServicesResponseSchema,
+      ),
     startRun: (request) => post("/runs", request, StartRunResponseSchema),
     continueRun: (runId, request) =>
       post(`/runs/${encodePathSegment(runId)}/continue`, request, ContinueRunResponseSchema),
@@ -436,6 +458,20 @@ export function createRuntimeClient(options: RuntimeClientOptions): RuntimeClien
       get(
         `/runs/${encodePathSegment(runId)}/efficiency-metrics`,
         RunEfficiencyMetricsSchema,
+      ),
+    getRunModelUsage: (runId) =>
+      get(`/runs/${encodePathSegment(runId)}/model-usage`, RunModelUsageSchema),
+    getRunBudgetProfile: (runId) =>
+      get(`/runs/${encodePathSegment(runId)}/budget-profile`, RunBudgetProfileSchema),
+    getGenerationOperationUsage: (projectId, operationId) =>
+      get(
+        `/projects/${encodePathSegment(projectId)}/generation-operations/${encodePathSegment(operationId)}/usage`,
+        GenerationOperationUsageSchema,
+      ),
+    getRunPromptEfficiency: (runId) =>
+      get(
+        `/runs/${encodePathSegment(runId)}/prompt-efficiency`,
+        RunPromptEfficiencySchema,
       ),
     getRunGenerationContextStatus: (runId) =>
       get(

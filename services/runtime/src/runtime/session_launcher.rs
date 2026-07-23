@@ -64,8 +64,14 @@ impl RunSessionLauncher for RuntimeSessionLauncher {
                 tool_executor,
                 generation_context_enabled,
                 config.observation_receipts_enabled,
+                run.as_ref()
+                    .and_then(|run| run.budget_profile.as_deref().cloned()),
             );
-            if let Err(error) = session.submit_run(&run_id).await {
+            let execution = match session {
+                Ok(session) => session.submit_run(&run_id).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = execution {
                 if let Some(run) = session_store.get_run(&run_id).await {
                     if !run.status.is_terminal() && run.status != AgentRunStatus::NeedsUserInput {
                         session_store

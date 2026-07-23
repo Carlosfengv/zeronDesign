@@ -2,7 +2,9 @@ use super::preview_acceptance::collect_and_persist_acceptance;
 use super::preview_fidelity::{
     evaluate_design_profile_fidelity, reject_unchanged_fidelity_republish,
 };
-use super::preview_validation::collect_and_persist_generation_validation;
+use super::preview_validation::{
+    collect_and_persist_generation_validation, validation_failure_owners,
+};
 use super::*;
 use crate::{
     runtime_storage::FileAcceptanceReportStore, types::canonical_json_hash,
@@ -10,6 +12,8 @@ use crate::{
 };
 
 const DEFAULT_MAX_ACCEPTANCE_REPAIR_CYCLES: u32 = 3;
+const REPAIR_CONTEXT_MAX_BYTES: usize = 16 * 1024;
+const REPAIR_CONTEXT_MAX_ESTIMATED_TOKENS: u64 = 4_000;
 
 pub(super) fn preview_rebuilding_tool() -> Arc<dyn Tool> {
     Arc::new(PreviewRebuildingTool)
@@ -182,6 +186,7 @@ impl Tool for PreviewReportCandidateTool {
             .map(str::to_string);
         report_preview_candidate(
             &*self.workspace,
+            None,
             &ctx,
             url,
             screenshot_id,
@@ -416,6 +421,7 @@ impl Tool for PreviewPublishTool {
         }
         let published = report_preview_candidate(
             &*self.workspace,
+            Some(&*self.command),
             &ctx,
             url,
             screenshot_id,
@@ -570,6 +576,7 @@ fn block_required_design_context_verification(
 
 async fn report_preview_candidate(
     workspace: &dyn WorkspaceBackend,
+    command: Option<&dyn SandboxCommandBackend>,
     ctx: &ToolContext,
     url: String,
     screenshot_id: String,
@@ -913,6 +920,7 @@ async fn report_preview_candidate(
         let (validation_report, validation_report_uri) =
             match collect_and_persist_generation_validation(
                 workspace,
+                command,
                 ctx,
                 &template,
                 &candidate.id,
@@ -957,20 +965,134 @@ async fn report_preview_candidate(
                 )
                 .await
                 .ok();
+            let entry_route_probe = validation_report
+                .evidence
+                .get("entryRouteProbe")
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "status": "failed",
+                        "owner": "runtime",
+                        "reason": "entry_route_probe_missing"
+                    })
+                });
+            let failure_owners = validation_failure_owners(&validation_report, &entry_route_probe);
+            let non_source_owners = validation_blockers
+                .iter()
+                .filter_map(|blocker| {
+                    failure_owners
+                        .get(&blocker.check_id)
+                        .filter(|owner| owner.as_str() != "source")
+                        .map(|owner| (blocker.check_id.clone(), owner.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if !non_source_owners.is_empty() {
+                return Err(ToolError::TerminalWithMetadata {
+                    message: "preview.publish stopped because validation is owned by Runtime, Artifact, or Serving rather than project source"
+                        .to_string(),
+                    error_kind: "generation.platform_validation_failed".to_string(),
+                    metadata: json!({
+                        "validationReportUri": validation_report_uri,
+                        "candidateManifestHash": candidate_manifest_hash,
+                        "failureOwners": non_source_owners,
+                        "entryRouteProbe": entry_route_probe,
+                        "repairAllowed": false,
+                        "suggestedAction": "Do not modify project source. Preserve the Candidate evidence and repair the owning platform component."
+                    }),
+                });
+            }
+            let repair_attempt = ctx
+                .store
+                .conversation_items(&ctx.project_id)
+                .await
+                .into_iter()
+                .filter(|item| {
+                    item.run_id.as_deref() == Some(&ctx.run.id)
+                        && item.kind == "generation_validation_checked"
+                        && item
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("failed")
+                })
+                .count();
+            if repair_attempt > 1 {
+                return Err(ToolError::TerminalWithMetadata {
+                    message: "preview.publish exhausted the bounded generation repair cycle"
+                        .to_string(),
+                    error_kind: "generation.repair_exhausted".to_string(),
+                    metadata: json!({
+                        "candidateManifestHash": candidate_manifest_hash,
+                        "repairAttempt": repair_attempt,
+                        "maxRepairCycles": 1,
+                        "repairAllowed": false,
+                        "failureOwners": failure_owners,
+                    }),
+                });
+            }
+            let mut target_files = template
+                .editable_surface
+                .primary_routes
+                .iter()
+                .map(|route| route.source.clone())
+                .chain(template.editable_surface.inspection_hints.iter().cloned())
+                .filter(|path| {
+                    matches!(
+                        Path::new(path)
+                            .extension()
+                            .and_then(|extension| extension.to_str()),
+                        Some("js" | "jsx" | "ts" | "tsx" | "md" | "mdx" | "css" | "json")
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(8)
+                .collect::<Vec<_>>();
+            if target_files.is_empty() {
+                target_files.push("project source selected by the failed check".to_string());
+            }
+            let repair_context = json!({
+                "schemaVersion": "generation-repair-context@1",
+                "candidateManifestHash": candidate_manifest_hash,
+                "entryRouteProbe": entry_route_probe,
+                "blockers": validation_blockers.iter().map(|blocker| json!({
+                    "checkId": blocker.check_id,
+                    "status": blocker.status,
+                    "owner": "source",
+                    "diagnostic": blocker.message.as_deref().unwrap_or("source validation failed").chars().take(512).collect::<String>(),
+                })).collect::<Vec<_>>(),
+                "targetFiles": target_files,
+                "limits": {
+                    "maxBytes": REPAIR_CONTEXT_MAX_BYTES,
+                    "maxEstimatedTokens": REPAIR_CONTEXT_MAX_ESTIMATED_TOKENS,
+                    "maxRepairCycles": 1
+                }
+            });
+            let repair_context_text = serde_json::to_string_pretty(&repair_context)
+                .map_err(|error| ToolError::Terminal(error.to_string()))?;
+            let (repair_context_bytes, repair_context_estimated_tokens) =
+                validate_repair_context_size(&repair_context_text)?;
+            write_workspace_json(workspace, ctx, "state/repair-context.json", &repair_context)
+                .await?;
             reopen_run_after_candidate_rejection(ctx).await?;
             return Err(ToolError::typed_recoverable(
                 "preview.publish blocked by the generation validation contract",
                 "generation.validation_failed",
                 json!({
                     "validationReportUri": validation_report_uri,
-                    "validationReportPath": "state/validation-report.json",
+                    "repairContextPath": "state/repair-context.json",
+                    "validationReportPath": "state/repair-context.json",
                     "candidateManifestHash": candidate_manifest_hash,
+                    "repairContextBytes": repair_context_bytes,
+                    "repairContextEstimatedTokens": repair_context_estimated_tokens,
                     "blockers": validation_blockers.iter().map(|blocker| json!({
                         "checkId": blocker.check_id,
                         "status": blocker.status,
-                        "message": blocker.message,
+                        "owner": "source",
                     })).collect::<Vec<_>>(),
-                    "suggestedAction": "Read state/validation-report.json, repair the reported source or content issue, then publish a new candidate."
+                    "repairAllowed": true,
+                    "suggestedAction": "Read only state/repair-context.json, make one bounded mutation to a listed target file, then publish one new candidate."
                 }),
             ));
         }
@@ -1210,6 +1332,22 @@ fn cleanup_runtime_export(path: &Path) {
     // remote-fs-boundary: allow-end runtime-storage-export-cleanup
 }
 
+fn validate_repair_context_size(text: &str) -> Result<(usize, u64), ToolError> {
+    let bytes = text.len();
+    if bytes > REPAIR_CONTEXT_MAX_BYTES {
+        return Err(ToolError::Terminal(
+            "bounded generation repair context exceeded 16 KiB".to_string(),
+        ));
+    }
+    let estimated_tokens = (bytes as u64).div_ceil(4);
+    if estimated_tokens > REPAIR_CONTEXT_MAX_ESTIMATED_TOKENS {
+        return Err(ToolError::Terminal(
+            "bounded generation repair context exceeded 4,000 estimated tokens".to_string(),
+        ));
+    }
+    Ok((bytes, estimated_tokens))
+}
+
 pub(super) async fn collect_artifact_files(
     workspace: &dyn WorkspaceBackend,
     ctx: &ToolContext,
@@ -1252,7 +1390,7 @@ pub(super) async fn collect_artifact_files(
 
 #[cfg(test)]
 mod tests {
-    use super::block_required_design_context_verification;
+    use super::{block_required_design_context_verification, validate_repair_context_size};
     use crate::tools::runtime::ToolError;
     use serde_json::json;
 
@@ -1279,5 +1417,21 @@ mod tests {
         }
         assert!(block_required_design_context_verification(Some("observe"), &report).is_ok());
         assert!(block_required_design_context_verification(Some("enforced"), &json!({})).is_ok());
+    }
+
+    #[test]
+    fn repair_context_enforces_byte_and_estimated_token_limits_independently() {
+        assert_eq!(
+            validate_repair_context_size(&"x".repeat(16_000)).unwrap(),
+            (16_000, 4_000)
+        );
+        assert!(matches!(
+            validate_repair_context_size(&"x".repeat(16_001)),
+            Err(ToolError::Terminal(message)) if message.contains("4,000 estimated tokens")
+        ));
+        assert!(matches!(
+            validate_repair_context_size(&"x".repeat(16 * 1024 + 1)),
+            Err(ToolError::Terminal(message)) if message.contains("16 KiB")
+        ));
     }
 }

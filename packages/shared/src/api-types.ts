@@ -124,11 +124,17 @@ export const GenerationContextStatusSchema = z
     executionProfile: z
       .enum(["greenfield_static", "cold_dev", "warm_hmr", "repair_cold_dev", "repair_warm"])
       .nullable(),
+    budgetProfileId: z.string().min(1).nullable(),
+    budgetProfileHash: LowercaseSha256Schema.nullable(),
+    budgetProfileRolloutMode: z.enum(["off", "shadow", "enforced"]).nullable(),
     workflowState: z.string().min(1).nullable(),
     contextWindowEpoch: z.number().int().nonnegative(),
     contextInjectedTurn: z.number().int().nonnegative().nullable(),
+    operationId: z.string().min(1).nullable(),
+    operationAttempt: z.number().int().positive(),
     predecessorRunId: z.string().min(1).nullable(),
     successorRunId: z.string().min(1).nullable(),
+    continuationSnapshotId: z.string().min(1).nullable(),
     contentPlan: ContentPlanIdentitySchema.nullable(),
     approvalId: z.string().min(1).nullable(),
     approvalState: z.string().min(1).nullable(),
@@ -172,6 +178,81 @@ export const RunEfficiencyMetricsSchema = z
     outOfScopeMutationCount: z.number().int().nonnegative(),
     firstBuildSucceeded: z.boolean(),
     requiredFidelityPassed: z.boolean().nullable(),
+  })
+  .strict();
+
+export const RunModelUsageSchema = z
+  .object({
+    schemaVersion: z.literal("run-model-usage@1"),
+    runId: z.string().min(1),
+    modelServiceId: z.string().min(1).nullable(),
+    modelDisplayName: z.string().min(1).nullable(),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    totalTokens: z.number().int().nonnegative(),
+    estimated: z.boolean(),
+    turnCount: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const GenerationOperationAttemptUsageSchema = z
+  .object({
+    runId: z.string().min(1),
+    attempt: z.number().int().positive(),
+    status: z.string().min(1),
+    inputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    totalTokens: z.number().int().nonnegative(),
+    turnCount: z.number().int().nonnegative(),
+    estimated: z.boolean(),
+    startedAt: z.string().datetime(),
+    completedAt: z.string().datetime().nullable(),
+  })
+  .strict();
+
+export const GenerationOperationUsageSchema = z
+  .object({
+    schemaVersion: z.literal("generation-operation-usage@1"),
+    projectId: z.string().min(1),
+    operationId: z.string().min(1),
+    attempts: z.array(GenerationOperationAttemptUsageSchema).min(1),
+    inputTokens: z.number().int().nonnegative(),
+    uncachedInputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    totalTokens: z.number().int().nonnegative(),
+    turnCount: z.number().int().nonnegative(),
+    automaticContinuationCount: z.number().int().nonnegative(),
+    retryAmplificationBasisPoints: z.number().int().nonnegative().nullable(),
+    estimated: z.boolean(),
+    startedAt: z.string().datetime(),
+    completedAt: z.string().datetime().nullable(),
+    latencyMs: z.number().int().nonnegative().nullable(),
+    status: z.string().min(1),
+  })
+  .strict();
+
+export const RunPromptEfficiencySchema = z
+  .object({
+    schemaVersion: z.literal("run-prompt-efficiency@1"),
+    runId: z.string().min(1),
+    grossInputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    uncachedInputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    turnCount: z.number().int().nonnegative(),
+    maxTurnInputTokens: z.number().int().nonnegative(),
+    averageTurnInputTokens: z.number().int().nonnegative(),
+    cacheHitRateBasisPoints: z.number().int().min(0).max(10_000),
+    generationContextEstimatedTokens: z.number().int().nonnegative(),
+    generationContextRepeatedEstimatedTokens: z.number().int().nonnegative(),
+    promptCompactionCount: z.number().int().nonnegative(),
+    promptTokensRemovedByCompaction: z.number().int().nonnegative(),
+    largeToolArgumentTokensRetainedPeak: z.number().int().nonnegative(),
+    retryAmplificationBasisPoints: z.number().int().nonnegative().nullable(),
+    estimated: z.boolean(),
   })
   .strict();
 
@@ -268,6 +349,31 @@ export const ContentSourceSchema = z.object({
   text: z.string(),
   readable: z.boolean().default(true),
 });
+
+export const ModelServicePhaseSchema = z.enum(["build", "edit", "repair"]);
+export const AvailableModelServiceSchema = z
+  .object({
+    id: z.string().min(1).max(128),
+    displayName: z.string().min(1),
+    description: z.string(),
+    capabilities: z
+      .object({
+        toolCalls: z.boolean().default(false),
+        strictToolSchema: z.boolean().default(false),
+        streaming: z.boolean().default(false),
+        vision: z.boolean().default(false),
+        visionInput: z.boolean().default(false),
+        supportedImageMediaTypes: z.array(z.string()).default([]),
+        maxImageBytes: z.number().int().nonnegative().default(0),
+        maxImageCount: z.number().int().nonnegative().default(0),
+      })
+      .strict(),
+    availability: z.literal("available"),
+  })
+  .strict();
+export const AvailableModelServicesResponseSchema = z
+  .object({ items: z.array(AvailableModelServiceSchema) })
+  .strict();
 
 export const StartRunRequestSchema = z
   .object({
@@ -751,6 +857,8 @@ export const ProjectRuntimeStateResponseSchema = z
     sourceSnapshotUri: z.string().min(1),
     appRoot: z.string().min(1),
     templateKey: z.string().min(1),
+    modelServiceId: z.string().min(1).nullable().optional(),
+    modelServiceDisplayName: z.string().min(1).nullable().optional(),
     styleContractPath: z.string().min(1).nullable().optional(),
     styleContract: RuntimeStyleContractSchema.nullable().optional(),
     latestBuild: RuntimeLatestBuildSchema.nullable().optional(),
@@ -1056,6 +1164,11 @@ export const ErrorResponseSchema = z.object({
 });
 
 export type ContentSource = z.infer<typeof ContentSourceSchema>;
+export type ModelServicePhase = z.infer<typeof ModelServicePhaseSchema>;
+export type AvailableModelService = z.infer<typeof AvailableModelServiceSchema>;
+export type AvailableModelServicesResponse = z.infer<
+  typeof AvailableModelServicesResponseSchema
+>;
 export type ContentPlanIdentity = z.infer<typeof ContentPlanIdentitySchema>;
 export type ContentPlanApproval = z.infer<typeof ContentPlanApprovalSchema>;
 export type RecordContentPlanApprovalRequest = z.input<
@@ -1073,6 +1186,9 @@ export type ContentPlanApprovalProducerStatus = z.infer<
 >;
 export type GenerationContextStatus = z.infer<typeof GenerationContextStatusSchema>;
 export type RunEfficiencyMetrics = z.infer<typeof RunEfficiencyMetricsSchema>;
+export type RunModelUsage = z.infer<typeof RunModelUsageSchema>;
+export type GenerationOperationUsage = z.infer<typeof GenerationOperationUsageSchema>;
+export type RunPromptEfficiency = z.infer<typeof RunPromptEfficiencySchema>;
 export type StartRunRequest = z.infer<typeof StartRunRequestSchema>;
 export type StartRunResponse = z.infer<typeof StartRunResponseSchema>;
 export type ContinueRunRequest = z.infer<typeof ContinueRunRequestSchema>;

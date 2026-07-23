@@ -1,0 +1,125 @@
+{
+  "schemaVersion": "generation-context-warm-structural-expansion-summary@1",
+  "recordedAt": "2026-07-22T03:48:01Z",
+  "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "visionCapable": false,
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "pair": {
+    "pairId": "batch-26-oilfield-operations-dashboard-warm-structural",
+    "batchId": "batch-26",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "warm_structural",
+    "templateVersion": "next-app",
+    "phase": "edit",
+    "controlAttempts": [
+      "accepted"
+    ],
+    "candidateAttempts": [
+      "accepted"
+    ],
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-5832",
+      "draftSnapshotId": "draft-snapshot-5865",
+      "recordHash": "5defa8abdfd14e1fa1409023442156a803a8a2c20273eb2d9c2a579f41080e14",
+      "metrics": {
+        "inputTokens": 71621,
+        "outputTokens": 940,
+        "turns": 6,
+        "toolCalls": 11,
+        "totalDurationMs": 28759,
+        "timeToFirstSourceMutationMs": 17785,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3203,
+        "timeToDurableSnapshotMs": 17785,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "runId": "run-2898",
+      "draftSnapshotId": "draft-snapshot-2927",
+      "recordHash": "de750a6307c26bf64ba7f34f1980a89e817fcb4fde7744d46057221d28670d69",
+      "metrics": {
+        "inputTokens": 98272,
+        "outputTokens": 1259,
+        "turns": 7,
+        "toolCalls": 12,
+        "totalDurationMs": 50079,
+        "timeToFirstSourceMutationMs": 19195,
+        "modelTurnAtFirstSourceMutation": 2,
+        "timeToIframeAppliedMs": 11017,
+        "timeToDurableSnapshotMs": 19195,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": 37.21,
+      "outputTokens": 33.94,
+      "turns": 16.67,
+      "toolCalls": 9.09,
+      "totalDurationMs": 74.13,
+      "timeToFirstSourceMutationMs": 7.93,
+      "modelTurnAtFirstSourceMutation": -33.33,
+      "timeToIframeAppliedMs": 243.96,
+      "timeToDurableSnapshotMs": 7.93
+    },
+    "coverage": {
+      "nextTemplate": true,
+      "nonVisualUnavailableMainTaskPassed": false,
+      "multimodalVisualDelivered": false
+    },
+    "openFindings": [
+      "the pair proves Structural HMR correctness, locality, iframe acknowledgement, and durable snapshot for both sides, but does not prove an optimization benefit",
+      "candidate reached first mutation at model turn 2 instead of control turn 3, while input tokens, tool calls, total duration, first mutation time, iframe acknowledgement, and durable snapshot all regressed",
+      "candidate iframe acknowledgement was 11017ms, above the Structural 5000ms P95 target, and durable snapshot was 19195ms, above its 5000ms P95 target",
+      "Warm Structural remains at one of twenty required pairs and one of three required batches in this frozen cohort"
+    ]
+  },
+  "ledger": {
+    "recordCount": 9,
+    "sampleCount": 8,
+    "completePairCount": 4,
+    "pendingPairCount": 0,
+    "headRecordHash": "de750a6307c26bf64ba7f34f1980a89e817fcb4fde7744d46057221d28670d69",
+    "sha256": "b6a6e3b514cf5081721d3020fe51b5d8a64cb5ab831ad7ec2479c6ebb98bbc55"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 3,
+    "warmCopyCssBatchCount": 3,
+    "warmStructuralPairCount": 1,
+    "warmStructuralMinimumPairCount": 20,
+    "warmStructuralBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "e1697c0d33c01bfee2b2ca2d3b552e3b015618ce507f9484f5574316acae9f01"
+  },
+  "sourceSha256": {
+    "pairSpec": "6bb3223b015ebf1fc53da8ac1c2a8c530d2d4a3609650213d2a2f3f2a5d45510",
+    "pairResult": "c5f49c0971b7f85565d848f4cad40d896a096e14fd9b4df5f29b57724345e80d",
+    "controlCase": "e2e6f5984c402ad07f03efc2cd8ab425f505d3c2ab032404d5d774ab50ad685c",
+    "candidateCase": "f1fe8332069e4a4c4499d4e2f57f00a5d953a23537eabce520e236499bdf1bc2",
+    "rolloutEvidence": "e1697c0d33c01bfee2b2ca2d3b552e3b015618ce507f9484f5574316acae9f01"
+  }
+}

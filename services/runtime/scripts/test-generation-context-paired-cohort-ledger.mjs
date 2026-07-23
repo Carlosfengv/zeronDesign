@@ -25,6 +25,7 @@ function session() {
     createdAt: "2026-07-20T00:00:00.000Z",
     calculatorVersion: "generation-context-rollout-calculator@1",
     bootstrap: { iterations: 100, seed: 42 },
+    source: { commit: "abc123", dirty: false },
     sourcePolicy: "hashes_only",
     fixtureManifestSha256: HASH_A,
     providers: [{
@@ -67,6 +68,7 @@ function sample(side, pairId = "batch-1-fixture-1") {
       providerParametersHash: HASH_B,
       templateVersion: "next-app@2",
       capabilitySnapshotHash: HASH_C,
+      designProfileHash: HASH_C,
       phase: "build",
     },
     execution: {

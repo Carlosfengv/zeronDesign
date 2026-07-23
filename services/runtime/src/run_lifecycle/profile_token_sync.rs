@@ -358,7 +358,7 @@ impl RunLifecycleService {
                 &source_run.id,
                 AgentPhase::Edit,
                 "edit".to_string(),
-                self.config.agent_model.clone(),
+                source_run.model.clone(),
                 None,
                 Vec::new(),
             )

@@ -193,9 +193,25 @@ impl Tool for ProjectBuildTool {
                     }),
                 )
             })?;
+            let route_contract = resolve_project_template_spec(&ctx)?
+                .generation_contract()
+                .and_then(|contract| contract.effective_route_contract())
+                .map_err(|error| {
+                    ToolError::typed_recoverable(
+                        format!("project build route contract is invalid: {error}"),
+                        "artifact.route_contract_invalid",
+                        json!({ "suggestedAction": "Repair the Runtime-owned template route contract before rebuilding." }),
+                    )
+                })?;
             Some(
-                create_candidate_snapshot(&*self.workspace, &ctx, &build_id, static_output_dir)
-                    .await?,
+                create_candidate_snapshot(
+                    &*self.workspace,
+                    &ctx,
+                    &build_id,
+                    static_output_dir,
+                    &route_contract,
+                )
+                .await?,
             )
         } else {
             None
@@ -224,6 +240,8 @@ impl Tool for ProjectBuildTool {
             "candidateOutputPath": candidate.as_ref().map(|candidate| candidate.output_path.clone()),
             "candidateManifestPath": candidate.as_ref().map(|candidate| candidate.manifest_path.clone()),
             "candidateManifestHash": candidate.as_ref().map(|candidate| candidate.manifest_hash.clone()),
+            "artifactRouteManifestPath": candidate.as_ref().map(|candidate| candidate.route_manifest_path.clone()),
+            "artifactRouteManifestHash": candidate.as_ref().map(|candidate| candidate.route_manifest_hash.clone()),
             "error": error_message,
         });
         write_workspace_json(&*self.workspace, &ctx, "outputs/build/latest.json", &latest).await?;
@@ -237,6 +255,8 @@ impl Tool for ProjectBuildTool {
                     "logPath": format!("/workspace/{log_path}"),
                     "status": status,
                     "exitCode": output.as_ref().and_then(|output| output.status),
+                    "sourceSnapshotUri": source_snapshot_uri,
+                    "sourceFingerprint": source_fingerprint,
                     "stderr": output.as_ref().map(|output| truncate_for_metadata(&output.stderr)),
                     "error": error_message,
                     "suggestedAction": classification.suggested_action,
@@ -258,6 +278,8 @@ struct CandidateSnapshot {
     output_path: String,
     manifest_path: String,
     manifest_hash: String,
+    route_manifest_path: String,
+    route_manifest_hash: String,
 }
 
 async fn create_candidate_snapshot(
@@ -265,6 +287,7 @@ async fn create_candidate_snapshot(
     ctx: &ToolContext,
     build_id: &str,
     static_output_dir: &Path,
+    route_contract: &crate::artifact_routes::ArtifactRouteContract,
 ) -> Result<CandidateSnapshot, ToolError> {
     let candidates_root = ctx.workspace_root.join("outputs/candidates");
     let staging_root = candidates_root.join(format!(".staging-{build_id}"));
@@ -282,6 +305,7 @@ async fn create_candidate_snapshot(
         })?;
 
     let mut files = Vec::new();
+    let mut route_files = Vec::new();
     let mut stack = vec![staging_root.clone()];
     while let Some(directory) = stack.pop() {
         let entries = workspace
@@ -302,10 +326,15 @@ async fn create_candidate_snapshot(
                         .map_err(|error| ToolError::Terminal(error.to_string()))?
                         .to_string_lossy()
                         .replace('\\', "/");
+                    let sha256 = sha256_hex(&bytes);
+                    route_files.push(ArtifactRouteFile {
+                        path: relative.clone(),
+                        sha256: sha256.clone(),
+                    });
                     files.push(json!({
                         "path": relative,
                         "bytes": bytes.len(),
-                        "sha256": sha256_hex(&bytes),
+                        "sha256": sha256,
                     }));
                 }
             }
@@ -316,9 +345,47 @@ async fn create_candidate_snapshot(
             .and_then(Value::as_str)
             .cmp(&right.get("path").and_then(Value::as_str))
     });
+    let route_manifest = match ArtifactRouteManifest::build(build_id, route_contract, route_files) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = workspace.remove_dir_all(ctx, &staging_root).await;
+            return Err(ToolError::typed_recoverable(
+                error.to_string(),
+                error.error_kind,
+                json!({
+                    "route": error.route,
+                    "files": error.files,
+                    "suggestedAction": "Ensure the static export contains exactly one artifact file for every contracted route."
+                }),
+            ));
+        }
+    };
+    let route_manifest_text = serde_json::to_string_pretty(&route_manifest)
+        .map_err(|error| ToolError::Terminal(error.to_string()))?;
+    let route_manifest_hash = sha256_hex(route_manifest_text.as_bytes());
+    workspace
+        .write_string(
+            ctx,
+            &staging_root.join(ARTIFACT_ROUTE_MANIFEST_FILE),
+            &route_manifest_text,
+        )
+        .await
+        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+    files.push(json!({
+        "path": ARTIFACT_ROUTE_MANIFEST_FILE,
+        "bytes": route_manifest_text.len(),
+        "sha256": sha256_hex(route_manifest_text.as_bytes()),
+    }));
+    files.sort_by(|left, right| {
+        left.get("path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("path").and_then(Value::as_str))
+    });
     let manifest = json!({
         "schemaVersion": "candidate-manifest@1",
         "buildId": build_id,
+        "artifactRouteManifestPath": ARTIFACT_ROUTE_MANIFEST_FILE,
+        "artifactRouteManifestHash": route_manifest_hash.clone(),
         "files": files,
     });
     let manifest_text = serde_json::to_string_pretty(&manifest)
@@ -349,6 +416,10 @@ async fn create_candidate_snapshot(
             "/workspace/outputs/candidates/{build_id}/.anydesign-candidate-manifest.json"
         ),
         manifest_hash,
+        route_manifest_path: format!(
+            "/workspace/outputs/candidates/{build_id}/{ARTIFACT_ROUTE_MANIFEST_FILE}"
+        ),
+        route_manifest_hash,
     })
 }
 

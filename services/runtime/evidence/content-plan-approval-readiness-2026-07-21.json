@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "content-plan-approval-readiness-record@1",
+  "recordedAt": "2026-07-21T09:26:29.694Z",
+  "sourceEvidence": {
+    "path": "services/runtime/target/e2e-evidence/zerondesign-e2e/content-plan-approval-readiness.json",
+    "sha256": "b1060efeb94d9904da5cbeddaba2dd7613e9e28c0a44665af16014c752f35409"
+  },
+  "target": {
+    "context": "k3d-zerondesign-e2e",
+    "namespace": "anydesign-runtime",
+    "deployment": "anydesign-runtime",
+    "runtimeImage": "anydesign/runtime:wave1-producer-20260721"
+  },
+  "producer": {
+    "schemaVersion": "content-plan-approval-producer@1",
+    "transactionSchemaVersion": "content-plan-approval-transaction@1",
+    "ready": true,
+    "sequenceBefore": 53,
+    "sequenceAfter": 57,
+    "expectedSequenceDelta": 4
+  },
+  "assertions": {
+    "initialApprovalVerified": true,
+    "planChangeInvalidatedInitialApproval": true,
+    "staleConfirmationHttpStatus": 409,
+    "staleConfirmationErrorCode": "content_plan.confirmation_event_stale",
+    "reapprovalVerified": true,
+    "runtimePodUidChanged": true,
+    "verifiedStateRecoveredAfterRestart": true,
+    "internalProducerAuthorizationUsed": true,
+    "publicPrincipalSecretMutated": false,
+    "secretMaterialRecorded": false
+  },
+  "rolloutState": {
+    "generationContextMode": "shadow",
+    "contentPlanAttestationMode": "shadow",
+    "contentPlanApprovalProducerRequired": false,
+    "observationReceiptsEnabled": true
+  },
+  "openGate": {
+    "kind": "historical_approval_migration_evidence_missing",
+    "enabledOrEnforceAllowed": false,
+    "reason": "The rebuilt environment does not contain an auditable pre-ContentPlanApproval confirmation dataset."
+  },
+  "passed": true
+}

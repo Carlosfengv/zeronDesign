@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 const REQUIRED_BUCKETS = ["greenfield", "warm_copy_css", "warm_structural", "cold_dev", "repair"];
 const IDENTITY_FIELDS = [
   "fixtureId", "modelResource", "modelVersion", "providerParametersHash",
-  "templateVersion", "capabilitySnapshotHash", "phase",
+  "templateVersion", "capabilitySnapshotHash", "designProfileHash", "phase",
 ];
 const SHA256 = /^[a-f0-9]{64}$/;
 const FORBIDDEN_KEY = /(?:^|_)(?:api_?key|authorization|credential|secret|prompt|text|source_?content|image_?(?:bytes|url)|provider_?(?:response|body)|request_?body|response_?body|signed_?url|temporary_?url)(?:$|_)/i;
@@ -218,7 +218,7 @@ export function evaluateRolloutEvidence(evidence) {
       || pair.identity.providerResourceRevision <= 0) {
       errors.push(`pairs[${index}].identity.providerResourceRevision must be a positive integer`);
     }
-    for (const field of ["providerParametersHash", "capabilitySnapshotHash"]) {
+    for (const field of ["providerParametersHash", "capabilitySnapshotHash", "designProfileHash"]) {
       if (!SHA256.test(pair?.identity?.[field] ?? "")) errors.push(`pairs[${index}].identity.${field} must be sha256`);
     }
     if (pair?.control?.flag !== "legacy" || pair?.candidate?.flag !== "generation_context") {

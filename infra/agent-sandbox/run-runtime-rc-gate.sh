@@ -1680,9 +1680,55 @@ aggregate_args=(
 if [[ -n "${RUNTIME_RC_PROVIDER_EVIDENCE:-}" ]]; then
   aggregate_args+=(--provider "${RUNTIME_RC_PROVIDER_EVIDENCE}")
 fi
+if [[ -n "${RUNTIME_RC_PROVIDER_CACHE_EVIDENCE:-}" ]]; then
+  aggregate_args+=(--provider-cache "${RUNTIME_RC_PROVIDER_CACHE_EVIDENCE}")
+elif [[ "${rc_mode}" == "release" ]]; then
+  printf 'RUNTIME_RC_PROVIDER_CACHE_EVIDENCE is required in release mode\n' >&2
+  exit 3
+fi
+if [[ -n "${RUNTIME_RC_TERMINAL_BUNDLE_SET:-}" ]]; then
+  aggregate_args+=(--terminal-bundles "${RUNTIME_RC_TERMINAL_BUNDLE_SET}")
+elif [[ "${rc_mode}" == "release" ]]; then
+  printf 'RUNTIME_RC_TERMINAL_BUNDLE_SET is required in release mode\n' >&2
+  exit 3
+fi
+if [[ "${rc_mode}" == "release" ]]; then
+  release_budget_policy="${RUNTIME_RC_BUDGET_POLICY:-infra/generation-reliability/release-budget-policy.json}"
+  if [[ ! -f "${release_budget_policy}" ]]; then
+    printf 'release Budget Policy does not exist: %s\n' "${release_budget_policy}" >&2
+    exit 3
+  fi
+  aggregate_args+=(--budget-policy "${release_budget_policy}")
+  efficiency_benchmark_ledger="${RUNTIME_RC_EFFICIENCY_BENCHMARK_LEDGER:-}"
+  if [[ -z "${efficiency_benchmark_ledger}" || ! -f "${efficiency_benchmark_ledger}" ]]; then
+    printf 'RUNTIME_RC_EFFICIENCY_BENCHMARK_LEDGER is required in release mode and must exist\n' >&2
+    exit 3
+  fi
+  aggregate_args+=(--efficiency-benchmark-ledger "${efficiency_benchmark_ledger}")
+  efficiency_source_ledger="${RUNTIME_RC_EFFICIENCY_SOURCE_LEDGER:-}"
+  if [[ -z "${efficiency_source_ledger}" || ! -f "${efficiency_source_ledger}" ]]; then
+    printf 'RUNTIME_RC_EFFICIENCY_SOURCE_LEDGER is required in release mode and must exist\n' >&2
+    exit 3
+  fi
+  efficiency_import_mapping="${RUNTIME_RC_EFFICIENCY_IMPORT_MAPPING:-}"
+  if [[ -z "${efficiency_import_mapping}" || ! -f "${efficiency_import_mapping}" ]]; then
+    printf 'RUNTIME_RC_EFFICIENCY_IMPORT_MAPPING is required in release mode and must exist\n' >&2
+    exit 3
+  fi
+  aggregate_args+=(
+    --efficiency-source-ledger "${efficiency_source_ledger}"
+    --efficiency-import-mapping "${efficiency_import_mapping}"
+  )
+fi
 node services/runtime/scripts/aggregate-release-evidence.mjs "${aggregate_args[@]}"
 if [[ "${rc_mode}" == "release" ]]; then
-  node services/runtime/scripts/validate-release-evidence.mjs "${release_evidence}"
+  node services/runtime/scripts/validate-release-evidence.mjs \
+    "${release_evidence}" \
+    --provider-cache "${RUNTIME_RC_PROVIDER_CACHE_EVIDENCE}" \
+    --budget-policy "${release_budget_policy}" \
+    --efficiency-benchmark-ledger "${efficiency_benchmark_ledger}" \
+    --efficiency-source-ledger "${efficiency_source_ledger}" \
+    --efficiency-import-mapping "${efficiency_import_mapping}"
   release_evidence_absolute="$(cd "$(dirname "${release_evidence}")" && pwd)/$(basename "${release_evidence}")"
   printf 'RC_RELEASE_ELIGIBLE=true\n'
   printf 'RC_EVIDENCE_SUMMARY=%s\n' "${release_evidence_absolute}"

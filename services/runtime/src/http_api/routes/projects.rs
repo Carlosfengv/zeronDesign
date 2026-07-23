@@ -1,4 +1,6 @@
 use super::super::*;
+use crate::run_metrics::{calculate_generation_operation_usage, GenerationOperationUsage};
+use crate::types::AgentEvent;
 
 mod draft_previews;
 mod project_assets;
@@ -14,6 +16,10 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
             get(project_runtime_state),
         )
         .route("/projects/{project_id}/history", get(project_history))
+        .route(
+            "/projects/{project_id}/generation-operations/{operation_id}/usage",
+            get(generation_operation_usage),
+        )
         .route(
             "/projects/{project_id}/draft-preview",
             get(draft_previews::current_draft_preview),
@@ -79,6 +85,35 @@ pub(in crate::http_api) fn router() -> Router<AppState> {
             "/projects/{project_id}/visual-reviews",
             post(schedule_visual_review),
         )
+}
+
+async fn generation_operation_usage(
+    State(state): State<AppState>,
+    Extension(policy): Extension<ApplicationAuthorizationPolicy>,
+    Path((project_id, operation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<GenerationOperationUsage>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_project_operation(
+        &state,
+        &policy,
+        &headers,
+        &project_id,
+        PROJECT_READ_OPERATION,
+    )
+    .await?;
+    let runs = state
+        .store
+        .project_runs(&project_id)
+        .await
+        .map_err(internal_error)?;
+    let mut run_events = Vec::with_capacity(runs.len());
+    for run in runs {
+        let events = state.store.events(&run.id).await;
+        run_events.push((run, events));
+    }
+    calculate_generation_operation_usage(&project_id, &operation_id, &run_events)
+        .map(Json)
+        .ok_or_else(|| not_found(format!("generation operation not found: {operation_id}")))
 }
 
 async fn create_element_observation(
@@ -670,6 +705,29 @@ async fn project_runtime_state(
         ))
     })?;
     let current_run = state.store.get_run(&current.created_by_run_id).await;
+    let model_service_id = current_run
+        .as_ref()
+        .and_then(|run| run.model.strip_prefix("resource:"))
+        .map(str::to_string);
+    let model_service_display_name = if let Some(run) = current_run.as_ref() {
+        state
+            .store
+            .events(&run.id)
+            .await
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                AgentEvent::ModelExecution { snapshot, .. } => snapshot
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_string),
+                _ => None,
+            })
+            .or_else(|| model_service_id.clone())
+    } else {
+        None
+    };
     let template_key = if let Some(run) = current_run.as_ref() {
         if let Some(brief_id) = &run.brief_version {
             state
@@ -724,6 +782,8 @@ async fn project_runtime_state(
         source_snapshot_uri,
         app_root: "project".to_string(),
         template_key,
+        model_service_id,
+        model_service_display_name,
         style_contract_path: style_contract
             .as_ref()
             .map(|_| "/workspace/state/style-contract.json".to_string()),

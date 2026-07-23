@@ -1,7 +1,18 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { generationContextProtocol, validateGenerationContextRunEvidence } from "./generation-context-evidence.mjs";
+import {
+  enforceReleaseBudgetPolicy,
+  validateReleaseBudgetPolicy,
+} from "../../../infra/generation-reliability/runtime-release-budget-policy.mjs";
+import { evaluateRuntimeEfficiencyBenchmark } from "../../../infra/generation-reliability/runtime-efficiency-benchmark.mjs";
+import {
+  assembleBenchmarkCohort,
+  evaluateBenchmarkLedger,
+} from "../../../infra/generation-reliability/runtime-efficiency-benchmark-ledger.mjs";
+import { validateRuntimeEfficiencyBenchmarkSourceBinding } from "../../../infra/generation-reliability/collect-runtime-efficiency-benchmark.mjs";
 
 function fail(errors, message) {
   errors.push(message);
@@ -31,6 +42,70 @@ function hasText(value) {
 
 function sha256(value) {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function validateProviderCacheRawBinding(evidence, rawText) {
+  const rawSha256 = createHash("sha256").update(rawText).digest("hex");
+  if (rawSha256 !== evidence?.providerCacheSmokeSha256) {
+    throw new Error("release Provider Cache raw SHA-256 mismatch");
+  }
+  const authoritative = JSON.parse(rawText);
+  if (authoritative?.toolSetHashVersion !== "tool-definition-set@1"
+    || canonical(authoritative) !== canonical(evidence?.providerCacheSmoke)) {
+    throw new Error("release Provider Cache raw evidence mismatch");
+  }
+  return authoritative;
+}
+
+function positiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function validateEfficiencyBenchmark(errors, benchmark, provider, repositoryCommit) {
+  const cohort = benchmark?.cohort;
+  const evaluation = benchmark?.evaluation;
+  const sourceLedger = benchmark?.sourceLedger;
+  const sourceBinding = benchmark?.sourceBinding;
+  if (!cohort || !evaluation || !sourceLedger || !sourceBinding) {
+    fail(errors, "passing Runtime efficiency Benchmark evidence is required");
+    return;
+  }
+  const recomputed = evaluateRuntimeEfficiencyBenchmark(cohort);
+  const profiles = Array.isArray(cohort.profiles) ? cohort.profiles : [];
+  const workloads = new Set(profiles.map(profile => profile?.workload));
+  if (sourceLedger?.schemaVersion !== "runtime-efficiency-benchmark-ledger-verification@1"
+    || sourceLedger?.status !== "passed"
+    || !sha256(sourceLedger?.ledgerSha256)
+    || sourceLedger.ledgerSha256 !== cohort?.ledger?.sha256
+    || sourceBinding?.schemaVersion !== "runtime-efficiency-benchmark-source-binding@1"
+    || sourceBinding?.status !== "passed"
+    || !sha256(sourceBinding?.pairedLedgerSha256)
+    || !sha256(sourceBinding?.pairedLedgerHeadRecordHash)
+    || !sha256(sourceBinding?.mappingSha256)
+    || sourceBinding?.attemptCount !== sourceLedger?.attemptCount
+    || sourceBinding?.source?.commit !== repositoryCommit
+    || sourceBinding?.source?.dirty !== false
+    || cohort?.source?.commit !== repositoryCommit
+    || cohort?.source?.dirty !== false
+    || evaluation?.result !== "pass"
+    || recomputed.result !== "pass"
+    || JSON.stringify(evaluation) !== JSON.stringify(recomputed)
+    || !workloads.has("greenfield_build")
+    || !workloads.has("style_token_edit")
+    || profiles.some(profile =>
+      profile?.modelResourceId !== provider?.modelResourceId
+      || profile?.providerResourceRevision !== provider?.providerResourceRevision
+      || profile?.providerParametersHash !== provider?.providerConfigSha256)) {
+    fail(errors, "Runtime efficiency Benchmark identity, sample, or threshold gate failed");
+  }
 }
 
 function validateDcpStage(errors, stage, label) {
@@ -167,7 +242,135 @@ export function validateReleaseEvidence(evidence) {
   if (evidence?.auth?.channelJwtVerified !== true) fail(errors, "workspace channel JWT gate is required");
   if (evidence?.provider?.mode !== "real") fail(errors, "real provider evidence is required");
   if (!hasText(evidence?.provider?.model)) fail(errors, "provider model is required");
+  if (!hasText(evidence?.provider?.modelResourceId)
+    || !positiveInteger(evidence?.provider?.providerResourceRevision)
+    || !sha256(evidence?.provider?.providerConfigSha256)) {
+    fail(errors, "provider resource identity, revision, and configuration digest are required");
+  }
   if (evidence?.provider?.credentialPresent !== true) fail(errors, "provider credential presence was not recorded");
+  const providerCache = evidence?.providerCacheSmoke;
+  const providerCacheRuns = Array.isArray(providerCache?.runs) ? providerCache.runs : [];
+  const providerCacheStableRuns = providerCacheRuns.filter((run) =>
+    run?.compositionValid === true
+    && run?.metricsValid === true
+    && run?.providerIdentityValid === true
+    && run?.buildIdentityValid === true
+    && run?.generationContextIdentityValid === true
+    && run?.redactionValid === true
+    && run?.repeatedStableTurns >= 2);
+  const providerCacheGrossInputTokens = providerCacheStableRuns.reduce(
+    (total, run) => total + Number(run.grossInputTokens || 0),
+    0,
+  );
+  const providerCacheCachedInputTokens = providerCacheStableRuns.reduce(
+    (total, run) => total + Number(run.cachedInputTokens || 0),
+    0,
+  );
+  if (providerCache?.schemaVersion !== "provider-cache-smoke-audit@1"
+    || providerCache?.toolSetHashVersion !== "tool-definition-set@1"
+    || providerCache?.status !== "passed"
+    || providerCache?.releaseEligible !== true
+    || !positiveInteger(providerCache?.stableRunCount)
+    || !positiveInteger(providerCache?.cachedInputTokens)
+    || providerCache?.invalidRunCount !== 0
+    || providerCache?.auditedRunCount !== providerCacheRuns.length
+    || providerCache?.stableRunCount !== providerCacheStableRuns.length
+    || providerCache?.grossInputTokens !== providerCacheGrossInputTokens
+    || providerCache?.cachedInputTokens !== providerCacheCachedInputTokens
+    || providerCache?.sourceDirty !== false
+    || providerCache?.sourceCommit !== evidence?.repository?.commit
+    || providerCache?.modelResourceId !== evidence?.provider?.modelResourceId
+    || providerCache?.providerResourceRevision !== evidence?.provider?.providerResourceRevision
+    || providerCache?.providerConfigSha256 !== evidence?.provider?.providerConfigSha256) {
+    fail(errors, "release requires passing real-provider stable-prefix cache smoke evidence");
+  }
+  const terminalBundles = evidence?.terminalBundles;
+  const terminalEntries = Array.isArray(terminalBundles?.entries)
+    ? terminalBundles.entries
+    : [];
+  const requiredTerminalKinds = [
+    "website",
+    "docs",
+    "edit",
+    "repair",
+    "runtime_restart",
+  ];
+  const terminalKinds = new Set(terminalEntries.map((entry) => entry?.kind));
+  const terminalWebsite = terminalEntries.find((entry) => entry?.kind === "website");
+  const terminalDocs = terminalEntries.find((entry) => entry?.kind === "docs");
+  let releaseBudgetPolicyValid = true;
+  try {
+    validateReleaseBudgetPolicy(evidence?.releaseBudgetPolicy);
+    for (const entry of terminalEntries) {
+      const result = enforceReleaseBudgetPolicy(
+        evidence.releaseBudgetPolicy,
+        entry?.budgetProfiles,
+      );
+      if (result.status !== "passed"
+        || result.runs.length !== entry?.budgetProfileCount
+        || !result.runs.some((run) =>
+          run.runId === entry?.runId && run.profileHash === entry?.budgetProfileHash)) {
+        throw new Error("terminal Budget Policy result does not bind the primary Run");
+      }
+    }
+  } catch {
+    releaseBudgetPolicyValid = false;
+  }
+  if (terminalBundles?.schemaVersion !== "runtime-terminal-bundle-index@1"
+    || terminalBundles?.status !== "passed"
+    || !sha256(terminalBundles?.setSha256)
+    || terminalBundles?.budgetPolicyStatus !== "passed"
+    || !sha256(terminalBundles?.budgetPolicySha256)
+    || terminalBundles?.budgetPolicySha256 !== evidence?.releaseBudgetPolicySha256
+    || releaseBudgetPolicyValid !== true
+    || !positiveInteger(terminalBundles?.filesScanned)
+    || terminalBundles?.replayedCount !== terminalEntries.length
+    || terminalEntries.length < requiredTerminalKinds.length
+    || new Set(terminalEntries.map((entry) => entry?.evidenceId)).size !== terminalEntries.length
+    || requiredTerminalKinds.some((kind) => !terminalKinds.has(kind))
+    || terminalWebsite?.entryRoute !== "/"
+    || terminalDocs?.entryRoute !== "/docs/"
+    || terminalWebsite?.runId === terminalDocs?.runId
+    || terminalWebsite?.projectId === terminalDocs?.projectId
+    || terminalEntries.some((entry) =>
+      !hasText(entry?.evidenceId)
+      || entry?.replayStatus !== "passed"
+      || entry?.resultStatus !== "accepted"
+      || entry?.bundleKind !== (entry?.kind === "runtime_restart"
+        ? "runtime_restart_terminal"
+        : "real_provider_terminal")
+      || entry?.gitSha !== evidence?.repository?.commit
+      || entry?.modelResourceId !== evidence?.provider?.modelResourceId
+      || entry?.modelResourceRevision !== evidence?.provider?.providerResourceRevision
+      || entry?.providerConfigSha256 !== evidence?.provider?.providerConfigSha256
+      || entry?.providerCacheSourceAuditSha256 !== evidence?.providerCacheSmokeSha256
+      || !hasText(entry?.budgetProfileId)
+      || !sha256(entry?.budgetProfileHash)
+      || !sha256(entry?.budgetProfilesSha256)
+      || !sha256(entry?.runModelUsageSha256)
+      || entry?.budgetConformanceStatus !== "passed"
+      || entry?.releaseBudgetPolicyStatus !== "passed"
+      || !positiveInteger(entry?.budgetProfileCount)
+      || !positiveInteger(entry?.maxTurnInputTokens)
+      || !sha256(entry?.checksumsSha256)
+      || !sha256(entry?.streamSha256)
+      || !hasText(entry?.projectId)
+      || !hasText(entry?.runId)
+      || !hasText(entry?.operationId))) {
+    fail(errors, "release requires replayed terminal Bundles for Website, Docs, Edit, Repair, and Runtime Restart");
+  }
+  if (!sha256(evidence?.providerCacheSmokeSha256)) {
+    fail(errors, "release Provider Cache evidence SHA-256 is required");
+  }
+  if (!sha256(evidence?.releaseBudgetPolicySha256)) {
+    fail(errors, "release Budget Policy SHA-256 is required");
+  }
+  validateEfficiencyBenchmark(
+    errors,
+    evidence?.efficiencyBenchmark,
+    evidence?.provider,
+    evidence?.repository?.commit,
+  );
 
   const preflight = evidence?.preflight;
   if (preflight?.schemaVersion !== "runtime-rc-preflight@1" || preflight?.passed !== true || preflight?.prefetchImages !== true) {
@@ -277,16 +480,69 @@ export function validateReleaseEvidence(evidence) {
 }
 
 async function main() {
-  const path = process.argv[2];
-  if (!path) throw new Error("usage: validate-release-evidence.mjs <release-evidence.json>");
-  const evidence = JSON.parse(await readFile(path, "utf8"));
+  const [evidencePath, ...rawArgs] = process.argv.slice(2);
+  if (!evidencePath || rawArgs.length % 2 !== 0) {
+    throw new Error("usage: validate-release-evidence.mjs <release-evidence.json> [--provider-cache <provider-cache-smoke-audit.json> --budget-policy <policy.json>] [--efficiency-benchmark-ledger <ledger.jsonl> --efficiency-source-ledger <paired-ledger.ndjson> --efficiency-import-mapping <mapping.json>]");
+  }
+  const args = {};
+  for (let index = 0; index < rawArgs.length; index += 2) {
+    const flag = rawArgs[index];
+    if (!flag?.startsWith("--") || rawArgs[index + 1] === undefined) {
+      throw new Error(`invalid argument: ${flag ?? "<missing>"}`);
+    }
+    args[flag.slice(2)] = rawArgs[index + 1];
+  }
+  if (Object.keys(args).some(key => ![
+    "budget-policy",
+    "provider-cache",
+    "efficiency-benchmark-ledger",
+    "efficiency-source-ledger",
+    "efficiency-import-mapping",
+  ].includes(key))) {
+    throw new Error("unsupported release validation argument");
+  }
+  const evidence = JSON.parse(await readFile(evidencePath, "utf8"));
+  if (evidence.releaseEligible === true) {
+    if (!args["provider-cache"]) throw new Error("release validation requires --provider-cache");
+    if (!args["budget-policy"]) throw new Error("release validation requires --budget-policy");
+    if (!args["efficiency-benchmark-ledger"]) {
+      throw new Error("release validation requires --efficiency-benchmark-ledger");
+    }
+    if (!args["efficiency-source-ledger"] || !args["efficiency-import-mapping"]) {
+      throw new Error("release validation requires --efficiency-source-ledger and --efficiency-import-mapping");
+    }
+    const providerCacheRaw = await readFile(args["provider-cache"], "utf8");
+    validateProviderCacheRawBinding(evidence, providerCacheRaw);
+    const policyRaw = await readFile(args["budget-policy"], "utf8");
+    const policySha256 = createHash("sha256").update(policyRaw).digest("hex");
+    if (policySha256 !== evidence.releaseBudgetPolicySha256) {
+      throw new Error("release Budget Policy raw SHA-256 mismatch");
+    }
+    const authoritativeBenchmark = evaluateBenchmarkLedger(args["efficiency-benchmark-ledger"]);
+    const authoritativeCohort = assembleBenchmarkCohort(args["efficiency-benchmark-ledger"]);
+    const authoritativeSourceBinding = validateRuntimeEfficiencyBenchmarkSourceBinding(
+      args["efficiency-source-ledger"],
+      args["efficiency-benchmark-ledger"],
+      JSON.parse(await readFile(args["efficiency-import-mapping"], "utf8")),
+    );
+    if (authoritativeBenchmark.evaluation.result !== "pass"
+      || authoritativeBenchmark.sourceLedger.ledgerSha256
+        !== evidence?.efficiencyBenchmark?.sourceLedger?.ledgerSha256
+      || JSON.stringify(authoritativeCohort) !== JSON.stringify(evidence?.efficiencyBenchmark?.cohort)
+      || JSON.stringify(authoritativeBenchmark.evaluation)
+        !== JSON.stringify(evidence?.efficiencyBenchmark?.evaluation)
+      || JSON.stringify(authoritativeSourceBinding)
+        !== JSON.stringify(evidence?.efficiencyBenchmark?.sourceBinding)) {
+      throw new Error("release Runtime efficiency Benchmark raw Ledger mismatch");
+    }
+  }
   const errors = validateReleaseEvidence(evidence);
   if (errors.length) {
     for (const error of errors) process.stderr.write(`release evidence: ${error}\n`);
     process.exitCode = 1;
     return;
   }
-  process.stdout.write(`Release evidence valid: ${path}\n`);
+  process.stdout.write(`Release evidence valid: ${evidencePath}\n`);
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {

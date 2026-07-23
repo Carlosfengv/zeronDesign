@@ -176,6 +176,40 @@ describe("shared schemas", () => {
           sessionId: "session-1",
           phase: "brief",
           agentProfile: "brief",
+          budgetProfile: {
+            schemaVersion: "run-budget-profile@1",
+            profileId: "phase-budget-v1-brief",
+            phase: "brief",
+            rolloutMode: "shadow",
+            tokenBudgetMode: "legacy",
+            operationBudgetMode: "shadow",
+            enforcedLimits: {
+              maxTurns: 20,
+              maxToolCalls: 60,
+              maxInputTokens: 200_000,
+              maxGrossInputTokens: 300_000,
+              maxUncachedInputTokens: 180_000,
+              maxPromptTokensPerTurn: 64_000,
+              maxOutputTokens: 40_000,
+            },
+            phaseTargetLimits: {
+              maxTurns: 6,
+              maxToolCalls: 60,
+              maxInputTokens: 80_000,
+              maxGrossInputTokens: 80_000,
+              maxUncachedInputTokens: 40_000,
+              maxPromptTokensPerTurn: 24_000,
+              maxOutputTokens: 40_000,
+            },
+            operationLimits: {
+              maxGrossInputTokens: 450_000,
+              maxUncachedInputTokens: 270_000,
+              maxOutputTokens: 80_000,
+              maxTurns: 30,
+              maxToolCalls: 100,
+            },
+            profileHash: "a".repeat(64),
+          },
           status,
           model: "internal-balanced",
           parentRunId: null,
@@ -678,6 +712,58 @@ describe("shared schemas", () => {
         timestamp,
       },
       {
+        type: "workflow.lifecycle_started",
+        runId: "run-1",
+        driverId: "workflow-driver-1",
+        action: "project.build",
+        sequence: 1,
+        attempt: 1,
+        idempotencyKey: "a".repeat(64),
+        timestamp,
+      },
+      {
+        type: "workflow.lifecycle_completed",
+        runId: "run-1",
+        driverId: "workflow-driver-1",
+        action: "project.build",
+        sequence: 1,
+        attempt: 1,
+        idempotencyKey: "a".repeat(64),
+        outcome: "completed",
+        progressEvidence: {
+          schemaVersion: "workflow-lifecycle-progress@1",
+          isError: false,
+          content: { status: "success" },
+          metadata: null,
+        },
+        timestamp,
+      },
+      {
+        type: "workflow.lifecycle_failed",
+        runId: "run-1",
+        driverId: "workflow-driver-1",
+        action: "preview.dev_status",
+        sequence: 2,
+        attempt: 1,
+        idempotencyKey: "b".repeat(64),
+        errorKind: "preview.compile_failed",
+        recoverable: true,
+        diagnosticRef: "state/logs/dev.log",
+        sourceSnapshotUri: null,
+        sourceHash: null,
+        timestamp,
+      },
+      {
+        type: "run.continuation_created",
+        runId: "run-2",
+        operationId: "operation-1",
+        predecessorRunId: "run-1",
+        continuationSnapshotId: "continuation-1",
+        attempt: 2,
+        automatic: true,
+        timestamp,
+      },
+      {
         type: "permission.requested",
         runId: "run-1",
         permissionId: "permission-1",
@@ -752,6 +838,27 @@ describe("shared schemas", () => {
         timestamp,
       }),
     ).not.toThrow();
+  });
+
+  it("keeps historical prompt composition events readable without making the hash version implicit", () => {
+    const historical = AgentEventSchema.parse({
+      type: "prompt.composition",
+      runId: "run-legacy",
+      turn: 1,
+      estimatedInputTokens: 100,
+      systemTokens: 10,
+      messageTokens: 20,
+      toolDefinitionTokens: 30,
+      generationContextTokens: 5,
+      staticPrefixHash: "a".repeat(64),
+      toolSetHash: "b".repeat(64),
+      timestamp,
+    });
+
+    expect(historical.type).toBe("prompt.composition");
+    if (historical.type === "prompt.composition") {
+      expect(historical.toolSetHashVersion).toBeUndefined();
+    }
   });
 
   it("validates durable conversation and finding records", () => {

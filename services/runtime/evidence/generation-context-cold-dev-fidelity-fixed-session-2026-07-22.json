@@ -1,0 +1,118 @@
+{
+  "schemaVersion": "generation-context-cold-dev-fidelity-fixed-session-summary@1",
+  "recordedAt": "2026-07-22T04:22:23Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "visionCapable": false
+  },
+  "pair": {
+    "pairId": "batch-02-oilfield-operations-dashboard-cold-dev",
+    "batchId": "batch-02",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "cold_dev",
+    "lifecycleProfile": "cold_dev",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "attempts": [
+        "accepted"
+      ],
+      "runId": "run-16308614",
+      "draftSnapshotId": "draft-snapshot-16308650",
+      "recordHash": "bb665167ce54bac449db113de257952a0556477ad352c780bfc22f0a79c80286",
+      "metrics": {
+        "inputTokens": 141326,
+        "outputTokens": 1035,
+        "turns": 11,
+        "toolCalls": 16,
+        "totalDurationMs": 41052,
+        "timeToFirstSourceMutationMs": 17310,
+        "modelTurnAtFirstSourceMutation": 4,
+        "coldDevReadyMs": 34238,
+        "timeToDurableSnapshotMs": 17310,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "attempts": [
+        "accepted"
+      ],
+      "runId": "run-9603175",
+      "draftSnapshotId": "draft-snapshot-9603208",
+      "recordHash": "18eb8c66dfb7c6c9d877202f1381cf5bcf90f538721f7da65b4056cd95124a55",
+      "metrics": {
+        "inputTokens": 162060,
+        "outputTokens": 1120,
+        "turns": 11,
+        "toolCalls": 17,
+        "totalDurationMs": 50428,
+        "timeToFirstSourceMutationMs": 18210,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 36709,
+        "timeToDurableSnapshotMs": 18210,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": 14.67,
+      "outputTokens": 8.21,
+      "turns": 0.0,
+      "toolCalls": 6.25,
+      "totalDurationMs": 22.84,
+      "timeToFirstSourceMutationMs": 5.2,
+      "modelTurnAtFirstSourceMutation": -25.0,
+      "coldDevReadyMs": 7.22,
+      "timeToDurableSnapshotMs": 5.2
+    },
+    "openFindings": [
+      "both sides prove ordered source mutation, dependency restoration, Dev stop/start/status, current-revision readiness, durable snapshot, Provider identity, and required fidelity",
+      "candidate reached first mutation at model turn 3 instead of control turn 4, but every measured token, tool, latency, Cold Ready, and durable snapshot total was equal or worse",
+      "candidate Cold Dev Ready was 36709ms, above the 30000ms P95 target, and candidate durable snapshot was 18210ms, above the 5000ms P95 target",
+      "the replacement cohort has one of ten required Cold Dev pairs and one of three required batches"
+    ]
+  },
+  "ledger": {
+    "recordCount": 5,
+    "sampleCount": 4,
+    "completePairCount": 2,
+    "pendingPairCount": 0,
+    "headRecordHash": "18eb8c66dfb7c6c9d877202f1381cf5bcf90f538721f7da65b4056cd95124a55",
+    "sha256": "963b4be2f73938598831a331a770866d64ab0517947024dc74fca9e6cda0528e"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "warmStructuralPairCount": 1,
+    "coldDevPairCount": 1,
+    "coldDevMinimumPairCount": 10,
+    "coldDevBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "1f5f3c9129145d957fe65a2ec491e9de6fa1e74b7f1ff8065beb7181f3efedaf"
+  },
+  "sourceSha256": {
+    "pairSpec": "16535db2d55ec33ccd1d37d305e422bba1ab8491763260fa89c763d73e4b1b79",
+    "pairResult": "c009e82c42e5410396fef24771d6287ed26f9734a95776076618b4499562c391",
+    "controlCase": "8c6dd6f0b0d75ea8aa670ee2c95993b34e6961efbc1b96ca13432fb20090c479",
+    "candidateCase": "c685b8c7d071a0b46dcf308ebb43a9e7817b6bf64667a766baa5dfd3d9269ae0",
+    "rolloutEvidence": "1f5f3c9129145d957fe65a2ec491e9de6fa1e74b7f1ff8065beb7181f3efedaf"
+  }
+}

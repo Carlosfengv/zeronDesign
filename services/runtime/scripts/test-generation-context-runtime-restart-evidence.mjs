@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import {
   createRuntimeRestartEvidence,
   validateRuntimeRestartEvidence,
@@ -10,9 +11,51 @@ const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonical(value[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function budgetProfile() {
+  const tokenLimits = {
+    maxTurns: 16,
+    maxToolCalls: 100,
+    maxInputTokens: 300000,
+    maxGrossInputTokens: 300000,
+    maxUncachedInputTokens: 180000,
+    maxPromptTokensPerTurn: 64000,
+    maxOutputTokens: 50000,
+  };
+  const profile = {
+    schemaVersion: "run-budget-profile@1",
+    profileId: "phase-budget-v1-build",
+    phase: "build",
+    rolloutMode: "shadow",
+    tokenBudgetMode: "split_shadow",
+    operationBudgetMode: "shadow",
+    enforcedLimits: tokenLimits,
+    phaseTargetLimits: { ...tokenLimits },
+    operationLimits: {
+      maxGrossInputTokens: 600000,
+      maxUncachedInputTokens: 400000,
+      maxOutputTokens: 100000,
+      maxTurns: 40,
+      maxToolCalls: 200,
+    },
+  };
+  profile.profileHash = crypto.createHash("sha256").update(canonical(profile)).digest("hex");
+  return profile;
+}
+
 function snapshot(side) {
   const projectId = `${side}-project`;
   const runId = `${side}-run`;
+  const frozenBudgetProfile = budgetProfile();
   return {
     schemaVersion: "generation-context-runtime-restart-snapshot@1",
     recordedAt: "2026-07-22T00:00:00.000Z",
@@ -32,6 +75,9 @@ function snapshot(side) {
           runtimeAttestationHash: HASH_C,
           visualBindingSetHash: HASH_A,
           executionProfile: "greenfield_static",
+          budgetProfileId: "phase-budget-v1-build",
+          budgetProfileHash: frozenBudgetProfile.profileHash,
+          budgetProfileRolloutMode: "shadow",
           workflowState: "completed",
           contextWindowEpoch: 0,
         }
@@ -47,9 +93,13 @@ function snapshot(side) {
           runtimeAttestationHash: null,
           visualBindingSetHash: null,
           executionProfile: "greenfield_static",
+          budgetProfileId: "phase-budget-v1-build",
+          budgetProfileHash: frozenBudgetProfile.profileHash,
+          budgetProfileRolloutMode: "shadow",
           workflowState: null,
           contextWindowEpoch: 0,
         },
+    budgetProfile: frozenBudgetProfile,
     efficiency: {
       schemaVersion: "run-efficiency-metrics@1",
       calculatorVersion: "run-efficiency-calculator@1",
@@ -130,7 +180,7 @@ for (const side of ["control", "candidate"]) {
       runId: before.runId,
       runtimeDeploymentRevision: `${side}-revision`,
     }),
-    /state changed|recovery invariant|hash mismatch/,
+    /Budget identity|state changed|recovery invariant|hash mismatch/,
   );
 
   const samePod = structuredClone(evidence);
@@ -144,6 +194,33 @@ for (const side of ["control", "candidate"]) {
     }),
     /replace the Runtime Pod UID/,
   );
+
+  const budgetDrift = structuredClone(evidence);
+  budgetDrift.after.generationContextStatus.budgetProfileHash = HASH_B;
+  assert.throws(
+    () => validateRuntimeRestartEvidence(budgetDrift, {
+      side,
+      projectId: before.projectId,
+      runId: before.runId,
+      runtimeDeploymentRevision: `${side}-revision`,
+    }),
+    /Budget identity|state changed|recovery invariant|hash mismatch/,
+  );
+}
+
+{
+  const before = snapshot("candidate");
+  const after = { ...structuredClone(before), recordedAt: "2026-07-22T00:01:00.000Z" };
+  delete before.budgetProfile;
+  delete after.budgetProfile;
+  const legacy = createRuntimeRestartEvidence(metadata("candidate"), before, after);
+  assert.equal(legacy.schemaVersion, "generation-context-runtime-restart-evidence@1");
+  assert.doesNotThrow(() => validateRuntimeRestartEvidence(legacy, {
+    side: "candidate",
+    projectId: before.projectId,
+    runId: before.runId,
+    runtimeDeploymentRevision: "candidate-revision",
+  }));
 }
 
 {
@@ -188,6 +265,65 @@ for (const side of ["control", "candidate"]) {
       runtimeDeploymentRevision: "candidate-revision",
     }),
     /artifact|state changed|recovery invariant|unsupported|hash mismatch/,
+  );
+}
+
+{
+  const before = snapshot("candidate");
+  const after = { ...structuredClone(before), recordedAt: "2026-07-22T00:01:00.000Z" };
+  after.sandboxRelease = {
+    required: true,
+    released: true,
+    requiredSuccessfulResponses: 2,
+    attempts: [
+      { attempt: 1, ok: true, status: 204, error: null },
+      { attempt: 2, ok: true, status: 204, error: null },
+    ],
+  };
+  const evidence = createRuntimeRestartEvidence(metadata("candidate"), before, after);
+  assert.equal(evidence.schemaVersion, "generation-context-runtime-restart-evidence@2");
+  assert.equal(evidence.cleanup.released, true);
+  assert.doesNotThrow(() => validateRuntimeRestartEvidence(evidence, {
+    side: "candidate",
+    projectId: before.projectId,
+    runId: before.runId,
+    runtimeDeploymentRevision: "candidate-revision",
+  }));
+
+  const missingCleanup = structuredClone(evidence);
+  missingCleanup.cleanup.released = false;
+  assert.throws(
+    () => validateRuntimeRestartEvidence(missingCleanup, {
+      side: "candidate",
+      projectId: before.projectId,
+      runId: before.runId,
+      runtimeDeploymentRevision: "candidate-revision",
+    }),
+    /confirmed Sandbox release/,
+  );
+
+  const missingProfile = structuredClone(evidence);
+  delete missingProfile.after.budgetProfile;
+  assert.throws(
+    () => validateRuntimeRestartEvidence(missingProfile, {
+      side: "candidate",
+      projectId: before.projectId,
+      runId: before.runId,
+      runtimeDeploymentRevision: "candidate-revision",
+    }),
+    /budgetProfile/,
+  );
+
+  const tamperedProfile = structuredClone(evidence);
+  tamperedProfile.after.budgetProfile.enforcedLimits.maxPromptTokensPerTurn += 1;
+  assert.throws(
+    () => validateRuntimeRestartEvidence(tamperedProfile, {
+      side: "candidate",
+      projectId: before.projectId,
+      runId: before.runId,
+      runtimeDeploymentRevision: "candidate-revision",
+    }),
+    /profileHash|state changed/,
   );
 }
 

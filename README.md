@@ -2,14 +2,21 @@
 
 ## Runtime model providers
 
-The runtime keeps the existing internal model gateway as the default:
+Runtime and all formal real-provider gates use the internal Provider Gateway:
 
 ```bash
 MODEL_PROVIDER=internal_gateway
 MODEL_GATEWAY_URL=http://localhost:9000
+MODEL_GATEWAY_AUTH_TOKEN_FILE=/path/to/runtime-workload-token
+AGENT_MODEL=deepseek-v4-pro
 ```
 
-Real OpenAI-compatible providers can be enabled with environment variables:
+Runs submit only `modelResourceId`. Provider endpoint, physical model, capabilities and Provider API Key are resolved
+by the Gateway from the versioned Model Resource. Configure or rotate the Provider Secret through the Gateway Admin
+API or a mounted Secret; never pass it to Runtime or a Run request.
+
+The direct OpenAI-compatible adapters below are retained only for isolated connectivity diagnostics and unit coverage.
+They do not qualify as canary, paired-cohort, or release evidence:
 
 ```bash
 # DeepSeek
@@ -39,14 +46,16 @@ KIMI_CN_BASE_URL=https://api.moonshot.cn/v1
 `AGENT_MODEL` or `MODEL_NAME` can override the model used by `/runs` for any
 provider. The default remains `internal-balanced` for the internal gateway.
 
-Real DeepSeek regression checks are gated behind ignored tests so API keys are
-never required for the default suite. To rerun the website-generation regression:
+Real governed regression checks are gated behind ignored tests, so a live Gateway is never required by the default
+suite. To rerun the Generation Context regression against an already configured Model Resource:
 
 ```bash
-DEEPSEEK_API_KEY=... \
-DEEPSEEK_E2E_MODEL=deepseek-chat \
+MODEL_GATEWAY_URL=http://localhost:9000 \
+MODEL_GATEWAY_AUTH_TOKEN_FILE=/path/to/runtime-workload-token \
+DEEPSEEK_E2E_MODEL=deepseek-v4-pro \
+RUNTIME_PROVIDER_APPROVAL_ID=<approval-event-id> \
 cargo test --manifest-path services/runtime/Cargo.toml \
-  --test agent_loop real_deepseek_design_md_website_generation_e2e \
+  --test http_api real_provider_generation_context_greenfield_build \
   -- --ignored --nocapture
 ```
 

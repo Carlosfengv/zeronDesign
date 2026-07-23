@@ -1,0 +1,114 @@
+{
+  "schemaVersion": "generation-context-repair-second-batch-summary@1",
+  "recordedAt": "2026-07-22T06:56:22Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-13-private-ai-security-runbook-repair",
+    "batchId": "batch-13",
+    "fixtureId": "private-ai-security-runbook",
+    "bucket": "repair",
+    "templateVersion": "fumadocs-docs",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "reviewRunId": "run-16313818",
+      "repairRunId": "run-16313855",
+      "recordHash": "83180a3987f968184748774057b95f3aab11aeea9ad2f8b31de870015405df9a",
+      "verification": {
+        "setupEditAccepted": true,
+        "blockingFindingRecorded": true,
+        "findingFixedByCompletedRepair": true,
+        "freshVersionCreated": true,
+        "previewPublishRecorded": true,
+        "markerPreserved": true
+      },
+      "metrics": {
+        "inputTokens": 124294,
+        "outputTokens": 1465,
+        "toolCalls": 15,
+        "totalDurationMs": 79076,
+        "timeToFirstSourceMutationMs": 30766,
+        "modelTurnAtFirstSourceMutation": 5,
+        "prebuildFsReadCount": 4,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "reviewRunId": "run-9605573",
+      "repairRunId": "run-9605610",
+      "recordHash": "9e960e2ff5b198e1a823ecb06014cbf5377dd76bb490e8a5e321de220dcb664b",
+      "verification": {
+        "setupEditAccepted": true,
+        "blockingFindingRecorded": true,
+        "findingFixedByCompletedRepair": true,
+        "freshVersionCreated": true,
+        "previewPublishRecorded": true,
+        "markerPreserved": true
+      },
+      "metrics": {
+        "inputTokens": 102884,
+        "outputTokens": 1089,
+        "toolCalls": 13,
+        "totalDurationMs": 83796,
+        "timeToFirstSourceMutationMs": 28420,
+        "modelTurnAtFirstSourceMutation": 4,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 2,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -17.23,
+      "outputTokens": -25.67,
+      "toolCalls": -13.33,
+      "totalDurationMs": 5.97,
+      "timeToFirstSourceMutationMs": -7.63,
+      "modelTurnAtFirstSourceMutation": -20.0,
+      "prebuildFsReadCount": -50.0,
+      "prebuildFsSearchCount": 100.0
+    },
+    "openFindings": [
+      "the candidate reduced tokens, tool calls, first-mutation latency, mutation turn, and prebuild reads while preserving required fidelity",
+      "candidate total duration regressed by 5.97% and prebuild search increased from one to two",
+      "two pairs across two batches cannot establish the ten-pair or three-batch gates",
+      "the pair exposed a separate Sandbox terminal-deletion verification gap documented independently"
+    ]
+  },
+  "ledger": {
+    "recordCount": 25,
+    "sampleCount": 24,
+    "completePairCount": 12,
+    "pendingPairCount": 0,
+    "headRecordHash": "9e960e2ff5b198e1a823ecb06014cbf5377dd76bb490e8a5e321de220dcb664b",
+    "sha256": "db2dba16ad0ea0b1185eb050a62f3cbd23bbcbd587a09b81b9262508a82347d5"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "repairPairCount": 2,
+    "repairMinimumPairCount": 10,
+    "repairBatchCount": 2,
+    "repairMinimumBatchCount": 3,
+    "repairControlMedianInputTokens": 102780.5,
+    "repairCandidateMedianInputTokens": 70762.5,
+    "rolloutEvidenceSha256": "4ad8fcfb88b72cfa04234eab5b996c83318c730d34281f0dc3d5dc76557da4c9"
+  },
+  "sourceSha256": {
+    "pairSpec": "104db92ffe3d5acdbe196122fd6838101cb887028113c82bb5a6121c07066d62",
+    "pairResult": "ebf2e62c3bc0a2e54d6f3fcb6b4b52e08f3d23c12a8a07c69a9d6a02f132bfd0",
+    "controlCase": "6b76e49fde080fc243ecbe2b9fb1d6827258043ef616acaaf72053997ff1959e",
+    "candidateCase": "25020ce3787e3eca1dac68f8cab6022aa2f891172e6336b8153ea7ee6081f3f1",
+    "rolloutEvidence": "4ad8fcfb88b72cfa04234eab5b996c83318c730d34281f0dc3d5dc76557da4c9"
+  }
+}

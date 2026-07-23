@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "artifact-route-manifest@1",
+  "buildId": "fixture-build-docs-p6",
+  "entryRoute": "/docs/",
+  "canonicalPolicy": "trailing_slash",
+  "routes": {
+    "/docs/": {
+      "file": "docs.html",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "contentType": "text/html; charset=utf-8"
+    }
+  },
+  "aliases": {
+    "/docs": "/docs/"
+  }
+}

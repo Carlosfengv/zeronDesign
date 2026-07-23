@@ -39,6 +39,7 @@ run_step "runtime tool permissions" \
   cargo test --manifest-path services/runtime/Cargo.toml --test tool_permissions_integration -- --nocapture
 
 run_step "runtime agent loop" \
+  env RUST_MIN_STACK=8388608 \
   cargo test --manifest-path services/runtime/Cargo.toml --test agent_loop -- --nocapture
 
 run_step "runtime http api" \

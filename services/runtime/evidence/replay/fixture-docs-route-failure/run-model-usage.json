@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "run-model-usage@1",
+  "runId": "fixture-run",
+  "modelServiceId": "fixture-model",
+  "modelDisplayName": "fixture-model",
+  "inputTokens": 1500,
+  "outputTokens": 200,
+  "cachedInputTokens": 400,
+  "totalTokens": 1700,
+  "estimated": false,
+  "turnCount": 2
+}

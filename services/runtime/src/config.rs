@@ -121,6 +121,24 @@ pub enum ContentPlanAttestationMode {
     Enforce,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationMode {
+    Off,
+    Shadow,
+    Enforced,
+}
+
+impl ContinuationMode {
+    fn from_env_value(value: &str) -> Self {
+        match value {
+            "enforced" | "enforce" | "enabled" | "on" => Self::Enforced,
+            "shadow" => Self::Shadow,
+            _ => Self::Off,
+        }
+    }
+}
+
 impl ContentPlanAttestationMode {
     fn from_env_value(value: &str) -> Self {
         match value {
@@ -223,6 +241,8 @@ pub struct RuntimeConfig {
     pub enable_design_context_enforcement: bool,
     pub generation_context_mode: GenerationContextMode,
     pub content_plan_attestation_mode: ContentPlanAttestationMode,
+    pub continuation_mode: ContinuationMode,
+    pub continuation_allowlist_json: Option<String>,
     pub content_plan_approval_producer_required: bool,
     pub observation_receipts_enabled: bool,
     /// Runtime-owned browser worker bound into an enforced DCP Run.  This
@@ -407,6 +427,13 @@ impl RuntimeConfig {
                 .ok()
                 .map(|value| ContentPlanAttestationMode::from_env_value(&value))
                 .unwrap_or(ContentPlanAttestationMode::Shadow),
+            continuation_mode: env::var("RUNTIME_AGENT_CONTINUATION_MODE")
+                .ok()
+                .map(|value| ContinuationMode::from_env_value(&value))
+                .unwrap_or(ContinuationMode::Shadow),
+            continuation_allowlist_json: optional_string_env(
+                "RUNTIME_AGENT_CONTINUATION_ALLOWLIST_JSON",
+            ),
             content_plan_approval_producer_required: truthy_env(
                 "RUNTIME_CONTENT_PLAN_APPROVAL_PRODUCER_REQUIRED",
             ),

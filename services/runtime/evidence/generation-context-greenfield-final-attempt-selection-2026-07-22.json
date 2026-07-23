@@ -1,0 +1,127 @@
+{
+  "schemaVersion": "generation-context-greenfield-final-attempt-selection-summary@1",
+  "recordedAt": "2026-07-22T04:52:00Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "collectorFix": {
+    "classification": "final_attempt_run_selection",
+    "finding": "phase-only source=runs selection saw Build Runs from every retry and rejected an otherwise valid accepted pair",
+    "behaviorBefore": "all case runs were eligible and exactly one phase match was required",
+    "behaviorAfter": "implicit phase selection is restricted to the final attempt runIds; an explicit runId remains authoritative",
+    "paidProviderRerunRequired": false,
+    "regressionTestPassed": true
+  },
+  "pair": {
+    "pairId": "batch-04-oilfield-operations-dashboard-greenfield",
+    "batchId": "batch-04",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "greenfield",
+    "templateVersion": "next-app",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "no_progress",
+        "accepted"
+      ],
+      "selectedFinalBuildRunId": "run-16309694",
+      "recordHash": "174e7eaf79f40e01c6b899963c2c13a6eed80a3b2e03e4f32cdfd03a7dd0d3f1",
+      "metrics": {
+        "inputTokens": 457271,
+        "outputTokens": 8619,
+        "turns": 30,
+        "toolCalls": 81,
+        "totalDurationMs": 226941,
+        "timeToFirstSourceMutationMs": 53968,
+        "modelTurnAtFirstSourceMutation": 10,
+        "timeToFirstGreenfieldBuildMs": 208824,
+        "prebuildFsReadCount": 24,
+        "prebuildFsListCount": 6,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 1703,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalBuildRunId": "run-9603585",
+      "recordHash": "eb0a433436aabbbde7532ecd63506a00289c8cb6387904eb882bfe1b38347adf",
+      "metrics": {
+        "inputTokens": 125194,
+        "outputTokens": 4412,
+        "turns": 10,
+        "toolCalls": 14,
+        "totalDurationMs": 127663,
+        "timeToFirstSourceMutationMs": 24650,
+        "modelTurnAtFirstSourceMutation": 2,
+        "timeToFirstGreenfieldBuildMs": 109190,
+        "timeToDurableSnapshotMs": 122043,
+        "prebuildFsReadCount": 0,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -72.62,
+      "outputTokens": -48.81,
+      "turns": -66.67,
+      "toolCalls": -82.72,
+      "totalDurationMs": -43.75,
+      "timeToFirstSourceMutationMs": -54.32,
+      "modelTurnAtFirstSourceMutation": -80.0,
+      "timeToFirstGreenfieldBuildMs": -47.71,
+      "prebuildFsReadCount": -100.0,
+      "prebuildFsListCount": -100.0,
+      "prebuildFsSearchCount": 0.0
+    },
+    "singlePairTargetObservations": {
+      "inputTokenReductionAtLeast50Percent": true,
+      "firstBuildReductionAtLeast40Percent": true,
+      "firstMutationAtMostModelTurn2": true,
+      "prebuildFsListPlusSearchAtMost2": true,
+      "duplicateFullReadRateBelow5Percent": true,
+      "outOfScopeMutationZero": true,
+      "durableSnapshotP95AtMost5000Ms": false
+    },
+    "openFindings": [
+      "this pair meets the point-estimate targets for input tokens, first Build latency, first mutation turn, prebuild exploration, duplicate reads, and mutation locality",
+      "one pair cannot establish medians, P95, confidence intervals, or non-inferiority gates",
+      "candidate durable snapshot was 122043ms, far above the 5000ms P95 target",
+      "Greenfield remains at one of twenty required pairs and one of three required batches in the replacement cohort"
+    ]
+  },
+  "ledger": {
+    "recordCount": 9,
+    "sampleCount": 8,
+    "completePairCount": 4,
+    "pendingPairCount": 0,
+    "headRecordHash": "eb0a433436aabbbde7532ecd63506a00289c8cb6387904eb882bfe1b38347adf",
+    "sha256": "d771e9fdb37c3bd0a262d865fd3f7b24f776ece06f8128c808d247f1929bbe7a"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "greenfieldPairCount": 1,
+    "greenfieldMinimumPairCount": 20,
+    "greenfieldBatchCount": 1,
+    "warmStructuralPairCount": 1,
+    "coldDevPairCount": 1,
+    "repairPairCount": 1,
+    "rolloutEvidenceSha256": "868d712ec3bed2454d2f749bf0261232f809c6d838b032ca26159c1280483053"
+  },
+  "sourceSha256": {
+    "pairSpec": "cdd73227bcb758682c93dc0021d5587f8bf3ccb89ce20f982197f5584f10cb63",
+    "pairResult": "a0afd472cbb16ce7da69267c0d8822e7d9845a48f0ac39fa80259e417899dddd",
+    "controlCase": "120be4570ea99ffea980025c7c7a6ed488f6c3a2eb9ad8bda97ff2f27a381c90",
+    "candidateCase": "8ad33baa17d28f78afb2832428240338b29f110dffa34d613ce78210dede37cd",
+    "rolloutEvidence": "868d712ec3bed2454d2f749bf0261232f809c6d838b032ca26159c1280483053",
+    "collector": "079c81ba7e0e64c421d966aaf82a1a5a8d68f867cc0091bca0bc6dba174cfbad",
+    "collectorTest": "4b5b4181a1c86a7999a53e57125af238139a9e62f2c29ecf9602cbbc5be0e106"
+  }
+}

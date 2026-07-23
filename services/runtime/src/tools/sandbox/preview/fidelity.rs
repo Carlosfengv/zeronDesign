@@ -840,7 +840,10 @@ pub(super) async fn collect_browser_evidence(
     evidence
 }
 
-fn internal_browser_evidence_url(ctx: Option<&ToolContext>, preview_url: &str) -> String {
+pub(super) fn internal_browser_evidence_url(
+    ctx: Option<&ToolContext>,
+    preview_url: &str,
+) -> String {
     let Some(ctx) = ctx.filter(|ctx| ctx.remote_workspace) else {
         return preview_url.to_string();
     };

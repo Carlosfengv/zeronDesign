@@ -1,0 +1,68 @@
+{
+  "schemaVersion": "generation-context-repair-sandbox-terminal-cleanup-summary@1",
+  "recordedAt": "2026-07-22T06:56:22Z",
+  "sourceCommit": "6a5603c0a4649856855e799cff50ea271fe88e7d",
+  "sourceDirty": true,
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "incident": {
+    "pairId": "batch-13-private-ai-security-runbook-repair",
+    "classification": "sandbox_release_http_success_without_terminal_absence",
+    "finding": "both release requests returned HTTP 200 and the Runtime store reported deleted, but the SandboxClaim and Sandbox resources remained Ready in Kubernetes",
+    "affectedProjects": [
+      "real-20260722063703-private-ai-security-runbook",
+      "real-20260722064341-private-ai-security-runbook"
+    ],
+    "initialResidualSandboxClaimCount": 2,
+    "initialResidualSandboxCount": 2,
+    "deletionTimestampPresent": false,
+    "persistentPairEvidenceModified": false
+  },
+  "recovery": {
+    "method": "repeat the governed release endpoint after the suite fully settled",
+    "controlHttpStatus": 200,
+    "candidateHttpStatus": 200,
+    "reportedBindingStatus": "deleted",
+    "terminalSandboxClaimCount": 0,
+    "terminalSandboxCount": 0,
+    "passed": true
+  },
+  "remediation": {
+    "runtimeBackend": {
+      "behaviorBefore": "mark the Runtime binding deleted immediately after kubectl delete returned success",
+      "behaviorAfter": "poll both SandboxClaim and Sandbox until absent; timeout returns an error and leaves the binding non-deleted",
+      "deployedToFrozenSession": false,
+      "reasonNotDeployed": "the cohort freezes Runtime Deployment identity; deploying this code requires a new prepared session"
+    },
+    "currentSessionRunner": {
+      "maximumReleaseAttempts": 3,
+      "requiredSuccessfulResponses": 2,
+      "behavior": "require two successful governed release responses before recording released=true; otherwise fail closed as sandbox_release_failed",
+      "activeForSubsequentPairs": true
+    }
+  },
+  "validation": {
+    "javascriptRunnerTests": {
+      "command": "node infra/generation-reliability/run-real-provider-examples.test.mjs",
+      "passed": true
+    },
+    "rustSandboxAdapterTests": {
+      "command": "cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_adapter",
+      "testCount": 19,
+      "passed": true,
+      "newScenarios": [
+        "release waits through a present-resource observation until terminal absence",
+        "release timeout does not mark the binding deleted"
+      ]
+    },
+    "fullContractGate": {
+      "command": "infra/generation-reliability/check-contract.sh",
+      "passed": true
+    }
+  },
+  "sourceSha256": {
+    "runner": "432de0961f00d5e0176ab98bee7adbd6ce50d3dc0adb2dc7016828da3b9ab092",
+    "runnerTest": "8b703e9d76028871434e5189badd2cc025194236509ba697b397a55c07afdf50",
+    "sandboxAdapter": "72e3db824acc94b6d0813f0dc73b075db1769d7a572409f88483a42746b53a8f",
+    "sandboxAdapterTest": "22b02d09788f49352973309cc2bb289eac673e727dc1dbafb6dbc7aa6c797672"
+  }
+}

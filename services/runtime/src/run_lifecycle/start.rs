@@ -46,6 +46,7 @@ pub struct StartRunContext {
     pub sandbox_binding_id: Option<String>,
     pub parent_run_id: Option<String>,
     pub predecessor_run_id: Option<String>,
+    pub continuation_snapshot_id: Option<String>,
     pub design_profile_id: Option<String>,
     pub design_fidelity_mode: Option<String>,
     pub model_resource_id: Option<String>,
@@ -84,11 +85,29 @@ impl RunLifecycleService {
             inherited_build_content_sources(&self.store, &request).await,
             request.input_context.content_sources.clone(),
         );
-        let selected_model = selected_run_model(
-            &self.config.agent_model,
-            request.input_context.model_resource_id.as_deref(),
-        );
-        if request.input_context.predecessor_run_id.is_some() {
+        let selected_model = if request.input_context.model_resource_id.is_none() {
+            if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
+                self.store
+                    .get_run(parent_run_id)
+                    .await
+                    .map(|run| run.model)
+                    .unwrap_or_else(|| self.config.agent_model.clone())
+            } else {
+                self.config.agent_model.clone()
+            }
+        } else {
+            selected_run_model(
+                &self.config.agent_model,
+                request.input_context.model_resource_id.as_deref(),
+            )
+        };
+        let continuation_snapshot =
+            if let Some(snapshot_id) = request.input_context.continuation_snapshot_id.as_deref() {
+                Some(validate_continuation_successor(self, &request, snapshot_id).await?)
+            } else {
+                None
+            };
+        if request.input_context.predecessor_run_id.is_some() && continuation_snapshot.is_none() {
             validate_replan_successor(&self.store, &request).await?;
         }
         if matches!(request.phase, AgentPhase::Edit | AgentPhase::Repair)
@@ -108,8 +127,16 @@ impl RunLifecycleService {
         }
         let edit_base = request.input_context.edit_base.clone();
         let edit_impact_plan_hash = request.input_context.edit_impact_plan_hash.clone();
-        let run =
-            if let Some(predecessor_run_id) = request.input_context.predecessor_run_id.as_deref() {
+        let (run, continuation_created) = if let Some(snapshot) = continuation_snapshot.as_ref() {
+            let (run, created) = self
+                .store
+                .create_continuation_successor_run(snapshot, content_sources)
+                .await
+                .map_err(conflict_error)?;
+            (run, created)
+        } else if let Some(predecessor_run_id) = request.input_context.predecessor_run_id.as_deref()
+        {
+            (
                 self.store
                     .create_replan_successor_run_with_context(
                         predecessor_run_id,
@@ -122,9 +149,12 @@ impl RunLifecycleService {
                         request.input_context.base_version_id,
                     )
                     .await
-                    .map_err(conflict_error)?
-            } else if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
-                if request.phase == AgentPhase::Repair {
+                    .map_err(conflict_error)?,
+                true,
+            )
+        } else if let Some(parent_run_id) = request.input_context.parent_run_id.as_deref() {
+            if request.phase == AgentPhase::Repair {
+                (
                     self.store
                         .create_repair_run_for_findings(
                             parent_run_id,
@@ -134,8 +164,11 @@ impl RunLifecycleService {
                             selected_model.clone(),
                         )
                         .await
-                        .map_err(repair_run_error)?
-                } else {
+                        .map_err(repair_run_error)?,
+                    true,
+                )
+            } else {
+                (
                     self.store
                         .create_child_run(
                             parent_run_id,
@@ -146,9 +179,12 @@ impl RunLifecycleService {
                             request.input_context.finding_ids,
                         )
                         .await
-                        .map_err(|_| not_found(format!("parent run not found: {parent_run_id}")))?
-                }
-            } else {
+                        .map_err(|_| not_found(format!("parent run not found: {parent_run_id}")))?,
+                    true,
+                )
+            }
+        } else {
+            (
                 self.store
                     .create_run_with_context(
                         request.project_id,
@@ -159,8 +195,19 @@ impl RunLifecycleService {
                         request.input_context.brief_id,
                         request.input_context.base_version_id,
                     )
-                    .await
-            };
+                    .await,
+                true,
+            )
+        };
+        if continuation_snapshot.is_some() && !continuation_created {
+            return Ok(RunLifecycleOutcome {
+                run_id: run.id,
+                status: serde_json::to_value(run.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
         let run = if let (Some(edit_base), Some(plan_hash)) = (edit_base, edit_impact_plan_hash) {
             self.store
                 .set_run_edit_context(&run.id, edit_base, plan_hash)
@@ -285,9 +332,8 @@ impl RunLifecycleService {
         } else {
             run
         };
-        let inherited_edit_dcp =
-            run.phase == AgentPhase::Edit && run.design_context_manifest.is_some();
-        if !inherited_edit_dcp {
+        let inherited_frozen_dcp = run.design_context_manifest.is_some();
+        if !inherited_frozen_dcp {
             if let Some(profile) = design_profile.as_ref() {
                 if let Some((blocked_state, message)) =
                     self.design_profiles.prebuild_failure(&run, profile).await
@@ -400,7 +446,7 @@ impl RunLifecycleService {
                 status: "needs_user_input".to_string(),
             });
         }
-        if !inherited_edit_dcp {
+        if !inherited_frozen_dcp {
             if let Some(conflict_reason) = design_profile_conflict {
                 self.store
                     .append_conversation_item(
@@ -469,22 +515,38 @@ impl RunLifecycleService {
                     .await);
             }
         }
-        if run.phase == AgentPhase::Build && run.sandbox_id.is_some() {
-            if let Err(error) = self
-                .edit_workspace_restorer
-                .prepare_build(&self.store, &self.config, &run)
-                .await
-            {
+        if run.sandbox_id.is_some() {
+            let workspace_result = if let Some(snapshot) = continuation_snapshot.as_ref() {
+                self.edit_workspace_restorer
+                    .restore(
+                        &self.store,
+                        &self.config,
+                        &run,
+                        &snapshot.source_snapshot_uri,
+                    )
+                    .await
+            } else if run.phase == AgentPhase::Build {
+                self.edit_workspace_restorer
+                    .prepare_build(&self.store, &self.config, &run)
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = workspace_result {
                 return Err(self
                     .compensate_created_run_error(
                         &run,
-                        "build_workspace_prepare",
+                        if continuation_snapshot.is_some() {
+                            "continuation_workspace_restore"
+                        } else {
+                            "build_workspace_prepare"
+                        },
                         conflict_error(error),
                     )
                     .await);
             }
         }
-        if run.phase == AgentPhase::Edit {
+        if run.phase == AgentPhase::Edit && continuation_snapshot.is_none() {
             if let Err(error) = restore_edit_workspace_from_base_version(self, &run).await {
                 return Err(self
                     .compensate_created_run_error(
@@ -518,11 +580,24 @@ impl RunLifecycleService {
             content_plan_verification,
         )
         .await?;
+        if let Some(snapshot) = continuation_snapshot.as_ref() {
+            if run.generation_context_content_hash != snapshot.generation_context_content_hash {
+                return Err(self
+                    .compensate_created_run_error(
+                        &run,
+                        "continuation_generation_context_verify",
+                        conflict_error(anyhow::anyhow!(
+                            "continuation GenerationContext content identity changed"
+                        )),
+                    )
+                    .await);
+            }
+        }
         self.store
             .ensure_initial_checkpoint(&run.id)
             .await
             .map_err(internal_error)?;
-        if run.phase != AgentPhase::Edit {
+        if run.phase != AgentPhase::Edit || continuation_snapshot.is_some() {
             self.register_start_session(&run).await?;
         }
 
@@ -534,6 +609,134 @@ impl RunLifecycleService {
 }
 
 impl RunLifecycleService {
+    pub async fn dispatch_continuation_successor(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<RunLifecycleOutcome, RunLifecycleError> {
+        let snapshot = self
+            .store
+            .get_run_continuation_snapshot(snapshot_id)
+            .map_err(conflict_error)?
+            .ok_or_else(|| not_found(format!("continuation snapshot not found: {snapshot_id}")))?;
+        let predecessor = self
+            .store
+            .get_run(&snapshot.predecessor_run_id)
+            .await
+            .ok_or_else(|| {
+                not_found(format!(
+                    "continuation predecessor Run not found: {}",
+                    snapshot.predecessor_run_id
+                ))
+            })?;
+        if let Some(successor_run_id) = predecessor.successor_run_id.as_deref() {
+            let successor = self.store.get_run(successor_run_id).await.ok_or_else(|| {
+                internal_error(anyhow::anyhow!(
+                    "continuation successor Run is missing: {successor_run_id}"
+                ))
+            })?;
+            if successor.continuation_snapshot_id.as_deref() != Some(snapshot_id) {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "continuation predecessor already has a different successor Run"
+                )));
+            }
+            return Ok(RunLifecycleOutcome {
+                run_id: successor.id,
+                status: serde_json::to_value(successor.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
+        let decision = self
+            .store
+            .evaluate_run_continuation_snapshot(&self.config.runtime_storage_dir, snapshot_id)
+            .await
+            .map_err(conflict_error)?;
+        if !decision.eligible {
+            return Err(conflict_error(anyhow::anyhow!(
+                "continuation snapshot is not eligible: {}",
+                decision.reasons.join(",")
+            )));
+        }
+        let content_plan = match (
+            predecessor.content_plan_id.clone(),
+            predecessor.content_plan_revision,
+            predecessor.content_plan_hash.clone(),
+        ) {
+            (Some(plan_id), Some(revision), Some(content_hash)) => Some(ContentPlanIdentity {
+                plan_id,
+                revision,
+                content_hash,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(conflict_error(anyhow::anyhow!(
+                    "continuation predecessor has an incomplete ContentPlan identity"
+                )))
+            }
+        };
+        let visual_bindings = self
+            .store
+            .run_visual_bindings(&predecessor.id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .filter(|binding| binding.role == RunVisualBindingRole::Reference)
+            .map(|binding| StartRunVisualBinding {
+                artifact_id: binding.artifact_id,
+                role: binding.role,
+                route: binding.route,
+                viewport: binding.viewport,
+                target: binding.target,
+                order: binding.order,
+            })
+            .collect();
+        let content_sources = self.store.content_sources(&predecessor.id).await;
+        let model_resource_id = predecessor
+            .model
+            .strip_prefix("resource:")
+            .map(ToOwned::to_owned);
+        let outcome = self
+            .start(StartRunCommand {
+                project_id: predecessor.project_id.clone(),
+                phase: predecessor.phase,
+                agent_profile: predecessor.agent_profile.clone(),
+                input_context: StartRunContext {
+                    content_sources,
+                    brief_id: predecessor.brief_version.clone(),
+                    base_version_id: predecessor.base_version_id.clone(),
+                    edit_base: predecessor.edit_base.clone(),
+                    edit_impact_plan_hash: predecessor.edit_impact_plan_hash.clone(),
+                    sandbox_binding_id: predecessor.sandbox_id.clone(),
+                    predecessor_run_id: Some(predecessor.id.clone()),
+                    continuation_snapshot_id: Some(snapshot.snapshot_id.clone()),
+                    design_profile_id: predecessor.design_profile_id.clone(),
+                    design_fidelity_mode: predecessor.design_fidelity_mode.clone(),
+                    model_resource_id,
+                    content_plan,
+                    visual_bindings,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        self.store
+            .append_conversation_item(
+                &predecessor.project_id,
+                Some(&predecessor.id),
+                "orchestrator_dispatch",
+                Some("system"),
+                "An eligible immutable continuation snapshot created a successor Run.",
+                Some(json!({
+                    "successorRunId": outcome.run_id,
+                    "continuationSnapshotId": snapshot.snapshot_id,
+                    "operationId": snapshot.operation_id,
+                    "automatic": true,
+                })),
+            )
+            .await;
+        Ok(outcome)
+    }
+
     pub async fn dispatch_replan_successor(
         &self,
         predecessor_run_id: &str,
@@ -1573,6 +1776,47 @@ async fn validate_replan_successor(
         .validate_executable(&store.draft_preview_store(), plan_hash)
         .map_err(|error| conflict_error(anyhow::anyhow!(error.to_string())))?;
     Ok(())
+}
+
+async fn validate_continuation_successor(
+    service: &RunLifecycleService,
+    request: &StartRunCommand,
+    snapshot_id: &str,
+) -> Result<crate::types::RunContinuationSnapshot, RunLifecycleError> {
+    let snapshot = service
+        .store
+        .get_run_continuation_snapshot(snapshot_id)
+        .map_err(conflict_error)?
+        .ok_or_else(|| not_found(format!("continuation snapshot not found: {snapshot_id}")))?;
+    let predecessor_run_id = request
+        .input_context
+        .predecessor_run_id
+        .as_deref()
+        .ok_or_else(|| {
+            conflict_error(anyhow::anyhow!(
+                "continuation successor requires predecessorRunId"
+            ))
+        })?;
+    if snapshot.predecessor_run_id != predecessor_run_id
+        || snapshot.project_id != request.project_id
+        || snapshot.phase != request.phase
+    {
+        return Err(conflict_error(anyhow::anyhow!(
+            "continuation snapshot identity does not match the requested successor"
+        )));
+    }
+    let decision = service
+        .store
+        .evaluate_run_continuation_snapshot(&service.config.runtime_storage_dir, snapshot_id)
+        .await
+        .map_err(conflict_error)?;
+    if !decision.eligible {
+        return Err(conflict_error(anyhow::anyhow!(
+            "continuation snapshot is not eligible: {}",
+            decision.reasons.join(",")
+        )));
+    }
+    Ok(snapshot)
 }
 
 async fn validate_build_confirmed_brief(

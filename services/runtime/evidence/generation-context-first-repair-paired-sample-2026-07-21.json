@@ -1,0 +1,196 @@
+{
+  "schemaVersion": "generation-context-first-repair-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T17:31:23.723Z",
+  "sessionId": "deepseek-v4-pro-20260721T171447Z",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:gctx-repair-content-preserve-20260721",
+    "dockerImageId": "sha256:11d43621910945b087006a0bb3eb5712ee1bf913c5222b633fba6062c82e18aa",
+    "clusterImageId": "sha256:bdd59473cd941afeaead6eb3edc299200fa6d4d672ae6aba3d37f4807adce3e2",
+    "controlDeploymentRevision": "242f317b8da691fe2a8c774983a45a03e362646ed0c525669ff4c11978f8e09c",
+    "candidateDeploymentRevision": "2a9b62f9ff7e288c00a3bfd0537abd1625a505bd9989acadcc558c328f7db576"
+  },
+  "pair": {
+    "id": "batch-05-agent-cloud-quickstart-repair",
+    "batchId": "batch-05",
+    "bucket": "repair",
+    "identity": {
+      "fixtureId": "agent-cloud-quickstart",
+      "templateVersion": "fumadocs-docs",
+      "phase": "repair",
+      "lifecycleProfile": "repair_warm",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "secretMaterialPersisted": false,
+      "reviewFindingRecorded": true,
+      "findingFixedByCompletedRepair": true,
+      "sourceMutationRecorded": true,
+      "previewPublishRecorded": true,
+      "freshVersionCreated": true,
+      "markerPreserved": true,
+      "initialBuildRunId": "run-97632164008",
+      "reviewRunId": "run-97632164273",
+      "repairRunId": "run-97632164307",
+      "findingId": "finding-97632164296",
+      "initialBuildVersionId": "version-97632164180",
+      "baseVersionId": "version-97632164251",
+      "repairedVersionId": "version-97632164350",
+      "artifactBodySha256": "4381ab710c4a851e0c7dfd6587805128143ddccbc3faada374096bd4568c8d27",
+      "recordHash": "2a4aad043fd9cab2505f525cc7801f400c643a4c729fa118ede9b16fa4c44de7",
+      "metrics": {
+        "inputTokens": 86003,
+        "outputTokens": 953,
+        "cachedInputTokens": 21248,
+        "turns": 8,
+        "toolCalls": 13,
+        "terminalToolFailures": 0,
+        "totalDurationMs": 61041,
+        "timeToFirstSourceMutationMs": 14197,
+        "modelTurnAtFirstSourceMutation": 4,
+        "prebuildFsReadCount": 3,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadDeliveries": 0,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "secretMaterialPersisted": false,
+      "reviewFindingRecorded": true,
+      "findingFixedByCompletedRepair": true,
+      "sourceMutationRecorded": true,
+      "previewPublishRecorded": true,
+      "freshVersionCreated": true,
+      "markerPreserved": true,
+      "initialBuildRunId": "run-5827321",
+      "reviewRunId": "run-5827482",
+      "repairRunId": "run-5827519",
+      "findingId": "finding-5827508",
+      "initialBuildVersionId": "version-5827397",
+      "baseVersionId": "version-5827460",
+      "repairedVersionId": "version-5827563",
+      "artifactBodySha256": "1f797838e920514c75ae355bbbfa7ef64113c5e26f60236525237df928cd959c",
+      "contextContentHash": "b2ad1b32f247abba3e61ebae28f4c42f4f8d6929018ea11986955f1782656a8c",
+      "runContextBindingHash": "6fb85bc2eaaa50329a14e229d9571c1ff0a62ddada3cb9c58e6ef8a62cd0f1f2",
+      "recordHash": "b90a7e17b4e18e0831ed963a69d17df3b912f344b528318810c37c6845a428e8",
+      "metrics": {
+        "inputTokens": 85588,
+        "outputTokens": 1191,
+        "cachedInputTokens": 1920,
+        "turns": 8,
+        "toolCalls": 13,
+        "terminalToolFailures": 0,
+        "totalDurationMs": 79341,
+        "timeToFirstSourceMutationMs": 32942,
+        "modelTurnAtFirstSourceMutation": 5,
+        "prebuildFsReadCount": 3,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 2,
+        "duplicateFullReadDeliveries": 0,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -0.48,
+      "outputTokens": 24.97,
+      "turns": 0.0,
+      "toolCalls": 0.0,
+      "totalDurationMs": 29.98,
+      "timeToFirstSourceMutationMs": 132.03,
+      "modelTurnAtFirstSourceMutation": 25.0,
+      "prebuildFsReadCount": 0.0,
+      "prebuildFsSearchCount": 100.0
+    },
+    "openFindings": [
+      "the first accepted Repair pair proves lifecycle correctness but does not show a latency benefit; candidate total duration increased by 29.98%",
+      "candidate time to first source mutation increased from 14197ms to 32942ms and the mutation turn increased from 4 to 5",
+      "candidate input tokens decreased by only 0.48% while output tokens and prebuild search count increased",
+      "one Repair pair from one batch is below the required 10 Repair pairs across at least three batches"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "sessionId": "deepseek-v4-pro-20260721T160236Z",
+      "pairId": "batch-01-agent-cloud-quickstart-repair",
+      "result": "failed_pair",
+      "findings": [
+        "legacy Build repeated source reads after authoring instead of publishing its first candidate",
+        "candidate Review repeated browser and diagnostic exploration after source evidence instead of reporting the scoped finding"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260721T162416Z",
+      "pairId": "batch-02-agent-cloud-quickstart-repair",
+      "result": "control_repair_failed_candidate_not_run",
+      "findings": [
+        "Repair mutated the scoped source but started a preview instead of publishing the required fresh Fumadocs Version"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260721T164055Z",
+      "pairId": "batch-03-agent-cloud-quickstart-repair",
+      "result": "control_repair_failed_candidate_not_run",
+      "findings": [
+        "project.inspect incorrectly promoted parent candidate metadata into the current Repair run and skipped the required mutation stage"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260721T170006Z",
+      "pairId": "batch-04-agent-cloud-quickstart-repair",
+      "result": "control_acceptance_failed_candidate_not_run",
+      "findings": [
+        "the model removed the visible canary marker instead of preserving its content while fixing contrast"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "b90a7e17b4e18e0831ed963a69d17df3b912f344b528318810c37c6845a428e8",
+    "sha256": "fcb17b1757ba667e310cc7759910a21fa5b5af6b9960579c63d82e6cdd904120"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "fumadocsTemplate": true,
+    "repairPairCount": 1,
+    "repairMinimumPairCount": 10,
+    "repairBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "a91006b5e246a68748ec58f5379890976a080ba1abf5d0bc30cf50ac4ebb4e77",
+    "evaluationSha256": "bd23ceff2db2c3ddad174768a2a0346b011e990110feca3ebc2a676dbbdc568d"
+  },
+  "sourceSha256": {
+    "deployment": "e9cc5622f074b16b1e1d517d8bf2ae8393fdcc5ca89c2e920bbd238bc0f71732",
+    "session": "8db63ce2f470497fd34f98ee3f11e64e704fc6c368f34a0c52fa23e0dc306312",
+    "sessionMeta": "dba3a250d8717b0dee8637ae466e932d7a56d5fafff197093c1003dd23b7af95",
+    "providerReconcile": "3baaab0715faedf3259a4a0b6709ab12b1643961f50061edcb85fac2b340b63f",
+    "controlCase": "4de8756e4a79997fbd42351c494ab79cd7666f4e966eb40ebe8f1fb43a64a4f3",
+    "candidateCase": "cee5c71c3fcd02f27410e1d9d69ae90ed7d942a72d652d557a356023bd2ad881",
+    "pairResult": "7042b0092c213df28220f3e0efa7a1378f8c60e0cbf890cfaa8dd76233e34a02",
+    "rolloutEvidence": "a91006b5e246a68748ec58f5379890976a080ba1abf5d0bc30cf50ac4ebb4e77"
+  }
+}

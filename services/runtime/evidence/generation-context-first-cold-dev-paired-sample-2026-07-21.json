@@ -1,0 +1,147 @@
+{
+  "schemaVersion": "generation-context-first-cold-dev-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T13:56:18.126Z",
+  "sessionId": "deepseek-v4-pro-20260721T134741Z",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:gctx-cold-ordered-20260721",
+    "imageId": "sha256:f76fb978e31f84f82e712eb0256f4906d6a2234e5b5056f9fc8e80564c3496c9",
+    "controlDeploymentRevision": "422038828400f99ac3a1be566e67fc95a7f380f163b1d9b97313e3f00f445a61",
+    "candidateDeploymentRevision": "22129daa92bb5819f49185928213a777af73a9e51b51ff29a1d188d03deff542"
+  },
+  "sandboxImage": {
+    "ref": "anydesign/agent-sandbox:gctx-cold-process-20260721",
+    "imageId": "sha256:d86bf3fcebc7038a6a292ce49823aaa8d56c312e0970ab9bdccbcfd7b8fe8003"
+  },
+  "pair": {
+    "id": "batch-01-zenova-agent-cloud-cold-dev",
+    "batchId": "batch-01",
+    "bucket": "cold_dev",
+    "identity": {
+      "fixtureId": "zenova-agent-cloud",
+      "templateVersion": "next-app",
+      "phase": "edit",
+      "lifecycleProfile": "cold_dev",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "durableRevisionMatched": true,
+      "productionBuildExecuted": false,
+      "metrics": {
+        "inputTokens": 106548,
+        "outputTokens": 920,
+        "turns": 9,
+        "toolCalls": 15,
+        "recoverableToolFailures": 3,
+        "totalDurationMs": 35533,
+        "timeToFirstSourceMutationMs": 15566,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 31657,
+        "timeToDurableSnapshotMs": 15566,
+        "prebuildFsReadCount": 2,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      }
+    },
+    "candidate": {
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "durableRevisionMatched": true,
+      "productionBuildExecuted": false,
+      "metrics": {
+        "inputTokens": 113509,
+        "outputTokens": 952,
+        "turns": 9,
+        "toolCalls": 14,
+        "recoverableToolFailures": 1,
+        "totalDurationMs": 45633,
+        "timeToFirstSourceMutationMs": 18783,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 37112,
+        "timeToDurableSnapshotMs": 18783,
+        "prebuildFsReadCount": 1,
+        "outOfScopeMutationCount": 0,
+        "firstBuildSucceeded": false
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": 6.53,
+      "turns": 0.0,
+      "toolCalls": -6.67,
+      "totalDurationMs": 28.42,
+      "timeToFirstSourceMutationMs": 20.67,
+      "coldDevReadyMs": 17.23,
+      "timeToDurableSnapshotMs": 20.67,
+      "prebuildFsReadCount": -50.0
+    },
+    "openFindings": [
+      "candidate coldDevReadyMs=37112 exceeds the Cold Dev P50/P95 targets of 15000/30000ms; control coldDevReadyMs=31657 also exceeds the P95 target",
+      "candidate timeToDurableSnapshotMs=18783 and control=15566 both exceed the durable snapshot P95 target of 5000ms",
+      "the first accepted candidate does not show an input-token or latency reduction; only Tool Call and prebuild read counts decreased",
+      "one pair from one batch is below the required 10 Cold Dev pairs across at least three batches"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "sessionId": "deepseek-v4-pro-20260721T124238Z",
+      "result": "failed_pair",
+      "findings": [
+        "the canary requested direct mutation of Runtime-owned package.json",
+        "the stopped Draft session could be selected during workflow reconciliation"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260721T131237Z",
+      "result": "failed_pair",
+      "findings": [
+        "the control side did not derive cold_dev from the frozen EditImpactPlan",
+        "sandbox process.stop terminated npm but left the child Dev process holding port 3000"
+      ]
+    },
+    {
+      "sessionId": "deepseek-v4-pro-20260721T133221Z",
+      "result": "control_completed_candidate_replan_required",
+      "findings": [
+        "the candidate stopped the Draft writer before its first source mutation",
+        "the unchanged base revision was incorrectly eligible for Cold Dev ready metrics"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "81d053a682b72a27595513d3bcb476781205db877e3611ac503185596680f749",
+    "sha256": "bbe7bc0a1369ecb6739c41ce2b432c5540812cec81e89f879fb0acf3fdb96857"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "coldDevPairCount": 1,
+    "coldDevMinimumPairCount": 10,
+    "coldDevBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "c811139e531928c07265e86ba395da7d37d6c4e842ee016cc6fd157efb5d6777",
+    "evaluationSha256": "e80263ccc7a0f76fa43940d1ccf072de7e5e2598b7f7a92a122067bef33d1094"
+  },
+  "sourceSha256": {
+    "controlCase": "67a024490df30d164dde23d54e17f358b7b9b28583535509ddf06f6cec6e49b2",
+    "candidateCase": "a265d34346ec90f61221a6dd24a61cedff326ed3be9909a38272c48c9dfed0a8",
+    "pairResult": "4414ab5b3330f486a430bfc7ad175eb0794c827ebedecc92149b7cc4025ddfff"
+  }
+}

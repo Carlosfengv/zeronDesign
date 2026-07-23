@@ -1,0 +1,102 @@
+{
+  "schemaVersion": "generation-context-first-warm-copy-css-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T12:35:18.125Z",
+  "sessionId": "deepseek-v4-pro-20260721T115817Z",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:gctx-release-evidence-fastpath-20260721",
+    "imageId": "sha256:4205307954c4d5ff677dafbb62040e12ce0aeaf4f51978f2883c62fa35eec0c1",
+    "controlDeploymentRevision": "c56674b6ac3fe3d181e3f8355bd5caa7e41825ed80e6e5a92f43ae0615027e6a",
+    "candidateDeploymentRevision": "8764c879ceb7cd8b2eca2fa6b713a24eea87e1d58478ed65a848f6d6442ece9e"
+  },
+  "pair": {
+    "id": "batch-04-zenova-agent-cloud-warm-copy-css",
+    "batchId": "batch-04",
+    "bucket": "warm_copy_css",
+    "identity": {
+      "fixtureId": "zenova-agent-cloud",
+      "templateVersion": "next-app",
+      "phase": "edit",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "status": "completed",
+      "requiredFidelityPassed": false,
+      "failure": "Draft Warm Edit completed without recording the HMR iframe metric",
+      "metrics": {
+        "inputTokens": 67251,
+        "outputTokens": 687,
+        "turns": 6,
+        "toolCalls": 10,
+        "totalDurationMs": 23828,
+        "timeToFirstSourceMutationMs": 14760,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 16566,
+        "timeToIframeAppliedMs": null,
+        "timeToDurableSnapshotMs": 20077,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "expectedTextFound": true,
+      "durableRevisionMatched": true,
+      "metrics": {
+        "inputTokens": 51638,
+        "outputTokens": 804,
+        "turns": 5,
+        "toolCalls": 10,
+        "totalDurationMs": 25949,
+        "timeToFirstSourceMutationMs": 13882,
+        "modelTurnAtFirstSourceMutation": 2,
+        "coldDevReadyMs": 5813,
+        "timeToIframeAppliedMs": 7080,
+        "timeToDurableSnapshotMs": null,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedReductionPercent": {
+      "inputTokens": 23.22,
+      "timeToFirstSourceMutationMs": 5.95,
+      "modelTurnAtFirstSourceMutation": 33.33,
+      "coldDevReadyMs": 64.91,
+      "turns": 16.67,
+      "toolCalls": 0.00
+    },
+    "openFindings": [
+      "candidate timeToIframeAppliedMs=7080 exceeds the warm_copy_css P50/P95 targets of 1000/3000ms",
+      "candidate durable revision and snapshot were verified by the Draft Preview evidence but timeToDurableSnapshotMs was not recorded",
+      "control completed the Edit and durable snapshot but emitted no iframe-applied metric"
+    ]
+  },
+  "ledger": {
+    "recordCount": 5,
+    "completePairCount": 2,
+    "pendingPairCount": 0,
+    "headRecordHash": "6d4f998b6c510a6d06c3b3fee7f611a60378acb3731093bda75ba6e0c410ad48",
+    "sha256": "2be10bc341100d70c09ea098ac38b24505e2755fa033fe86767eb86fc5399ac6"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 1,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 1,
+    "minimumBatchCount": 3
+  },
+  "sourceSha256": {
+    "controlCase": "a603f902310d2ffd4e4ec23f7f747e74cd2f84afa00c5fe72f8a7147d738d900",
+    "candidateCase": "d5e8ad5be56e9a27a669f782245d7462712a190538e1c921991eb1a35f851208",
+    "pairResult": "9251db494f38ff8edabf3b8bf074616967a93b4b7bc0d04a1752aa6d81da68c4",
+    "rolloutEvidence": "016c9e16692ea559d0236bc72896e1fb566d2ad584b336bfbe364cf53b838ce6"
+  }
+}

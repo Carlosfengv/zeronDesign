@@ -1,0 +1,119 @@
+{
+  "schemaVersion": "generation-context-fumadocs-first-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T12:08:23.310Z",
+  "sessionId": "deepseek-v4-pro-20260721T115817Z",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f"
+  },
+  "fixtureManifestSha256": "f8f3d93d8ff9a8171fa23b2c8bf646934bcd04705490eb2a97229fecdc225e78",
+  "runtimeImage": {
+    "ref": "anydesign/runtime:gctx-release-evidence-fastpath-20260721",
+    "imageId": "sha256:4205307954c4d5ff677dafbb62040e12ce0aeaf4f51978f2883c62fa35eec0c1",
+    "controlDeploymentRevision": "c56674b6ac3fe3d181e3f8355bd5caa7e41825ed80e6e5a92f43ae0615027e6a",
+    "candidateDeploymentRevision": "8764c879ceb7cd8b2eca2fa6b713a24eea87e1d58478ed65a848f6d6442ece9e"
+  },
+  "pair": {
+    "id": "batch-01-agent-cloud-quickstart-greenfield",
+    "batchId": "batch-01",
+    "bucket": "greenfield",
+    "identity": {
+      "fixtureId": "agent-cloud-quickstart",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "modelVersion": "deepseek-v4-pro",
+      "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+      "templateVersion": "fumadocs-docs",
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315",
+      "phase": "build"
+    },
+    "control": {
+      "status": "completed",
+      "firstBuildSucceeded": false,
+      "requiredFidelityPassed": true,
+      "artifactHttpStatus": 200,
+      "expectedTextFound": true,
+      "metrics": {
+        "inputTokens": 167329,
+        "outputTokens": 5803,
+        "totalDurationMs": 160371,
+        "timeToFirstSourceMutationMs": 87746,
+        "modelTurnAtFirstSourceMutation": 8,
+        "turns": 13,
+        "toolCalls": 25,
+        "prebuildFsReadCount": 12,
+        "prebuildFsListCount": 1,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "status": "completed",
+      "firstBuildSucceeded": false,
+      "requiredFidelityPassed": true,
+      "artifactHttpStatus": 200,
+      "expectedTextFound": true,
+      "fumadocsTemplateCoverage": true,
+      "metrics": {
+        "inputTokens": 87746,
+        "outputTokens": 4029,
+        "totalDurationMs": 129105,
+        "timeToFirstSourceMutationMs": 64045,
+        "modelTurnAtFirstSourceMutation": 4,
+        "turns": 8,
+        "toolCalls": 15,
+        "prebuildFsReadCount": 4,
+        "prebuildFsListCount": 1,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedReductionPercent": {
+      "inputTokens": 47.56,
+      "outputTokens": 30.57,
+      "totalDurationMs": 19.50,
+      "timeToFirstSourceMutationMs": 27.01,
+      "modelTurnAtFirstSourceMutation": 50.00,
+      "turns": 38.46,
+      "toolCalls": 40.00,
+      "prebuildFsReadCount": 66.67
+    }
+  },
+  "releaseEvidenceDiagnostic": {
+    "status": "accepted",
+    "available": false,
+    "reason": "build-only-suite-does-not-create-edit-baseline",
+    "endpointTimedOut": false
+  },
+  "ledger": {
+    "recordCount": 3,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "d9db12df756d51457f30d31d9697e0e5a5d4e61688150f4323f77938ff251569",
+    "sha256": "86220e43427c7b23fede671b29cb97a24ba6e740e0e7108aa8d105e11448e2f3"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "fumadocsTemplate": true,
+    "greenfieldPairCount": 1,
+    "greenfieldMinimumPairCount": 20,
+    "greenfieldBatchCount": 1,
+    "minimumBatchCount": 3
+  },
+  "sourceSha256": {
+    "deployment": "09fb200f7b9e58978f7a7fa5d1d9c1000af2367e9c66911c35c0d61d7438a80f",
+    "session": "5c9af7d3ff5975451c66d2d08645541baa29ee284d22cca710ad60c741268676",
+    "sessionMeta": "693defbf364c30119dd0097ba993703a9f9608818baea20bc386febe7204f4cc",
+    "providerReconcile": "4d14fa2fb01390f18d016101246e01756f679364285951c35f7b058f7cc45088",
+    "controlCase": "fcf99be8b7bfd4948906a2a1606866129330d9cf7110b25034a494a9c244d31b",
+    "candidateCase": "b80e30ca9fdbb7c0d0e86af9f1d42d1701ebb99bbcc459c252df1c3e40bfed15",
+    "pairResult": "05377f0d7d523990a010b39d6ef6478da11566e1d38f920c09a03af59ff48267",
+    "rolloutEvidence": "8a0a74c8c5605b4cac12f483a1a1bda9202f948a4bd9a967d7c0a0c915331b72"
+  }
+}

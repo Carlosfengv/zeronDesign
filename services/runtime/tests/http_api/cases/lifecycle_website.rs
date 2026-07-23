@@ -44,8 +44,12 @@ fn dcp_observe_profile(project_id: &str) -> DesignProfile {
     }
 }
 
-#[tokio::test]
-async fn website_dcp_flag_matrix_is_fail_closed_and_backward_compatible() {
+#[test]
+fn website_dcp_flag_matrix_is_fail_closed_and_backward_compatible() {
+    run_with_http_test_stack("website-dcp-flag-matrix", website_dcp_flag_matrix_inner());
+}
+
+async fn website_dcp_flag_matrix_inner() {
     let store = RuntimeStore::new();
     let cases = [
         ("off-off", false, false, false),

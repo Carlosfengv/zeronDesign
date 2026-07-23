@@ -1,17 +1,19 @@
-use super::preview_fidelity::collect_browser_evidence;
+use super::preview_fidelity::{collect_browser_evidence, internal_browser_evidence_url};
 use super::*;
 use crate::{
     artifact_publisher::StagedArtifact,
+    artifact_routes::ArtifactRouteManifest,
     generation_contract::{
-        ArtifactType, GenerationContract, ValidationCheckResult, ValidationCheckStatus,
-        ValidationReport, VALIDATION_REPORT_SCHEMA,
+        GenerationContract, ValidationCheckResult, ValidationCheckStatus, ValidationReport,
+        VALIDATION_REPORT_SCHEMA,
     },
     runtime_storage::FileValidationReportStore,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub(super) async fn collect_and_persist_generation_validation(
     workspace: &dyn WorkspaceBackend,
+    command: Option<&dyn SandboxCommandBackend>,
     ctx: &ToolContext,
     template: &TemplateSpec,
     candidate_version_id: &str,
@@ -23,7 +25,63 @@ pub(super) async fn collect_and_persist_generation_validation(
     let contract = template
         .generation_contract()
         .map_err(|error| ToolError::Terminal(format!("generation contract is invalid: {error}")))?;
-    let browser_rules = common_browser_rules(contract.artifact_type);
+    let browser_rules = common_browser_rules(&contract)?;
+    let mut entry_route_probe =
+        collect_entry_route_probe(workspace, ctx, &contract, latest_build, preview_url).await;
+    if entry_route_probe.get("status").and_then(Value::as_str) == Some("failed")
+        && entry_route_probe.get("owner").and_then(Value::as_str) == Some("serving")
+    {
+        let previous_probe = entry_route_probe.clone();
+        let restart = match super::preview_lifecycle::restart_static_candidate_preview(
+            workspace,
+            command,
+            ctx,
+            latest_build,
+            preview_url,
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => json!({
+                "attempt": 1,
+                "status": "failed",
+                "owner": "serving",
+                "diagnostic": format!("{error:?}").chars().take(512).collect::<String>(),
+            }),
+        };
+        entry_route_probe =
+            collect_entry_route_probe(workspace, ctx, &contract, latest_build, preview_url).await;
+        entry_route_probe["previousProbe"] = previous_probe;
+        entry_route_probe["servingRestart"] = restart;
+    }
+    let correlation_digest = crate::types::sha256_hex(
+        format!(
+            "{}:{}:{}",
+            ctx.run.id,
+            candidate_version_id,
+            latest_build
+                .get("candidateManifestHash")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        )
+        .as_bytes(),
+    );
+    entry_route_probe["correlationId"] =
+        json!(format!("entry-route-probe-{}", &correlation_digest[..16]));
+    ctx.store
+        .append_conversation_item(
+            &ctx.project_id,
+            Some(&ctx.run.id),
+            "entry_route_probe_checked",
+            Some("assistant"),
+            format!(
+                "Entry route probe {} (owner: {}).",
+                entry_route_probe["status"].as_str().unwrap_or("failed"),
+                entry_route_probe["owner"].as_str().unwrap_or("unknown")
+            ),
+            Some(entry_route_probe.clone()),
+        )
+        .await;
     let browser_evidence = collect_browser_evidence(Some(ctx), preview_url, &browser_rules).await;
     let report_uri =
         FileValidationReportStore::uri(&ctx.project_id, &ctx.run.id, candidate_version_id);
@@ -36,8 +94,30 @@ pub(super) async fn collect_and_persist_generation_validation(
         latest_build,
         staged_artifact,
         browser_evidence,
+        entry_route_probe.clone(),
         &report_uri,
     )?;
+    let failure_owners = validation_failure_owners(&report, &entry_route_probe);
+    ctx.store
+        .append_conversation_item(
+            &ctx.project_id,
+            Some(&ctx.run.id),
+            "validation_failure_owner_shadowed",
+            Some("assistant"),
+            format!(
+                "Validation failure ownership shadowed for {} check(s).",
+                failure_owners.len()
+            ),
+            Some(json!({
+                "mode": "shadow",
+                "legacyDecision": "source_repair",
+                "failureOwners": failure_owners,
+                "correlationId": entry_route_probe.get("correlationId").cloned(),
+                "candidateVersionId": candidate_version_id,
+                "candidateManifestHash": latest_build.get("candidateManifestHash").cloned(),
+            })),
+        )
+        .await;
     let report_value = serde_json::to_value(&report).map_err(|error| {
         ToolError::Terminal(format!("validation report serialization failed: {error}"))
     })?;
@@ -81,12 +161,12 @@ pub(super) async fn collect_and_persist_generation_validation(
     Ok((report, persisted_uri))
 }
 
-fn common_browser_rules(artifact_type: ArtifactType) -> Vec<Value> {
-    let route = match artifact_type {
-        ArtifactType::Website => "/",
-        ArtifactType::Docs => "/docs/",
-    };
-    vec![
+fn common_browser_rules(contract: &GenerationContract) -> Result<Vec<Value>, ToolError> {
+    let route = contract
+        .effective_route_contract()
+        .map_err(|error| ToolError::Terminal(format!("route contract is invalid: {error}")))?
+        .entry_route;
+    Ok(vec![
         json!({
             "id": "validation:page-health",
             "verification": { "kind": "page", "check": "health", "route": route }
@@ -111,7 +191,148 @@ fn common_browser_rules(artifact_type: ArtifactType) -> Vec<Value> {
             "id": "validation:viewport-desktop",
             "verification": { "kind": "viewport", "viewport": 1440, "route": route }
         }),
-    ]
+    ])
+}
+
+async fn collect_entry_route_probe(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    contract: &GenerationContract,
+    latest_build: &Value,
+    preview_url: &str,
+) -> Value {
+    let route_contract = match contract.effective_route_contract() {
+        Ok(contract) => contract,
+        Err(error) => {
+            return json!({ "status": "failed", "owner": "artifact", "reason": "route_contract_invalid", "diagnostic": error });
+        }
+    };
+    let Some(route_manifest_path) = latest_build
+        .get("artifactRouteManifestPath")
+        .and_then(Value::as_str)
+    else {
+        return json!({ "status": "failed", "owner": "artifact", "reason": "route_manifest_missing" });
+    };
+    let route_manifest_text = match workspace
+        .read_to_string(ctx, &resolve_path(route_manifest_path, &ctx.workspace_root))
+        .await
+    {
+        Ok(text) => text,
+        Err(error) => {
+            return json!({ "status": "failed", "owner": "artifact", "reason": "route_manifest_unreadable", "diagnostic": error.to_string() });
+        }
+    };
+    let route_manifest: ArtifactRouteManifest = match serde_json::from_str(&route_manifest_text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return json!({ "status": "failed", "owner": "artifact", "reason": "route_manifest_invalid", "diagnostic": error.to_string() });
+        }
+    };
+    if let Err(error) = route_manifest.validate() {
+        return json!({ "status": "failed", "owner": "artifact", "reason": "route_manifest_invalid", "diagnostic": error.to_string() });
+    }
+    let expected_route_manifest_hash = latest_build
+        .get("artifactRouteManifestHash")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if crate::types::sha256_hex(route_manifest_text.as_bytes()) != expected_route_manifest_hash {
+        return json!({ "status": "failed", "owner": "artifact", "reason": "route_manifest_hash_mismatch" });
+    }
+    let Some(target) = route_manifest.resolve(&route_contract.entry_route) else {
+        return json!({ "status": "failed", "owner": "artifact", "reason": "entry_route_unresolved", "route": route_contract.entry_route });
+    };
+    let base = internal_browser_evidence_url(Some(ctx), preview_url);
+    let probe_url = format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        route_contract.entry_route.trim_start_matches('/')
+    );
+    let response = match reqwest::Client::new()
+        .get(&probe_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({ "status": "failed", "owner": "serving", "reason": "request_failed", "route": route_contract.entry_route, "diagnostic": error.to_string() });
+        }
+    };
+    let http_status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let resolved_path = response
+        .headers()
+        .get("x-anydesign-artifact-path")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let resolved_hash = response
+        .headers()
+        .get("x-anydesign-artifact-sha256")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let candidate_hash = response
+        .headers()
+        .get("x-anydesign-candidate-manifest-hash")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let expected_candidate_hash = latest_build
+        .get("candidateManifestHash")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let passed = response.status().is_success()
+        && content_type.starts_with("text/html")
+        && resolved_path == target.file
+        && resolved_hash == target.sha256
+        && candidate_hash == expected_candidate_hash;
+    json!({
+        "status": if passed { "passed" } else { "failed" },
+        "owner": if passed { "none" } else { "serving" },
+        "reason": if passed { "route_manifest_match" } else { "route_probe_mismatch" },
+        "route": route_contract.entry_route,
+        "httpStatus": http_status,
+        "contentType": content_type,
+        "resolvedArtifactPath": resolved_path,
+        "resolvedArtifactSha256": resolved_hash,
+        "candidateManifestHash": candidate_hash,
+    })
+}
+
+pub(super) fn validation_failure_owners(
+    report: &ValidationReport,
+    entry_route_probe: &Value,
+) -> BTreeMap<String, String> {
+    let mut owners = BTreeMap::new();
+    let entry_failure_owner =
+        (entry_route_probe.get("status").and_then(Value::as_str) != Some("passed")).then(|| {
+            entry_route_probe
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("runtime")
+        });
+    if let Some(owner) = entry_failure_owner {
+        owners.insert("entry-route".to_string(), owner.to_string());
+    }
+    for check in &report.checks {
+        if check.status == ValidationCheckStatus::Passed {
+            continue;
+        }
+        let owner = match check.id.as_str() {
+            "build" => "build",
+            "artifact-integrity" | "duplicate-slugs" => "artifact",
+            _ if check.status == ValidationCheckStatus::Unavailable => "runtime",
+            _ => entry_failure_owner.unwrap_or("source"),
+        };
+        owners.insert(check.id.clone(), owner.to_string());
+    }
+    owners
 }
 
 fn build_validation_report(
@@ -123,6 +344,7 @@ fn build_validation_report(
     latest_build: &Value,
     staged_artifact: &StagedArtifact,
     browser_evidence: Value,
+    entry_route_probe: Value,
     report_uri: &str,
 ) -> Result<ValidationReport, ToolError> {
     let candidate_manifest_value: Value =
@@ -373,6 +595,7 @@ fn build_validation_report(
             "build": latest_build,
             "candidateManifest": candidate_manifest_value,
             "artifact": staged_artifact,
+            "entryRouteProbe": entry_route_probe,
             "browser": browser_evidence,
         }),
     };
@@ -498,6 +721,7 @@ fn static_route_for_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation_contract::ArtifactType;
 
     fn build(contract: &GenerationContract, browser: Value) -> ValidationReport {
         let manifest = json!({
@@ -527,6 +751,11 @@ mod tests {
                 file_count: 2,
             },
             browser,
+            json!({
+                "status": "passed",
+                "owner": "none",
+                "reason": "route_manifest_match"
+            }),
             "runtime://validation-reports/project-1/run-1/version-1.json",
         )
         .unwrap()
@@ -599,7 +828,11 @@ mod tests {
         for (artifact_type, expected_route) in
             [(ArtifactType::Website, "/"), (ArtifactType::Docs, "/docs/")]
         {
-            let rules = common_browser_rules(artifact_type);
+            let contract = match artifact_type {
+                ArtifactType::Website => GenerationContract::website("next-app", "dist"),
+                ArtifactType::Docs => GenerationContract::docs("fumadocs-docs", "out"),
+            };
+            let rules = common_browser_rules(&contract).unwrap();
             assert!(rules
                 .iter()
                 .all(|rule| { rule["verification"]["route"].as_str() == Some(expected_route) }));
@@ -638,5 +871,40 @@ mod tests {
         assert!(contract
             .required_checks
             .contains(&"duplicate-slugs".to_string()));
+    }
+
+    #[test]
+    fn failure_owner_shadow_distinguishes_serving_runtime_artifact_and_source() {
+        let contract = GenerationContract::docs("fumadocs-docs", "out");
+        let mut report = build(&contract, passing_browser());
+        report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == "artifact-integrity")
+            .unwrap()
+            .status = ValidationCheckStatus::Failed;
+        report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == "metadata")
+            .unwrap()
+            .status = ValidationCheckStatus::Failed;
+        report
+            .checks
+            .iter_mut()
+            .find(|check| check.id == "desktop-render")
+            .unwrap()
+            .status = ValidationCheckStatus::Unavailable;
+
+        let owners =
+            validation_failure_owners(&report, &json!({ "status": "failed", "owner": "serving" }));
+        assert_eq!(owners["entry-route"], "serving");
+        assert_eq!(owners["artifact-integrity"], "artifact");
+        assert_eq!(owners["metadata"], "serving");
+        assert_eq!(owners["desktop-render"], "runtime");
+
+        let owners =
+            validation_failure_owners(&report, &json!({ "status": "passed", "owner": "none" }));
+        assert_eq!(owners["metadata"], "source");
     }
 }

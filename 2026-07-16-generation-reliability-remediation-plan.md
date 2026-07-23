@@ -163,7 +163,7 @@ Candidate
 {
   "schemaVersion": "generation-contract@1",
   "artifactType": "website",
-  "templateKey": "astro-website",
+  "templateKey": "next-app",
   "build": {
     "command": ["npm", "run", "build"],
     "outputDirectory": "dist"
@@ -304,7 +304,7 @@ project.write_page
   "candidateManifestHash": "<sha256>",
   "artifactManifestHash": "<sha256>",
   "generationContractDigest": "<sha256>",
-  "templateVersion": "astro-website@runtime-p3",
+  "templateVersion": "next-app@1",
   "checks": [
     {
       "id": "mobile-render",

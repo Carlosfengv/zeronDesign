@@ -336,6 +336,23 @@ async function runScenario({
     }
     if (
       request.method === "GET" &&
+      url.pathname.endsWith("/design-context-manifest")
+    ) {
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run not found" });
+      return json(response, 200, {
+        runId,
+        package: {
+          designProfileId: "fixture-design-profile",
+          designProfileVersion: 1,
+          effectiveProfileHash: "9".repeat(64),
+        },
+        artifacts: [],
+      });
+    }
+    if (
+      request.method === "GET" &&
       url.pathname.endsWith("/efficiency-metrics")
     ) {
       const runId = url.pathname.split("/").at(-2);
@@ -371,6 +388,80 @@ async function runScenario({
         requiredFidelityPassed: run.phase === "build" ? terminalStatus === "completed" : null,
       });
     }
+    if (
+      request.method === "GET" &&
+      url.pathname.endsWith("/prompt-efficiency")
+    ) {
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run not found" });
+      return json(response, 200, {
+        schemaVersion: "run-prompt-efficiency@1",
+        runId,
+        grossInputTokens: usageInputTokens,
+        cachedInputTokens: 2,
+        uncachedInputTokens: Math.max(0, usageInputTokens - 2),
+        outputTokens: usageOutputTokens,
+        turnCount: 1,
+        maxTurnInputTokens: usageInputTokens,
+        averageTurnInputTokens: usageInputTokens,
+        cacheHitRateBasisPoints: 200,
+        generationContextEstimatedTokens: 0,
+        generationContextRepeatedEstimatedTokens: 0,
+        promptCompactionCount: 0,
+        promptTokensRemovedByCompaction: 0,
+        largeToolArgumentTokensRetainedPeak: 0,
+        retryAmplificationBasisPoints: null,
+        estimated: false,
+      });
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.endsWith("/budget-profile")
+    ) {
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run not found" });
+      return json(response, 200, fixtureBudgetProfile(run.phase));
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname.endsWith("/generation-context-status")
+    ) {
+      const runId = url.pathname.split("/").at(-2);
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run not found" });
+      const budgetProfile = fixtureBudgetProfile(run.phase);
+      return json(response, 200, {
+        schemaVersion: "generation-context-status@1",
+        runId,
+        runContractVersion: "generation-context@1",
+        status: "compiled",
+        runtimeMode: "enabled",
+        compilerVersion: "generation-context-compiler@1",
+        contextContentHash: "c".repeat(64),
+        runContextBindingHash: "d".repeat(64),
+        runtimeAttestationHash: "e".repeat(64),
+        visualBindingSetHash: null,
+        visualDeliveryState: "not_applicable",
+        executionProfile: "greenfield_static",
+        budgetProfileId: budgetProfile.profileId,
+        budgetProfileHash: budgetProfile.profileHash,
+        budgetProfileRolloutMode: "shadow",
+        workflowState: "completed",
+        contextWindowEpoch: 0,
+        contextInjectedTurn: 1,
+        operationId: `operation-${runId}`,
+        operationAttempt: 1,
+        predecessorRunId: null,
+        successorRunId: null,
+        continuationSnapshotId: null,
+        contentPlan: null,
+        approvalId: null,
+        approvalState: null,
+        designSourceKind: "template_default",
+      });
+    }
     if (request.method === "GET" && url.pathname.endsWith("/events")) {
       response.writeHead(200, { "content-type": "text/event-stream" });
       const phase = url.pathname.includes("brief-run") ? "brief" : "build";
@@ -400,12 +491,37 @@ async function runScenario({
             }]
           : []),
         {
+          type: "prompt.composition",
+          turn: 1,
+          staticPrefixHash: "a".repeat(64),
+          toolSetHashVersion: "tool-definition-set@1",
+          toolSetHash: "b".repeat(64),
+          estimatedInputTokens: usageInputTokens,
+        },
+        {
           type: "model.usage",
           inputTokens: usageInputTokens,
           outputTokens: usageOutputTokens,
           cachedInputTokens: 2,
         },
-        { type: "tool.started", toolName: "fixture.tool" },
+        { type: "tool.started", runId, toolName: "fixture.tool" },
+        ...(phase === "build"
+          ? [{
+              type: "tool.completed",
+              tool: "project.build",
+              metadata: {
+                postToolUseSuccess: {
+                  effect: "build_state_updated",
+                  buildId: "fixture-build",
+                  sourceSnapshotUri: "runtime://source-snapshots/fixture/build",
+                  sourceFingerprint: "c".repeat(64),
+                  candidateManifestHash: "d".repeat(64),
+                  artifactRouteManifestPath: ".anydesign-artifact-routes.json",
+                  artifactRouteManifestHash: "e".repeat(64),
+                },
+              },
+            }]
+          : []),
         ...(phase === "build" && draftPreviewAcceptance
           ? [
               {
@@ -578,6 +694,32 @@ async function runScenario({
     );
     assert.equal(caseEvidence.schemaVersion, "generation-real-provider-case-evidence@2");
     assert.equal(caseEvidence.runs.length, expectedRunCount);
+    if (expectedStatus === "accepted") {
+      const primaryRuns = caseEvidence.runs.filter((run) =>
+        (run.phase === "brief" || run.phase === "build") && run.status === "completed"
+      );
+      assert.ok(primaryRuns.length >= 2);
+      assert.ok(primaryRuns.every((run) =>
+        run.promptEfficiency?.schemaVersion === "run-prompt-efficiency@1"
+      ));
+      assert.ok(primaryRuns.every((run) =>
+        run.promptCompositions?.[0]?.staticPrefixHash === "a".repeat(64)
+        && run.promptCompositions?.[0]?.toolSetHashVersion === "tool-definition-set@1"
+      ));
+      assert.ok(primaryRuns.every((run) =>
+        run.budgetProfile?.schemaVersion === "run-budget-profile@1"
+        && run.budgetProfile.phase === run.phase
+        && run.budgetProfile.profileHash.length === 64
+      ));
+      assert.equal(
+        primaryRuns.find((run) => run.phase === "build")?.generationContextStatus?.contextContentHash,
+        "c".repeat(64),
+      );
+      assert.equal(
+        primaryRuns.find((run) => run.phase === "build")?.buildEvidence?.artifactRouteManifestHash,
+        "e".repeat(64),
+      );
+    }
     assert.equal(caseEvidence.attempts.length, expectedAttemptCount);
     assert.equal(caseEvidence.sandboxRelease.required, !keepSandbox);
     assert.equal(
@@ -626,7 +768,8 @@ async function runScenario({
       assert.equal(run.eventStream.format, "ndjson");
       assert.equal(
         run.eventStream.eventCount,
-        (includeModelExecution ? 4 : 3) +
+        (includeModelExecution ? 5 : 4) +
+          (run.phase === "build" ? 1 : 0) +
           (draftPreviewAcceptance && run.phase === "build"
             ? devDraftPreviewAcceptance ? 3 : 2
             : 0),
@@ -650,6 +793,8 @@ async function runScenario({
         "utf8",
       );
       assert.ok(!eventText.includes("provider-request-id-must-not-persist"));
+      assert.ok(!eventText.includes('"summary":'));
+      assert.ok(eventText.includes('"summarySha256":'));
       if (includeModelExecution) {
         assert.ok(eventText.includes('"providerRequestIdPresent":true'));
       }
@@ -687,6 +832,50 @@ function fixtureManifest() {
       prompt: "Create a fixture artifact",
     })),
   };
+}
+
+function fixtureBudgetProfile(phase) {
+  const enforcedLimits = {
+    maxTurns: 60,
+    maxToolCalls: 180,
+    maxInputTokens: 600000,
+    maxGrossInputTokens: 600000,
+    maxUncachedInputTokens: 600000,
+    maxPromptTokensPerTurn: 600000,
+    maxOutputTokens: 80000,
+  };
+  const profile = {
+    schemaVersion: "run-budget-profile@1",
+    profileId: `phase-default-${phase}`,
+    phase,
+    rolloutMode: "shadow",
+    tokenBudgetMode: "legacy",
+    operationBudgetMode: "shadow",
+    enforcedLimits,
+    phaseTargetLimits: { ...enforcedLimits },
+    operationLimits: {
+      maxGrossInputTokens: 5000000,
+      maxUncachedInputTokens: 5000000,
+      maxOutputTokens: 500000,
+      maxTurns: 600,
+      maxToolCalls: 1800,
+    },
+  };
+  profile.profileHash = crypto
+    .createHash("sha256")
+    .update(canonicalJson(profile))
+    .digest("hex");
+  return profile;
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function json(response, status, value) {

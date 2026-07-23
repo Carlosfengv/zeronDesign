@@ -471,7 +471,14 @@ fn fumadocs_template_pins_a_resolvable_yuku_analyzer_graph() {
     let registry = BuiltInTemplateRegistry::built_in();
     let template_id = TemplateId::parse("fumadocs-docs").unwrap();
     let spec = registry.current(&template_id).unwrap();
-    assert_eq!(spec.version.as_str(), "fumadocs-docs@runtime-p6");
+    assert_eq!(spec.version.as_str(), "fumadocs-docs@runtime-p7");
+    assert!(spec
+        .files
+        .iter()
+        .find(|file| file.path == "next.config.mjs")
+        .unwrap()
+        .content
+        .contains("trailingSlash: true"));
     let editable = spec.editable_surface_view("project").unwrap();
     assert_eq!(editable.primary_routes[0].route, "/docs/");
     assert_eq!(

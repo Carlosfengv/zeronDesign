@@ -120,6 +120,8 @@ pub struct ModelExecutionSnapshot {
     pub id: String,
     pub model_resource_id: String,
     pub model_resource_revision: u64,
+    #[serde(default)]
+    pub display_name: String,
     pub provider_id: String,
     pub physical_model: String,
     pub selection_policy_id: String,

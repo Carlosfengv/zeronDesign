@@ -513,19 +513,27 @@ US-080, US-081
 US-021(Draft 首屏目标), US-031, US-032, US-033
 ```
 
+视觉参考、`next-app`、多模态视觉审查、组件/资产、元素定位和版本恢复的增量 Story 见
+`2026-07-18-ai-website-docs-generator-p0-user-stories.md`，工程拆分见
+`2026-07-19-visual-react-runtime-capability-implementation-plan.md`。
+
 ## 14. 非目标与避免误收范围
 
 以下内容不进入当前 User Story Backlog：
 
 - Figma/Canvas 级拖拽编辑器；
 - 多人同时编辑同一个项目；
-- SSR、Server Actions、自定义后端或用户数据库；
+- Lovable 式全栈能力，包括 SSR 动态业务逻辑、Server Actions、Route Handlers、自定义后端、
+  用户数据库、认证、运行时 Secret 和第三方业务集成；
 - 自定义域名自助接入；
 - 模板市场、插件市场和计费；
 - 任意 Dockerfile、自定义镜像和浏览器直连 Sandbox；
 - 每个历史 Release 的独立公开域名。
 
 如后续加入，应单独完成产品、权限、成本和运维评审，不能作为当前 MVP 的“顺手实现”。
+
+通用 `next-app` React 前端模板属于当前视觉创作范围，但必须使用静态导出和受控前端交互
+契约；采用 Next.js 不等于把上述全栈能力带入当前 MVP。
 
 ## 15. Enablement Backlog：支撑 Story 的技术项
 

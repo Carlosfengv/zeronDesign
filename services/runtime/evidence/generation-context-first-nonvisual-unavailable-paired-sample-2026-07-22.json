@@ -1,0 +1,187 @@
+{
+  "schemaVersion": "generation-context-first-nonvisual-unavailable-paired-sample-summary@1",
+  "recordedAt": "2026-07-21T22:53:42.456Z",
+  "sessionId": "deepseek-v4-pro-20260722-nonvisual-003",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315",
+    "visionCapable": false,
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:6a5603c0a464-dirty-827f177b77e8",
+    "dockerImageId": "sha256:b09a27f0fbb4dbd95b323bd0523cc4646c956f2a99215ada88abcff952fde154",
+    "controlDeploymentRevision": "f622a906a2270499061c27a78006be985aaa7daa1867e55e8fdc2c26a2a919ed",
+    "candidateDeploymentRevision": "8423b47486d93b65fd15928e78958511fa7dbd79f711120f093c53f114a2fe00"
+  },
+  "providerGatewayImage": {
+    "ref": "zerondesign/provider-gateway:6a5603c0a464-dirty-109654790317",
+    "dockerImageId": "sha256:7e862f3cb43bcd079bba402b6b6fbad6ce0296a83a6af16c6f14c7249b7b8ecb"
+  },
+  "pair": {
+    "id": "batch-20-oilfield-operations-dashboard-warm-copy-css",
+    "batchId": "batch-20",
+    "bucket": "warm_copy_css",
+    "identity": {
+      "fixtureId": "oilfield-operations-dashboard",
+      "templateVersion": "next-app",
+      "phase": "edit",
+      "lifecycleProfile": "warm_hmr",
+      "warmEditKind": "copy_css",
+      "modelResource": "deepseek-v4-pro",
+      "providerResourceRevision": 4,
+      "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315"
+    },
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "runId": "run-3025",
+      "durableSnapshotId": "draft-snapshot-3058",
+      "recordHash": "7e0d92630f0e9cf30d020417f79978dd732e09c651891b8d9c1c0eae1bfc6315",
+      "visualDelivery": {
+        "state": null,
+        "unavailableMetricRecorded": false,
+        "mainTaskCompleted": true
+      },
+      "metrics": {
+        "inputTokens": 108012,
+        "outputTokens": 877,
+        "turns": 7,
+        "toolCalls": 12,
+        "recoverableToolFailures": 0,
+        "totalDurationMs": 31756,
+        "timeToFirstSourceMutationMs": 14787,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 8641,
+        "timeToDurableSnapshotMs": 14787,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "runId": "run-1628",
+      "durableSnapshotId": "draft-snapshot-1659",
+      "recordHash": "b9677e2b4542ab1004232df1914d301fcca5cba33ca30fcb3fef63d56ddb29cf",
+      "visualDelivery": {
+        "state": "unavailable",
+        "visualBindingsVerified": true,
+        "visualBindingSetHash": "67ac1d33e9758767f5d8e16d4102a2920fa760ce9bfa7974c1b396811c326f34",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "bindingVerificationSource": "frozen-runtime-attestation-plus-unavailable-delivery-metric",
+        "unavailableMetricRecorded": true,
+        "mainTaskCompleted": true,
+        "modelExecutionsAfterUnavailable": 5
+      },
+      "metrics": {
+        "inputTokens": 93092,
+        "outputTokens": 795,
+        "turns": 6,
+        "toolCalls": 11,
+        "recoverableToolFailures": 0,
+        "totalDurationMs": 31346,
+        "timeToFirstSourceMutationMs": 12726,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 4029,
+        "timeToDurableSnapshotMs": 12726,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -13.81,
+      "outputTokens": -9.35,
+      "turns": -14.29,
+      "toolCalls": -8.33,
+      "totalDurationMs": -1.29,
+      "timeToFirstSourceMutationMs": -13.94,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": -53.37,
+      "timeToDurableSnapshotMs": -13.94
+    },
+    "coverage": {
+      "nextTemplate": true,
+      "nonVisualUnavailableMainTaskPassed": true,
+      "multimodalVisualDelivered": false
+    },
+    "openFindings": [
+      "the first accepted non-visual pair proves that a frozen visual binding can be rejected by a non-vision Provider without blocking the text main task, but one pair from one batch is below the required multi-batch stability evidence",
+      "candidate timeToIframeAppliedMs was 4029ms, above the Warm Copy/CSS P95 target of 3000ms, and timeToDurableSnapshotMs was 12726ms, above the 5000ms P95 target",
+      "candidate input tokens decreased by 13.81%, below the 50% target, and first source mutation remained at model turn 3 instead of the target maximum of 2",
+      "multimodalVisualDelivered remains false because deepseek-v4-pro@4 is intentionally non-visual; a separately governed vision-capable Provider Resource is still required"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "pairId": "batch-17-oilfield-operations-dashboard-warm-copy-css",
+      "result": "actual_provider_capability_code_discovered",
+      "findings": [
+        "the Provider Gateway returned provider_capability_mismatch for real image delivery, while Runtime only recognized three narrower vision codes",
+        "after Runtime learned the actual code, the next request exposed that Gateway had forwarded the internal runtime message role without OpenAI normalization"
+      ]
+    },
+    {
+      "pairId": "batch-19-oilfield-operations-dashboard-warm-copy-css",
+      "result": "candidate_main_task_completed_harness_contract_corrected",
+      "findings": [
+        "candidate recorded unavailable once, completed five subsequent real model executions, mutated source, persisted a durable snapshot, and completed the Run",
+        "the evidence harness incorrectly required visualBindingsState even though the public status API exposes the attested visualBindingSetHash and runtimeAttestationHash instead"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "b9677e2b4542ab1004232df1914d301fcca5cba33ca30fcb3fef63d56ddb29cf",
+    "sha256": "5b95fbc4b388a0c84026c30adbe82aac7b4eb8494a6fe063b11a6d6c74f9f7a5"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "nextTemplate": true,
+    "fumadocsTemplate": false,
+    "runtimeRestart": false,
+    "multimodalVisualDelivered": false,
+    "nonVisualUnavailableMainTaskPassed": true,
+    "warmCopyCssPairCount": 1,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "4679b84de70031df73bedd158bdcfa32f23abe7036273a7fc16bfe7112256e05"
+  },
+  "sourceSha256": {
+    "session": "67ff5bc02ce5ba2891b2e2607dfd8556e71d3e259c1b2851d21beae4b7f6df80",
+    "sessionMeta": "923d70d3e922b56fd3e90cca81727794ba8322c77327324a0bbae39d21f24b53",
+    "providerReconcile": "3be9c4dd27b20049d75ca22e21d3da63f650dcde01ed01799e8feb83d88551a8",
+    "controlCase": "5e75ba5a71f75703b4b3d272ee36ece42ae5802cfad90a98b7f6d850db072a49",
+    "candidateCase": "0d3eba83ed4ef662b60a03783d7e66225e5d71b05618dc5e721ae202f7e1577f",
+    "pairSpec": "17eb28a0a5146c4db316338d9a8fab2820d2966131b0aa2fb2934dc559f7216b",
+    "pairResult": "035fb1a72ce40f7ed4da6a0e953b467132aee9d1dfc5b5da091b73f35fdaf6ff",
+    "rolloutEvidence": "4679b84de70031df73bedd158bdcfa32f23abe7036273a7fc16bfe7112256e05",
+    "rolloutEvaluation": "8d5c26cfbb42e36364ff9e08b214978daeceef52026b7a40bbda3bda9de92272"
+  }
+}

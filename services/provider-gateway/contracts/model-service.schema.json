@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider Gateway Model Service",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "providerConnectionId", "displayName", "physicalModel"],
+  "properties": {
+    "schemaVersion": { "const": "model-service@1" },
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "providerConnectionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "displayName": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "default": "" },
+    "physicalModel": { "type": "string", "minLength": 1 },
+    "capabilities": { "type": "object" },
+    "defaults": { "type": "object" },
+    "sortOrder": { "type": "integer", "default": 0 },
+    "expectedRevision": { "type": "integer", "minimum": 0 }
+  }
+}

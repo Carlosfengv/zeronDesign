@@ -54,6 +54,42 @@ pub static FILES: &[TemplateFile] = &[
     },
 ];
 
+pub static FILES_RUNTIME_P6: &[TemplateFile] = &[
+    asset!("package.json", TemplateFileRole::PackageManifest),
+    asset!("package-lock.json", TemplateFileRole::Lockfile),
+    asset!("postcss.config.mjs", TemplateFileRole::FrameworkConfig),
+    TemplateFile {
+        path: "next.config.mjs",
+        content: include_str!("files/next.config.runtime-p6.mjs"),
+        trim_final_newline: false,
+        role: TemplateFileRole::FrameworkConfig,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+    asset!("source.config.ts", TemplateFileRole::FrameworkConfig),
+    asset!("tsconfig.json", TemplateFileRole::FrameworkConfig),
+    asset!("next-env.d.ts", TemplateFileRole::FrameworkConfig),
+    asset!("lib/source.js", TemplateFileRole::Source),
+    asset!("lib/layout.shared.jsx", TemplateFileRole::Source),
+    asset!("components/mdx.jsx", TemplateFileRole::Source),
+    asset!("components/ui/button.jsx", TemplateFileRole::Source),
+    asset!("mdx-components.jsx", TemplateFileRole::Source),
+    asset!("app/tokens.css", TemplateFileRole::Style),
+    asset!("app/global.css", TemplateFileRole::Style),
+    asset!("app/layout.jsx", TemplateFileRole::Source),
+    asset!("app/page.jsx", TemplateFileRole::Source),
+    asset!("app/docs/layout.jsx", TemplateFileRole::Source),
+    asset!("app/docs/[[...slug]]/page.jsx", TemplateFileRole::Source),
+    asset!("content/docs/index.mdx", TemplateFileRole::Content),
+    asset!("content/docs/runtime-flow.mdx", TemplateFileRole::Content),
+    TemplateFile {
+        path: "content/docs/meta.json",
+        content: include_str!("files/content/docs/meta.json"),
+        trim_final_newline: true,
+        role: TemplateFileRole::Content,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
+];
+
 pub static FILES_RUNTIME_P3: &[TemplateFile] = &[
     TemplateFile {
         path: "package.json",
@@ -70,7 +106,13 @@ pub static FILES_RUNTIME_P3: &[TemplateFile] = &[
         write_mode: TemplateWriteMode::ReplaceOnInit,
     },
     asset!("postcss.config.mjs", TemplateFileRole::FrameworkConfig),
-    asset!("next.config.mjs", TemplateFileRole::FrameworkConfig),
+    TemplateFile {
+        path: "next.config.mjs",
+        content: include_str!("files/next.config.runtime-p6.mjs"),
+        trim_final_newline: false,
+        role: TemplateFileRole::FrameworkConfig,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
     asset!("source.config.ts", TemplateFileRole::FrameworkConfig),
     asset!("tsconfig.json", TemplateFileRole::FrameworkConfig),
     asset!("next-env.d.ts", TemplateFileRole::FrameworkConfig),
@@ -106,7 +148,13 @@ pub static FILES_RUNTIME_P4: &[TemplateFile] = &[
     asset!("package.json", TemplateFileRole::PackageManifest),
     asset!("package-lock.json", TemplateFileRole::Lockfile),
     asset!("postcss.config.mjs", TemplateFileRole::FrameworkConfig),
-    asset!("next.config.mjs", TemplateFileRole::FrameworkConfig),
+    TemplateFile {
+        path: "next.config.mjs",
+        content: include_str!("files/next.config.runtime-p6.mjs"),
+        trim_final_newline: false,
+        role: TemplateFileRole::FrameworkConfig,
+        write_mode: TemplateWriteMode::ReplaceOnInit,
+    },
     asset!("source.config.ts", TemplateFileRole::FrameworkConfig),
     asset!("tsconfig.json", TemplateFileRole::FrameworkConfig),
     asset!("next-env.d.ts", TemplateFileRole::FrameworkConfig),
@@ -407,8 +455,8 @@ impl TemplateOperations for FumadocsDocsOperations {
 
 pub fn spec() -> TemplateSpec {
     spec_with_identity(
-        "fumadocs-docs@runtime-p6",
-        "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
+        "fumadocs-docs@runtime-p7",
+        "2bd187762248a010c945ec10beae227fc3acb64e5ef9710f2efecee3e2051ba6",
         FILES,
         EditableSurfaceMetadata {
             primary_routes: vec![EditableRoute {
@@ -430,11 +478,20 @@ pub fn spec() -> TemplateSpec {
     )
 }
 
+pub fn legacy_p6_spec() -> TemplateSpec {
+    spec_with_identity(
+        "fumadocs-docs@runtime-p6",
+        "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
+        FILES_RUNTIME_P6,
+        EditableSurfaceMetadata::default(),
+    )
+}
+
 pub fn legacy_p5_spec() -> TemplateSpec {
     spec_with_identity(
         "fumadocs-docs@runtime-p5",
         "c8f3130e045d6a625ff0c3596d772e8c20da90a569c961cc9f67d303c24fd908",
-        FILES,
+        FILES_RUNTIME_P6,
         EditableSurfaceMetadata::default(),
     )
 }

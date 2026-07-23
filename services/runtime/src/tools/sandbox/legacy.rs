@@ -1,6 +1,7 @@
 use super::{adapters::*, ports::*};
 use crate::{
     artifact_publisher::{safe_segment, ArtifactFile, ArtifactPublisher, FileArtifactPublisher},
+    artifact_routes::{ArtifactRouteFile, ArtifactRouteManifest, ARTIFACT_ROUTE_MANIFEST_FILE},
     channel_manager::ChannelManager,
     config::{RuntimeConfig, RuntimePolicyProfile},
     conversation::RuntimeStore,
@@ -35,7 +36,7 @@ use scraper::{Html as ParsedHtml, Selector};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "runtime-validation-summary@1",
+  "checks": [
+    {
+      "id": "entry-route",
+      "status": "passed",
+      "owner": "serving",
+      "diagnosticRef": "runtime://validation/entry-route"
+    },
+    {
+      "id": "metadata",
+      "status": "failed",
+      "owner": "source",
+      "diagnosticRef": "runtime://validation/metadata"
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "schemaVersion": "runtime-evidence-bundle@1",
+  "evidenceId": "fixture-docs-route-failure",
+  "gitSha": "0000000000000000000000000000000000000000",
+  "harnessRevision": "replay-evidence@1",
+  "runtimeMode": "in_process_local",
+  "storeIdentityHash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "projectId": "fixture-project",
+  "runId": "fixture-run",
+  "operationId": "fixture-operation",
+  "modelResourceId": "fixture-model",
+  "modelResourceRevision": 1,
+  "promptSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "generationContextHash": "3333333333333333333333333333333333333333333333333333333333333333",
+  "templateVersion": "fumadocs-docs@runtime-p6",
+  "artifactManifestHash": "4444444444444444444444444444444444444444444444444444444444444444",
+  "artifactRouteManifestHash": "b9d8ed0ce064e651bd7930cf7e5882600c5fa76565faea73f032717e9982767e",
+  "sourceFingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+  "streamSha256": "4eb89e159e40e9d2f986c8f9479c6b6019ec677262196463f397d67a0e6b79dc",
+  "command": [
+    "node",
+    "infra/generation-reliability/replay-evidence.mjs",
+    "services/runtime/evidence/replay/fixture-docs-route-failure"
+  ],
+  "startedAt": "2026-07-22T00:00:00Z",
+  "result": {
+    "status": "partial",
+    "reason": "fixture source validation failure after successful route probes"
+  },
+  "replayExpectations": {
+    "usage": {
+      "modelCalls": 2,
+      "inputTokens": 1500,
+      "cachedInputTokens": 400,
+      "uncachedInputTokens": 1100,
+      "outputTokens": 200
+    },
+    "runModelUsage": {
+      "schemaVersion": "run-model-usage@1",
+      "runId": "fixture-run",
+      "modelServiceId": "fixture-model",
+      "modelDisplayName": "fixture-model",
+      "inputTokens": 1500,
+      "outputTokens": 200,
+      "cachedInputTokens": 400,
+      "totalTokens": 1700,
+      "estimated": false,
+      "turnCount": 2
+    },
+    "failureOwners": {
+      "metadata": "source"
+    },
+    "substantiveProgressCount": 2,
+    "finalStage": "validating"
+  }
+}

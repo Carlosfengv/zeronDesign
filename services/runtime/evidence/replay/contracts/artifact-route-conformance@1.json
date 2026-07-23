@@ -1,0 +1,112 @@
+{
+  "schemaVersion": "artifact-route-conformance@1",
+  "cases": [
+    {
+      "id": "docs-index-entry",
+      "contract": {
+        "entryRoute": "/docs/",
+        "canonicalPolicy": "trailing_slash"
+      },
+      "files": [
+        {
+          "path": "docs/index.html",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "docs/guide/index.html",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "expectedRoutes": {
+        "/docs/": "docs/index.html",
+        "/docs/guide/": "docs/guide/index.html"
+      },
+      "expectedAliases": {
+        "/docs": "/docs/",
+        "/docs/guide": "/docs/guide/"
+      },
+      "resolutions": [
+        { "requestPath": "/docs", "expectedFile": "docs/index.html" },
+        { "requestPath": "/docs/", "expectedFile": "docs/index.html" },
+        { "requestPath": "/docs/guide", "expectedFile": "docs/guide/index.html" },
+        { "requestPath": "/missing", "expectedFile": null }
+      ]
+    },
+    {
+      "id": "legacy-docs-html-entry",
+      "contract": {
+        "entryRoute": "/docs/",
+        "canonicalPolicy": "trailing_slash"
+      },
+      "files": [
+        {
+          "path": "docs.html",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }
+      ],
+      "expectedRoutes": {
+        "/docs/": "docs.html"
+      },
+      "expectedAliases": {
+        "/docs": "/docs/"
+      },
+      "resolutions": [
+        { "requestPath": "/docs", "expectedFile": "docs.html" },
+        { "requestPath": "/docs/", "expectedFile": "docs.html" }
+      ]
+    },
+    {
+      "id": "website-root-entry",
+      "contract": {
+        "entryRoute": "/",
+        "canonicalPolicy": "root"
+      },
+      "files": [
+        {
+          "path": "index.html",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      ],
+      "expectedRoutes": {
+        "/": "index.html"
+      },
+      "expectedAliases": {},
+      "resolutions": [
+        { "requestPath": "/", "expectedFile": "index.html" },
+        { "requestPath": "/index.html", "expectedFile": null }
+      ]
+    },
+    {
+      "id": "ambiguous-docs-entry",
+      "contract": {
+        "entryRoute": "/docs/",
+        "canonicalPolicy": "trailing_slash"
+      },
+      "files": [
+        {
+          "path": "docs.html",
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        },
+        {
+          "path": "docs/index.html",
+          "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ],
+      "expectedErrorKind": "artifact.route_ambiguous"
+    },
+    {
+      "id": "missing-docs-entry",
+      "contract": {
+        "entryRoute": "/docs/",
+        "canonicalPolicy": "trailing_slash"
+      },
+      "files": [
+        {
+          "path": "guide/index.html",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "expectedErrorKind": "artifact.entry_route_missing"
+    }
+  ]
+}

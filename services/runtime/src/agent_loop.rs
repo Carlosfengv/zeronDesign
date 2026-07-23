@@ -10,7 +10,8 @@ use crate::{
     design_profile::render_design_profile_markdown,
     model_gateway::{
         ModelClient, ModelGatewayRequestError, ModelGatewayScope, ModelRequest, ModelResponse,
-        ModelTokenUsage, ToolCall, ToolInputParseFailure, ToolInputTooLargeFailure,
+        ModelTokenUsage, ModelToolDefinition, ToolCall, ToolInputParseFailure,
+        ToolInputTooLargeFailure,
     },
     tools::{
         self,
@@ -21,7 +22,8 @@ use crate::{
         canonical_json_hash, sha256_hex, AgentCheckpoint, AgentEvent, AgentPhase, AgentRun,
         AgentRunStatus, Brief, CheckpointConversationRange, DesignProfile, DesignSourceIndex,
         DesignSourceIndexSection, ObservationOutcome, ObservationPurpose, ObservationReceipt,
-        ObservationView, OBSERVATION_RECEIPT_SCHEMA,
+        ObservationView, RunBudgetProfile, RunOperationBudgetLimits, RunTokenBudgetLimits,
+        OBSERVATION_RECEIPT_SCHEMA, TOOL_SET_HASH_VERSION,
     },
     visual_contracts::{DraftPreviewSessionStatus, EditBase},
 };
@@ -32,6 +34,8 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -45,17 +49,122 @@ const BOOTSTRAP_DIRECT_WRITE_TEXT_CHARS: usize = 48_000;
 const BOOTSTRAP_CHUNK_TEXT_CHARS: usize = 7_000;
 const COMPACT_MESSAGE_THRESHOLD: usize = 32;
 const COMPACT_KEEP_RECENT: usize = 16;
+const COMPACT_CONVERSATION_TOKEN_THRESHOLD: u64 = 8_000;
+const COMPACT_LARGEST_MESSAGE_TOKEN_THRESHOLD: u64 = 4_000;
+const COMPACT_NEXT_REQUEST_TOKEN_THRESHOLD: u64 = 14_000;
+const COMPACT_CONVERSATION_BYTE_THRESHOLD: u64 = 32 * 1024;
+const COMPACT_LARGEST_MESSAGE_BYTE_THRESHOLD: u64 = 16 * 1024;
+const MICROCOMPACT_EXCHANGE_TOKEN_THRESHOLD: u64 = 2_000;
 const COMPACT_SOURCE_RESTORE_MAX_FILES: usize = 5;
 const COMPACT_SOURCE_RESTORE_MAX_FILE_TOKENS: u64 = 4_000;
-const COMPACT_SOURCE_RESTORE_MAX_TOTAL_TOKENS: u64 = 16_000;
+const COMPACT_SOURCE_RESTORE_BUILD_TOKENS: u64 = 8_000;
+const COMPACT_SOURCE_RESTORE_EDIT_REPAIR_TOKENS: u64 = 4_000;
 const MAX_PROGRESS_OBSERVATIONS: usize = 24;
+const DEFAULT_WORKFLOW_DRIVER_MAX_ACTIONS: u32 = 8;
+const DEFAULT_WORKFLOW_DRIVER_WAIT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WORKFLOW_DRIVER_POLL_INTERVAL_MS: u64 = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenBudgetMode {
+    Legacy,
+    SplitShadow,
+    SplitEnforced,
+}
+
+impl TokenBudgetMode {
+    fn from_env() -> Self {
+        match env::var("RUNTIME_AGENT_TOKEN_BUDGET_MODE")
+            .unwrap_or_else(|_| "legacy".to_string())
+            .trim()
+        {
+            "split_shadow" => Self::SplitShadow,
+            "split_enforced" => Self::SplitEnforced,
+            _ => Self::Legacy,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::SplitShadow => "split_shadow",
+            Self::SplitEnforced => "split_enforced",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeWorkflowDriverMode {
+    Off,
+    Shadow,
+    Enforced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationBudgetMode {
+    Shadow,
+    Enforced,
+}
+
+impl OperationBudgetMode {
+    fn from_env() -> Self {
+        match env::var("RUNTIME_AGENT_OPERATION_BUDGET_MODE")
+            .unwrap_or_else(|_| "shadow".to_string())
+            .trim()
+        {
+            "enforced" => Self::Enforced,
+            _ => Self::Shadow,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Enforced => "enforced",
+        }
+    }
+}
+
+impl RuntimeWorkflowDriverMode {
+    fn from_env() -> Self {
+        match env::var("RUNTIME_AGENT_WORKFLOW_DRIVER_MODE")
+            .unwrap_or_else(|_| "off".to_string())
+            .trim()
+        {
+            "shadow" => Self::Shadow,
+            "enforced" => Self::Enforced,
+            _ => Self::Off,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforced => "enforced",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLoopLimits {
+    pub token_budget_mode: TokenBudgetMode,
+    pub operation_budget_mode: OperationBudgetMode,
+    pub workflow_driver_mode: RuntimeWorkflowDriverMode,
+    pub workflow_driver_max_actions: u32,
+    pub workflow_driver_wait_timeout: Duration,
+    pub workflow_driver_poll_interval: Duration,
     pub max_turns: u32,
     pub max_tool_calls: u32,
     pub max_input_tokens: u64,
+    pub max_gross_input_tokens: u64,
+    pub max_uncached_input_tokens: u64,
+    pub max_turn_prompt_tokens: u64,
     pub max_output_tokens: u64,
+    pub max_operation_gross_input_tokens: u64,
+    pub max_operation_uncached_input_tokens: u64,
+    pub max_operation_output_tokens: u64,
+    pub max_operation_turns: u32,
+    pub max_operation_tool_calls: u32,
     pub max_consecutive_protocol_errors: u32,
     pub total_timeout: Duration,
     pub idle_timeout: Duration,
@@ -69,10 +178,28 @@ pub struct AgentLoopLimits {
 impl Default for AgentLoopLimits {
     fn default() -> Self {
         Self {
+            token_budget_mode: TokenBudgetMode::Legacy,
+            operation_budget_mode: OperationBudgetMode::Shadow,
+            workflow_driver_mode: RuntimeWorkflowDriverMode::Off,
+            workflow_driver_max_actions: DEFAULT_WORKFLOW_DRIVER_MAX_ACTIONS,
+            workflow_driver_wait_timeout: Duration::from_millis(
+                DEFAULT_WORKFLOW_DRIVER_WAIT_TIMEOUT_MS,
+            ),
+            workflow_driver_poll_interval: Duration::from_millis(
+                DEFAULT_WORKFLOW_DRIVER_POLL_INTERVAL_MS,
+            ),
             max_turns: 20,
             max_tool_calls: 60,
             max_input_tokens: 200_000,
+            max_gross_input_tokens: 300_000,
+            max_uncached_input_tokens: 180_000,
+            max_turn_prompt_tokens: 64_000,
             max_output_tokens: 40_000,
+            max_operation_gross_input_tokens: 450_000,
+            max_operation_uncached_input_tokens: 270_000,
+            max_operation_output_tokens: 80_000,
+            max_operation_turns: 30,
+            max_operation_tool_calls: 100,
             max_consecutive_protocol_errors: 3,
             total_timeout: Duration::from_secs(30 * 60),
             idle_timeout: Duration::from_secs(5 * 60),
@@ -89,6 +216,21 @@ impl AgentLoopLimits {
     fn from_env() -> Self {
         let defaults = Self::default();
         Self {
+            token_budget_mode: TokenBudgetMode::from_env(),
+            operation_budget_mode: OperationBudgetMode::from_env(),
+            workflow_driver_mode: RuntimeWorkflowDriverMode::from_env(),
+            workflow_driver_max_actions: positive_u32_env(
+                "RUNTIME_AGENT_WORKFLOW_DRIVER_MAX_ACTIONS",
+                defaults.workflow_driver_max_actions,
+            ),
+            workflow_driver_wait_timeout: Duration::from_millis(positive_u64_env(
+                "RUNTIME_AGENT_WORKFLOW_DRIVER_WAIT_TIMEOUT_MS",
+                defaults.workflow_driver_wait_timeout.as_millis() as u64,
+            )),
+            workflow_driver_poll_interval: Duration::from_millis(positive_u64_env(
+                "RUNTIME_AGENT_WORKFLOW_DRIVER_POLL_INTERVAL_MS",
+                defaults.workflow_driver_poll_interval.as_millis() as u64,
+            )),
             max_turns: positive_u32_env("RUNTIME_AGENT_MAX_TURNS", defaults.max_turns),
             max_tool_calls: positive_u32_env(
                 "RUNTIME_AGENT_MAX_TOOL_CALLS",
@@ -98,9 +240,41 @@ impl AgentLoopLimits {
                 "RUNTIME_AGENT_MAX_INPUT_TOKENS",
                 defaults.max_input_tokens,
             ),
+            max_gross_input_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_GROSS_INPUT_TOKENS",
+                defaults.max_gross_input_tokens,
+            ),
+            max_uncached_input_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_UNCACHED_INPUT_TOKENS",
+                defaults.max_uncached_input_tokens,
+            ),
+            max_turn_prompt_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_PROMPT_TOKENS_PER_TURN",
+                defaults.max_turn_prompt_tokens,
+            ),
             max_output_tokens: positive_u64_env(
                 "RUNTIME_AGENT_MAX_OUTPUT_TOKENS",
                 defaults.max_output_tokens,
+            ),
+            max_operation_gross_input_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_OPERATION_GROSS_INPUT_TOKENS",
+                defaults.max_operation_gross_input_tokens,
+            ),
+            max_operation_uncached_input_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_OPERATION_UNCACHED_INPUT_TOKENS",
+                defaults.max_operation_uncached_input_tokens,
+            ),
+            max_operation_output_tokens: positive_u64_env(
+                "RUNTIME_AGENT_MAX_OPERATION_OUTPUT_TOKENS",
+                defaults.max_operation_output_tokens,
+            ),
+            max_operation_turns: positive_u32_env(
+                "RUNTIME_AGENT_MAX_OPERATION_TURNS",
+                defaults.max_operation_turns,
+            ),
+            max_operation_tool_calls: positive_u32_env(
+                "RUNTIME_AGENT_MAX_OPERATION_TOOL_CALLS",
+                defaults.max_operation_tool_calls,
             ),
             max_consecutive_protocol_errors: positive_u32_env(
                 "RUNTIME_AGENT_MAX_CONSECUTIVE_PROTOCOL_ERRORS",
@@ -136,6 +310,153 @@ impl AgentLoopLimits {
             ),
         }
     }
+
+    fn apply_run_budget_profile(mut self, profile: &RunBudgetProfile) -> Result<Self> {
+        profile
+            .validate(profile.phase)
+            .map_err(anyhow::Error::msg)?;
+        let limits = if profile.rollout_mode == "enforced" {
+            &profile.phase_target_limits
+        } else {
+            &profile.enforced_limits
+        };
+        self.token_budget_mode = if profile.rollout_mode == "enforced" {
+            TokenBudgetMode::SplitEnforced
+        } else {
+            match profile.token_budget_mode.as_str() {
+                "split_shadow" => TokenBudgetMode::SplitShadow,
+                "split_enforced" => TokenBudgetMode::SplitEnforced,
+                _ => TokenBudgetMode::Legacy,
+            }
+        };
+        self.operation_budget_mode = match profile.operation_budget_mode.as_str() {
+            "enforced" => OperationBudgetMode::Enforced,
+            _ => OperationBudgetMode::Shadow,
+        };
+        self.max_turns = limits.max_turns;
+        self.max_tool_calls = limits.max_tool_calls;
+        self.max_input_tokens = limits.max_input_tokens;
+        self.max_gross_input_tokens = limits.max_gross_input_tokens;
+        self.max_uncached_input_tokens = limits.max_uncached_input_tokens;
+        self.max_turn_prompt_tokens = limits.max_prompt_tokens_per_turn;
+        self.max_output_tokens = limits.max_output_tokens;
+        self.max_operation_gross_input_tokens = profile.operation_limits.max_gross_input_tokens;
+        self.max_operation_uncached_input_tokens =
+            profile.operation_limits.max_uncached_input_tokens;
+        self.max_operation_output_tokens = profile.operation_limits.max_output_tokens;
+        self.max_operation_turns = profile.operation_limits.max_turns;
+        self.max_operation_tool_calls = profile.operation_limits.max_tool_calls;
+        Ok(self)
+    }
+}
+
+pub(crate) fn phase_budget_profile_from_env(phase: AgentPhase) -> RunBudgetProfile {
+    let limits = AgentLoopLimits::from_env();
+    let enforced_limits = RunTokenBudgetLimits {
+        max_turns: limits.max_turns,
+        max_tool_calls: limits.max_tool_calls,
+        max_input_tokens: limits.max_input_tokens,
+        max_gross_input_tokens: limits.max_gross_input_tokens,
+        max_uncached_input_tokens: limits.max_uncached_input_tokens,
+        max_prompt_tokens_per_turn: limits.max_turn_prompt_tokens,
+        max_output_tokens: limits.max_output_tokens,
+    };
+    let mut phase_target_limits = enforced_limits.clone();
+    match phase {
+        AgentPhase::Brief => {
+            phase_target_limits.max_turns =
+                positive_u32_env("RUNTIME_AGENT_PHASE_BRIEF_MAX_TURNS", 6);
+            phase_target_limits.max_gross_input_tokens =
+                positive_u64_env("RUNTIME_AGENT_PHASE_BRIEF_MAX_GROSS_INPUT_TOKENS", 80_000);
+            phase_target_limits.max_input_tokens = phase_target_limits.max_gross_input_tokens;
+            phase_target_limits.max_uncached_input_tokens = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_BRIEF_MAX_UNCACHED_INPUT_TOKENS",
+                40_000,
+            );
+            phase_target_limits.max_prompt_tokens_per_turn = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_BRIEF_MAX_PROMPT_TOKENS_PER_TURN",
+                24_000,
+            );
+        }
+        AgentPhase::Build => {
+            phase_target_limits.max_turns =
+                positive_u32_env("RUNTIME_AGENT_PHASE_BUILD_MAX_TURNS", 16);
+            phase_target_limits.max_gross_input_tokens =
+                positive_u64_env("RUNTIME_AGENT_PHASE_BUILD_MAX_GROSS_INPUT_TOKENS", 300_000);
+            phase_target_limits.max_input_tokens = phase_target_limits.max_gross_input_tokens;
+            phase_target_limits.max_uncached_input_tokens = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_BUILD_MAX_UNCACHED_INPUT_TOKENS",
+                180_000,
+            );
+            phase_target_limits.max_prompt_tokens_per_turn = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_BUILD_MAX_PROMPT_TOKENS_PER_TURN",
+                64_000,
+            );
+        }
+        AgentPhase::Edit => {
+            phase_target_limits.max_turns =
+                positive_u32_env("RUNTIME_AGENT_PHASE_EDIT_MAX_TURNS", 12);
+            phase_target_limits.max_gross_input_tokens =
+                positive_u64_env("RUNTIME_AGENT_PHASE_EDIT_MAX_GROSS_INPUT_TOKENS", 220_000);
+            phase_target_limits.max_input_tokens = phase_target_limits.max_gross_input_tokens;
+            phase_target_limits.max_uncached_input_tokens = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_EDIT_MAX_UNCACHED_INPUT_TOKENS",
+                120_000,
+            );
+            phase_target_limits.max_prompt_tokens_per_turn = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_EDIT_MAX_PROMPT_TOKENS_PER_TURN",
+                48_000,
+            );
+        }
+        AgentPhase::Repair => {
+            phase_target_limits.max_turns =
+                positive_u32_env("RUNTIME_AGENT_PHASE_REPAIR_MAX_TURNS", 10);
+            phase_target_limits.max_gross_input_tokens =
+                positive_u64_env("RUNTIME_AGENT_PHASE_REPAIR_MAX_GROSS_INPUT_TOKENS", 180_000);
+            phase_target_limits.max_input_tokens = phase_target_limits.max_gross_input_tokens;
+            phase_target_limits.max_uncached_input_tokens = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_REPAIR_MAX_UNCACHED_INPUT_TOKENS",
+                100_000,
+            );
+            phase_target_limits.max_prompt_tokens_per_turn = positive_u64_env(
+                "RUNTIME_AGENT_PHASE_REPAIR_MAX_PROMPT_TOKENS_PER_TURN",
+                48_000,
+            );
+        }
+        AgentPhase::Review | AgentPhase::Export => {}
+    }
+    let rollout_mode = match env::var("RUNTIME_AGENT_PHASE_BUDGET_MODE")
+        .unwrap_or_else(|_| "shadow".to_string())
+        .trim()
+    {
+        "off" => "off",
+        "enforced" | "enforce" => "enforced",
+        _ => "shadow",
+    };
+    let phase_name = serde_json::to_value(phase)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut profile = RunBudgetProfile {
+        schema_version: "run-budget-profile@1".to_string(),
+        profile_id: format!("phase-budget-v1-{phase_name}"),
+        phase,
+        rollout_mode: rollout_mode.to_string(),
+        token_budget_mode: limits.token_budget_mode.as_str().to_string(),
+        operation_budget_mode: limits.operation_budget_mode.as_str().to_string(),
+        enforced_limits,
+        phase_target_limits,
+        operation_limits: RunOperationBudgetLimits {
+            max_gross_input_tokens: limits.max_operation_gross_input_tokens,
+            max_uncached_input_tokens: limits.max_operation_uncached_input_tokens,
+            max_output_tokens: limits.max_operation_output_tokens,
+            max_turns: limits.max_operation_turns,
+            max_tool_calls: limits.max_operation_tool_calls,
+        },
+        profile_hash: String::new(),
+    };
+    profile.profile_hash = profile.identity_hash();
+    profile
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -150,7 +471,15 @@ struct ObservationBudgetUsage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RunTokenUsage {
     input_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OperationBudgetUsage {
+    tokens: RunTokenUsage,
+    model_turns: u32,
+    tool_calls: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +495,32 @@ struct RunProgressState {
     target_session_epoch: Option<u64>,
     target_workspace_revision: Option<u64>,
     durable_snapshot_id: Option<String>,
+    substantive_progress: BTreeSet<String>,
+    workflow_driver_blocker: Option<WorkflowDriverBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowDriverBlocker {
+    action: String,
+    error_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeWorkflowDriverOutcome {
+    completion: Option<(AgentRunStatus, String)>,
+    action_count: u32,
+    stopped_reason: Option<String>,
+}
+
+impl RuntimeWorkflowDriverOutcome {
+    fn idle() -> Self {
+        Self {
+            completion: None,
+            action_count: 0,
+            stopped_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,16 +532,80 @@ enum FumadocsRepairToolStage {
 
 impl RunProgressState {
     fn fingerprint(&self) -> String {
+        canonical_json_hash(&json!({
+            "schemaVersion": "substantive-progress-ledger@1",
+            "entries": self.substantive_progress,
+        }))
+    }
+
+    fn legacy_fingerprint(&self) -> String {
+        let mut legacy = self.clone();
+        legacy.substantive_progress.clear();
+        let mut value = serde_json::to_value(legacy)
+            .expect("legacy run progress state must serialize deterministically");
+        if let Some(object) = value.as_object_mut() {
+            object.remove("substantiveProgress");
+        }
         sha256_hex(
-            &serde_json::to_vec(self).expect("run progress state must serialize deterministically"),
+            &serde_json::to_vec(&value)
+                .expect("legacy run progress state must serialize deterministically"),
         )
     }
+
+    fn seed_substantive_progress(&mut self) {
+        for (target, digest) in &self.source_mutations {
+            self.substantive_progress
+                .insert(format!("source-mutation:{target}:{digest}"));
+        }
+        if let Some(digest) = &self.source_digest {
+            self.substantive_progress
+                .insert(format!("source-digest:{digest}"));
+        }
+        if let Some(digest) = &self.candidate_digest {
+            self.substantive_progress
+                .insert(format!("candidate-digest:{digest}"));
+        }
+        for digest in &self.rejected_candidate_digests {
+            self.substantive_progress
+                .insert(format!("rejected-candidate:{digest}"));
+        }
+        if let Some(snapshot_id) = &self.durable_snapshot_id {
+            self.substantive_progress
+                .insert(format!("durable-snapshot:{snapshot_id}"));
+        }
+        for milestone in self.completed_steps.iter().filter(|step| {
+            matches!(
+                step.as_str(),
+                "brief.write_draft"
+                    | "project.init"
+                    | "source_authored"
+                    | "project.build"
+                    | "draft.snapshot_create"
+                    | "draft_ready"
+                    | "preview.publish"
+                    | "candidate_ready"
+                    | "run.complete"
+                    | "run_completed"
+            )
+        }) {
+            self.substantive_progress
+                .insert(format!("milestone:{milestone}"));
+        }
+    }
+}
+
+pub(crate) fn progress_ledger_fingerprint(evidence: &Value) -> Option<String> {
+    let state = serde_json::from_value::<RunProgressState>(evidence.get("state")?.clone()).ok()?;
+    Some(state.fingerprint())
 }
 
 impl RunTokenUsage {
     fn add(self, usage: ModelTokenUsage) -> Self {
         Self {
             input_tokens: self.input_tokens.saturating_add(usage.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_add(usage.cached_input_tokens.min(usage.input_tokens)),
             output_tokens: self.output_tokens.saturating_add(usage.output_tokens),
         }
     }
@@ -198,11 +617,19 @@ impl RunTokenUsage {
                 .input_tokens
                 .saturating_sub(previous.input_tokens)
                 .saturating_add(usage.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(previous.cached_input_tokens.min(previous.input_tokens))
+                .saturating_add(usage.cached_input_tokens.min(usage.input_tokens)),
             output_tokens: self
                 .output_tokens
                 .saturating_sub(previous.output_tokens)
                 .saturating_add(usage.output_tokens),
         }
+    }
+
+    fn uncached_input_tokens(self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
     }
 }
 
@@ -223,6 +650,7 @@ pub struct AgentLoop {
     post_tool_failure_hook: PostToolUseFailureHook,
     post_tool_success_hook: PostToolUseSuccessHook,
     limits: AgentLoopLimits,
+    run_budget_profile: Option<RunBudgetProfile>,
     generation_context_enabled: bool,
     observation_receipts_enabled: bool,
 }
@@ -236,6 +664,7 @@ impl AgentLoop {
             post_tool_failure_hook: PostToolUseFailureHook::default(),
             post_tool_success_hook: PostToolUseSuccessHook,
             limits: AgentLoopLimits::from_env(),
+            run_budget_profile: None,
             generation_context_enabled: false,
             observation_receipts_enabled: false,
         }
@@ -253,6 +682,7 @@ impl AgentLoop {
             post_tool_failure_hook: PostToolUseFailureHook::default(),
             post_tool_success_hook: PostToolUseSuccessHook,
             limits: AgentLoopLimits::from_env(),
+            run_budget_profile: None,
             generation_context_enabled: false,
             observation_receipts_enabled: false,
         }
@@ -263,6 +693,14 @@ impl AgentLoop {
         self
     }
 
+    pub fn with_run_budget_profile(mut self, profile: Option<RunBudgetProfile>) -> Result<Self> {
+        if let Some(profile) = profile {
+            self.limits = self.limits.apply_run_budget_profile(&profile)?;
+            self.run_budget_profile = Some(profile);
+        }
+        Ok(self)
+    }
+
     pub fn with_generation_context_enabled(mut self, enabled: bool) -> Self {
         self.generation_context_enabled = enabled;
         self
@@ -271,6 +709,104 @@ impl AgentLoop {
     pub fn with_observation_receipts_enabled(mut self, enabled: bool) -> Self {
         self.observation_receipts_enabled = enabled;
         self
+    }
+
+    async fn prior_operation_budget_usage(&self, current: &AgentRun) -> OperationBudgetUsage {
+        let Some(operation_id) = current.operation_id.as_deref() else {
+            return OperationBudgetUsage::default();
+        };
+        let Ok(runs) = self.store.project_runs(&current.project_id).await else {
+            return OperationBudgetUsage::default();
+        };
+        let mut usage = OperationBudgetUsage::default();
+        for run in runs
+            .into_iter()
+            .filter(|run| run.id != current.id && run.operation_id.as_deref() == Some(operation_id))
+        {
+            let events = self.store.events(&run.id).await;
+            let usage_by_turn = recovered_model_usage_by_turn(&events);
+            usage.tokens = usage_by_turn
+                .values()
+                .copied()
+                .fold(usage.tokens, RunTokenUsage::add);
+            usage.model_turns = usage
+                .model_turns
+                .saturating_add(u32::try_from(usage_by_turn.len()).unwrap_or(u32::MAX));
+            usage.tool_calls = usage.tool_calls.saturating_add(
+                u32::try_from(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                AgentEvent::ToolStarted { tool_use_id, .. }
+                                    if !tool_use_id.starts_with("bootstrap:")
+                            )
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX),
+            );
+        }
+        usage
+    }
+
+    async fn record_phase_budget_shadow(
+        &self,
+        run_id: &str,
+        turn: u32,
+        usage: RunTokenUsage,
+        tool_calls_used: u32,
+    ) {
+        let Some(profile) = self
+            .run_budget_profile
+            .as_ref()
+            .filter(|profile| profile.rollout_mode == "shadow")
+        else {
+            return;
+        };
+        let limits = &profile.phase_target_limits;
+        for (kind, used, limit) in [
+            (
+                "phase_gross_input",
+                usage.input_tokens,
+                limits.max_gross_input_tokens,
+            ),
+            (
+                "phase_uncached_input",
+                usage.uncached_input_tokens(),
+                limits.max_uncached_input_tokens,
+            ),
+            (
+                "phase_output",
+                usage.output_tokens,
+                limits.max_output_tokens,
+            ),
+            ("phase_turns", u64::from(turn), u64::from(limits.max_turns)),
+            (
+                "phase_tool_calls",
+                u64::from(tool_calls_used),
+                u64::from(limits.max_tool_calls),
+            ),
+        ] {
+            let _ = self
+                .store
+                .append_event(AgentEvent::TokenBudgetDecision {
+                    run_id: run_id.to_string(),
+                    turn,
+                    mode: "phase_shadow".to_string(),
+                    budget_kind: kind.to_string(),
+                    used,
+                    limit,
+                    exhausted: used > limit,
+                    enforced: false,
+                    gross_input_tokens: usage.input_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    uncached_input_tokens: usage.uncached_input_tokens(),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
     }
 
     pub async fn run(&self, run_id: &str) -> Result<Vec<ToolResultMessage>> {
@@ -333,6 +869,40 @@ impl AgentLoop {
                 timestamp: Utc::now(),
             })
             .await;
+        if let Some(profile) = self.run_budget_profile.as_ref() {
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "run.budget_profile_bound".to_string(),
+                    value: 1,
+                    metadata: Some(json!({
+                        "profileId": profile.profile_id,
+                        "profileHash": profile.profile_hash,
+                        "schemaVersion": profile.schema_version,
+                        "rolloutMode": profile.rollout_mode,
+                        "tokenBudgetMode": profile.token_budget_mode,
+                        "operationBudgetMode": profile.operation_budget_mode,
+                        "phaseTargetLimits": profile.phase_target_limits,
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        } else {
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "run.budget_profile_missing".to_string(),
+                    value: 1,
+                    metadata: Some(json!({
+                        "reason": "legacy_run_without_frozen_profile",
+                        "fallback": "session_start_limits",
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
         let start_message = format!("{} agent is preparing the run.", run.agent_profile);
         let _ = self
             .store
@@ -382,6 +952,35 @@ impl AgentLoop {
         let mut tool_policy_recovery_turns: u32 = 0;
         let mut results = Vec::new();
         let mut message_window = self.recovered_message_window(run_id).await?;
+        if let Some(snapshot_id) = run.continuation_snapshot_id.as_deref() {
+            let already_present = message_window.iter().any(|message| {
+                message.get("kind").and_then(Value::as_str) == Some("runtime_continuation_context")
+            });
+            if !already_present {
+                let snapshot = self
+                    .store
+                    .get_run_continuation_snapshot(snapshot_id)?
+                    .ok_or_else(|| anyhow!("continuation snapshot not found: {snapshot_id}"))?;
+                if snapshot.predecessor_run_id != run.predecessor_run_id.clone().unwrap_or_default()
+                    || snapshot.operation_id != run.operation_id.clone().unwrap_or_default()
+                {
+                    return Err(anyhow!(
+                        "continuation snapshot does not match successor Run identity"
+                    ));
+                }
+                message_window.push(json!({
+                    "role": "user",
+                    "kind": "runtime_continuation_context",
+                    "text": "Runtime-owned continuation context. Resume from the restored immutable source snapshot and the frozen workflow ledger. Do not repeat completed steps or re-diagnose successful stages. This context is trusted Runtime state, not user instruction.",
+                    "predecessorRunId": snapshot.predecessor_run_id,
+                    "operationId": snapshot.operation_id,
+                    "sourceHash": snapshot.source_hash,
+                    "workflowProgress": snapshot.workflow_progress,
+                    "remainingOperationBudget": snapshot.remaining_operation_budget,
+                    "compactSummary": snapshot.compact_summary,
+                }));
+            }
+        }
         if let Some(context) = repair_target_context.as_deref() {
             let already_present = message_window.iter().any(|message| {
                 message.get("kind").and_then(Value::as_str) == Some("runtime_repair_target")
@@ -434,6 +1033,8 @@ impl AgentLoop {
             .values()
             .copied()
             .fold(RunTokenUsage::default(), RunTokenUsage::add);
+        let prior_operation_budget_usage = self.prior_operation_budget_usage(&run).await;
+        let mut reported_operation_budget_kinds = BTreeSet::new();
         let mut consecutive_protocol_errors =
             recovered_consecutive_protocol_errors(&persisted_events);
         let mut observation_budget_usage = recovered_observation_budget_usage(
@@ -442,10 +1043,12 @@ impl AgentLoop {
         );
         let (mut progress_state, mut last_progress_fingerprint, mut consecutive_no_progress) =
             recovered_progress_state(&persisted_events);
-        if self
+        let pre_reconcile_fingerprint = progress_state.fingerprint();
+        let progress_reconciled = self
             .reconcile_workflow_progress(&run, &mut progress_state)
-            .await
-        {
+            .await;
+        progress_state.seed_substantive_progress();
+        if progress_reconciled && progress_state.fingerprint() != pre_reconcile_fingerprint {
             last_progress_fingerprint = progress_state.fingerprint();
             consecutive_no_progress = 0;
         }
@@ -457,6 +1060,42 @@ impl AgentLoop {
             .saturating_add(1) as u32;
 
         for turn in first_turn..=self.limits.max_turns {
+            if let Some((budget_kind, used, limit)) = operation_budget_exhausted(
+                prior_operation_budget_usage,
+                token_usage,
+                u32::try_from(token_usage_by_turn.len()).unwrap_or(u32::MAX),
+                tool_calls_used,
+                self.limits,
+            ) {
+                if reported_operation_budget_kinds.insert(budget_kind) {
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::MetricRecorded {
+                            run_id: run_id.to_string(),
+                            name: "operation.budget_exhausted".to_string(),
+                            value: used,
+                            metadata: Some(json!({
+                                "operationId": run.operation_id,
+                                "attempt": run.operation_attempt.max(1),
+                                "mode": self.limits.operation_budget_mode.as_str(),
+                                "budgetKind": budget_kind,
+                                "used": used,
+                                "limit": limit,
+                                "enforced": self.limits.operation_budget_mode == OperationBudgetMode::Enforced,
+                            })),
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                }
+                if self.limits.operation_budget_mode == OperationBudgetMode::Enforced {
+                    let reason = format!(
+                        "Operation budget exhausted: budgetKind={budget_kind}, used={used}, limit={limit}"
+                    );
+                    self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
+                        .await?;
+                    return Ok(results);
+                }
+            }
             if let Some(reason) = token_budget_exhausted_reason(token_usage, self.limits, false) {
                 self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
                     .await?;
@@ -516,6 +1155,47 @@ impl AgentLoop {
                 .get_run(run_id)
                 .await
                 .ok_or_else(|| anyhow!("run not found before model turn: {run_id}"))?;
+            let driver_outcome = self
+                .drive_runtime_workflow(
+                    &current_run,
+                    turn,
+                    &mut progress_state,
+                    &mut message_window,
+                    &mut last_progress_fingerprint,
+                    &mut consecutive_no_progress,
+                    observation_budget_usage,
+                )
+                .await;
+            if self.limits.workflow_driver_mode != RuntimeWorkflowDriverMode::Off
+                && workflow_driver_supports(&current_run)
+            {
+                self.save_turn_checkpoint(run_id, turn, &message_window)
+                    .await?;
+            }
+            if let Some((status, summary)) = driver_outcome.completion {
+                self.finalize(run_id, status, &summary, &message_window)
+                    .await?;
+                return Ok(results);
+            }
+            if let Some(status) = self
+                .store
+                .get_run(run_id)
+                .await
+                .map(|run| run.status)
+                .filter(|status| status.is_terminal())
+            {
+                self.finalize(
+                    run_id,
+                    status,
+                    &format!(
+                        "Runtime workflow stopped with status {}",
+                        status_string(status)
+                    ),
+                    &message_window,
+                )
+                .await?;
+                return Ok(results);
+            }
             if self.generation_context_enabled {
                 let (context_injected, visuals_injected) = inject_generation_context_message(
                     &current_run,
@@ -555,40 +1235,121 @@ impl AgentLoop {
                         .await?;
                 }
             }
-            let (tools, deferred_tools) = self
+            let (mut tools, mut deferred_tools) = self
                 .tool_executor
                 .model_tool_snapshot(self.store.clone(), run_id)
                 .await;
-            let mut system_prompt = system_prompt_for_run(
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            deferred_tools.sort_by(|left, right| left.name.cmp(&right.name));
+            let system_prompt = system_prompt_for_run(
                 &current_run,
                 repair_target_context.as_deref(),
                 self.generation_context_enabled,
             );
+            let static_prefix_hash = sha256_hex(system_prompt.as_bytes());
             if matches!(
                 current_run.phase,
                 AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
             ) {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&render_workflow_progress_context(
-                    &current_run,
-                    &progress_state,
-                    observation_budget_usage,
-                    self.limits,
-                    self.generation_context_enabled,
-                ));
+                upsert_ephemeral_context_message(
+                    &mut message_window,
+                    turn,
+                    "runtime_workflow_progress",
+                    render_workflow_progress_context(
+                        &current_run,
+                        &progress_state,
+                        observation_budget_usage,
+                        self.limits,
+                        self.generation_context_enabled,
+                    ),
+                );
             }
-            let model_request = ModelRequest {
-                run_id: run_id.to_string(),
-                turn,
-                model: current_run.model.clone(),
-                phase: current_run.phase,
-                agent_profile: current_run.agent_profile.clone(),
-                system_prompt,
-                messages: message_window.clone(),
-                tools,
-                deferred_tools,
-            };
+            let model_request = self
+                .prepare_model_request(
+                    run_id,
+                    turn,
+                    current_run.model.clone(),
+                    current_run.phase,
+                    current_run.agent_profile.clone(),
+                    system_prompt,
+                    &mut message_window,
+                    tools,
+                    deferred_tools,
+                )
+                .await?;
             let estimated_input_tokens = estimate_model_request_tokens(&model_request);
+            let composition = prompt_composition(&model_request, &static_prefix_hash);
+            let _ = self
+                .store
+                .append_event(AgentEvent::PromptComposition {
+                    run_id: run_id.to_string(),
+                    turn,
+                    estimated_input_tokens,
+                    system_tokens: composition.system_tokens,
+                    message_tokens: composition.message_tokens,
+                    tool_definition_tokens: composition.tool_definition_tokens,
+                    generation_context_tokens: composition.generation_context_tokens,
+                    static_prefix_hash: composition.static_prefix_hash,
+                    tool_set_hash_version: Some(TOOL_SET_HASH_VERSION.to_string()),
+                    tool_set_hash: composition.tool_set_hash,
+                    timestamp: Utc::now(),
+                })
+                .await;
+            if let Some(profile) = self
+                .run_budget_profile
+                .as_ref()
+                .filter(|profile| profile.rollout_mode == "shadow")
+            {
+                let limit = profile.phase_target_limits.max_prompt_tokens_per_turn;
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::TokenBudgetDecision {
+                        run_id: run_id.to_string(),
+                        turn,
+                        mode: "phase_shadow".to_string(),
+                        budget_kind: "phase_prompt_per_turn".to_string(),
+                        used: estimated_input_tokens,
+                        limit,
+                        exhausted: estimated_input_tokens > limit,
+                        enforced: false,
+                        gross_input_tokens: token_usage.input_tokens,
+                        cached_input_tokens: token_usage.cached_input_tokens,
+                        uncached_input_tokens: token_usage.uncached_input_tokens(),
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+            }
+            let turn_prompt_exhausted = estimated_input_tokens > self.limits.max_turn_prompt_tokens;
+            let turn_prompt_enforced =
+                self.limits.token_budget_mode == TokenBudgetMode::SplitEnforced;
+            let _ = self
+                .store
+                .append_event(AgentEvent::TokenBudgetDecision {
+                    run_id: run_id.to_string(),
+                    turn,
+                    mode: self.limits.token_budget_mode.as_str().to_string(),
+                    budget_kind: "turn_prompt".to_string(),
+                    used: estimated_input_tokens,
+                    limit: self.limits.max_turn_prompt_tokens,
+                    exhausted: turn_prompt_exhausted,
+                    enforced: turn_prompt_enforced,
+                    gross_input_tokens: token_usage.input_tokens,
+                    cached_input_tokens: token_usage.cached_input_tokens,
+                    uncached_input_tokens: token_usage.uncached_input_tokens(),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            if turn_prompt_exhausted && turn_prompt_enforced {
+                let reason = format!(
+                    "Run token budget exhausted: budgetKind=turn_prompt, used={estimated_input_tokens}, limit={}",
+                    self.limits.max_turn_prompt_tokens
+                );
+                self.save_turn_checkpoint(run_id, turn, &message_window)
+                    .await?;
+                self.finalize(run_id, AgentRunStatus::Partial, &reason, &message_window)
+                    .await?;
+                return Ok(results);
+            }
             let _ = self
                 .store
                 .append_event(AgentEvent::ModelTurnStarted {
@@ -631,6 +1392,19 @@ impl AgentLoop {
                     });
                 let previous_usage = token_usage_by_turn.insert(turn, usage);
                 token_usage = token_usage.replace(previous_usage, usage);
+                if usage.cached_input_tokens > usage.input_tokens {
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::TokenUsageContractViolation {
+                            run_id: run_id.to_string(),
+                            turn,
+                            input_tokens: usage.input_tokens,
+                            cached_input_tokens: usage.cached_input_tokens,
+                            normalized_cached_input_tokens: usage.input_tokens,
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                }
                 let _ = self
                     .store
                     .append_event(AgentEvent::ModelUsage {
@@ -642,6 +1416,27 @@ impl AgentLoop {
                         estimated,
                         timestamp: Utc::now(),
                     })
+                    .await;
+                for decision in token_budget_decisions(token_usage, self.limits, true) {
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::TokenBudgetDecision {
+                            run_id: run_id.to_string(),
+                            turn,
+                            mode: self.limits.token_budget_mode.as_str().to_string(),
+                            budget_kind: decision.kind.to_string(),
+                            used: decision.used,
+                            limit: decision.limit,
+                            exhausted: decision.exhausted,
+                            enforced: decision.enforced,
+                            gross_input_tokens: token_usage.input_tokens,
+                            cached_input_tokens: token_usage.cached_input_tokens,
+                            uncached_input_tokens: token_usage.uncached_input_tokens(),
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                }
+                self.record_phase_budget_shadow(run_id, turn, token_usage, tool_calls_used)
                     .await;
                 if let Some(kind) = model_protocol_error_kind(&turn_response.response) {
                     consecutive_protocol_errors = consecutive_protocol_errors.saturating_add(1);
@@ -688,6 +1483,23 @@ impl AgentLoop {
                         "Run tool-call budget exhausted: used={}, requested={}, limit={}",
                         tool_calls_used, incoming_tool_calls, self.limits.max_tool_calls
                     );
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::TokenBudgetDecision {
+                            run_id: run_id.to_string(),
+                            turn,
+                            mode: self.limits.token_budget_mode.as_str().to_string(),
+                            budget_kind: "tool_call".to_string(),
+                            used: u64::from(tool_calls_used.saturating_add(incoming_tool_calls)),
+                            limit: u64::from(self.limits.max_tool_calls),
+                            exhausted: true,
+                            enforced: true,
+                            gross_input_tokens: token_usage.input_tokens,
+                            cached_input_tokens: token_usage.cached_input_tokens,
+                            uncached_input_tokens: token_usage.uncached_input_tokens(),
+                            timestamp: Utc::now(),
+                        })
+                        .await;
                     let budget_results = self
                         .emit_missing_tool_results(run_id, &budget_calls, &reason)
                         .await;
@@ -782,7 +1594,8 @@ impl AgentLoop {
                         }));
                         self.save_turn_checkpoint(run_id, turn, &message_window)
                             .await?;
-                        self.compact_if_needed(run_id, &mut message_window).await?;
+                        self.compact_if_needed(run_id, &mut message_window, None)
+                            .await?;
                         continue;
                     }
                     empty_turns = 0;
@@ -903,8 +1716,37 @@ impl AgentLoop {
                             .await?;
                         return Ok(results);
                     }
+                    let workflow_run = self
+                        .store
+                        .get_run(run_id)
+                        .await
+                        .unwrap_or_else(|| current_run.clone());
+                    let driver_outcome = self
+                        .drive_runtime_workflow(
+                            &workflow_run,
+                            turn,
+                            &mut progress_state,
+                            &mut message_window,
+                            &mut last_progress_fingerprint,
+                            &mut consecutive_no_progress,
+                            observation_budget_usage,
+                        )
+                        .await;
+                    if self.limits.workflow_driver_mode != RuntimeWorkflowDriverMode::Off
+                        && workflow_driver_supports(&workflow_run)
+                    {
+                        self.save_turn_checkpoint(run_id, turn, &message_window)
+                            .await?;
+                    }
+                    if let Some((status, summary)) = driver_outcome.completion {
+                        results.extend(tool_results);
+                        self.finalize(run_id, status, &summary, &message_window)
+                            .await?;
+                        return Ok(results);
+                    }
                     results.extend(tool_results);
-                    self.compact_if_needed(run_id, &mut message_window).await?;
+                    self.compact_if_needed(run_id, &mut message_window, None)
+                        .await?;
                 }
                 Ok(ModelResponse::ToolInputParseFailed {
                     parsed_calls,
@@ -986,7 +1828,8 @@ impl AgentLoop {
                             .await?;
                         return Ok(results);
                     }
-                    self.compact_if_needed(run_id, &mut message_window).await?;
+                    self.compact_if_needed(run_id, &mut message_window, None)
+                        .await?;
                 }
                 Ok(ModelResponse::ToolInputTooLarge {
                     parsed_calls,
@@ -1070,7 +1913,8 @@ impl AgentLoop {
                             .await?;
                         return Ok(results);
                     }
-                    self.compact_if_needed(run_id, &mut message_window).await?;
+                    self.compact_if_needed(run_id, &mut message_window, None)
+                        .await?;
                 }
                 Ok(ModelResponse::ToolCallsThenError { calls, error }) => {
                     message_window.push(json!({
@@ -1164,7 +2008,8 @@ impl AgentLoop {
                         return Ok(results);
                     }
                     recoverable_error_state = None;
-                    self.compact_if_needed(run_id, &mut message_window).await?;
+                    self.compact_if_needed(run_id, &mut message_window, None)
+                        .await?;
                     continue;
                 }
                 Ok(ModelResponse::TextOnly(text)) => {
@@ -1228,7 +2073,8 @@ impl AgentLoop {
                         .await?;
                         break;
                     }
-                    self.compact_if_needed(run_id, &mut message_window).await?;
+                    self.compact_if_needed(run_id, &mut message_window, None)
+                        .await?;
                 }
                 Ok(ModelResponse::Error(error)) => {
                     message_window.push(json!({
@@ -1320,6 +2166,23 @@ impl AgentLoop {
             .await
             .ok_or_else(|| anyhow!("run not found after loop"))?;
         if !run.status.is_terminal() && run.status != AgentRunStatus::NeedsUserInput {
+            let _ = self
+                .store
+                .append_event(AgentEvent::TokenBudgetDecision {
+                    run_id: run_id.to_string(),
+                    turn: self.limits.max_turns,
+                    mode: self.limits.token_budget_mode.as_str().to_string(),
+                    budget_kind: "turn".to_string(),
+                    used: u64::from(self.limits.max_turns),
+                    limit: u64::from(self.limits.max_turns),
+                    exhausted: true,
+                    enforced: true,
+                    gross_input_tokens: token_usage.input_tokens,
+                    cached_input_tokens: token_usage.cached_input_tokens,
+                    uncached_input_tokens: token_usage.uncached_input_tokens(),
+                    timestamp: Utc::now(),
+                })
+                .await;
             self.finalize(
                 run_id,
                 AgentRunStatus::Partial,
@@ -2810,7 +3673,9 @@ impl AgentLoop {
             })
             .collect::<Vec<_>>();
         let evidence = json!({
+            "schemaVersion": "substantive-progress-ledger@1",
             "state": state,
+            "substantiveProgress": state.substantive_progress,
             "toolSequenceDigest": canonical_json_hash(&json!(tool_sequence)),
             "toolNames": calls.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
         });
@@ -2857,6 +3722,530 @@ impl AgentLoop {
                 *consecutive_no_progress, self.limits.max_no_progress_turns
             )
         })
+    }
+
+    async fn persist_runtime_workflow_progress(
+        &self,
+        run: &AgentRun,
+        turn: u32,
+        action: &str,
+        input: &Value,
+        state: &mut RunProgressState,
+        last_fingerprint: &mut String,
+        consecutive_no_progress: &mut u32,
+        observation_budget_usage: ObservationBudgetUsage,
+    ) {
+        state.seed_substantive_progress();
+        let fingerprint = state.fingerprint();
+        if fingerprint != *last_fingerprint {
+            *consecutive_no_progress = 0;
+        }
+        let evidence = json!({
+            "schemaVersion": "substantive-progress-ledger@1",
+            "origin": "runtime_workflow_driver",
+            "state": state,
+            "substantiveProgress": state.substantive_progress,
+            "toolSequenceDigest": canonical_json_hash(&json!([{
+                "name": action,
+                "inputDigest": canonical_json_hash(input),
+            }])),
+            "toolNames": [action],
+        });
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunProgressFingerprint {
+                run_id: run.id.clone(),
+                turn,
+                fingerprint: fingerprint.clone(),
+                consecutive_no_progress: *consecutive_no_progress,
+                evidence,
+                timestamp: Utc::now(),
+            })
+            .await;
+        let workflow = workflow_progress_snapshot(
+            run.phase,
+            run.project_state_snapshot
+                .as_ref()
+                .map(|project| project.template_key.as_str()),
+            state,
+            observation_budget_usage,
+            self.limits,
+            self.generation_context_enabled,
+        );
+        let workflow_stage = workflow.stage.clone();
+        let _ = self
+            .store
+            .append_event(AgentEvent::RunWorkflowProgress {
+                run_id: run.id.clone(),
+                turn,
+                stage: workflow.stage,
+                completed_steps: workflow.completed_steps,
+                next_action: workflow.next_action,
+                budgets: workflow.budgets,
+                timestamp: Utc::now(),
+            })
+            .await;
+        let _ = self
+            .store
+            .update_run_generation_runtime_progress(
+                &run.id,
+                Some(&workflow_stage),
+                None,
+                None,
+                None,
+            )
+            .await;
+        *last_fingerprint = fingerprint;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_runtime_workflow(
+        &self,
+        run: &AgentRun,
+        turn: u32,
+        state: &mut RunProgressState,
+        message_window: &mut Vec<Value>,
+        last_fingerprint: &mut String,
+        consecutive_no_progress: &mut u32,
+        observation_budget_usage: ObservationBudgetUsage,
+    ) -> RuntimeWorkflowDriverOutcome {
+        if self.limits.workflow_driver_mode == RuntimeWorkflowDriverMode::Off
+            || !workflow_driver_supports(run)
+        {
+            return RuntimeWorkflowDriverOutcome::idle();
+        }
+        if state.completed_steps.contains("run_completed") {
+            return RuntimeWorkflowDriverOutcome {
+                completion: Some((
+                    AgentRunStatus::Completed,
+                    "Runtime workflow recovered a previously completed Draft operation."
+                        .to_string(),
+                )),
+                action_count: 0,
+                stopped_reason: Some("recovered_completion".to_string()),
+            };
+        }
+
+        let driver_id_hash = canonical_json_hash(&json!({
+            "schemaVersion": "runtime-workflow-driver@1",
+            "runId": run.id,
+            "executionProfile": run.execution_profile,
+        }));
+        let driver_id = format!("workflow-driver-{}", &driver_id_hash[..16]);
+        let mut action_summaries = Vec::new();
+
+        for sequence in 1..=self.limits.workflow_driver_max_actions {
+            let workflow = workflow_progress_snapshot(
+                run.phase,
+                run.project_state_snapshot
+                    .as_ref()
+                    .map(|project| project.template_key.as_str()),
+                state,
+                observation_budget_usage,
+                self.limits,
+                self.generation_context_enabled,
+            );
+            let Some(action) = workflow
+                .next_action
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                break;
+            };
+            let Some(input) = workflow_driver_action_input(&action) else {
+                break;
+            };
+
+            if self.limits.workflow_driver_mode == RuntimeWorkflowDriverMode::Shadow {
+                let plan_hash = canonical_json_hash(&json!({
+                    "driverId": driver_id,
+                    "action": action,
+                    "input": input,
+                    "progressFingerprint": state.fingerprint(),
+                }));
+                let already_recorded = self.store.events(&run.id).await.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::MetricRecorded {
+                            name,
+                            metadata: Some(metadata),
+                            ..
+                        } if name == "workflow.driver.shadow_plan"
+                            && metadata.get("planHash").and_then(Value::as_str)
+                                == Some(plan_hash.as_str())
+                    )
+                });
+                if !already_recorded {
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::MetricRecorded {
+                            run_id: run.id.clone(),
+                            name: "workflow.driver.shadow_plan".to_string(),
+                            value: 1,
+                            metadata: Some(json!({
+                                "mode": self.limits.workflow_driver_mode.as_str(),
+                                "driverId": driver_id,
+                                "stage": workflow.stage,
+                                "action": action,
+                                "planHash": plan_hash,
+                            })),
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                }
+                return RuntimeWorkflowDriverOutcome {
+                    completion: None,
+                    action_count: 0,
+                    stopped_reason: Some("shadow_plan_recorded".to_string()),
+                };
+            }
+
+            let action_started = Instant::now();
+            let mut attempt = 1u32;
+            loop {
+                let idempotency_key = canonical_json_hash(&json!({
+                    "schemaVersion": "runtime-workflow-action@1",
+                    "driverId": driver_id,
+                    "action": action,
+                    "input": input,
+                    "progressFingerprint": state.fingerprint(),
+                    "sequence": sequence,
+                    "attempt": attempt,
+                }));
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::WorkflowLifecycleStarted {
+                        run_id: run.id.clone(),
+                        driver_id: driver_id.clone(),
+                        action: action.clone(),
+                        sequence,
+                        attempt,
+                        idempotency_key: idempotency_key.clone(),
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+
+                let call = ToolCall::new(idempotency_key.clone(), action.clone(), input.clone());
+                let streaming_result = StreamingToolExecutor::new(self.tool_executor.clone())
+                    .execute_calls(self.store.clone(), &run.id, vec![call.clone()])
+                    .await
+                    .into_iter()
+                    .next();
+                let result = match streaming_result {
+                    Some(result) => ToolResultMessage {
+                        tool_use_id: result.tool_use_id,
+                        tool_name: result.tool_name,
+                        is_error: result.result.is_error,
+                        content: result.result.content,
+                        metadata: result.result.metadata,
+                    },
+                    None => ToolResultMessage {
+                        tool_use_id: idempotency_key.clone(),
+                        tool_name: action.clone(),
+                        is_error: true,
+                        content: json!({ "error": "Runtime workflow action returned no result" }),
+                        metadata: Some(json!({
+                            "errorKind": "workflow.lifecycle_result_missing",
+                            "recoverable": true,
+                        })),
+                    },
+                };
+                let before_state = state.clone();
+                let error_kind = workflow_lifecycle_error_kind(&result);
+                let selected_fallback = result.is_error
+                    && action == "preview.dev_start"
+                    && error_kind == "preview.dev_unavailable"
+                    && run.phase == AgentPhase::Build;
+
+                if result.is_error && !selected_fallback {
+                    let recoverable = result
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("recoverable"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let diagnostic_ref = workflow_lifecycle_diagnostic_ref(&result);
+                    let source_snapshot_uri = result
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| find_string_field(metadata, "sourceSnapshotUri"))
+                        .or_else(|| find_string_field(&result.content, "sourceSnapshotUri"));
+                    let source_hash = result
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| find_string_field(metadata, "sourceFingerprint"))
+                        .or_else(|| find_string_field(&result.content, "sourceFingerprint"));
+                    update_progress_state(
+                        state,
+                        std::slice::from_ref(&call),
+                        std::slice::from_ref(&result),
+                    );
+                    if !state.completed_steps.contains("repair_required") {
+                        state.workflow_driver_blocker = Some(WorkflowDriverBlocker {
+                            action: action.clone(),
+                            error_kind: error_kind.clone(),
+                        });
+                    }
+                    let _ = self
+                        .store
+                        .append_event(AgentEvent::WorkflowLifecycleFailed {
+                            run_id: run.id.clone(),
+                            driver_id: driver_id.clone(),
+                            action: action.clone(),
+                            sequence,
+                            attempt,
+                            idempotency_key: idempotency_key.clone(),
+                            error_kind: error_kind.clone(),
+                            recoverable,
+                            diagnostic_ref: diagnostic_ref.clone(),
+                            source_snapshot_uri,
+                            source_hash,
+                            timestamp: Utc::now(),
+                        })
+                        .await;
+                    if *state != before_state {
+                        self.persist_runtime_workflow_progress(
+                            run,
+                            turn,
+                            &action,
+                            &input,
+                            state,
+                            last_fingerprint,
+                            consecutive_no_progress,
+                            observation_budget_usage,
+                        )
+                        .await;
+                    }
+                    upsert_ephemeral_context_message(
+                        message_window,
+                        turn,
+                        "runtime_workflow_result",
+                        serde_json::to_string(&json!({
+                            "schemaVersion": "runtime-workflow-result@1",
+                            "status": "failed",
+                            "driverId": driver_id,
+                            "action": action,
+                            "errorKind": error_kind,
+                            "recoverable": recoverable,
+                            "diagnosticRef": diagnostic_ref,
+                            "instruction": "The deterministic Runtime lifecycle stopped after its first failure. Repair only when the typed failure is source-owned; do not repeat completed lifecycle actions."
+                        }))
+                        .expect("workflow failure context must serialize"),
+                    );
+                    return RuntimeWorkflowDriverOutcome {
+                        completion: None,
+                        action_count: sequence.saturating_sub(1),
+                        stopped_reason: Some("action_failed".to_string()),
+                    };
+                }
+
+                update_progress_state(
+                    state,
+                    std::slice::from_ref(&call),
+                    std::slice::from_ref(&result),
+                );
+                let progress_evidence = workflow_lifecycle_progress_evidence(&result);
+                let outcome = if selected_fallback {
+                    "fallback_selected"
+                } else {
+                    "completed"
+                };
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::WorkflowLifecycleCompleted {
+                        run_id: run.id.clone(),
+                        driver_id: driver_id.clone(),
+                        action: action.clone(),
+                        sequence,
+                        attempt,
+                        idempotency_key: idempotency_key.clone(),
+                        outcome: outcome.to_string(),
+                        progress_evidence,
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+
+                if *state != before_state {
+                    self.persist_runtime_workflow_progress(
+                        run,
+                        turn,
+                        &action,
+                        &input,
+                        state,
+                        last_fingerprint,
+                        consecutive_no_progress,
+                        observation_budget_usage,
+                    )
+                    .await;
+                    action_summaries.push(json!({
+                        "action": action,
+                        "outcome": outcome,
+                        "attempt": attempt,
+                    }));
+                    if action == "run.complete" && !result.is_error {
+                        let status = status_from_value(&result.content);
+                        let summary = result
+                            .content
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or(
+                                "Runtime workflow completed the current validated Draft revision.",
+                            )
+                            .to_string();
+                        upsert_ephemeral_context_message(
+                            message_window,
+                            turn,
+                            "runtime_workflow_result",
+                            serde_json::to_string(&json!({
+                                "schemaVersion": "runtime-workflow-result@1",
+                                "status": "completed",
+                                "driverId": driver_id,
+                                "actions": action_summaries,
+                            }))
+                            .expect("workflow completion context must serialize"),
+                        );
+                        return RuntimeWorkflowDriverOutcome {
+                            completion: Some((status, summary)),
+                            action_count: sequence,
+                            stopped_reason: Some("completed".to_string()),
+                        };
+                    }
+                    break;
+                }
+
+                if action == "preview.dev_status"
+                    && action_started.elapsed() < self.limits.workflow_driver_wait_timeout
+                {
+                    attempt = attempt.saturating_add(1);
+                    time::sleep(self.limits.workflow_driver_poll_interval).await;
+                    continue;
+                }
+
+                let error_kind = if action == "preview.dev_status" {
+                    "workflow.preview_wait_timeout"
+                } else {
+                    "workflow.no_state_transition"
+                };
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::WorkflowLifecycleFailed {
+                        run_id: run.id.clone(),
+                        driver_id: driver_id.clone(),
+                        action: action.clone(),
+                        sequence,
+                        attempt,
+                        idempotency_key,
+                        error_kind: error_kind.to_string(),
+                        recoverable: true,
+                        diagnostic_ref: None,
+                        source_snapshot_uri: None,
+                        source_hash: None,
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+                upsert_ephemeral_context_message(
+                    message_window,
+                    turn,
+                    "runtime_workflow_result",
+                    serde_json::to_string(&json!({
+                        "schemaVersion": "runtime-workflow-result@1",
+                        "status": "failed",
+                        "driverId": driver_id,
+                        "action": action,
+                        "errorKind": error_kind,
+                        "instruction": "The Runtime lifecycle made no verified state transition and stopped without retrying a repair."
+                    }))
+                    .expect("workflow timeout context must serialize"),
+                );
+                return RuntimeWorkflowDriverOutcome {
+                    completion: None,
+                    action_count: sequence.saturating_sub(1),
+                    stopped_reason: Some(error_kind.to_string()),
+                };
+            }
+        }
+
+        let workflow = workflow_progress_snapshot(
+            run.phase,
+            run.project_state_snapshot
+                .as_ref()
+                .map(|project| project.template_key.as_str()),
+            state,
+            observation_budget_usage,
+            self.limits,
+            self.generation_context_enabled,
+        );
+        let next_runtime_action = workflow
+            .next_action
+            .get("tool")
+            .and_then(Value::as_str)
+            .filter(|action| workflow_driver_action_input(action).is_some());
+        let stopped_reason = if let Some(action) = next_runtime_action {
+            let error_kind = "workflow.action_budget_exhausted";
+            let idempotency_key = canonical_json_hash(&json!({
+                "schemaVersion": "runtime-workflow-action-budget@1",
+                "driverId": driver_id,
+                "action": action,
+                "limit": self.limits.workflow_driver_max_actions,
+                "progressFingerprint": state.fingerprint(),
+            }));
+            let _ = self
+                .store
+                .append_event(AgentEvent::WorkflowLifecycleFailed {
+                    run_id: run.id.clone(),
+                    driver_id: driver_id.clone(),
+                    action: action.to_string(),
+                    sequence: self.limits.workflow_driver_max_actions.saturating_add(1),
+                    attempt: 1,
+                    idempotency_key,
+                    error_kind: error_kind.to_string(),
+                    recoverable: true,
+                    diagnostic_ref: None,
+                    source_snapshot_uri: None,
+                    source_hash: None,
+                    timestamp: Utc::now(),
+                })
+                .await;
+            upsert_ephemeral_context_message(
+                message_window,
+                turn,
+                "runtime_workflow_result",
+                serde_json::to_string(&json!({
+                    "schemaVersion": "runtime-workflow-result@1",
+                    "status": "failed",
+                    "driverId": driver_id,
+                    "errorKind": error_kind,
+                    "actionLimit": self.limits.workflow_driver_max_actions,
+                    "instruction": "The bounded Runtime lifecycle stopped before another action; do not repeat completed actions."
+                }))
+                .expect("workflow action budget context must serialize"),
+            );
+            Some(error_kind.to_string())
+        } else if action_summaries.is_empty() {
+            Some("model_action_required".to_string())
+        } else {
+            upsert_ephemeral_context_message(
+                message_window,
+                turn,
+                "runtime_workflow_result",
+                serde_json::to_string(&json!({
+                    "schemaVersion": "runtime-workflow-result@1",
+                    "status": "paused",
+                    "driverId": driver_id,
+                    "actions": action_summaries,
+                    "nextAction": workflow.next_action,
+                }))
+                .expect("workflow pause context must serialize"),
+            );
+            Some("model_action_required".to_string())
+        };
+        let action_count = u32::try_from(action_summaries.len()).unwrap_or(u32::MAX);
+        RuntimeWorkflowDriverOutcome {
+            completion: None,
+            action_count,
+            stopped_reason,
+        }
     }
 
     async fn reconcile_workflow_progress(
@@ -3076,6 +4465,9 @@ impl AgentLoop {
         if run_before_finalize.as_ref().map(|run| run.status) != Some(status) {
             self.store.update_run_status(run_id, status).await?;
         }
+        if status == AgentRunStatus::Partial && continuation_partial_reason_allowed(summary) {
+            self.prepare_continuation_snapshot(run_id, summary).await;
+        }
         let completion_already_recorded = self
             .store
             .events(run_id)
@@ -3103,6 +4495,103 @@ impl AgentLoop {
             .await;
         }
         Ok(())
+    }
+
+    async fn prepare_continuation_snapshot(&self, run_id: &str, summary: &str) {
+        let events = self.store.events(run_id).await;
+        let Some((source_snapshot_uri, source_hash)) =
+            continuation_source_snapshot_evidence(&events)
+        else {
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "run.continuation_snapshot_rejected".to_string(),
+                    value: 1,
+                    metadata: Some(json!({ "reason": "source_snapshot_unavailable" })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            return;
+        };
+        let Some(run) = self.store.get_run(run_id).await else {
+            return;
+        };
+        let prior = self.prior_operation_budget_usage(&run).await;
+        let current_usage_by_turn = recovered_model_usage_by_turn(&events);
+        let current_tokens = current_usage_by_turn
+            .values()
+            .copied()
+            .fold(RunTokenUsage::default(), RunTokenUsage::add);
+        let current_tool_calls = u32::try_from(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::ToolStarted { tool_use_id, .. }
+                            if !tool_use_id.starts_with("bootstrap:")
+                    )
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let gross_input = prior
+            .tokens
+            .input_tokens
+            .saturating_add(current_tokens.input_tokens);
+        let uncached_input = prior
+            .tokens
+            .uncached_input_tokens()
+            .saturating_add(current_tokens.uncached_input_tokens());
+        let output = prior
+            .tokens
+            .output_tokens
+            .saturating_add(current_tokens.output_tokens);
+        let turns = prior
+            .model_turns
+            .saturating_add(u32::try_from(current_usage_by_turn.len()).unwrap_or(u32::MAX));
+        let tool_calls = prior.tool_calls.saturating_add(current_tool_calls);
+        let remaining_operation_budget = json!({
+            "schemaVersion": "remaining-operation-budget@1",
+            "grossInputTokens": self.limits.max_operation_gross_input_tokens.saturating_sub(gross_input),
+            "uncachedInputTokens": self.limits.max_operation_uncached_input_tokens.saturating_sub(uncached_input),
+            "outputTokens": self.limits.max_operation_output_tokens.saturating_sub(output),
+            "turns": self.limits.max_operation_turns.saturating_sub(turns),
+            "toolCalls": self.limits.max_operation_tool_calls.saturating_sub(tool_calls),
+        });
+        if let Err(error) = self
+            .store
+            .create_run_continuation_snapshot(
+                self.tool_executor.runtime_storage_dir(),
+                run_id,
+                &source_snapshot_uri,
+                &source_hash,
+                remaining_operation_budget,
+                summary,
+            )
+            .await
+        {
+            let reason = if error.to_string().contains("hash mismatch") {
+                "source_snapshot_hash_mismatch"
+            } else if error.to_string().contains("workflow progress") {
+                "workflow_progress_unavailable"
+            } else if error.to_string().contains("checkpoint") {
+                "checkpoint_unavailable"
+            } else {
+                "continuation_snapshot_invalid"
+            };
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "run.continuation_snapshot_rejected".to_string(),
+                    value: 1,
+                    metadata: Some(json!({ "reason": reason })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
     }
 
     async fn append_tool_conversation_item(
@@ -3174,7 +4663,12 @@ impl AgentLoop {
             }
             _ => None,
         };
-        let (message_window, conversation_range) = recent_messages_with_range(message_window);
+        let (message_window, mut conversation_range) = recent_messages_with_range(message_window);
+        if let Some(range) = conversation_range.as_mut() {
+            range.projection_version = Some("active-window-projection@1".to_string());
+            range.projection_hash = Some(canonical_json_hash(&json!(message_window)));
+            range.protected_exchange_ids = protected_exchange_ids(&message_window);
+        }
         let checkpoint = AgentCheckpoint {
             id: self.store.next_id("checkpoint"),
             run_id: run.id.clone(),
@@ -3231,6 +4725,11 @@ impl AgentLoop {
                 self.observation_receipts_enabled,
             ) {
                 return Err(anyhow!("generation_context.checkpoint_binding_mismatch"));
+            }
+        }
+        if let Some(range) = checkpoint.conversation_range.as_ref() {
+            if !checkpoint_projection_matches(&checkpoint.message_window, range) {
+                return Err(anyhow!("transcript_projection_mismatch"));
             }
         }
         Ok(checkpoint.message_window)
@@ -3345,98 +4844,235 @@ impl AgentLoop {
         Ok(())
     }
 
-    async fn compact_if_needed(&self, run_id: &str, message_window: &mut Vec<Value>) -> Result<()> {
-        if message_window.len() <= COMPACT_MESSAGE_THRESHOLD {
-            return Ok(());
-        }
-
-        let compacted_count = message_window.len().saturating_sub(COMPACT_KEEP_RECENT);
-        let recent = message_window
-            .iter()
-            .skip(compacted_count)
-            .cloned()
-            .collect::<Vec<_>>();
-        let compacted = message_window
-            .iter()
-            .take(compacted_count)
-            .cloned()
-            .collect::<Vec<_>>();
-        let last_consumed_conversation_item_id = last_consumed_conversation_item_id(message_window);
-        let run = self
-            .store
-            .get_run(run_id)
-            .await
-            .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
-        let previous_context = self.read_workspace_file(&run, "state/context.md").await?;
-        self.write_workspace_file(
-            &run,
-            "state/context.md",
-            render_compacted_context(
-                run_id,
-                compacted_count,
-                previous_context.as_deref(),
-                &compacted,
-            ),
-        )
-        .await?;
-
-        let summary = json!({
-            "role": "system",
-            "kind": "compact_summary",
-            "text": format!(
-                "Older conversation compacted to state/context.md; retained the last {} messages.",
-                recent.len()
-            ),
-            "contextPath": "state/context.md",
-            "compactedMessages": compacted_count,
-            "lastConsumedConversationItemId": last_consumed_conversation_item_id,
-        });
-        message_window.clear();
-        message_window.push(summary);
-        message_window.extend(recent);
-        let next_epoch = self
-            .store
-            .events(run_id)
-            .await
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::MetricRecorded { name, value, .. }
-                    if name == "context_window_epoch_advanced" =>
-                {
-                    Some(*value)
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let _ = self
-            .store
-            .append_event(AgentEvent::MetricRecorded {
+    fn prepare_model_request<'a>(
+        &'a self,
+        run_id: &'a str,
+        turn: u32,
+        model: String,
+        phase: AgentPhase,
+        agent_profile: String,
+        system_prompt: String,
+        message_window: &'a mut Vec<Value>,
+        tools: Vec<ModelToolDefinition>,
+        deferred_tools: Vec<ModelToolDefinition>,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelRequest>> + Send + 'a>> {
+        Box::pin(async move {
+            let estimated_next_request_tokens = {
+                let candidate = ModelRequest {
+                    run_id: run_id.to_string(),
+                    turn,
+                    model: model.clone(),
+                    phase,
+                    agent_profile: agent_profile.clone(),
+                    system_prompt: system_prompt.clone(),
+                    messages: message_window.clone(),
+                    tools: tools.clone(),
+                    deferred_tools: deferred_tools.clone(),
+                };
+                estimate_model_request_tokens(&candidate)
+            };
+            if next_request_compaction_is_useful(
+                Some(estimated_next_request_tokens),
+                estimate_serialized_tokens(message_window),
+            ) {
+                self.compact_if_needed(run_id, message_window, Some(estimated_next_request_tokens))
+                    .await?;
+            }
+            Ok(ModelRequest {
                 run_id: run_id.to_string(),
-                name: "context_window_epoch_advanced".to_string(),
-                value: next_epoch,
-                metadata: Some(json!({
-                    "compactedMessages": compacted_count,
-                    "retainedMessages": message_window.len(),
-                })),
-                timestamp: Utc::now(),
+                turn,
+                model,
+                phase,
+                agent_profile,
+                system_prompt,
+                messages: message_window.clone(),
+                tools,
+                deferred_tools,
             })
-            .await;
-        self.store
-            .update_run_generation_runtime_progress(run_id, None, Some(next_epoch), None, None)
+        })
+    }
+
+    fn compact_if_needed<'a>(
+        &'a self,
+        run_id: &'a str,
+        message_window: &'a mut Vec<Value>,
+        estimated_next_request_tokens: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let before_microcompact_tokens = estimate_serialized_tokens(message_window);
+            let microcompact = microcompact_completed_tool_exchanges(message_window);
+            if microcompact.compacted_exchanges > 0 {
+                let _ = self
+                    .store
+                    .append_event(AgentEvent::MetricRecorded {
+                        run_id: run_id.to_string(),
+                        name: "prompt.microcompact_tokens_removed".to_string(),
+                        value: microcompact.removed_tokens,
+                        metadata: Some(json!({
+                            "compactedExchanges": microcompact.compacted_exchanges,
+                            "beforeTokens": before_microcompact_tokens,
+                            "afterTokens": estimate_serialized_tokens(message_window),
+                        })),
+                        timestamp: Utc::now(),
+                    })
+                    .await;
+            }
+            let conversation_tokens = estimate_serialized_tokens(message_window);
+            let largest_message_tokens = message_window
+                .iter()
+                .map(estimate_serialized_tokens)
+                .max()
+                .unwrap_or_default();
+            let conversation_bytes = serialized_len(message_window) as u64;
+            let largest_message_bytes = message_window
+                .iter()
+                .map(|message| serialized_len(message) as u64)
+                .max()
+                .unwrap_or_default();
+            let trigger_reasons = compaction_trigger_reasons(
+                message_window.len(),
+                conversation_tokens,
+                conversation_bytes,
+                largest_message_tokens,
+                largest_message_bytes,
+                estimated_next_request_tokens,
+            );
+            if trigger_reasons.is_empty() {
+                if microcompact.compacted_exchanges > 0 {
+                    self.save_checkpoint(
+                        run_id,
+                        message_window,
+                        "Microcompacted completed tool exchanges".to_string(),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            if message_window.len() <= 1 {
+                return Ok(());
+            }
+
+            let keep_recent = if message_window.len() > COMPACT_MESSAGE_THRESHOLD {
+                COMPACT_KEEP_RECENT
+            } else {
+                (message_window.len() / 2).clamp(1, 8)
+            };
+            let compacted_count = message_window.len().saturating_sub(keep_recent);
+            let recent = message_window
+                .iter()
+                .skip(compacted_count)
+                .cloned()
+                .collect::<Vec<_>>();
+            let compacted = message_window
+                .iter()
+                .take(compacted_count)
+                .cloned()
+                .collect::<Vec<_>>();
+            let last_consumed_conversation_item_id =
+                last_consumed_conversation_item_id(message_window);
+            let run = self
+                .store
+                .get_run(run_id)
+                .await
+                .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+            let previous_context = self.read_workspace_file(&run, "state/context.md").await?;
+            self.write_workspace_file(
+                &run,
+                "state/context.md",
+                render_compacted_context(
+                    run_id,
+                    compacted_count,
+                    previous_context.as_deref(),
+                    &compacted,
+                ),
+            )
             .await?;
-        if self.observation_receipts_enabled {
-            self.restore_recent_source_observations(&run, message_window)
+
+            let summary = json!({
+                "role": "system",
+                "kind": "compact_summary",
+                "text": format!(
+                    "Older conversation compacted to state/context.md; retained the last {} messages.",
+                    recent.len()
+                ),
+                "contextPath": "state/context.md",
+                "compactedMessages": compacted_count,
+                "lastConsumedConversationItemId": last_consumed_conversation_item_id,
+            });
+            message_window.clear();
+            message_window.push(summary);
+            message_window.extend(recent);
+            let after_compaction_tokens = estimate_serialized_tokens(message_window);
+            let next_epoch = self
+                .store
+                .events(run_id)
+                .await
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::MetricRecorded { name, value, .. }
+                        if name == "context_window_epoch_advanced" =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "context_window_epoch_advanced".to_string(),
+                    value: next_epoch,
+                    metadata: Some(json!({
+                        "compactedMessages": compacted_count,
+                        "retainedMessages": message_window.len(),
+                        "beforeTokens": conversation_tokens,
+                        "afterTokens": after_compaction_tokens,
+                        "largestMessageTokens": largest_message_tokens,
+                        "conversationBytes": conversation_bytes,
+                        "largestMessageBytes": largest_message_bytes,
+                        "estimatedNextRequestTokens": estimated_next_request_tokens,
+                        "triggerReasons": &trigger_reasons,
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            self.store
+                .update_run_generation_runtime_progress(run_id, None, Some(next_epoch), None, None)
                 .await?;
-        }
-        self.save_checkpoint(
-            run_id,
-            message_window,
-            "Compacted conversation history and restored bounded source context".to_string(),
-        )
-        .await?;
-        Ok(())
+            let _ = self
+                .store
+                .append_event(AgentEvent::MetricRecorded {
+                    run_id: run_id.to_string(),
+                    name: "prompt.compaction_tokens_removed".to_string(),
+                    value: conversation_tokens.saturating_sub(after_compaction_tokens),
+                    metadata: Some(json!({
+                        "beforeTokens": conversation_tokens,
+                        "afterTokens": after_compaction_tokens,
+                        "compactedMessages": compacted_count,
+                        "retainedMessages": message_window.len(),
+                        "conversationBytes": conversation_bytes,
+                        "largestMessageBytes": largest_message_bytes,
+                        "estimatedNextRequestTokens": estimated_next_request_tokens,
+                        "triggerReasons": &trigger_reasons,
+                    })),
+                    timestamp: Utc::now(),
+                })
+                .await;
+            if self.observation_receipts_enabled {
+                self.restore_recent_source_observations(&run, message_window)
+                    .await?;
+            }
+            self.save_checkpoint(
+                run_id,
+                message_window,
+                "Compacted conversation history and restored bounded source context".to_string(),
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     async fn restore_recent_source_observations(
@@ -3446,20 +5082,39 @@ impl AgentLoop {
     ) -> Result<()> {
         let visible_paths = full_source_paths_in_messages(message_window);
         let events = self.store.events(&run.id).await;
-        let candidates = select_source_restore_paths(&events, &visible_paths);
+        let planned_token_limit = source_restore_token_limit(run.phase);
+        let candidates =
+            select_source_restore_candidates(&events, &visible_paths, planned_token_limit);
 
         let mut restored = 0u64;
         let mut restored_tokens = 0u64;
-        for path in candidates {
-            let Some(text) = self.read_workspace_file(run, &path).await? else {
+        let mut hash_mismatch_count = 0u64;
+        let mut estimate_mismatch_count = 0u64;
+        let mut oversized_after_read_count = 0u64;
+        for candidate in candidates {
+            let Some(text) = self.read_workspace_file(run, &candidate.path).await? else {
                 continue;
             };
             let content_sha256 = sha256_hex(text.as_bytes());
-            let estimated_tokens = (text.chars().count() as u64).div_ceil(4);
+            if content_sha256 != candidate.content_sha256 {
+                hash_mismatch_count = hash_mismatch_count.saturating_add(1);
+                continue;
+            }
+            let estimated_tokens = estimated_tokens_for_len(text.len());
+            if estimated_tokens != candidate.estimated_tokens {
+                estimate_mismatch_count = estimate_mismatch_count.saturating_add(1);
+                continue;
+            }
+            if estimated_tokens > COMPACT_SOURCE_RESTORE_MAX_FILE_TOKENS
+                || restored_tokens.saturating_add(estimated_tokens) > planned_token_limit
+            {
+                oversized_after_read_count = oversized_after_read_count.saturating_add(1);
+                continue;
+            }
             message_window.push(json!({
                 "role": "user",
                 "kind": "runtime_source_restore",
-                "path": path,
+                "path": candidate.path,
                 "contentSha256": content_sha256,
                 "view": "full",
                 "text": text,
@@ -3477,13 +5132,152 @@ impl AgentLoop {
                     "restoredFiles": restored,
                     "estimatedTokens": restored_tokens,
                     "maxFiles": COMPACT_SOURCE_RESTORE_MAX_FILES,
-                    "plannedTokenLimit": COMPACT_SOURCE_RESTORE_MAX_TOTAL_TOKENS,
+                    "plannedTokenLimit": planned_token_limit,
+                    "phase": format!("{:?}", run.phase).to_ascii_lowercase(),
+                    "hashMismatchCount": hash_mismatch_count,
+                    "estimateMismatchCount": estimate_mismatch_count,
+                    "oversizedAfterReadCount": oversized_after_read_count,
                 })),
                 timestamp: Utc::now(),
             })
             .await;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MicrocompactStats {
+    compacted_exchanges: u64,
+    removed_tokens: u64,
+}
+
+fn microcompact_completed_tool_exchanges(message_window: &mut Vec<Value>) -> MicrocompactStats {
+    let original = std::mem::take(message_window);
+    let protect_from = original.len().saturating_sub(4);
+    let mut projected = Vec::with_capacity(original.len());
+    let mut stats = MicrocompactStats::default();
+    let mut index = 0usize;
+    while index < original.len() {
+        if index >= protect_from {
+            projected.extend(original[index..].iter().cloned());
+            break;
+        }
+        let Some(calls) = original[index].get("toolCalls").and_then(Value::as_array) else {
+            projected.push(original[index].clone());
+            index += 1;
+            continue;
+        };
+        if original[index].get("role").and_then(Value::as_str) != Some("assistant")
+            || calls.is_empty()
+            || calls.iter().any(|call| {
+                !call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(microcompact_eligible_tool)
+            })
+        {
+            projected.push(original[index].clone());
+            index += 1;
+            continue;
+        }
+        let call_ids = calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        if call_ids.len() != calls.len() {
+            projected.push(original[index].clone());
+            index += 1;
+            continue;
+        }
+        let mut result_by_id = BTreeMap::<&str, &Value>::new();
+        let mut next = index + 1;
+        while next < protect_from && result_by_id.len() < call_ids.len() {
+            let message = &original[next];
+            if message.get("role").and_then(Value::as_str) != Some("tool") {
+                break;
+            }
+            let Some(tool_use_id) = message.get("toolUseId").and_then(Value::as_str) else {
+                break;
+            };
+            if !call_ids.contains(tool_use_id)
+                || message.get("isError").and_then(Value::as_bool) != Some(false)
+            {
+                break;
+            }
+            result_by_id.insert(tool_use_id, message);
+            next += 1;
+        }
+        if result_by_id.len() != call_ids.len() {
+            projected.push(original[index].clone());
+            index += 1;
+            continue;
+        }
+        let exchange_tokens = estimate_serialized_tokens(&original[index..next]);
+        if exchange_tokens <= MICROCOMPACT_EXCHANGE_TOKEN_THRESHOLD {
+            projected.extend(original[index..next].iter().cloned());
+            index = next;
+            continue;
+        }
+        let summaries = calls
+            .iter()
+            .filter_map(|call| {
+                let id = call.get("id").and_then(Value::as_str)?;
+                let name = call.get("name").and_then(Value::as_str)?;
+                let result = result_by_id.get(id)?;
+                let content = result.get("content").unwrap_or(&Value::Null);
+                Some(json!({
+                    "toolUseId": id,
+                    "tool": name,
+                    "inputDigest": canonical_json_hash(call.get("input").unwrap_or(&Value::Null)),
+                    "resultDigest": canonical_json_hash(content),
+                    "path": find_string_field(content, "path").map(|path| path.chars().take(256).collect::<String>()),
+                    "bytes": find_u64_field(content, "bytes"),
+                    "workspaceRevision": find_u64_field(content, "workspaceRevision"),
+                    "buildId": find_string_field(content, "buildId"),
+                    "sourceFingerprint": find_string_field(content, "sourceFingerprint"),
+                    "candidateManifestHash": find_string_field(content, "candidateManifestHash"),
+                    "durableSnapshotId": find_string_field(content, "durableSnapshotId"),
+                }))
+            })
+            .collect::<Vec<_>>();
+        let summary = json!({
+            "role": "system",
+            "kind": "runtime_tool_exchange_summary",
+            "turn": original[index].get("turn").cloned().unwrap_or(Value::Null),
+            "schemaVersion": "runtime-tool-exchange-summary@1",
+            "exchanges": summaries,
+        });
+        let summary_tokens = estimate_serialized_tokens(&summary);
+        stats.compacted_exchanges = stats
+            .compacted_exchanges
+            .saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX));
+        stats.removed_tokens = stats
+            .removed_tokens
+            .saturating_add(exchange_tokens.saturating_sub(summary_tokens));
+        projected.push(summary);
+        index = next;
+    }
+    *message_window = projected;
+    stats
+}
+
+fn microcompact_eligible_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "fs.write"
+            | "fs.patch"
+            | "fs.multi_patch"
+            | "fs.write_chunk"
+            | "fs.commit_chunks"
+            | "style.update_tokens"
+            | "project.ensure_dependencies"
+            | "project.build"
+            | "preview.start"
+            | "preview.publish"
+            | "preview.dev_start"
+            | "preview.dev_status"
+            | "draft.snapshot_create"
+    )
 }
 
 fn tool_result_persisted_durable_snapshot(tool_name: &str, content: &Value) -> bool {
@@ -3519,10 +5313,28 @@ fn generation_checkpoint_binding_matches(
         && (!observation_receipts_enabled || checkpoint.observation_receipts_version == Some(1))
 }
 
-fn select_source_restore_paths(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceRestoreCandidate {
+    path: String,
+    content_sha256: String,
+    estimated_tokens: u64,
+}
+
+fn source_restore_token_limit(phase: AgentPhase) -> u64 {
+    match phase {
+        AgentPhase::Build => COMPACT_SOURCE_RESTORE_BUILD_TOKENS,
+        AgentPhase::Edit | AgentPhase::Review | AgentPhase::Repair => {
+            COMPACT_SOURCE_RESTORE_EDIT_REPAIR_TOKENS
+        }
+        _ => 0,
+    }
+}
+
+fn select_source_restore_candidates(
     events: &[AgentEvent],
     visible_paths: &BTreeSet<String>,
-) -> Vec<String> {
+    token_limit: u64,
+) -> Vec<SourceRestoreCandidate> {
     let mut selected_paths = BTreeSet::new();
     let mut candidates = Vec::new();
     let mut planned_tokens = 0u64;
@@ -3536,14 +5348,17 @@ fn select_source_restore_paths(
             || visible_paths.contains(&receipt.normalized_path)
             || selected_paths.contains(&receipt.normalized_path)
             || receipt.estimated_tokens > COMPACT_SOURCE_RESTORE_MAX_FILE_TOKENS
-            || planned_tokens.saturating_add(receipt.estimated_tokens)
-                > COMPACT_SOURCE_RESTORE_MAX_TOTAL_TOKENS
+            || planned_tokens.saturating_add(receipt.estimated_tokens) > token_limit
         {
             continue;
         }
         planned_tokens = planned_tokens.saturating_add(receipt.estimated_tokens);
         selected_paths.insert(receipt.normalized_path.clone());
-        candidates.push(receipt.normalized_path.clone());
+        candidates.push(SourceRestoreCandidate {
+            path: receipt.normalized_path.clone(),
+            content_sha256: receipt.content_sha256.clone(),
+            estimated_tokens: receipt.estimated_tokens,
+        });
         if candidates.len() >= COMPACT_SOURCE_RESTORE_MAX_FILES {
             break;
         }
@@ -3658,7 +5473,7 @@ fn positive_u64_env(name: &str, default: u64) -> u64 {
 }
 
 fn recovered_progress_state(events: &[AgentEvent]) -> (RunProgressState, String, u32) {
-    for event in events.iter().rev() {
+    for (index, event) in events.iter().enumerate().rev() {
         if let AgentEvent::RunProgressFingerprint {
             fingerprint,
             consecutive_no_progress,
@@ -3666,18 +5481,88 @@ fn recovered_progress_state(events: &[AgentEvent]) -> (RunProgressState, String,
             ..
         } = event
         {
-            if let Ok(state) = serde_json::from_value::<RunProgressState>(
+            if let Ok(mut state) = serde_json::from_value::<RunProgressState>(
                 evidence.get("state").cloned().unwrap_or(Value::Null),
             ) {
                 if state.fingerprint() == *fingerprint {
-                    return (state, fingerprint.clone(), *consecutive_no_progress);
+                    let checkpoint_state = state.clone();
+                    recover_workflow_lifecycle_progress(&events[index + 1..], &mut state);
+                    let recovered_fingerprint = state.fingerprint();
+                    let recovered_no_progress = if state == checkpoint_state {
+                        *consecutive_no_progress
+                    } else {
+                        0
+                    };
+                    return (state, recovered_fingerprint, recovered_no_progress);
+                }
+                if state.substantive_progress.is_empty()
+                    && state.legacy_fingerprint() == *fingerprint
+                {
+                    state.seed_substantive_progress();
+                    let checkpoint_state = state.clone();
+                    recover_workflow_lifecycle_progress(&events[index + 1..], &mut state);
+                    let recovered_fingerprint = state.fingerprint();
+                    let recovered_no_progress = if state == checkpoint_state {
+                        *consecutive_no_progress
+                    } else {
+                        0
+                    };
+                    return (state, recovered_fingerprint, recovered_no_progress);
                 }
             }
         }
     }
-    let state = RunProgressState::default();
+    let mut state = RunProgressState::default();
+    recover_workflow_lifecycle_progress(events, &mut state);
     let fingerprint = state.fingerprint();
     (state, fingerprint, 0)
+}
+
+fn recover_workflow_lifecycle_progress(events: &[AgentEvent], state: &mut RunProgressState) {
+    for event in events {
+        match event {
+            AgentEvent::WorkflowLifecycleCompleted {
+                action,
+                idempotency_key,
+                progress_evidence,
+                ..
+            } => {
+                let call = ToolCall::new(
+                    idempotency_key.clone(),
+                    action.clone(),
+                    workflow_driver_action_input(action).unwrap_or_else(|| json!({})),
+                );
+                let result = ToolResultMessage {
+                    tool_use_id: idempotency_key.clone(),
+                    tool_name: action.clone(),
+                    is_error: progress_evidence
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    content: progress_evidence
+                        .get("content")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    metadata: progress_evidence.get("metadata").cloned(),
+                };
+                update_progress_state(state, &[call], &[result]);
+            }
+            AgentEvent::WorkflowLifecycleFailed {
+                action, error_kind, ..
+            } => {
+                if preview_failure_requires_repair(Some(error_kind)) {
+                    state.completed_steps.insert("repair_required".to_string());
+                    state.completed_steps.remove("repair_mutated");
+                } else {
+                    state.workflow_driver_blocker = Some(WorkflowDriverBlocker {
+                        action: action.clone(),
+                        error_kind: error_kind.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn observation_tool_class(tool_name: &str) -> Option<&'static str> {
@@ -3941,6 +5826,17 @@ fn workflow_progress_snapshot(
                 ),
             )
         }
+    } else if let Some(blocker) = state.workflow_driver_blocker.as_ref() {
+        (
+            "runtime_lifecycle_failed",
+            workflow_action(
+                "model.handle_runtime_failure",
+                &format!(
+                    "Runtime action {} stopped with {}; inspect the typed failure and do not repeat completed lifecycle actions",
+                    blocker.action, blocker.error_kind
+                ),
+            ),
+        )
     } else if !project_initialized {
         (
             "context_ready",
@@ -4112,6 +6008,105 @@ fn workflow_action(tool: &str, reason: &str) -> Value {
     json!({ "tool": tool, "reason": reason })
 }
 
+fn workflow_driver_supports(run: &AgentRun) -> bool {
+    run.project_state_snapshot
+        .as_ref()
+        .is_some_and(|project| project.template_key == "next-app")
+        && matches!(
+            run.phase,
+            AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+        )
+        && matches!(
+            run.execution_profile.as_deref(),
+            Some("greenfield_static" | "cold_dev" | "warm_hmr" | "repair_cold_dev" | "repair_warm")
+        )
+}
+
+fn workflow_driver_action_input(action: &str) -> Option<Value> {
+    match action {
+        "project.ensure_dependencies" => Some(json!({ "mode": "restore" })),
+        "project.build"
+        | "preview.dev_stop"
+        | "preview.dev_start"
+        | "preview.dev_status"
+        | "preview.start"
+        | "draft.snapshot_create" => Some(json!({})),
+        "run.complete" => Some(json!({
+            "status": "completed",
+            "summary": "Runtime workflow completed the current validated Draft revision."
+        })),
+        _ => None,
+    }
+}
+
+fn workflow_lifecycle_progress_evidence(result: &ToolResultMessage) -> Value {
+    let mut content = serde_json::Map::new();
+    for key in [
+        "status",
+        "sessionId",
+        "sessionEpoch",
+        "workspaceRevision",
+        "lastReadyRevision",
+        "durableRevision",
+        "durableSnapshotId",
+        "success",
+        "summary",
+    ] {
+        if let Some(value) = result.content.get(key) {
+            content.insert(key.to_string(), value.clone());
+        }
+    }
+    let metadata = result.metadata.as_ref().map(|metadata| {
+        let mut bounded = serde_json::Map::new();
+        for key in [
+            "errorKind",
+            "recoverable",
+            "validationReportPath",
+            "acceptanceReportPath",
+            "repairContextPath",
+            "suggestedAction",
+        ] {
+            if let Some(value) = metadata.get(key) {
+                bounded.insert(key.to_string(), value.clone());
+            }
+        }
+        Value::Object(bounded)
+    });
+    json!({
+        "schemaVersion": "workflow-lifecycle-progress@1",
+        "isError": result.is_error,
+        "content": Value::Object(content),
+        "metadata": metadata,
+    })
+}
+
+fn workflow_lifecycle_error_kind(result: &ToolResultMessage) -> String {
+    result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("errorKind"))
+        .and_then(Value::as_str)
+        .unwrap_or("workflow.lifecycle_action_failed")
+        .to_string()
+}
+
+fn workflow_lifecycle_diagnostic_ref(result: &ToolResultMessage) -> Option<String> {
+    let metadata = result.metadata.as_ref()?;
+    [
+        "repairContextPath",
+        "validationReportPath",
+        "acceptanceReportPath",
+        "diagnosticRef",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 fn render_workflow_progress_context(
     run: &AgentRun,
     state: &RunProgressState,
@@ -4139,6 +6134,22 @@ fn render_workflow_progress_context(
         }))
         .expect("workflow progress must serialize")
     )
+}
+
+fn upsert_ephemeral_context_message(
+    message_window: &mut Vec<Value>,
+    turn: u32,
+    kind: &str,
+    text: String,
+) {
+    message_window.retain(|message| message.get("kind").and_then(Value::as_str) != Some(kind));
+    message_window.push(json!({
+        "role": "system",
+        "turn": turn,
+        "kind": kind,
+        "ephemeral": true,
+        "text": text,
+    }));
 }
 
 fn update_progress_state(
@@ -4190,7 +6201,7 @@ fn update_progress_state(
                             if error_kind == Some("acceptance.validation_failed") {
                                 "state/acceptance-report.json"
                             } else {
-                                "state/validation-report.json"
+                                "state/repair-context.json"
                             }
                             .to_string(),
                         )
@@ -4217,11 +6228,26 @@ fn update_progress_state(
             if preview_failure_requires_repair(error_kind) {
                 state.completed_steps.insert("repair_required".to_string());
                 state.completed_steps.remove("repair_mutated");
+                if let Some(error_kind) = error_kind {
+                    state
+                        .substantive_progress
+                        .insert(format!("repair-evidence:{error_kind}"));
+                }
                 if error_kind.is_some_and(|kind| kind.starts_with("build.")) {
                     state.completed_steps.insert("build_failed".to_string());
                 }
             }
+            state.seed_substantive_progress();
             continue;
+        }
+        if state
+            .workflow_driver_blocker
+            .as_ref()
+            .is_some_and(|blocker| {
+                blocker.action == call.name || is_source_mutation_tool(&call.name)
+            })
+        {
+            state.workflow_driver_blocker = None;
         }
         let normalized_path = call
             .input
@@ -4454,6 +6480,7 @@ fn update_progress_state(
         ) {
             state.completed_steps.insert(call.name.clone());
         }
+        state.seed_substantive_progress();
     }
 }
 
@@ -4699,7 +6726,7 @@ fn fumadocs_repair_tool_denial(
                     state
                         .required_repair_report_path
                         .as_deref()
-                        .unwrap_or("state/validation-report.json")
+                        .unwrap_or("state/repair-context.json")
                 )
             }
             FumadocsRepairToolStage::RepairSource => {
@@ -4718,7 +6745,7 @@ fn fumadocs_repair_tool_denial(
                     state
                         .required_repair_report_path
                         .as_deref()
-                        .unwrap_or("state/validation-report.json"),
+                        .unwrap_or("state/repair-context.json"),
                 ) =>
         {
             Some(format!(
@@ -4726,7 +6753,7 @@ fn fumadocs_repair_tool_denial(
                 state
                     .required_repair_report_path
                     .as_deref()
-                    .unwrap_or("state/validation-report.json")
+                    .unwrap_or("state/repair-context.json")
             ))
         }
         FumadocsRepairToolStage::RepairSource
@@ -4837,6 +6864,39 @@ fn find_u64_field(value: &Value, field: &str) -> Option<u64> {
     }
 }
 
+fn continuation_source_snapshot_evidence(events: &[AgentEvent]) -> Option<(String, String)> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::WorkflowLifecycleFailed {
+            source_snapshot_uri: Some(uri),
+            source_hash: Some(hash),
+            ..
+        } => Some((uri.clone(), hash.clone())),
+        AgentEvent::ToolCompleted { metadata, .. } | AgentEvent::ToolFailed { metadata, .. } => {
+            let metadata = metadata.as_ref()?;
+            Some((
+                find_string_field(metadata, "sourceSnapshotUri")?,
+                find_string_field(metadata, "sourceFingerprint")?,
+            ))
+        }
+        _ => None,
+    })
+}
+
+fn continuation_partial_reason_allowed(summary: &str) -> bool {
+    let normalized = summary.to_ascii_lowercase();
+    [
+        "budget exhausted",
+        "provider",
+        "runtime",
+        "sandbox",
+        "project.build",
+        "build failed",
+        "watchdog",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn recovered_model_usage_by_turn(events: &[AgentEvent]) -> BTreeMap<u32, ModelTokenUsage> {
     let mut usage_by_turn = BTreeMap::new();
     for event in events {
@@ -4887,30 +6947,167 @@ fn recovered_consecutive_protocol_errors(events: &[AgentEvent]) -> u32 {
         .unwrap_or(0)
 }
 
+fn operation_budget_exhausted(
+    prior: OperationBudgetUsage,
+    current_tokens: RunTokenUsage,
+    current_model_turns: u32,
+    current_tool_calls: u32,
+    limits: AgentLoopLimits,
+) -> Option<(&'static str, u64, u64)> {
+    let gross_input = prior
+        .tokens
+        .input_tokens
+        .saturating_add(current_tokens.input_tokens);
+    let uncached_input = prior
+        .tokens
+        .uncached_input_tokens()
+        .saturating_add(current_tokens.uncached_input_tokens());
+    let output = prior
+        .tokens
+        .output_tokens
+        .saturating_add(current_tokens.output_tokens);
+    let turns = prior.model_turns.saturating_add(current_model_turns) as u64;
+    let tool_calls = prior.tool_calls.saturating_add(current_tool_calls) as u64;
+    [
+        (
+            "operation_gross_input",
+            gross_input,
+            limits.max_operation_gross_input_tokens,
+        ),
+        (
+            "operation_uncached_input",
+            uncached_input,
+            limits.max_operation_uncached_input_tokens,
+        ),
+        (
+            "operation_output",
+            output,
+            limits.max_operation_output_tokens,
+        ),
+        (
+            "operation_turn",
+            turns,
+            u64::from(limits.max_operation_turns),
+        ),
+        (
+            "operation_tool_call",
+            tool_calls,
+            u64::from(limits.max_operation_tool_calls),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, used, limit)| used >= limit)
+}
+
 fn token_budget_exhausted_reason(
     usage: RunTokenUsage,
     limits: AgentLoopLimits,
     after_response: bool,
 ) -> Option<String> {
-    let input_exhausted = if after_response {
-        usage.input_tokens > limits.max_input_tokens
-    } else {
-        usage.input_tokens >= limits.max_input_tokens
+    token_budget_decisions(usage, limits, after_response)
+        .into_iter()
+        .find(|decision| decision.exhausted && decision.enforced)
+        .map(|decision| {
+            format!(
+                "Run token budget exhausted: budgetKind={}, used={}, limit={}, input_used={}, input_limit={}, output_used={}, output_limit={}, grossInputTokens={}, cachedInputTokens={}, uncachedInputTokens={}",
+                decision.kind,
+                decision.used,
+                decision.limit,
+                usage.input_tokens,
+                limits.max_input_tokens,
+                usage.output_tokens,
+                limits.max_output_tokens,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.uncached_input_tokens(),
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenBudgetDecision {
+    kind: &'static str,
+    used: u64,
+    limit: u64,
+    exhausted: bool,
+    enforced: bool,
+}
+
+fn token_budget_decisions(
+    usage: RunTokenUsage,
+    limits: AgentLoopLimits,
+    after_response: bool,
+) -> Vec<TokenBudgetDecision> {
+    let exhausted = |used: u64, limit: u64| {
+        if after_response {
+            used > limit
+        } else {
+            used >= limit
+        }
     };
-    let output_exhausted = if after_response {
-        usage.output_tokens > limits.max_output_tokens
-    } else {
-        usage.output_tokens >= limits.max_output_tokens
-    };
-    (input_exhausted || output_exhausted).then(|| {
-        format!(
-            "Run token budget exhausted: input_used={}, input_limit={}, output_used={}, output_limit={}",
-            usage.input_tokens,
-            limits.max_input_tokens,
-            usage.output_tokens,
-            limits.max_output_tokens
-        )
-    })
+    let mut decisions = Vec::new();
+    match limits.token_budget_mode {
+        TokenBudgetMode::Legacy => decisions.push(TokenBudgetDecision {
+            kind: "gross_input",
+            used: usage.input_tokens,
+            limit: limits.max_input_tokens,
+            exhausted: exhausted(usage.input_tokens, limits.max_input_tokens),
+            enforced: true,
+        }),
+        TokenBudgetMode::SplitShadow => {
+            decisions.push(TokenBudgetDecision {
+                kind: "legacy_gross_input",
+                used: usage.input_tokens,
+                limit: limits.max_input_tokens,
+                exhausted: exhausted(usage.input_tokens, limits.max_input_tokens),
+                enforced: true,
+            });
+            decisions.push(TokenBudgetDecision {
+                kind: "gross_input",
+                used: usage.input_tokens,
+                limit: limits.max_gross_input_tokens,
+                exhausted: exhausted(usage.input_tokens, limits.max_gross_input_tokens),
+                enforced: false,
+            });
+            decisions.push(TokenBudgetDecision {
+                kind: "uncached_input",
+                used: usage.uncached_input_tokens(),
+                limit: limits.max_uncached_input_tokens,
+                exhausted: exhausted(
+                    usage.uncached_input_tokens(),
+                    limits.max_uncached_input_tokens,
+                ),
+                enforced: false,
+            });
+        }
+        TokenBudgetMode::SplitEnforced => {
+            decisions.push(TokenBudgetDecision {
+                kind: "gross_input",
+                used: usage.input_tokens,
+                limit: limits.max_gross_input_tokens,
+                exhausted: exhausted(usage.input_tokens, limits.max_gross_input_tokens),
+                enforced: true,
+            });
+            decisions.push(TokenBudgetDecision {
+                kind: "uncached_input",
+                used: usage.uncached_input_tokens(),
+                limit: limits.max_uncached_input_tokens,
+                exhausted: exhausted(
+                    usage.uncached_input_tokens(),
+                    limits.max_uncached_input_tokens,
+                ),
+                enforced: true,
+            });
+        }
+    }
+    decisions.push(TokenBudgetDecision {
+        kind: "output",
+        used: usage.output_tokens,
+        limit: limits.max_output_tokens,
+        exhausted: exhausted(usage.output_tokens, limits.max_output_tokens),
+        enforced: true,
+    });
+    decisions
 }
 
 fn is_visual_delivery_unavailable(
@@ -5010,6 +7207,106 @@ fn estimate_model_request_tokens(request: &ModelRequest) -> u64 {
     serde_json::to_vec(request)
         .map(|serialized| estimated_tokens_for_len(serialized.len()))
         .unwrap_or(1)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCompositionEstimate {
+    system_tokens: u64,
+    message_tokens: u64,
+    tool_definition_tokens: u64,
+    generation_context_tokens: u64,
+    static_prefix_hash: String,
+    tool_set_hash: String,
+}
+
+fn prompt_composition(
+    request: &ModelRequest,
+    static_prefix_hash: &str,
+) -> PromptCompositionEstimate {
+    let generation_context_tokens = request
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message.get("kind").and_then(Value::as_str),
+                Some("runtime_generation_context" | "runtime_generation_visuals")
+            )
+        })
+        .map(estimate_serialized_tokens)
+        .sum();
+    let tool_identity = canonical_tool_set_identity(&request.tools, &request.deferred_tools);
+    PromptCompositionEstimate {
+        system_tokens: estimated_tokens_for_len(request.system_prompt.len()),
+        message_tokens: estimate_serialized_tokens(&request.messages),
+        tool_definition_tokens: estimate_serialized_tokens(&tool_identity),
+        generation_context_tokens,
+        static_prefix_hash: static_prefix_hash.to_string(),
+        tool_set_hash: canonical_json_hash(&tool_identity),
+    }
+}
+
+fn canonical_tool_set_identity(
+    tools: &[ModelToolDefinition],
+    deferred_tools: &[ModelToolDefinition],
+) -> Value {
+    let mut tools = tools.to_vec();
+    let mut deferred_tools = deferred_tools.to_vec();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    deferred_tools.sort_by(|left, right| left.name.cmp(&right.name));
+    json!({
+        "tools": tools,
+        "deferredTools": deferred_tools,
+    })
+}
+
+fn estimate_serialized_tokens<T: Serialize + ?Sized>(value: &T) -> u64 {
+    estimated_tokens_for_len(serialized_len(value))
+}
+
+fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(1)
+}
+
+fn compaction_trigger_reasons(
+    message_count: usize,
+    conversation_tokens: u64,
+    conversation_bytes: u64,
+    largest_message_tokens: u64,
+    largest_message_bytes: u64,
+    estimated_next_request_tokens: Option<u64>,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if message_count > COMPACT_MESSAGE_THRESHOLD {
+        reasons.push("message_count");
+    }
+    if conversation_tokens > COMPACT_CONVERSATION_TOKEN_THRESHOLD {
+        reasons.push("conversation_tokens");
+    }
+    if conversation_bytes > COMPACT_CONVERSATION_BYTE_THRESHOLD {
+        reasons.push("conversation_bytes");
+    }
+    if largest_message_tokens > COMPACT_LARGEST_MESSAGE_TOKEN_THRESHOLD {
+        reasons.push("largest_message_tokens");
+    }
+    if largest_message_bytes > COMPACT_LARGEST_MESSAGE_BYTE_THRESHOLD {
+        reasons.push("largest_message_bytes");
+    }
+    if next_request_compaction_is_useful(estimated_next_request_tokens, conversation_tokens) {
+        reasons.push("next_request_tokens");
+    }
+    reasons
+}
+
+fn next_request_compaction_is_useful(
+    estimated_next_request_tokens: Option<u64>,
+    conversation_tokens: u64,
+) -> bool {
+    estimated_next_request_tokens.is_some_and(|tokens| {
+        tokens > COMPACT_NEXT_REQUEST_TOKEN_THRESHOLD
+            && tokens.saturating_sub(conversation_tokens) < COMPACT_NEXT_REQUEST_TOKEN_THRESHOLD
+    })
 }
 
 fn estimate_model_response_tokens(response: &ModelResponse) -> u64 {
@@ -5128,7 +7425,39 @@ fn recent_messages_with_range(
     messages: &[Value],
 ) -> (Vec<Value>, Option<CheckpointConversationRange>) {
     const MAX_MESSAGE_WINDOW: usize = 20;
-    let start_index = messages.len().saturating_sub(MAX_MESSAGE_WINDOW);
+    let mut start_index = messages.len().saturating_sub(MAX_MESSAGE_WINDOW);
+    while start_index > 0
+        && messages[start_index].get("role").and_then(Value::as_str) == Some("tool")
+    {
+        start_index -= 1;
+    }
+    if start_index > 0
+        && messages[start_index - 1]
+            .get("toolCalls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        start_index -= 1;
+    }
+    let completed_ids = messages
+        .iter()
+        .filter_map(|message| message.get("toolUseId").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if let Some(pending_index) = messages.iter().enumerate().find_map(|(index, message)| {
+        message
+            .get("toolCalls")
+            .and_then(Value::as_array)
+            .filter(|calls| {
+                calls.iter().any(|call| {
+                    call.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !completed_ids.contains(id))
+                })
+            })
+            .map(|_| index)
+    }) {
+        start_index = start_index.min(pending_index);
+    }
     let retained = messages
         .iter()
         .skip(start_index)
@@ -5138,8 +7467,36 @@ fn recent_messages_with_range(
         start_index: start_index as u64,
         end_index_exclusive: messages.len() as u64,
         retained_count: retained.len() as u64,
+        projection_version: None,
+        projection_hash: None,
+        protected_exchange_ids: Vec::new(),
     });
     (retained, range)
+}
+
+fn protected_exchange_ids(messages: &[Value]) -> Vec<String> {
+    let completed = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|message| message.get("toolUseId").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    messages
+        .iter()
+        .filter_map(|message| message.get("toolCalls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .filter(|id| !completed.contains(id))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn checkpoint_projection_matches(messages: &[Value], range: &CheckpointConversationRange) -> bool {
+    range
+        .projection_hash
+        .as_deref()
+        .is_none_or(|expected| expected == canonical_json_hash(&json!(messages)))
 }
 
 fn split_text_by_chars(text: &str, max_chars: usize) -> Vec<String> {
@@ -5416,7 +7773,7 @@ fn generation_context_system_prompt(run: &AgentRun) -> String {
             "Use the Runtime-owned next-app Draft workflow. Treat the injected GenerationContext as the complete frozen task input: do not inventory or read DCP files. Before authoring, turn payload.acceptance into a checklist. Preserve every requiredText literal in one rendered text node; do not split it across JSX elements, translate it, or paraphrase it. Verify every required route and requiredText literal against source before Preview. Initialize the declared template when needed. project.init returns bounded full sourceObservations for the primary route, global styles, and token file and establishes their current mutation leases; use those contents to author on the next model turn without project.inspect, fs.read, or directory listing unless a required target is absent. Restore dependencies and run project.build. Then follow Runtime Workflow Progress exactly. If managed Dev is unavailable, call preview.start and immediately draft.snapshot_create; browser.open, browser.screenshot, preview.status, and sandbox lease tools are diagnostics only and must not delay the requested durable snapshot."
         }
         (Some("greenfield_static"), AgentPhase::Build, Some("fumadocs-docs")) => {
-            "Treat the injected GenerationContext as the complete frozen task input: do not inventory or read DCP files. Initialize the declared template when needed, inspect the derived Editable Surface once, read only existing source files necessary for safe replacement, and implement every required acceptance item without browsing component directories. Call preview.publish as the only Build and Candidate gate; do not call project.build, preview.start, browser tools, diagnostics tools, or preview audits separately. If preview.publish fails validation or acceptance, immediately read the exact validationReportPath or acceptanceReportPath from its structured metadata, make a real source repair for every blocker, and call preview.publish again. Never substitute a previous report path. Do not rebuild or inspect the unchanged rejected candidate. Follow Runtime Workflow Progress exactly and call run.complete as soon as the validated Candidate is ready."
+            "Treat the injected GenerationContext as the complete frozen task input: do not inventory or read DCP files. Initialize the declared template when needed, inspect the derived Editable Surface once, read only existing source files necessary for safe replacement, and implement every required acceptance item without browsing component directories. Call preview.publish as the only Build and Candidate gate; do not call project.build, preview.start, browser tools, diagnostics tools, or preview audits separately. If preview.publish fails generation validation, read only the exact repairContextPath from its structured metadata and make one bounded source repair. If acceptance fails, read the exact acceptanceReportPath and repair every blocker. Never substitute a previous report path, rebuild or inspect an unchanged rejected candidate, or modify source for a platform-owned validation failure. Follow Runtime Workflow Progress exactly and call run.complete as soon as the validated Candidate is ready."
         }
         (Some("greenfield_static"), AgentPhase::Build, _) | (None, AgentPhase::Build, _) => {
             "Treat the injected GenerationContext as the complete frozen task input: do not inventory or read DCP files. Initialize the declared template when needed, call project.inspect for the derived Editable Surface, implement every required acceptance item, and use the template-owned preview/build workflow before run.complete."
@@ -5472,7 +7829,7 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
             "Use the Runtime-owned next-app Draft workflow. First inventory inputs, read the frozen Brief, Content Sources, and only the Design Context files present, then initialize and inspect the project. Turn every frozen acceptance criterion into a checklist before authoring. Preserve each requiredText literal in one rendered text node; do not split it across JSX elements. Read state/style-contract.json before mutations and satisfy every required DesignProfile selector, token, data hook, section, and responsive rule. Edit only Runtime-permitted React source under app/ or components/. After authoring, call project.ensure_dependencies with mode restore, then project.build. Only after the build succeeds call preview.dev_start, followed by preview.dev_status until status is ready and durableRevision equals workspaceRevision. Then call run.complete. Never call preview.publish or preview.start for next-app. If Dev fails, use its process output, stop it, make one bounded repair, rebuild, and start Dev once more. A missing visual model is advisory and must not block a durable Draft or run.complete. Production WorkVersion creation happens only through the user-initiated PublishWorkflow."
         }
         AgentPhase::Build => {
-            "Use the runtime project workflow. First call fs.list on inputs, then read inputs/brief.md and inputs/content-sources.json plus only the optional Design Context files actually present in that listing; do not probe missing optional paths. Before editing, turn the frozen acceptanceCriteria in inputs/brief.md into a checklist and implement every required route and exact required text in the first Candidate; do not substitute another route or paraphrase exact text. Verify that checklist against source before the first preview.publish. Design responsive layouts for a 375px viewport from the first Candidate. Grid or flex children that contain tables, charts, code, or other intrinsic-width content must use min-width: 0; internal horizontal scrollers must be constrained with max-width: 100% and overflow-x: auto. If responsive-layout reports document-level horizontal overflow, inspect grid/flex min-content sizing and fixed or viewport widths first; keep necessary overflow inside the intended component and do not hide document overflow as a substitute for fixing the source. Prefer server-rendered HTML, CSS, or SVG for non-interactive charts and dashboard visuals. Do not add a client-side chart library or browser script unless the user explicitly requests interaction; never reference server-only or frontmatter variables directly from a client script. Every same-origin href must resolve to a generated route or anchor; render non-navigating states as buttons or plain content instead of broken links. For fumadocs-docs, the seeded shared layout is project/lib/layout.shared.jsx, not lib/layout.shared.js, and the seeded route is project/app/docs/[[...slug]]/page.jsx; never guess another extension. Use the seeded MDX component mapping: Steps/Step, Tabs/Tab, and Accordions/Accordion support both flat child syntax and compound syntax such as <Steps.Step>. Do not create src/mdx-components.tsx, replace components/mdx.jsx, or import fumadocs-ui/dist internals to use those components. Optional files are inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/app/page.tsx; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. For fumadocs-docs, after the source mutation your next lifecycle tool must be preview.publish with no arguments. preview.publish owns dependency restore, production build, managed preview, validation, Candidate creation, and output_version_id; never call project.build, preview.dev_start, preview.start, preview.status, or draft.snapshot_create before the first preview.publish. Inspect the returned validation report and designProfileFidelity report before run.complete. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, and browser.screenshot separately after preview.publish itself returns a failure that requires diagnostics; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. If fs.patch reports oldStr missing, immediately read that same file and use a new exact snippet; never repeat the rejected patch. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
+            "Use the runtime project workflow. First call fs.list on inputs, then read inputs/brief.md and inputs/content-sources.json plus only the optional Design Context files actually present in that listing; do not probe missing optional paths. Before editing, turn the frozen acceptanceCriteria in inputs/brief.md into a checklist and implement every required route and exact required text in the first Candidate; do not substitute another route or paraphrase exact text. Verify that checklist against source before the first preview.publish. Design responsive layouts for a 375px viewport from the first Candidate. Grid or flex children that contain tables, charts, code, or other intrinsic-width content must use min-width: 0; internal horizontal scrollers must be constrained with max-width: 100% and overflow-x: auto. If responsive-layout reports document-level horizontal overflow, inspect grid/flex min-content sizing and fixed or viewport widths first; keep necessary overflow inside the intended component and do not hide document overflow as a substitute for fixing the source. Prefer server-rendered HTML, CSS, or SVG for non-interactive charts and dashboard visuals. Do not add a client-side chart library or browser script unless the user explicitly requests interaction; never reference server-only or frontmatter variables directly from a client script. Every same-origin href must resolve to a generated route or anchor; render non-navigating states as buttons or plain content instead of broken links. For fumadocs-docs, the seeded shared layout is project/lib/layout.shared.jsx, not lib/layout.shared.js, and the seeded route is project/app/docs/[[...slug]]/page.jsx; never guess another extension. Use the seeded MDX component mapping: Steps/Step, Tabs/Tab, and Accordions/Accordion support both flat child syntax and compound syntax such as <Steps.Step>. Do not create src/mdx-components.tsx, replace components/mdx.jsx, or import fumadocs-ui/dist internals to use those components. Optional files are inputs/design-profile.json, inputs/design-profile-usage.md, inputs/component-recipes.json, inputs/template-style-contract.json, and inputs/design.md. A frozen Design Context Package may require these reads before project.init; read state/style-contract.json after init and before any source/token mutation or publish. Use project.inspect to summarize lifecycle state after initialization or before edits. Use relative workspace paths only, such as inputs/brief.md, project/package.json, and project/app/page.tsx; never use / or /workspace paths with fs.* tools. Do not call Brief tools during Build runs. If the app root is missing or package.json is missing, call project.init with the requested template; for a Design Context Package, omit path or use its frozen expected app root, and treat state/project.json appRoot as the only app root after initialization. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. For theme/token changes prefer style.update_tokens with state/style-contract.json instead of patching repeated CSS literals. For fumadocs-docs, after the source mutation your next lifecycle tool must be preview.publish with no arguments. preview.publish owns dependency restore, production build, managed preview, validation, Candidate creation, and output_version_id; never call project.build, preview.dev_start, preview.start, preview.status, or draft.snapshot_create before the first preview.publish. Inspect the returned bounded repair context and designProfileFidelity report before run.complete. If generation validation fails, read only state/repair-context.json and make one bounded repair to a listed target file; never read the full validation report or Candidate Manifest. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. Use only exact token names declared by state/style-contract.json; never invent a token name. Only use project.build, preview.start, and browser.screenshot separately after preview.publish itself returns a failure that requires diagnostics; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not use npm create, npx scaffold/add commands, or nested project/package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. If fs.patch reports oldStr missing, immediately read that same file and use a new exact snippet; never repeat the rejected patch. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Edit
             if next_app
@@ -5484,7 +7841,7 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
             "Use the Runtime-owned next-app Cold Dev workflow. Apply only the focused edit authorized by the frozen EditImpactPlan. Never modify Runtime-owned package manifests with fs.*; restore the dependency graph only through project.ensure_dependencies with mode restore. Follow Runtime Workflow Progress exactly: stop the prior managed Dev process once, restart Dev once, then use preview.dev_status until the current Epoch/Revision is Ready and has a durable DraftSnapshot. Do not inspect ports or processes with shell.run, do not call preview.publish, and do not run a Production Build. Call run.complete as soon as Runtime reports draft_ready."
         }
         AgentPhase::Edit => {
-            "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the validated candidate contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read inputs/design-profile.json, inputs/design.md, and new user content sources such as docs markdown when present, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. After source edits are complete, call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the validated candidate, the returned validation report, and the designProfileFidelity report. If generation validation fails, read state/validation-report.json and repair every required failed or unavailable check before publishing again. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property using only exact token names from state/style-contract.json, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. If the candidate and both validation reports satisfy the request, call run.complete; Runtime atomically promotes the candidate and completes the run. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
+            "Use the runtime project workflow. The latest user continue message is the acceptance criteria for this Edit run; before publishing, identify every explicit requested text, title, section, or style token and apply those exact requirements to source under appRoot. If the user provides an exact title or quoted text, preserve that literal text in the edited source and verify the validated candidate contains it before run.complete. Use project.inspect to summarize lifecycle state, then use relative workspace paths only with fs.* tools. Read state/project.json and treat its appRoot as the only app root. Inspect existing source, read inputs/design-profile.json, inputs/design.md, and new user content sources such as docs markdown when present, apply focused code/content/style changes under appRoot with fs.* tools, and prefer style.update_tokens for theme/token changes declared in state/style-contract.json. Use project.ensure_dependencies for dependency restore/add work; it runs the real npm/pnpm package manager under runtime policy control. Use project.ensure_dependencies({\"mode\":\"restore\"}) to install package.json dependencies and project.ensure_dependencies({\"mode\":\"add\",\"packages\":[...]}) for new dependencies. Do not call npm/pnpm/yarn/bun install or add through shell.run. After source edits are complete, call preview.publish without url, port, command, or mode arguments; Runtime owns the managed preview endpoint. After preview.publish succeeds, do not call preview.report_candidate manually; inspect the validated candidate, the returned bounded repair context, and the designProfileFidelity report. If generation validation fails, read only state/repair-context.json and make one bounded repair to a listed target file; never read the full validation report or Candidate Manifest. If a required DesignProfile rule fails, read state/design-profile-fidelity.json, edit the declared repairContext.globalCssFile or another source file imported by the page, make a real source mutation that addresses each reported selector/property using only exact token names from state/style-contract.json, and only then publish again; do not create unimported CSS, and inspecting or rebuilding unchanged source is not a repair. If the candidate and both validation reports satisfy the request, call run.complete; Runtime atomically promotes the candidate and completes the run. Only use project.build, preview.start, and browser.screenshot separately when debugging a failed publish; preview.report_candidate is local-E2E-only and must never be called in a production run. Do not create nested package.json roots. Keep direct fs.write payloads under 48000 text chars and 96000 serialized argument bytes. For existing files prefer fs.patch with small unique oldStr snippets after reading the file, or fs.multi_patch for multiple edits in one already-read file. For new large files use fs.write_chunk followed by fs.commit_chunks. If a tool returns recoverable=true with errorKind, follow the metadata guidance and switch strategy immediately; for tool.input_json_parse_failed or tool.input_too_large, do not retry the same full fs.write payload."
         }
         AgentPhase::Review => {
             "Review the targeted candidate using read-only tools and report actionable findings. The exact candidate version is included as CandidateVersion in the runtime identity; pass it unchanged as review.report_finding.versionId. When RuntimeReviewTargetDetails names a deliberate defect, inspect the relevant project source directly, then immediately call review.report_finding with repairable=true before any repeated browser or diagnostic inspection. Do not probe optional Design Context paths that are not declared in Runtime context. For an untargeted Review, read inputs/design-profile.json and inputs/design.md only when present, then compare the preview, source, style tokens, content voice, accessibility, and visible UI against the DesignProfile. If the candidate drifts from the DesignProfile, call review.report_finding with category visual, content, or safety as appropriate. Set repairable=true for an evidence-backed source defect that a scoped Repair run can fix. Do not mutate files during Review runs."
@@ -5838,6 +8195,509 @@ fn render_markdown_list(items: &[String]) -> String {
 mod design_capsule_tests {
     use super::*;
 
+    struct WorkflowFixtureTool {
+        name: &'static str,
+        result: Value,
+        error_kind: Option<&'static str>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::runtime::Tool for WorkflowFixtureTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn check_permission(
+            &self,
+            input: &Value,
+            _ctx: &crate::tools::runtime::ToolContext,
+        ) -> crate::permission::PermissionResult {
+            crate::permission::PermissionResult::Allow {
+                updated_input: input.clone(),
+                reason: crate::permission::PermissionReason::Other {
+                    reason: "workflow fixture allowed".to_string(),
+                },
+            }
+        }
+
+        async fn call(
+            &self,
+            _input: Value,
+            _ctx: crate::tools::runtime::ToolContext,
+            _progress: crate::tools::runtime::ProgressSink,
+        ) -> std::result::Result<crate::tools::runtime::ToolResult, crate::tools::runtime::ToolError>
+        {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error_kind) = self.error_kind {
+                return Err(crate::tools::runtime::ToolError::typed_recoverable(
+                    format!("{} fixture failed", self.name),
+                    error_kind,
+                    json!({ "recoverable": true }),
+                ));
+            }
+            Ok(crate::tools::runtime::ToolResult::ok(self.result.clone()))
+        }
+    }
+
+    fn workflow_fixture_tool(
+        name: &'static str,
+        result: Value,
+    ) -> (
+        Arc<dyn crate::tools::runtime::Tool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Arc::new(WorkflowFixtureTool {
+                name,
+                result,
+                error_kind: None,
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+
+    fn next_app_workflow_run(mut run: AgentRun, profile: &str) -> AgentRun {
+        run.execution_profile = Some(profile.to_string());
+        run.project_state_snapshot = Some(crate::types::ProjectRuntimeState {
+            project_id: run.project_id.clone(),
+            revision: 1,
+            app_root: "project".to_string(),
+            template_key: "next-app".to_string(),
+            template_version: "next-app@1".to_string(),
+            template_manifest_sha256: Some("a".repeat(64)),
+            framework: "nextjs".to_string(),
+            sandbox_execution_profile_id: Some("next-app".to_string()),
+            sandbox_execution_profile_version: Some("0.1.0".to_string()),
+            package_manager: "npm".to_string(),
+            lockfile: "package-lock.json".to_string(),
+            registry: "runtime".to_string(),
+            updated_at: Utc::now(),
+        });
+        run
+    }
+
+    #[tokio::test]
+    async fn runtime_workflow_driver_completes_greenfield_lifecycle_without_model_tool_pairs() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "workflow-driver-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let (dependencies, _) =
+            workflow_fixture_tool("project.ensure_dependencies", json!({ "status": "ready" }));
+        let (build, _) = workflow_fixture_tool(
+            "project.build",
+            json!({ "status": "success", "success": true }),
+        );
+        let (dev_start, _) = workflow_fixture_tool(
+            "preview.dev_start",
+            json!({ "status": "starting", "sessionEpoch": 1, "workspaceRevision": 2 }),
+        );
+        let (dev_status, _) = workflow_fixture_tool(
+            "preview.dev_status",
+            json!({
+                "status": "ready",
+                "sessionEpoch": 1,
+                "workspaceRevision": 2,
+                "lastReadyRevision": 2,
+                "durableRevision": 2,
+                "durableSnapshotId": "snapshot-2"
+            }),
+        );
+        let (complete, _) = workflow_fixture_tool(
+            "run.complete",
+            json!({
+                "status": "completed",
+                "summary": "Runtime workflow completed the current validated Draft revision."
+            }),
+        );
+        let executor = ToolExecutor::new(
+            vec![dependencies, build, dev_start, dev_status, complete],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store.clone(), model, executor)
+            .with_generation_context_enabled(true)
+            .with_limits(AgentLoopLimits {
+                workflow_driver_mode: RuntimeWorkflowDriverMode::Enforced,
+                workflow_driver_poll_interval: Duration::from_millis(1),
+                workflow_driver_wait_timeout: Duration::from_millis(10),
+                ..AgentLoopLimits::default()
+            });
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_inspected",
+                "source_authored",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state.seed_substantive_progress();
+        let mut fingerprint = state.fingerprint();
+        let mut no_progress = 0;
+        let mut messages = Vec::new();
+
+        let outcome = time::timeout(
+            Duration::from_secs(2),
+            loop_runner.drive_runtime_workflow(
+                &run,
+                2,
+                &mut state,
+                &mut messages,
+                &mut fingerprint,
+                &mut no_progress,
+                ObservationBudgetUsage::default(),
+            ),
+        )
+        .await
+        .expect("workflow driver must remain bounded");
+
+        assert_eq!(
+            outcome.completion.as_ref().map(|value| value.0),
+            Some(AgentRunStatus::Completed),
+            "outcome={outcome:?}"
+        );
+        assert_eq!(outcome.action_count, 5);
+        assert!(state.completed_steps.contains("run_completed"));
+        assert!(messages.iter().any(|message| {
+            message.get("kind").and_then(Value::as_str) == Some("runtime_workflow_result")
+        }));
+        let events = store.events(&run.id).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::WorkflowLifecycleCompleted { .. }))
+                .count(),
+            5
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStarted { tool_use_id, .. }
+                | AgentEvent::ToolCompleted { tool_use_id, .. }
+                if tool_use_id.len() == 64
+        )));
+    }
+
+    #[tokio::test]
+    async fn runtime_workflow_driver_stops_on_first_typed_failure() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "workflow-driver-failure-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let dependency_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dependencies: Arc<dyn crate::tools::runtime::Tool> = Arc::new(WorkflowFixtureTool {
+            name: "project.ensure_dependencies",
+            result: json!({}),
+            error_kind: Some("dependency.restore_failed"),
+            calls: dependency_calls.clone(),
+        });
+        let (build, build_calls) = workflow_fixture_tool(
+            "project.build",
+            json!({ "status": "success", "success": true }),
+        );
+        let executor = ToolExecutor::new(
+            vec![dependencies, build],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store.clone(), model, executor)
+            .with_generation_context_enabled(true)
+            .with_limits(AgentLoopLimits {
+                workflow_driver_mode: RuntimeWorkflowDriverMode::Enforced,
+                ..AgentLoopLimits::default()
+            });
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_inspected",
+                "source_authored",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state.seed_substantive_progress();
+        let mut fingerprint = state.fingerprint();
+        let mut no_progress = 0;
+        let mut messages = Vec::new();
+
+        let outcome = loop_runner
+            .drive_runtime_workflow(
+                &run,
+                2,
+                &mut state,
+                &mut messages,
+                &mut fingerprint,
+                &mut no_progress,
+                ObservationBudgetUsage::default(),
+            )
+            .await;
+
+        assert!(outcome.completion.is_none());
+        assert_eq!(outcome.stopped_reason.as_deref(), Some("action_failed"));
+        assert_eq!(
+            dependency_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(build_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store.events(&run.id).await.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowLifecycleFailed { error_kind, .. }
+                if error_kind == "dependency.restore_failed"
+        )));
+        assert_eq!(
+            state
+                .workflow_driver_blocker
+                .as_ref()
+                .map(|blocker| blocker.error_kind.as_str()),
+            Some("dependency.restore_failed")
+        );
+
+        let second = loop_runner
+            .drive_runtime_workflow(
+                &run,
+                3,
+                &mut state,
+                &mut messages,
+                &mut fingerprint,
+                &mut no_progress,
+                ObservationBudgetUsage::default(),
+            )
+            .await;
+        assert_eq!(
+            second.stopped_reason.as_deref(),
+            Some("model_action_required")
+        );
+        assert_eq!(
+            dependency_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the driver must not retry a failed lifecycle action before model repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_workflow_driver_uses_typed_greenfield_fallback_without_model_turn() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "workflow-driver-fallback-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let (dependencies, _) =
+            workflow_fixture_tool("project.ensure_dependencies", json!({ "status": "ready" }));
+        let (build, _) = workflow_fixture_tool(
+            "project.build",
+            json!({ "status": "success", "success": true }),
+        );
+        let dev_start_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev_start: Arc<dyn crate::tools::runtime::Tool> = Arc::new(WorkflowFixtureTool {
+            name: "preview.dev_start",
+            result: json!({}),
+            error_kind: Some("preview.dev_unavailable"),
+            calls: dev_start_calls,
+        });
+        let (preview_start, _) =
+            workflow_fixture_tool("preview.start", json!({ "status": "ready" }));
+        let (snapshot, _) = workflow_fixture_tool(
+            "draft.snapshot_create",
+            json!({ "status": "snapshot_created" }),
+        );
+        let (complete, _) = workflow_fixture_tool(
+            "run.complete",
+            json!({
+                "status": "completed",
+                "summary": "Runtime workflow completed the current validated Draft revision."
+            }),
+        );
+        let executor = ToolExecutor::new(
+            vec![
+                dependencies,
+                build,
+                dev_start,
+                preview_start,
+                snapshot,
+                complete,
+            ],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store.clone(), model, executor)
+            .with_generation_context_enabled(true)
+            .with_limits(AgentLoopLimits {
+                workflow_driver_mode: RuntimeWorkflowDriverMode::Enforced,
+                ..AgentLoopLimits::default()
+            });
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_inspected",
+                "source_authored",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state.seed_substantive_progress();
+        let mut fingerprint = state.fingerprint();
+        let mut no_progress = 0;
+        let mut messages = Vec::new();
+
+        let outcome = loop_runner
+            .drive_runtime_workflow(
+                &run,
+                2,
+                &mut state,
+                &mut messages,
+                &mut fingerprint,
+                &mut no_progress,
+                ObservationBudgetUsage::default(),
+            )
+            .await;
+
+        assert_eq!(
+            outcome.completion.as_ref().map(|value| value.0),
+            Some(AgentRunStatus::Completed)
+        );
+        assert_eq!(outcome.action_count, 6);
+        assert!(state.completed_steps.contains("preview_fallback_required"));
+        assert!(state.completed_steps.contains("draft.snapshot_create"));
+        assert!(store.events(&run.id).await.iter().any(|event| matches!(
+            event,
+            AgentEvent::WorkflowLifecycleCompleted { action, outcome, .. }
+                if action == "preview.dev_start" && outcome == "fallback_selected"
+        )));
+    }
+
+    #[test]
+    fn workflow_lifecycle_completion_after_checkpoint_is_recovered_once() {
+        let mut checkpoint_state = RunProgressState::default();
+        checkpoint_state
+            .completed_steps
+            .insert("source_authored".to_string());
+        checkpoint_state.seed_substantive_progress();
+        let checkpoint_fingerprint = checkpoint_state.fingerprint();
+        let now = Utc::now();
+        let events = vec![
+            AgentEvent::RunProgressFingerprint {
+                run_id: "run-recover".to_string(),
+                turn: 2,
+                fingerprint: checkpoint_fingerprint,
+                consecutive_no_progress: 3,
+                evidence: json!({
+                    "state": checkpoint_state,
+                }),
+                timestamp: now,
+            },
+            AgentEvent::WorkflowLifecycleCompleted {
+                run_id: "run-recover".to_string(),
+                driver_id: "workflow-driver-recover".to_string(),
+                action: "project.ensure_dependencies".to_string(),
+                sequence: 1,
+                attempt: 1,
+                idempotency_key: "c".repeat(64),
+                outcome: "completed".to_string(),
+                progress_evidence: json!({
+                    "schemaVersion": "workflow-lifecycle-progress@1",
+                    "isError": false,
+                    "content": { "status": "ready" },
+                    "metadata": null,
+                }),
+                timestamp: now,
+            },
+        ];
+
+        let (state, _, no_progress) = recovered_progress_state(&events);
+
+        assert!(state.completed_steps.contains("dependencies_ready"));
+        assert_eq!(no_progress, 0);
+    }
+
+    #[test]
+    fn workflow_lifecycle_failure_after_checkpoint_recovers_blocker_until_source_changes() {
+        let mut checkpoint_state = RunProgressState::default();
+        checkpoint_state
+            .completed_steps
+            .insert("source_authored".to_string());
+        checkpoint_state.seed_substantive_progress();
+        let checkpoint_fingerprint = checkpoint_state.fingerprint();
+        let now = Utc::now();
+        let events = vec![
+            AgentEvent::RunProgressFingerprint {
+                run_id: "run-recover-failure".to_string(),
+                turn: 2,
+                fingerprint: checkpoint_fingerprint,
+                consecutive_no_progress: 2,
+                evidence: json!({ "state": checkpoint_state }),
+                timestamp: now,
+            },
+            AgentEvent::WorkflowLifecycleFailed {
+                run_id: "run-recover-failure".to_string(),
+                driver_id: "workflow-driver-recover".to_string(),
+                action: "project.ensure_dependencies".to_string(),
+                sequence: 1,
+                attempt: 1,
+                idempotency_key: "d".repeat(64),
+                error_kind: "dependency.restore_failed".to_string(),
+                recoverable: true,
+                diagnostic_ref: None,
+                source_snapshot_uri: None,
+                source_hash: None,
+                timestamp: now,
+            },
+        ];
+        let (mut state, _, no_progress) = recovered_progress_state(&events);
+        assert_eq!(no_progress, 0);
+        assert_eq!(
+            state
+                .workflow_driver_blocker
+                .as_ref()
+                .map(|blocker| blocker.action.as_str()),
+            Some("project.ensure_dependencies")
+        );
+
+        let mutation = ToolCall::new(
+            "repair-source",
+            "fs.patch",
+            json!({ "path": "project/app/page.tsx" }),
+        );
+        let mutation_result = ToolResultMessage {
+            tool_use_id: mutation.id.clone(),
+            tool_name: mutation.name.clone(),
+            is_error: false,
+            content: json!({ "status": "patched" }),
+            metadata: None,
+        };
+        update_progress_state(&mut state, &[mutation], &[mutation_result]);
+        assert!(state.workflow_driver_blocker.is_none());
+    }
+
     #[test]
     fn provider_capability_mismatch_only_downgrades_when_visuals_were_delivered() {
         let failure = ModelGatewayRequestError {
@@ -5981,6 +8841,222 @@ mod design_capsule_tests {
         assert!(second.contains("first"));
         assert!(second.contains("second"));
         assert!(!second.contains("Previous Compact"));
+    }
+
+    #[test]
+    fn ephemeral_workflow_progress_replaces_prior_value_and_stays_at_tail() {
+        let mut messages = vec![json!({ "role": "user", "text": "task" })];
+        upsert_ephemeral_context_message(
+            &mut messages,
+            1,
+            "runtime_workflow_progress",
+            "stage one".to_string(),
+        );
+        upsert_ephemeral_context_message(
+            &mut messages,
+            2,
+            "runtime_workflow_progress",
+            "stage two".to_string(),
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("kind").and_then(Value::as_str)
+                    == Some("runtime_workflow_progress"))
+                .count(),
+            1
+        );
+        assert_eq!(messages.last().unwrap()["text"], json!("stage two"));
+        assert_eq!(messages.last().unwrap()["ephemeral"], json!(true));
+    }
+
+    #[test]
+    fn large_completed_tool_pair_is_microcompacted_without_retaining_payload() {
+        let large_source = "x".repeat(20_000);
+        let mut messages = vec![
+            json!({ "role": "user", "text": "task" }),
+            json!({
+                "role": "assistant",
+                "turn": 1,
+                "toolCalls": [{
+                    "id": "write-1",
+                    "name": "fs.write",
+                    "input": { "path": "project/app/page.tsx", "content": large_source }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "turn": 1,
+                "toolUseId": "write-1",
+                "toolName": "fs.write",
+                "isError": false,
+                "content": {
+                    "path": "project/app/page.tsx",
+                    "bytes": 20000,
+                    "workspaceRevision": 2
+                }
+            }),
+            json!({ "role": "user", "text": "next" }),
+            json!({ "role": "assistant", "text": "working" }),
+            json!({ "role": "user", "text": "continue" }),
+            json!({ "role": "system", "kind": "runtime_workflow_progress", "text": "next" }),
+        ];
+
+        let stats = microcompact_completed_tool_exchanges(&mut messages);
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert_eq!(stats.compacted_exchanges, 1);
+        assert!(stats.removed_tokens > 4_000);
+        assert!(serialized.contains("runtime_tool_exchange_summary"));
+        assert!(!serialized.contains(&"x".repeat(1_000)));
+        assert!(serialized.contains("project/app/page.tsx"));
+        assert!(serialized.contains("workspaceRevision"));
+    }
+
+    #[test]
+    fn full_compaction_reports_independent_message_token_byte_and_request_triggers() {
+        assert!(compaction_trigger_reasons(1, 1, 1, 1, 1, Some(1)).is_empty());
+        assert!(compaction_trigger_reasons(
+            1,
+            1,
+            1,
+            1,
+            1,
+            Some(COMPACT_NEXT_REQUEST_TOKEN_THRESHOLD + 1),
+        )
+        .is_empty());
+        assert_eq!(
+            compaction_trigger_reasons(
+                COMPACT_MESSAGE_THRESHOLD + 1,
+                COMPACT_CONVERSATION_TOKEN_THRESHOLD + 1,
+                COMPACT_CONVERSATION_BYTE_THRESHOLD + 1,
+                COMPACT_LARGEST_MESSAGE_TOKEN_THRESHOLD + 1,
+                COMPACT_LARGEST_MESSAGE_BYTE_THRESHOLD + 1,
+                Some(COMPACT_NEXT_REQUEST_TOKEN_THRESHOLD + 1),
+            ),
+            vec![
+                "message_count",
+                "conversation_tokens",
+                "conversation_bytes",
+                "largest_message_tokens",
+                "largest_message_bytes",
+                "next_request_tokens",
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_set_hash_is_order_independent_and_changes_with_the_full_schema() {
+        let definition = |name: &str, field_type: &str| ModelToolDefinition {
+            name: name.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "value": { "type": field_type } }
+            }),
+            input_json_schema: None,
+            output_schema: Some(json!({ "type": "object" })),
+            loading_policy: crate::tools::registry::ToolLoadingPolicy::Eager,
+            mcp_info: None,
+        };
+        let first = definition("a.tool", "string");
+        let second = definition("b.tool", "number");
+        let ordered = canonical_json_hash(&canonical_tool_set_identity(
+            &[first.clone(), second.clone()],
+            &[],
+        ));
+        let reordered = canonical_json_hash(&canonical_tool_set_identity(
+            &[second.clone(), first.clone()],
+            &[],
+        ));
+        let schema_changed = canonical_json_hash(&canonical_tool_set_identity(
+            &[definition("a.tool", "boolean"), second],
+            &[],
+        ));
+
+        assert_eq!(ordered, reordered);
+        assert_ne!(ordered, schema_changed);
+    }
+
+    #[test]
+    fn historical_prompt_composition_without_tool_hash_version_remains_readable() {
+        let event = serde_json::from_value::<AgentEvent>(json!({
+            "type": "prompt.composition",
+            "runId": "run-legacy",
+            "turn": 1,
+            "estimatedInputTokens": 100,
+            "systemTokens": 10,
+            "messageTokens": 20,
+            "toolDefinitionTokens": 30,
+            "generationContextTokens": 5,
+            "staticPrefixHash": "a".repeat(64),
+            "toolSetHash": "b".repeat(64),
+            "timestamp": "2026-07-23T00:00:00Z"
+        }))
+        .expect("legacy Prompt Composition must remain deserializable");
+
+        assert!(matches!(
+            event,
+            AgentEvent::PromptComposition {
+                tool_set_hash_version: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn checkpoint_projection_hash_detects_tampered_active_window() {
+        let messages = vec![json!({ "role": "user", "text": "task" })];
+        let range = CheckpointConversationRange {
+            start_index: 0,
+            end_index_exclusive: 1,
+            retained_count: 1,
+            projection_version: Some("active-window-projection@1".to_string()),
+            projection_hash: Some(canonical_json_hash(&json!(messages))),
+            protected_exchange_ids: Vec::new(),
+        };
+
+        assert!(checkpoint_projection_matches(&messages, &range));
+        assert!(!checkpoint_projection_matches(
+            &[json!({ "role": "user", "text": "tampered" })],
+            &range
+        ));
+    }
+
+    #[test]
+    fn checkpoint_projection_never_splits_or_drops_pending_tool_exchange() {
+        let mut messages = (0..20)
+            .map(|index| json!({ "role": "user", "text": format!("message-{index}") }))
+            .collect::<Vec<_>>();
+        messages.insert(
+            0,
+            json!({
+                "role": "assistant",
+                "toolCalls": [{ "id": "pending-1", "name": "fs.write", "input": {} }]
+            }),
+        );
+        messages.push(json!({ "role": "user", "text": "latest" }));
+
+        let (retained, range) = recent_messages_with_range(&messages);
+        let range = range.unwrap();
+        assert_eq!(range.start_index, 0);
+        assert_eq!(protected_exchange_ids(&retained), vec!["pending-1"]);
+
+        let paired = vec![
+            json!({ "role": "user", "text": "old" }),
+            json!({
+                "role": "assistant",
+                "toolCalls": [{ "id": "write-1", "name": "fs.write", "input": {} }]
+            }),
+            json!({
+                "role": "tool",
+                "toolUseId": "write-1",
+                "isError": false,
+                "content": {}
+            }),
+        ];
+        let (retained, _) = recent_messages_with_range(&paired);
+        assert_eq!(retained[1]["role"], json!("assistant"));
+        assert_eq!(retained[2]["role"], json!("tool"));
     }
 
     #[test]
@@ -6278,6 +9354,92 @@ mod design_capsule_tests {
     }
 
     #[test]
+    fn observations_and_transient_stage_fields_do_not_advance_substantive_progress() {
+        let mut state = RunProgressState::default();
+        let initial = state.fingerprint();
+        state
+            .observations
+            .insert("fs.read:project/app/page.tsx".to_string());
+        state.completed_steps.insert("repair_required".to_string());
+        state.required_repair_report_path = Some("state/repair-context.json".to_string());
+        state.target_session_epoch = Some(4);
+        state.target_workspace_revision = Some(19);
+        state.seed_substantive_progress();
+
+        assert_eq!(state.fingerprint(), initial);
+    }
+
+    #[test]
+    fn repeated_build_identity_is_not_progress_but_new_source_and_candidate_digests_are() {
+        let call = ToolCall::new("build-1", "project.build", json!({ "cwd": "project" }));
+        let result = |build_id: &str, source: &str| ToolResultMessage {
+            tool_use_id: "build-1".to_string(),
+            tool_name: "project.build".to_string(),
+            is_error: false,
+            content: json!({
+                "buildId": build_id,
+                "sourceFingerprint": source,
+            }),
+            metadata: None,
+        };
+        let mut state = RunProgressState::default();
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&call),
+            &[result("build-a", "source-a")],
+        );
+        let first = state.fingerprint();
+
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&call),
+            &[result("build-b", "source-a")],
+        );
+        assert_eq!(state.fingerprint(), first);
+
+        update_progress_state(&mut state, &[call], &[result("build-c", "source-b")]);
+        assert_ne!(state.fingerprint(), first);
+        let source_advanced = state.fingerprint();
+        state.candidate_digest = Some("candidate-a".to_string());
+        state.seed_substantive_progress();
+        assert_ne!(state.fingerprint(), source_advanced);
+    }
+
+    #[test]
+    fn legacy_progress_event_migrates_without_resetting_no_progress_counter() {
+        let mut legacy_state = RunProgressState::default();
+        legacy_state
+            .observations
+            .insert("fs.read:project/app/page.tsx".to_string());
+        legacy_state.source_digest = Some("source-a".to_string());
+        let legacy_fingerprint = legacy_state.legacy_fingerprint();
+        let mut evidence_state = serde_json::to_value(&legacy_state).unwrap();
+        evidence_state
+            .as_object_mut()
+            .unwrap()
+            .remove("substantiveProgress");
+        let event = AgentEvent::RunProgressFingerprint {
+            run_id: "run-1".to_string(),
+            turn: 7,
+            fingerprint: legacy_fingerprint,
+            consecutive_no_progress: 3,
+            evidence: json!({ "state": evidence_state }),
+            timestamp: Utc::now(),
+        };
+
+        let (state, fingerprint, consecutive) = recovered_progress_state(&[event]);
+        assert_eq!(consecutive, 3);
+        assert_eq!(fingerprint, state.fingerprint());
+        assert!(state
+            .substantive_progress
+            .contains("source-digest:source-a"));
+        assert!(!state
+            .substantive_progress
+            .iter()
+            .any(|entry| entry.contains("fs.read")));
+    }
+
+    #[test]
     fn legacy_observation_budget_recovery_counts_attempted_tools() {
         let now = Utc::now();
         let events = vec![
@@ -6487,7 +9649,10 @@ mod design_capsule_tests {
     #[test]
     fn compaction_restore_uses_recent_full_source_receipts_with_bounded_count() {
         let now = Utc::now();
-        let event = |index: usize, view: ObservationView, outcome: ObservationOutcome| {
+        let event = |index: usize,
+                     view: ObservationView,
+                     outcome: ObservationOutcome,
+                     estimated_tokens: u64| {
             AgentEvent::ObservationReceipt {
                 run_id: "run-restore".to_string(),
                 receipt: ObservationReceipt {
@@ -6502,8 +9667,8 @@ mod design_capsule_tests {
                     last_read_turn: index as u32,
                     read_count: 1,
                     purpose: ObservationPurpose::Source,
-                    delivered_bytes: 400,
-                    estimated_tokens: 100,
+                    delivered_bytes: estimated_tokens.saturating_mul(4),
+                    estimated_tokens,
                     duplicate_delivery: outcome == ObservationOutcome::Unchanged,
                 },
                 timestamp: now,
@@ -6515,6 +9680,7 @@ mod design_capsule_tests {
                     index,
                     ObservationView::Full,
                     ObservationOutcome::ContentReturned,
+                    100,
                 )
             })
             .collect::<Vec<_>>();
@@ -6522,21 +9688,55 @@ mod design_capsule_tests {
             8,
             ObservationView::Full,
             ObservationOutcome::Unchanged,
+            100,
         ));
         events.push(event(
             9,
             ObservationView::Partial,
             ObservationOutcome::ContentReturned,
+            100,
         ));
         let visible = BTreeSet::from(["project/app/file-6.tsx".to_string()]);
 
-        let selected = select_source_restore_paths(&events, &visible);
+        let selected = select_source_restore_candidates(
+            &events,
+            &visible,
+            COMPACT_SOURCE_RESTORE_BUILD_TOKENS,
+        );
 
         assert_eq!(selected.len(), COMPACT_SOURCE_RESTORE_MAX_FILES);
-        assert_eq!(selected[0], "project/app/file-5.tsx");
-        assert!(!selected.contains(&"project/app/file-6.tsx".to_string()));
-        assert!(!selected.contains(&"project/app/file-8.tsx".to_string()));
-        assert!(!selected.contains(&"project/app/file-9.tsx".to_string()));
+        assert_eq!(selected[0].path, "project/app/file-5.tsx");
+        let selected_paths = selected
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(!selected_paths.contains("project/app/file-6.tsx"));
+        assert!(!selected_paths.contains("project/app/file-8.tsx"));
+        assert!(!selected_paths.contains("project/app/file-9.tsx"));
+        assert_eq!(source_restore_token_limit(AgentPhase::Build), 8_000);
+        assert_eq!(source_restore_token_limit(AgentPhase::Edit), 4_000);
+        assert_eq!(source_restore_token_limit(AgentPhase::Repair), 4_000);
+        assert_eq!(source_restore_token_limit(AgentPhase::Brief), 0);
+
+        let budgeted = [10, 11, 12]
+            .into_iter()
+            .map(|index| {
+                event(
+                    index,
+                    ObservationView::Full,
+                    ObservationOutcome::ContentReturned,
+                    3_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            select_source_restore_candidates(&budgeted, &BTreeSet::new(), 8_000).len(),
+            2
+        );
+        assert_eq!(
+            select_source_restore_candidates(&budgeted, &BTreeSet::new(), 4_000).len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6789,9 +9989,10 @@ mod design_capsule_tests {
 
         let prompt = system_prompt_for_run(&run, None, true);
         assert!(prompt.contains("preview.publish as the only Build and Candidate gate"));
-        assert!(prompt.contains("read the exact validationReportPath"));
-        assert!(prompt.contains("make a real source repair for every blocker"));
-        assert!(prompt.contains("Do not rebuild or inspect the unchanged rejected candidate"));
+        assert!(prompt.contains("read only the exact repairContextPath"));
+        assert!(prompt.contains("make one bounded source repair"));
+        assert!(prompt.contains("rebuild or inspect an unchanged rejected candidate"));
+        assert!(prompt.contains("modify source for a platform-owned validation failure"));
         assert!(prompt.contains("do not call project.build, preview.start, browser tools"));
         assert!(!prompt.contains("First call fs.list on inputs"));
     }
@@ -6820,7 +10021,7 @@ mod design_capsule_tests {
         let report = ToolCall::new(
             "report",
             "fs.read",
-            json!({ "path": "state/validation-report.json" }),
+            json!({ "path": "state/repair-context.json" }),
         );
         let source = ToolCall::new(
             "source",
@@ -7321,5 +10522,149 @@ mod design_capsule_tests {
         assert_eq!(state.target_workspace_revision, Some(42));
         assert!(!state.completed_steps.contains("draft_ready"));
         assert!(state.durable_snapshot_id.is_none());
+    }
+
+    #[test]
+    fn split_budget_shadow_preserves_legacy_decision_and_reports_split_outcome() {
+        let limits = AgentLoopLimits {
+            token_budget_mode: TokenBudgetMode::SplitShadow,
+            max_input_tokens: 200,
+            max_gross_input_tokens: 400,
+            max_uncached_input_tokens: 150,
+            ..AgentLoopLimits::default()
+        };
+        let usage = RunTokenUsage {
+            input_tokens: 220,
+            cached_input_tokens: 120,
+            output_tokens: 10,
+        };
+        let decisions = token_budget_decisions(usage, limits, true);
+
+        assert!(decisions.iter().any(|decision| {
+            decision.kind == "legacy_gross_input" && decision.exhausted && decision.enforced
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.kind == "uncached_input" && !decision.exhausted && !decision.enforced
+        }));
+        assert!(token_budget_exhausted_reason(usage, limits, true)
+            .unwrap()
+            .contains("budgetKind=legacy_gross_input"));
+    }
+
+    #[test]
+    fn legacy_default_budget_remains_twenty_turns_and_two_hundred_thousand_input_tokens() {
+        let limits = AgentLoopLimits::default();
+
+        assert_eq!(limits.token_budget_mode, TokenBudgetMode::Legacy);
+        assert_eq!(limits.max_turns, 20);
+        assert_eq!(limits.max_input_tokens, 200_000);
+    }
+
+    #[test]
+    fn split_budget_enforcement_does_not_treat_cached_input_as_uncached() {
+        let limits = AgentLoopLimits {
+            token_budget_mode: TokenBudgetMode::SplitEnforced,
+            max_gross_input_tokens: 400,
+            max_uncached_input_tokens: 150,
+            ..AgentLoopLimits::default()
+        };
+        let usage = RunTokenUsage {
+            input_tokens: 220,
+            cached_input_tokens: 120,
+            output_tokens: 10,
+        };
+
+        assert!(token_budget_exhausted_reason(usage, limits, true).is_none());
+        let exhausted = RunTokenUsage {
+            cached_input_tokens: 20,
+            ..usage
+        };
+        assert!(token_budget_exhausted_reason(exhausted, limits, true)
+            .unwrap()
+            .contains("budgetKind=uncached_input"));
+    }
+
+    #[test]
+    fn operation_budget_combines_prior_attempts_and_current_run() {
+        let limits = AgentLoopLimits {
+            max_operation_gross_input_tokens: 400,
+            max_operation_uncached_input_tokens: 250,
+            max_operation_output_tokens: 100,
+            max_operation_turns: 5,
+            max_operation_tool_calls: 10,
+            ..AgentLoopLimits::default()
+        };
+        let prior = OperationBudgetUsage {
+            tokens: RunTokenUsage {
+                input_tokens: 250,
+                cached_input_tokens: 100,
+                output_tokens: 30,
+            },
+            model_turns: 3,
+            tool_calls: 4,
+        };
+        let current = RunTokenUsage {
+            input_tokens: 180,
+            cached_input_tokens: 100,
+            output_tokens: 10,
+        };
+
+        assert_eq!(
+            operation_budget_exhausted(prior, current, 1, 2, limits),
+            Some(("operation_gross_input", 430, 400))
+        );
+        let cached_current = RunTokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 100,
+            output_tokens: 10,
+        };
+        assert_eq!(
+            operation_budget_exhausted(prior, cached_current, 2, 2, limits),
+            Some(("operation_turn", 5, 5))
+        );
+    }
+
+    #[test]
+    fn phase_budget_profile_is_hash_frozen_and_uses_documented_targets() {
+        let profile = phase_budget_profile_from_env(AgentPhase::Build);
+        profile.validate(AgentPhase::Build).unwrap();
+        assert_eq!(profile.schema_version, "run-budget-profile@1");
+        assert_eq!(profile.phase_target_limits.max_turns, 16);
+        assert_eq!(profile.phase_target_limits.max_gross_input_tokens, 300_000);
+        assert_eq!(
+            profile.phase_target_limits.max_uncached_input_tokens,
+            180_000
+        );
+        assert_eq!(
+            profile.phase_target_limits.max_prompt_tokens_per_turn,
+            64_000
+        );
+        let mut tampered = profile;
+        tampered.phase_target_limits.max_turns = 17;
+        assert!(tampered.validate(AgentPhase::Build).is_err());
+    }
+
+    #[test]
+    fn frozen_phase_profile_selects_shadow_or_enforced_limits_without_rereading_env() {
+        let mut profile = phase_budget_profile_from_env(AgentPhase::Edit);
+        profile.rollout_mode = "shadow".to_string();
+        profile.token_budget_mode = "legacy".to_string();
+        profile.enforced_limits.max_turns = 19;
+        profile.phase_target_limits.max_turns = 12;
+        profile.profile_hash = profile.identity_hash();
+        let shadow = AgentLoopLimits::default()
+            .apply_run_budget_profile(&profile)
+            .unwrap();
+        assert_eq!(shadow.max_turns, 19);
+        assert_ne!(shadow.token_budget_mode, TokenBudgetMode::SplitEnforced);
+
+        profile.rollout_mode = "enforced".to_string();
+        profile.profile_hash = profile.identity_hash();
+        let enforced = AgentLoopLimits::default()
+            .apply_run_budget_profile(&profile)
+            .unwrap();
+        assert_eq!(enforced.max_turns, 12);
+        assert_eq!(enforced.max_gross_input_tokens, 220_000);
+        assert_eq!(enforced.token_budget_mode, TokenBudgetMode::SplitEnforced);
     }
 }

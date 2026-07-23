@@ -5,6 +5,10 @@ fn project_route_family_is_frozen() {
         &[
             ("GET", "/projects/{project_id}/conversation"),
             ("GET", "/projects/{project_id}/history"),
+            (
+                "GET",
+                "/projects/{project_id}/generation-operations/{operation_id}/usage",
+            ),
             ("GET", "/projects/{project_id}/draft-preview"),
             ("GET", "/draft-preview-sessions/{session_id}"),
             ("GET", "/draft-preview-sessions/{session_id}/events"),
@@ -27,6 +31,7 @@ fn project_route_family_is_frozen() {
             ("GET", "/projects/{project_id}/assets"),
             ("GET", "/projects/{project_id}/assets/{asset_id}"),
             ("GET", "/projects/{project_id}/runtime-state"),
+            ("GET", "/projects/{project_id}/model-services"),
             ("POST", "/projects/{project_id}/visual-artifacts"),
             (
                 "GET",

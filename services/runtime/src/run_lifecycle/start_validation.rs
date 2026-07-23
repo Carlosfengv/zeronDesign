@@ -33,6 +33,17 @@ pub(super) fn validate(command: &StartRunCommand) -> Result<(), RunLifecycleErro
         "predecessorRunId",
         command.input_context.predecessor_run_id.as_deref(),
     )?;
+    optional(
+        "continuationSnapshotId",
+        command.input_context.continuation_snapshot_id.as_deref(),
+    )?;
+    if command.input_context.continuation_snapshot_id.is_some()
+        && command.input_context.predecessor_run_id.is_none()
+    {
+        return Err(invalid_request(
+            "continuationSnapshotId requires predecessorRunId".to_string(),
+        ));
+    }
     if command.input_context.parent_run_id.is_some()
         && command.input_context.predecessor_run_id.is_some()
     {

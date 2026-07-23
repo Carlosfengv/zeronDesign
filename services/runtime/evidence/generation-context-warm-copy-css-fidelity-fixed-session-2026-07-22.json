@@ -1,0 +1,129 @@
+{
+  "schemaVersion": "generation-context-warm-copy-css-fidelity-fixed-session-summary@1",
+  "recordedAt": "2026-07-22T05:35:30Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-07-zenova-agent-cloud-warm-copy-css",
+    "batchId": "batch-07",
+    "fixtureId": "zenova-agent-cloud",
+    "bucket": "warm_copy_css",
+    "templateVersion": "next-app",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "no_progress",
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-16311273",
+      "recordHash": "880bb2ce27487603deb253228ae5b9cc8a1ccd611ba241590a889e0e391c3911",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 69768,
+        "outputTokens": 709,
+        "toolCalls": 10,
+        "totalDurationMs": 27484,
+        "timeToFirstSourceMutationMs": 16214,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 2819,
+        "timeToDurableSnapshotMs": 16214,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-9604255",
+      "recordHash": "0dafc10dfc4de12bb510a9cad45fe293cd71101dcc94865291afb41ac0227354",
+      "sandboxReleaseVerified": true,
+      "nonVisualReference": {
+        "state": "unavailable",
+        "providerVisionCapable": false,
+        "visualBindingsVerified": true,
+        "unavailableMetricRecorded": true,
+        "mainTaskCompleted": true,
+        "gatewayVisualInputAttested": false,
+        "gatewayAcceptedImageCount": 0,
+        "visualBindingSetHash": "08bd0e71c795b9ab4dff9e64050e7e943dad6bbf3d511175c9524641e23d26f1",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "referenceArtifactSha256": "431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460",
+        "referenceMediaType": "image/png",
+        "modelExecutionCountAfterFallback": 6
+      },
+      "metrics": {
+        "inputTokens": 78333,
+        "outputTokens": 882,
+        "toolCalls": 11,
+        "totalDurationMs": 35459,
+        "timeToFirstSourceMutationMs": 17420,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 2937,
+        "timeToDurableSnapshotMs": 17420,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": 12.28,
+      "outputTokens": 24.4,
+      "toolCalls": 10.0,
+      "totalDurationMs": 29.02,
+      "timeToFirstSourceMutationMs": 7.44,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 4.19,
+      "timeToDurableSnapshotMs": 7.44,
+      "prebuildFsReadCount": 100.0,
+      "prebuildFsSearchCount": 0.0
+    },
+    "openFindings": [
+      "the candidate proved frozen non-visual reference binding, an explicit unavailable metric, and continued main-task completion without fabricating pixel delivery",
+      "candidate iframe applied at 2937ms, below the 3000ms Warm Copy/CSS P95 target for this point sample",
+      "candidate durable snapshot at 17420ms remains far above the 5000ms P95 target",
+      "all measured efficiency point estimates except mutation turn and search count regressed in this pair",
+      "one pair in one batch cannot establish the required twenty-pair or three-batch gates"
+    ]
+  },
+  "ledger": {
+    "recordCount": 15,
+    "sampleCount": 14,
+    "completePairCount": 7,
+    "pendingPairCount": 0,
+    "headRecordHash": "0dafc10dfc4de12bb510a9cad45fe293cd71101dcc94865291afb41ac0227354",
+    "sha256": "dda8cb45dd42b2d1869c8ade27097f3aa71251c26ed7ca906e1a1aa53a25685c"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 1,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 1,
+    "warmCopyCssMinimumBatchCount": 3,
+    "rolloutEvidenceSha256": "704d511bd8c1db4bcf35b332e850eb980bce455643a355d10c35c37e2157c55f"
+  },
+  "clusterAfterPair": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "sourceSha256": {
+    "pairSpec": "9c6e5cdfb3f0bb5f006eebb7900a84d1511a84f12e27bcdb4380695e924414df",
+    "pairResult": "dd43ad425f26548682a13351a7157db3778ae1355796078b7b459262dc4eb192",
+    "controlCase": "bed8126a265b47fa4a07a9f8f5f87d2a04d1a86ba5a05a68f67a94d6b9074e56",
+    "candidateCase": "deae30c104ed46759a7815b5c6de6adf61cdc41b3ac090d4833d3a85a2357939",
+    "rolloutEvidence": "704d511bd8c1db4bcf35b332e850eb980bce455643a355d10c35c37e2157c55f"
+  }
+}

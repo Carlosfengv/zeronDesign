@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -43,6 +44,26 @@ use tower::ServiceExt;
 
 static SANDBOX_CHANNEL_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 const REAL_PROVIDER_STAGE_TIMEOUT_SECS: u64 = 420;
+const HTTP_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+pub(super) fn run_with_http_test_stack<F>(name: &str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(HTTP_TEST_STACK_BYTES)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build HTTP test runtime")
+                .block_on(future)
+        })
+        .expect("spawn HTTP test thread")
+        .join()
+        .expect("HTTP test thread panicked");
+}
 
 struct SandboxChannelEnvOverride;
 

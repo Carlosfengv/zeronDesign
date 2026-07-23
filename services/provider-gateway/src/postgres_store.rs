@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use crate::storage::{AuditEventRecord, ResourceHealthState, StoredAdminOperation, StoredTurn};
 use crate::{
     GatewayErrorEnvelope, GatewayTurnResponse, ModelExecutionSummary, ModelResource,
-    ModelSelectionPolicy,
+    ModelSelectionPolicy, ProviderConnection,
 };
 
 pub struct PostgresStore {
@@ -587,6 +587,175 @@ impl PostgresStore {
         })
     }
 
+    pub fn provider_connections(&self) -> Result<Vec<ProviderConnection>> {
+        self.with_client(|client| {
+            client
+                .query(
+                    "SELECT connection_json FROM provider_connections ORDER BY id",
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| {
+                    serde_json::from_str(row.get::<_, String>(0).as_str()).map_err(Into::into)
+                })
+                .collect()
+        })
+    }
+
+    pub fn provider_connection(&self, id: &str) -> Result<Option<ProviderConnection>> {
+        self.with_client(|client| {
+            client
+                .query_opt(
+                    "SELECT connection_json FROM provider_connections WHERE id = $1",
+                    &[&id],
+                )?
+                .map(|row| serde_json::from_str(row.get::<_, String>(0).as_str()))
+                .transpose()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn save_provider_connection(
+        &self,
+        mut connection: ProviderConnection,
+        expected_version: Option<u64>,
+    ) -> Result<ProviderConnection> {
+        self.with_client(|client| {
+            let mut transaction = client.transaction()?;
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                &[&connection.id],
+            )?;
+            let current = transaction
+                .query_opt(
+                    "SELECT version FROM provider_connections WHERE id = $1 FOR UPDATE",
+                    &[&connection.id],
+                )?
+                .map(|row| to_u64(row.get::<_, i64>(0), "provider connection version"))
+                .transpose()?;
+            check_revision(
+                "provider connection",
+                &connection.id,
+                current,
+                expected_version,
+            )?;
+            connection.version = current.unwrap_or(0).saturating_add(1);
+            transaction.execute(
+                "INSERT INTO provider_connections
+                    (id, version, enabled, connection_json)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    version = EXCLUDED.version,
+                    enabled = EXCLUDED.enabled,
+                    connection_json = EXCLUDED.connection_json,
+                    updated_at = CURRENT_TIMESTAMP",
+                &[
+                    &connection.id,
+                    &to_i64(connection.version, "provider connection version")?,
+                    &connection.enabled,
+                    &serde_json::to_string(&connection)?,
+                ],
+            )?;
+            insert_audit(
+                &mut transaction,
+                "provider_connection.saved",
+                &connection.id,
+                &serde_json::json!({
+                    "version": connection.version,
+                    "enabled": connection.enabled,
+                    "kind": connection.kind,
+                    "authType": connection.auth.auth_type,
+                    "credentialConfigured": !connection.auth.secret_ref.trim().is_empty(),
+                }),
+            )?;
+            bump_configuration_version(&mut transaction)?;
+            transaction.commit()?;
+            Ok(connection)
+        })
+    }
+
+    pub fn save_provider_connection_with_secret(
+        &self,
+        mut connection: ProviderConnection,
+        expected_version: Option<u64>,
+        secret_name: &str,
+        ciphertext: &str,
+    ) -> Result<ProviderConnection> {
+        self.with_client(|client| {
+            let mut transaction = client.transaction()?;
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+                &[&connection.id],
+            )?;
+            let current = transaction
+                .query_opt(
+                    "SELECT version FROM provider_connections WHERE id = $1 FOR UPDATE",
+                    &[&connection.id],
+                )?
+                .map(|row| to_u64(row.get::<_, i64>(0), "provider connection version"))
+                .transpose()?;
+            check_revision(
+                "provider connection",
+                &connection.id,
+                current,
+                expected_version,
+            )?;
+            connection.version = current.unwrap_or(0).saturating_add(1);
+            transaction.execute(
+                "INSERT INTO provider_gateway_encrypted_secrets (name, ciphertext)
+                 VALUES ($1, $2)
+                 ON CONFLICT(name) DO UPDATE SET
+                    ciphertext = EXCLUDED.ciphertext,
+                    updated_at = CURRENT_TIMESTAMP",
+                &[&secret_name, &ciphertext],
+            )?;
+            transaction.execute(
+                "INSERT INTO provider_connections (id, version, enabled, connection_json)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    version = EXCLUDED.version,
+                    enabled = EXCLUDED.enabled,
+                    connection_json = EXCLUDED.connection_json,
+                    updated_at = CURRENT_TIMESTAMP",
+                &[
+                    &connection.id,
+                    &to_i64(connection.version, "provider connection version")?,
+                    &connection.enabled,
+                    &serde_json::to_string(&connection)?,
+                ],
+            )?;
+            insert_audit(
+                &mut transaction,
+                "provider_connection.saved",
+                &connection.id,
+                &serde_json::json!({
+                    "version": connection.version,
+                    "enabled": connection.enabled,
+                    "kind": connection.kind,
+                    "authType": connection.auth.auth_type,
+                    "credentialConfigured": true,
+                }),
+            )?;
+            bump_configuration_version(&mut transaction)?;
+            transaction.commit()?;
+            Ok(connection)
+        })
+    }
+
+    pub fn configuration_version(&self) -> Result<u64> {
+        self.with_client(|client| {
+            to_u64(
+                client
+                    .query_one(
+                        "SELECT configuration_version FROM gateway_configuration_state WHERE singleton_id = 1",
+                        &[],
+                    )?
+                    .get::<_, i64>(0),
+                "configuration version",
+            )
+        })
+    }
+
     pub fn model_resource(&self, id: &str, revision: Option<u64>) -> Result<Option<ModelResource>> {
         self.with_client(|client| {
             let row = if let Some(revision) = revision {
@@ -679,6 +848,7 @@ impl PostgresStore {
                     "secretConfigured": !resource.auth.secret_ref.trim().is_empty(),
                 }),
             )?;
+            bump_configuration_version(&mut transaction)?;
             transaction.commit()?;
             Ok(resource)
         })
@@ -736,6 +906,7 @@ impl PostgresStore {
                 &policy.id,
                 &policy,
             )?;
+            bump_configuration_version(&mut transaction)?;
             transaction.commit()?;
             Ok(policy)
         })
@@ -790,6 +961,7 @@ impl PostgresStore {
                     "previousRevision": expected_current_revision,
                 }),
             )?;
+            bump_configuration_version(&mut transaction)?;
             transaction.commit()?;
             Ok(policy)
         })
@@ -888,6 +1060,9 @@ fn connect(database_url: &str) -> Result<Client> {
     connection
         .batch_execute(include_str!("../migrations/0001_postgres_shared_state.sql"))
         .context("applying Provider Gateway PostgreSQL migrations")?;
+    connection
+        .batch_execute(include_str!("../migrations/0002_provider_connections.sql"))
+        .context("applying Provider Connection PostgreSQL migration")?;
     Ok(connection)
 }
 
@@ -928,6 +1103,24 @@ fn insert_policy_revision(
         ],
     )?;
     Ok(())
+}
+
+fn bump_configuration_version(client: &mut impl GenericClient) -> Result<u64> {
+    let version = client
+        .query_one(
+            "UPDATE gateway_configuration_state
+             SET configuration_version = configuration_version + 1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE singleton_id = 1
+             RETURNING configuration_version",
+            &[],
+        )?
+        .get::<_, i64>(0);
+    client.query_one(
+        "SELECT pg_notify('provider_gateway_configuration', $1)",
+        &[&version.to_string()],
+    )?;
+    to_u64(version, "configuration version")
 }
 
 fn insert_audit(

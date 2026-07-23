@@ -34,21 +34,10 @@ fn configure_real_provider_gateway(config: &mut RuntimeConfig, model_resource_id
 
 #[test]
 fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds() {
-    std::thread::Builder::new()
-        .name("docs-lifecycle-e2e".to_string())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(
-                    public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds_inner(),
-                )
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+    run_with_http_test_stack(
+        "docs-lifecycle-e2e",
+        public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds_inner(),
+    );
 }
 
 async fn public_runtime_docs_lifecycle_build_runtime_state_edit_and_rebuilds_inner() {
@@ -587,6 +576,28 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
     let workspace = unique_temp_dir("real-provider-http-lifecycle");
     let store = RuntimeStore::with_checkpoint_dir(workspace.join("state/checkpoints"));
     let project_filter = std::env::var("REAL_PROVIDER_PROJECT_FILTER").ok();
+    let website_prompt = std::env::var("REAL_PROVIDER_WEBSITE_PROMPT").unwrap_or_else(|_| {
+        "Use project.init with next-app if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Prefer style.update_tokens for color edits. Do not use raw npm/pnpm install commands through shell.run.".to_string()
+    });
+    let website_design = std::env::var("REAL_PROVIDER_WEBSITE_DESIGN").unwrap_or_else(|_| {
+        "# Website design\n- Build a compact operational SaaS website for runtime harness engineers.\n- Use Tailwind/token styling and local UI primitives from the runtime template.\n- Hero title should initially include Runtime Harness.\n- Include sections for lifecycle, typed recovery, preview promotion, and evidence.\n".to_string()
+    });
+    let website_edit_prompt = std::env::var("REAL_PROVIDER_WEBSITE_EDIT_PROMPT").unwrap_or_else(|_| {
+        "Acceptance criteria: the promoted website artifact must contain the literal text TESTXXX in the hero title. Change the hero title to TESTXXX 标题内容, set the primary theme color token to #f97316 using style.update_tokens when possible, then rebuild and promote with preview.publish exactly once. Do not call run.complete until the served artifact contains TESTXXX.".to_string()
+    });
+    let website_expected_text =
+        std::env::var("REAL_PROVIDER_WEBSITE_EXPECTED_TEXT").unwrap_or_else(|_| "TESTXXX".into());
+    let docs_prompt = std::env::var("REAL_PROVIDER_DOCS_PROMPT").unwrap_or_else(|_| {
+        "Use project.init with fumadocs-docs if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Keep Docs source editable and tokenized.".to_string()
+    });
+    let docs_design = std::env::var("REAL_PROVIDER_DOCS_DESIGN").unwrap_or_else(|_| {
+        "# Docs design\n- Build a Fumadocs documentation portal for runtime lifecycle operations.\n- The overview page should explain create, generate, edit, build, screenshot, and promote.\n- Include a section on typed recoverable errors and preview evidence.\n".to_string()
+    });
+    let docs_edit_prompt = std::env::var("REAL_PROVIDER_DOCS_EDIT_PROMPT").unwrap_or_else(|_| {
+        "Rename the overview page to Edited docs title and add one short section about browser computed-style verification. Rebuild and promote with preview.publish.".to_string()
+    });
+    let docs_expected_text = std::env::var("REAL_PROVIDER_DOCS_EXPECTED_TEXT")
+        .unwrap_or_else(|_| "Edited docs title".into());
     let website_profile = if project_filter.as_deref() != Some("docs") {
         let mut profile_payload = design_profile_request("real-http-website", vec!["next-app"])
             ["profile"]
@@ -651,50 +662,60 @@ async fn real_provider_public_runtime_website_and_docs_lifecycle_matrix() {
             &model_resource_id,
             website_brief(),
             vec![
-                ContentSource::readable(
-                    "website-design",
-                    "design_md",
-                    "# Website design\n- Build a compact operational SaaS website for runtime harness engineers.\n- Use Tailwind/token styling and local UI primitives from the runtime template.\n- Hero title should initially include Runtime Harness.\n- Include sections for lifecycle, typed recovery, preview promotion, and evidence.\n",
-                ),
-                ContentSource::readable(
-                    "website-instructions",
-                    "prompt",
-                    "Use project.init with next-app if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Prefer style.update_tokens for color edits. Do not use raw npm/pnpm install commands through shell.run.",
-                ),
+                ContentSource::readable("website-design", "design_md", website_design),
+                ContentSource::readable("website-instructions", "prompt", website_prompt),
             ],
-            "Acceptance criteria: the promoted website artifact must contain the literal text TESTXXX in the hero title. Change the hero title to TESTXXX 标题内容, set the primary theme color token to #f97316 using style.update_tokens when possible, then rebuild and promote with preview.publish exactly once. Do not call run.complete until the served artifact contains TESTXXX.",
+            &website_edit_prompt,
             "/artifacts/real-http-website/current/",
-            "project/dist/index.html",
-            "TESTXXX",
+            "project/out/index.html",
+            &website_expected_text,
             true,
         )
         .await;
     }
 
     if project_filter.as_deref() != Some("website") {
+        let docs_test_brief =
+            if std::env::var("REAL_PROVIDER_DOCS_BRIEF_MODE").as_deref() == Ok("design-system") {
+                Brief {
+                    project_type: "docs".to_string(),
+                    audience: "design system consumers and contributors".to_string(),
+                    content_hierarchy: vec![
+                        "overview".to_string(),
+                        "foundations".to_string(),
+                        "components".to_string(),
+                        "accessibility".to_string(),
+                    ],
+                    page_structure: json!([
+                        {
+                            "title": "Overview",
+                            "level": 1,
+                            "content": "Explain how to adopt and contribute to the design system"
+                        }
+                    ]),
+                    visual_direction: "clear technical design system documentation".to_string(),
+                    recommended_template: "fumadocs-docs".to_string(),
+                    assumptions: vec![],
+                    missing_information: vec![],
+                }
+            } else {
+                docs_brief()
+            };
         run_real_provider_lifecycle_project(
             app,
             &store,
             &workspace,
             "real-http-docs",
             &model_resource_id,
-            docs_brief(),
+            docs_test_brief,
             vec![
-                ContentSource::readable(
-                    "docs-design",
-                    "design_md",
-                    "# Docs design\n- Build a Fumadocs documentation portal for runtime lifecycle operations.\n- The overview page should explain create, generate, edit, build, screenshot, and promote.\n- Include a section on typed recoverable errors and preview evidence.\n",
-                ),
-                ContentSource::readable(
-                    "docs-instructions",
-                    "prompt",
-                    "Use project.init with fumadocs-docs if needed, inspect the project, and use preview.publish for build/screenshot/candidate/promotion. Keep Docs source editable and tokenized.",
-                ),
+                ContentSource::readable("docs-design", "design_md", docs_design),
+                ContentSource::readable("docs-instructions", "prompt", docs_prompt),
             ],
-            "Rename the overview page to Edited docs title and add one short section about browser computed-style verification. Rebuild and promote with preview.publish.",
+            &docs_edit_prompt,
             "/artifacts/real-http-docs/current/docs",
             "project/out/docs.html",
-            "Edited docs title",
+            &docs_expected_text,
             false,
         )
         .await;
@@ -752,7 +773,8 @@ async fn assert_governed_model_resource_execution(
 ) {
     let run = store.get_run(run_id).await.expect("real-provider Run");
     assert_eq!(
-        run.model, model_resource_id,
+        run.model,
+        format!("resource:{model_resource_id}"),
         "Run must bind only the selected Model Resource ID"
     );
     assert!(
@@ -821,6 +843,34 @@ async fn run_real_provider_lifecycle_project(
         "real provider build run {build_run_id} should complete; events={}",
         serde_json::to_string(&store.events(&build_run_id).await).unwrap()
     );
+    if std::env::var("REAL_PROVIDER_BUILD_ONLY").as_deref() == Ok("1") {
+        let artifact_url = local_artifact_url(workspace_root, project_id, local_artifact_relative);
+        let artifact_path = workspace_root
+            .join(project_id)
+            .join(local_artifact_relative);
+        let artifact_html = std::fs::read_to_string(&artifact_path).unwrap_or_else(|error| {
+            panic!(
+                "reading build-only artifact {}: {error}",
+                artifact_path.display()
+            )
+        });
+        assert!(
+            artifact_html.contains(expected_artifact_text),
+            "build-only artifact must contain {expected_artifact_text}"
+        );
+        emit_real_provider_evidence(
+            project_id,
+            "build",
+            &build_run_id,
+            json!({
+                "artifactUrl": artifact_url,
+                "buildOnly": true,
+                "expectedArtifactText": expected_artifact_text,
+                "status": "completed",
+            }),
+        );
+        return;
+    }
     assert_preview_updated_before_completed(store, &build_run_id).await;
     let build_dcp_evidence = if require_dcp {
         real_provider_dcp_evidence(&build_run, AgentPhase::Build)

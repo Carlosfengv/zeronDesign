@@ -15,8 +15,41 @@ cases_file="${GENERATION_REAL_CASES_FILE:-${SCRIPT_DIR}/real-provider-cases.json
 evidence_dir="${GENERATION_REAL_EVIDENCE_DIR:-${ROOT_DIR}/services/runtime/target/e2e-evidence/${cluster_name}/real-provider-runs}"
 runtime_port="${GENERATION_REAL_RUNTIME_PORT:-}"
 prepared_session_dir="${GENERATION_REAL_PREPARED_SESSION_DIR:-}"
+evidence_mode="${GENERATION_REAL_EVIDENCE_MODE:-audit}"
 
 cd "${ROOT_DIR}"
+
+case "${evidence_mode}" in
+  audit|release) ;;
+  *)
+    printf 'GENERATION_REAL_EVIDENCE_MODE must be audit or release: %s\n' "${evidence_mode}" >&2
+    exit 2
+    ;;
+esac
+
+source_commit="$(git rev-parse HEAD 2>/dev/null || true)"
+source_dirty=false
+if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
+  source_dirty=true
+fi
+if [[ "${evidence_mode}" == "release" ]]; then
+  [[ "${source_dirty}" == "false" && -n "${source_commit}" ]] || {
+    printf 'generation_real.release_requires_clean_source\n' >&2
+    exit 2
+  }
+  [[ -n "${prepared_session_dir}" ]] || {
+    printf 'generation_real.release_requires_prepared_session\n' >&2
+    exit 2
+  }
+  [[ -s "${prepared_session_dir}/session-meta.json" ]] || {
+    printf 'generation_real.release_prepared_session_metadata_missing\n' >&2
+    exit 2
+  }
+  [[ "${GENERATION_REAL_PROVIDER_READINESS_PROBE:-1}" == "1" ]] || {
+    printf 'generation_real.release_requires_provider_readiness_probe\n' >&2
+    exit 2
+  }
+fi
 
 for command in "${KUBECTL}" jq node curl base64 grep; do
   command -v "${command}" >/dev/null || {
@@ -55,7 +88,17 @@ if (manifest.approval?.required !== false) throw new Error("human approval must 
 if (!Number.isSafeInteger(manifest.budget?.totalTokens) || manifest.budget.totalTokens <= 0 || manifest.budget.totalTokens > 25_000_000) {
   throw new Error("suite budget must be a positive safety ceiling no greater than 25,000,000 tokens");
 }
-if (manifest.cases?.length !== 5) throw new Error("suite must contain exactly five cases");
+const suiteKind = manifest.suiteKind ?? "functional_canary";
+if (!["functional_canary", "efficiency_benchmark"].includes(suiteKind)) {
+  throw new Error("unsupported suiteKind");
+}
+const expectedCaseCount = suiteKind === "efficiency_benchmark" ? 10 : 5;
+if (manifest.cases?.length !== expectedCaseCount) {
+  throw new Error(`${suiteKind} suite must contain exactly ${expectedCaseCount} cases`);
+}
+if (suiteKind === "efficiency_benchmark" && manifest.cases.some(item => item.kind !== "website")) {
+  throw new Error("efficiency Benchmark suite currently requires Website cases");
+}
 if (manifest.budget.maxRunsPerCase !== 2) throw new Error("suite must reserve exactly Brief + Build per case");
 const reserved = manifest.cases.length * manifest.budget.maxRunsPerCase *
   (manifest.budget.perRun.maxInputTokens + manifest.budget.perRun.maxOutputTokens);
@@ -65,7 +108,7 @@ if (perRunSafetyCeiling > manifest.budget.totalTokens) {
   throw new Error("per-run safety ceiling exceeds suite budget");
 }
 process.stdout.write(
-  `Validated five generated cases; theoretical maximum=${reserved}, per-run safety ceiling=${perRunSafetyCeiling}, suite actual-use ceiling=${manifest.budget.totalTokens}\n`,
+  `Validated ${expectedCaseCount} ${suiteKind} generated cases; theoretical maximum=${reserved}, per-run safety ceiling=${perRunSafetyCeiling}, suite actual-use ceiling=${manifest.budget.totalTokens}\n`,
 );
 NODE
 
@@ -107,9 +150,10 @@ if [[ -n "${prepared_session_dir}" ]]; then
     exit 2
   }
   node - "${prepared_session_dir}/session-meta.json" "${context}" "${workspace_namespace}" \
-    "${runtime_deployment}" "$(${KUBECTL} --context "${context}" -n "${namespace}" get deployment "${runtime_deployment}" -o json)" <<'NODE'
+    "${runtime_deployment}" "$(${KUBECTL} --context "${context}" -n "${namespace}" get deployment "${runtime_deployment}" -o json)" \
+    "${evidence_mode}" "${source_commit}" <<'NODE'
 const fs = require("node:fs");
-const [metaFile, context, workspaceNamespace, deploymentName, deploymentRaw] = process.argv.slice(2);
+const [metaFile, context, workspaceNamespace, deploymentName, deploymentRaw, evidenceMode, sourceCommit] = process.argv.slice(2);
 const meta = JSON.parse(fs.readFileSync(metaFile, "utf8"));
 const deployment = JSON.parse(deploymentRaw);
 const frozen = meta.deployments?.find(item => item.deployment === deploymentName);
@@ -118,6 +162,10 @@ if (meta.context !== context || meta.workspaceNamespace !== workspaceNamespace |
 }
 if (deployment.metadata?.uid !== frozen.uid || deployment.metadata?.generation !== frozen.generation) {
   throw new Error("prepared cohort Runtime deployment revision drift");
+}
+if (evidenceMode === "release"
+  && (meta.sourceCommit !== sourceCommit || meta.sourceDirty !== false)) {
+  throw new Error("prepared cohort session source identity is not release-eligible");
 }
 NODE
   export GENERATION_PROVIDER_CONFIG_DIGEST
@@ -140,12 +188,8 @@ else
   export GENERATION_PROVIDER_CONFIG_REVISION
   GENERATION_PROVIDER_CONFIG_REVISION="$(node -e 'process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).currentResource.revision))' "${provider_reconcile_evidence}")"
 fi
-export GENERATION_SOURCE_COMMIT
-GENERATION_SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
-export GENERATION_SOURCE_DIRTY=false
-if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
-  GENERATION_SOURCE_DIRTY=true
-fi
+export GENERATION_SOURCE_COMMIT="${source_commit}"
+export GENERATION_SOURCE_DIRTY="${source_dirty}"
 
 provider_config="$("${KUBECTL}" --context "${context}" -n provider-system \
   get configmap provider-gateway-model-resources \
@@ -324,5 +368,5 @@ if rg -n -i '(bearer[[:space:]]+[a-z0-9._-]{20,}|sk-[a-z0-9_-]{12,}|api[_-]?key[
   printf 'secret-like value found in real-provider evidence\n' >&2
   exit 7
 fi
-printf 'Five real Provider examples completed: %s\n' "${summary_file}"
+printf 'Governed real Provider examples completed: %s\n' "${summary_file}"
 exit "${suite_status}"

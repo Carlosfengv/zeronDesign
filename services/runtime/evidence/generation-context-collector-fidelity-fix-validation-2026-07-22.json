@@ -1,0 +1,103 @@
+{
+  "schemaVersion": "generation-context-collector-fidelity-fix-validation@1",
+  "recordedAt": "2026-07-22T04:11:51Z",
+  "supersededSession": {
+    "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+    "status": "invalidated",
+    "reason": "collector_fidelity_mapping_invalid",
+    "runnerPreflightRejectsFurtherPairs": true,
+    "ledgerRewritten": false
+  },
+  "replacementSession": {
+    "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+    "provider": {
+      "gatewayMode": "internal_gateway",
+      "modelResourceId": "deepseek-v4-pro",
+      "resourceRevision": 4,
+      "modelVersion": "deepseek-v4-pro",
+      "visionCapable": false
+    },
+    "runtimeImage": "anydesign/runtime:6a5603c0a464-dirty-dd5b89a754a9",
+    "controlDeploymentRevision": "6776b79817c242febdc3d203a5bf86f7993da678ce3b78445909ab3a5ca6a7e1",
+    "candidateDeploymentRevision": "c6fe54d9dfd49248b33cc987e7807c8331bfda19f272bb4cbc97a38bb5925847"
+  },
+  "collectorContract": {
+    "lifecycleRequiresOuterCaseAccepted": true,
+    "acceptanceEvidenceHashBindsOuterCaseContract": true,
+    "acceptanceEvidenceHashBindsOuterCaseStatus": true,
+    "acceptanceEvidenceHashBindsOuterCaseErrorClassification": true,
+    "completedRunWithFailedAcceptanceIsRetained": true,
+    "completedRunWithFailedAcceptanceRequiredFidelityPassed": false,
+    "offlinePositiveAndNegativeTestsPassed": true
+  },
+  "realProviderValidation": {
+    "pairId": "batch-01-zenova-agent-cloud-warm-structural",
+    "batchId": "batch-01",
+    "fixtureId": "zenova-agent-cloud",
+    "bucket": "warm_structural",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "no_progress",
+        "no_progress",
+        "accepted"
+      ],
+      "acceptanceEvidenceSha256": "31a8ea3a9a04ae7a89ceef0982ed877734842631fcb628e6a25592797bb47299",
+      "recordHash": "3e185d02d805cce41eb27e000006d3825627f4df028fbcbab7a6c23e7b669331"
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "acceptanceEvidenceSha256": "73c3f8b16a1d2fbfddc68f8e93f9d6acb40431c4bb21aaad21611cc43cb25a47",
+      "recordHash": "5eaae54931c4a0f086b9c39545b02d840db46144d1ddef8adc8e478214405be9"
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -12.04,
+      "outputTokens": -17.79,
+      "turns": -14.29,
+      "toolCalls": 0.0,
+      "totalDurationMs": 3.27,
+      "timeToFirstSourceMutationMs": 7.39,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 21.68,
+      "timeToDurableSnapshotMs": 7.39
+    }
+  },
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "5eaae54931c4a0f086b9c39545b02d840db46144d1ddef8adc8e478214405be9",
+    "sha256": "b1679d403641e142bf1cabb3475277b51c20bdc070e169b3ec278bdee313eb2b"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "warmStructuralPairCount": 1,
+    "warmStructuralMinimumPairCount": 20,
+    "warmStructuralBatchCount": 1,
+    "rolloutEvidenceSha256": "429bae03dc591e43b20b0ced5f993b8f587070917fb93fb0040e9941e369ec19"
+  },
+  "sourceSha256": {
+    "session": "11c00f934655251810f4480723fdd8b7fc6066b55d9b45e5105216c5d0176089",
+    "sessionMeta": "5b180fddf5c677d685a56aa4bc5da5652f4fb265442d1ab14657ccb33f2f48d0",
+    "providerReconcile": "db0c36d227f8c7625a84f33cc49efb2409736455d285c71eee615f3ad8ba759b",
+    "pairSpec": "454ab84741f7462c49ecb9b910bfb7efe5bd8f5b22dc4648cf12ffef6faee4c0",
+    "pairResult": "ea086339aca690d87218364963dcc7da8a9fd5f992006dbff151e6680d405cc2",
+    "controlCase": "755d5ac11ff4d1145362fc41ff4b62cd11c4d1e6c1e135174fdec7a6e3dc71d4",
+    "candidateCase": "d4f40c8a3513626f716998b3a710376619e21e46afb4b5c96de2b1999e1de6e9",
+    "rolloutEvidence": "429bae03dc591e43b20b0ced5f993b8f587070917fb93fb0040e9941e369ec19",
+    "collector": "b3d8a5e7ea4fdedc7331c18610a15f724dadba4acc7385e9d1ea9d25b10e54c3",
+    "collectorTest": "89548ad0b9a54843a33515e4d82e44a8ff20e02cbac634d8f484798f53470752",
+    "pairRunner": "c3c077efe1621753ab1ccec4c31f36c97f9e20fccbd7b6a198b1f7ba1eeb0f69",
+    "pairRunnerTest": "fd84c5b95b7fa79e1a7e5c3f808255671a9dc882c72fa4142b3dd539ad7935f6"
+  }
+}

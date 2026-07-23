@@ -12,11 +12,13 @@
     "finishReason": { "type": "string" },
     "modelExecution": {
       "type": "object",
-      "required": ["id", "modelResourceId", "modelResourceRevision", "physicalModel", "selectionPolicyId", "selectionPolicyRevision", "capabilitySnapshotHash", "selectionReason", "automaticSwitch"],
+      "required": ["id", "modelResourceId", "modelResourceRevision", "displayName", "providerId", "physicalModel", "selectionPolicyId", "selectionPolicyRevision", "capabilitySnapshotHash", "selectionReason", "automaticSwitch"],
       "properties": {
         "id": { "type": "string" },
         "modelResourceId": { "type": "string" },
         "modelResourceRevision": { "type": "integer", "minimum": 1 },
+        "displayName": { "type": "string" },
+        "providerId": { "type": "string" },
         "physicalModel": { "type": "string" },
         "selectionPolicyId": { "type": "string" },
         "selectionPolicyRevision": { "type": "integer", "minimum": 1 },

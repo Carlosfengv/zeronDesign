@@ -1,0 +1,187 @@
+{
+  "schemaVersion": "generation-context-second-nonvisual-unavailable-paired-sample-summary@1",
+  "recordedAt": "2026-07-22T02:58:00Z",
+  "sessionId": "deepseek-v4-pro-20260722-sample-expansion-001",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerConfigSha256": "f7d0dc9c125751f1744213e4e10ee922973da7db332825f03606077f12f26c38",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "capabilitySnapshotHash": "fa83494104ad2d234ae13f5f2e7fd3874590e4031865d2e88a69bb5dfc974315",
+    "visionCapable": false,
+    "readinessPassed": true
+  },
+  "runtimeImage": {
+    "ref": "anydesign/runtime:6a5603c0a464-dirty-dd5b89a754a9",
+    "containerImageId": "sha256:2acb0c8afefff44e9a34cf0d66870359f85b4463d0ac319bc7d42360c1944f15",
+    "controlDeploymentRevision": "b01fdb7facd6cd5dcdae6d57177a650230b1242f16f8b95808f0c0cf0923dc13",
+    "candidateDeploymentRevision": "c7a86479eb73974053e37add83b3ebbfa93ed5156bf3318596683b16de9fa10c"
+  },
+  "providerGatewayImage": {
+    "ref": "zerondesign/provider-gateway:6a5603c0a464-dirty-997a4e0fbfbc",
+    "containerImageId": "sha256:ec3db863f752a76dc2f89417e4b7c9b5017637ef9478de0ac3a44752a8b8468c"
+  },
+  "retryContract": {
+    "maxCaseAttempts": 3,
+    "noProgressRetryEnabled": true,
+    "regressionTestPassed": true,
+    "controlAttemptCount": 3,
+    "controlAttemptOutcomes": [
+      "no_progress",
+      "no_progress",
+      "accepted"
+    ],
+    "candidateAttemptCount": 1,
+    "candidateAttemptOutcomes": [
+      "accepted"
+    ],
+    "finding": "the runner previously limited retries to transient Provider failures even though the runbook exposed max-case-attempts for occasional no_progress; the bounded retry predicate now includes no_progress and retains every attempt in immutable evidence"
+  },
+  "pair": {
+    "id": "batch-22-oilfield-operations-dashboard-warm-copy-css",
+    "batchId": "batch-22",
+    "bucket": "warm_copy_css",
+    "fixtureId": "oilfield-operations-dashboard",
+    "templateVersion": "next-app",
+    "phase": "edit",
+    "lifecycleProfile": "warm_hmr",
+    "warmEditKind": "copy_css",
+    "control": {
+      "flag": "legacy",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "acceptedRunId": "run-4155",
+      "acceptedDraftSnapshotId": "draft-snapshot-4188",
+      "recordHash": "b736f4ad1c3a66362c1203f5f88ef5360c19e6e743c1019d177fabcaf9569889",
+      "visualDelivery": {
+        "state": null,
+        "unavailableMetricRecorded": false,
+        "mainTaskCompleted": true
+      },
+      "metrics": {
+        "inputTokens": 71103,
+        "outputTokens": 757,
+        "turns": 6,
+        "toolCalls": 11,
+        "recoverableToolFailures": 1,
+        "totalDurationMs": 26001,
+        "timeToFirstSourceMutationMs": 14687,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3194,
+        "timeToDurableSnapshotMs": 14687,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "flag": "generation_context",
+      "status": "completed",
+      "requiredFidelityPassed": true,
+      "providerVerified": true,
+      "expectedTextFound": true,
+      "hmrMetricRecorded": true,
+      "durableSnapshotMetricRecorded": true,
+      "acceptedRunId": "run-2059",
+      "acceptedDraftSnapshotId": "draft-snapshot-2090",
+      "recordHash": "50af092810272fea83ab4098a671c39a3539a1c0fc2a78129beeb53d876f45ec",
+      "visualDelivery": {
+        "state": "unavailable",
+        "visualBindingsVerified": true,
+        "visualBindingSetHash": "d4e859d8d819442edcb101433bd2aaf8cccc563cbb77a48d8377234bb5c73029",
+        "runtimeAttestationHash": "92ac41b5a6b9bf987bf7924ef9869cc153adcefa1be1726196ee315e7468b41f",
+        "unavailableMetricRecorded": true,
+        "gatewayVisualInputAttested": false,
+        "mainTaskCompleted": true,
+        "modelExecutionsAfterUnavailable": 5
+      },
+      "metrics": {
+        "inputTokens": 61681,
+        "outputTokens": 720,
+        "turns": 5,
+        "toolCalls": 10,
+        "recoverableToolFailures": 0,
+        "totalDurationMs": 28276,
+        "timeToFirstSourceMutationMs": 16353,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 3383,
+        "timeToDurableSnapshotMs": 16353,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -13.25,
+      "outputTokens": -4.89,
+      "turns": -16.67,
+      "toolCalls": -9.09,
+      "totalDurationMs": 8.75,
+      "timeToFirstSourceMutationMs": 11.34,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "timeToIframeAppliedMs": 5.92,
+      "timeToDurableSnapshotMs": 11.34
+    },
+    "coverage": {
+      "nextTemplate": true,
+      "nonVisualUnavailableMainTaskPassed": true,
+      "multimodalVisualDelivered": false
+    },
+    "openFindings": [
+      "this second accepted non-visual pair independently reproduces unavailable-with-main-task-success, but it is the first pair in the new immutable session and remains below the same-session multi-batch minimum",
+      "candidate iframe acknowledgement was 3383ms, above the Warm Copy/CSS P95 target of 3000ms, and durable snapshot was 16353ms, above the 5000ms P95 target",
+      "candidate input tokens decreased by 13.25%, below the 50% target; total duration, first mutation, iframe acknowledgement, and durable snapshot were slower than control",
+      "multimodalVisualDelivered remains false because deepseek-v4-pro@4 is governed as non-visual; a separately governed vision-capable Provider Resource is still required"
+    ]
+  },
+  "diagnosticHistory": [
+    {
+      "pairId": "batch-21-oilfield-operations-dashboard-warm-copy-css",
+      "result": "incomplete_pair_not_appended",
+      "findings": [
+        "control Build ended in no_progress while candidate completed",
+        "the collector refused the incomplete pair and the ledger remained header-only",
+        "the immutable failed directory was retained and the retry used a new batch identity"
+      ]
+    }
+  ],
+  "ledger": {
+    "recordCount": 3,
+    "sampleCount": 2,
+    "completePairCount": 1,
+    "pendingPairCount": 0,
+    "headRecordHash": "50af092810272fea83ab4098a671c39a3539a1c0fc2a78129beeb53d876f45ec",
+    "sha256": "bf2c08bf77a0d06d3b5ac334cd32caee2b0e3f6f20e5d2b42dfcbe5d92037aae"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "warmCopyCssPairCount": 1,
+    "warmCopyCssMinimumPairCount": 20,
+    "warmCopyCssBatchCount": 1,
+    "minimumBatchCount": 3,
+    "rolloutEvidenceSha256": "63f250f33e498eabb6dd0d57ea40dff8e32190e8daf03f3c5a0fe3312b2ffb94"
+  },
+  "sourceSha256": {
+    "session": "f62d8fc511cf6a3e9bf11566d5eded9b1caffd169497ece0f48d9359be404d26",
+    "sessionMeta": "f6c5e493c55b1111f8c7a85e6350278827118c95317350b598cafa111fd3df45",
+    "providerReconcile": "f581b54238136739ea1c346ef5988accd7c8ffc47853f44652db2b7d93a1aed8",
+    "controlCase": "112aae7a5325d282dff56e7d891c7dc9958606963ca59ac381bd17c057175096",
+    "candidateCase": "fc4113631604a00dbea31eae4288bd71fa585cce43f0b72be92359f81bd4dcb4",
+    "pairSpec": "8588823e4b6d0de9b3f5d4484bc340798e3c20eaefa6c2164de74f0dc2f6081d",
+    "pairResult": "9db0520054bdf9f43e0843477ec2871c6117ff3e371e920570a1eb93dbd53f61",
+    "rolloutEvidence": "63f250f33e498eabb6dd0d57ea40dff8e32190e8daf03f3c5a0fe3312b2ffb94",
+    "runner": "3cba969cb5d79ff1667d13f537d8cce37829ed35cb5c98d896b6c35004628811",
+    "runnerTest": "8a91d0f63b3349990166605c76dff00a8bc08f467dd90f151a94a5f868a5e0df"
+  }
+}

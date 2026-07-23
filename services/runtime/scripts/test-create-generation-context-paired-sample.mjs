@@ -20,6 +20,7 @@ const metadata = {
     providerParametersHash: hash("a"),
     templateVersion: "next-app@2",
     capabilitySnapshotHash: hash("b"),
+    designProfileHash: hash("f"),
     phase: "edit",
   },
   execution: {
@@ -30,6 +31,7 @@ const metadata = {
   },
   source: { storageRef: "evidence://pair-1/candidate", contentSha256: hash("d") },
   acceptanceEvidenceSha256: hash("e"),
+  caseAttemptCount: 1,
   coverage: ["nextTemplate"],
 };
 const efficiency = {
@@ -68,6 +70,25 @@ const efficiency = {
   firstBuildSucceeded: false,
   requiredFidelityPassed: true,
 };
+const promptEfficiency = {
+  schemaVersion: "run-prompt-efficiency@1",
+  runId: efficiency.runId,
+  grossInputTokens: 4_000,
+  cachedInputTokens: 1_000,
+  uncachedInputTokens: 3_000,
+  outputTokens: 500,
+  turnCount: 4,
+  maxTurnInputTokens: 1_200,
+  averageTurnInputTokens: 1_000,
+  cacheHitRateBasisPoints: 2_500,
+  generationContextEstimatedTokens: 128,
+  generationContextRepeatedEstimatedTokens: 512,
+  promptCompactionCount: 0,
+  promptTokensRemovedByCompaction: 0,
+  largeToolArgumentTokensRetainedPeak: 0,
+  retryAmplificationBasisPoints: null,
+  estimated: false,
+};
 
 const resourceSelectedEfficiency = {
   ...efficiency,
@@ -78,12 +99,20 @@ assert.equal(
   metadata.identity.modelResource,
 );
 
-const sample = createPairedCohortSample(metadata, efficiency);
+const sample = createPairedCohortSample(metadata, efficiency, promptEfficiency);
 assert.equal(sample.metrics.timeToIframeAppliedMs, 700);
 assert.equal(sample.metrics.timeToDurableSnapshotMs, 900);
 assert.equal(sample.metrics.timeToFirstSourceMutationMs, 300);
 assert.equal(sample.requiredFidelityPassed, true);
 assert.equal(sample.firstBuildSucceeded, false);
+assert.equal(sample.metrics.modelTurns, 4);
+assert.equal(sample.metrics.grossInputTokens, 4_000);
+assert.equal(sample.metrics.uncachedInputTokens, 3_000);
+assert.equal(sample.metrics.maxTurnInputTokens, 1_200);
+assert.equal(sample.metrics.cacheHitRateBasisPoints, 2_500);
+assert.equal(sample.metrics.generationContextBytes, 512);
+assert.equal(sample.metrics.duplicateFullReadDeliveries, 0);
+assert.equal(sample.metrics.caseAttemptCount, 1);
 assert.equal("runId" in sample, false);
 assert.equal("projectId" in sample, false);
 
@@ -94,6 +123,10 @@ assert.throws(
 assert.throws(
   () => createPairedCohortSample(metadata, { ...efficiency, model: "other-resource" }),
   /model must select/,
+);
+assert.throws(
+  () => createPairedCohortSample(metadata, efficiency, { ...promptEfficiency, runId: "other" }),
+  /prompt efficiency must match/,
 );
 
 process.stdout.write("Generation Context paired sample creator tests passed.\n");

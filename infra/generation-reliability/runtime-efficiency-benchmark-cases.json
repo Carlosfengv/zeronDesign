@@ -1,0 +1,113 @@
+{
+  "schemaVersion": "generation-real-provider-suite@1",
+  "suiteKind": "efficiency_benchmark",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro"
+  },
+  "approval": {
+    "required": false
+  },
+  "budget": {
+    "totalTokens": 25000000,
+    "maxRunsPerCase": 2,
+    "perRun": {
+      "maxTurns": 60,
+      "maxToolCalls": 180,
+      "maxInputTokens": 2000000,
+      "maxOutputTokens": 200000
+    }
+  },
+  "cases": [
+    {
+      "id": "aurora-component-catalog",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "Aurora Design System 组件目录",
+      "expectedRoute": "/",
+      "expectedText": "Aurora Design System",
+      "prompt": "请创建一个名为“Aurora Design System”的组件目录网站首页，供产品设计师和前端工程师查找基础组件。页面需要有组件分类导航、搜索入口、Button、Input、Card、Dialog 等组件预览、稳定性标签和使用指引入口。使用清晰的浅色中性界面和蓝紫色品牌强调色，体现统一的间距、圆角、字体层级与交互状态，并适配桌面和手机。"
+    },
+    {
+      "id": "design-token-governance",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "设计令牌治理中心",
+      "expectedRoute": "/",
+      "expectedText": "设计令牌治理中心",
+      "prompt": "请设计一个“设计令牌治理中心”后台页面，用于管理颜色、字体、间距、圆角和阴影令牌。页面要展示令牌覆盖率、待审核变更、主题差异、最近发布记录，以及按语义令牌分组的表格；提供清晰的状态、负责人和影响范围信息。整体使用专业的浅色 Design System 管理台风格，表格在窄屏内可滚动，关键操作和层级在移动端仍清楚。"
+    },
+    {
+      "id": "accessibility-quality-center",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "无障碍质量中心",
+      "expectedRoute": "/",
+      "expectedText": "无障碍质量中心",
+      "prompt": "请做一个 Design System 的“无障碍质量中心”仪表盘，帮助团队跟踪组件的 WCAG 检查结果。页面包含总体通过率、键盘可用性、颜色对比度、语义与屏幕阅读器问题趋势，以及需要修复的组件清单。请使用高对比但不过度鲜艳的配色，状态不能只依赖颜色表达，图表和表格使用本地演示数据，并兼顾桌面与手机浏览。"
+    },
+    {
+      "id": "brand-theme-workbench",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "品牌主题工作台",
+      "expectedRoute": "/",
+      "expectedText": "品牌主题工作台",
+      "prompt": "请创建一个 Design System 的“品牌主题工作台”，让管理员比较默认品牌、深色主题和一个子品牌主题。页面需要展示核心颜色、字体、圆角与密度令牌，提供 Button、Form、Card 和导航栏的并排主题预览，并显示未通过对比度检查的令牌提示。界面要像真实可用的主题管理产品，布局规整、预览清晰，适配桌面和移动端。"
+    },
+    {
+      "id": "component-release-center",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "组件发布中心",
+      "expectedRoute": "/",
+      "expectedText": "组件发布中心",
+      "prompt": "请设计一个 Design System 的“组件发布中心”，供维护者查看下一版本包含的组件变更。页面要有版本状态、Breaking Change 数量、待完成检查、组件变更列表、Changelog 摘要和发布流水线阶段，并区分新增、改进、废弃与修复。使用克制的开发者工具风格、清楚的状态层级和本地演示数据，确保长版本号和表格在小屏幕不会撑破页面。"
+    },
+    {
+      "id": "cross-platform-pattern-library",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "跨平台模式库",
+      "expectedRoute": "/",
+      "expectedText": "跨平台模式库",
+      "prompt": "请创建一个“跨平台模式库”网站，介绍同一 Design System 在 Web、iOS 和 Android 上的导航、表单、反馈和数据展示模式。首页需要有平台切换、模式分类、推荐用法、避免事项和三个平台的示例对照卡片，并说明哪些属性由共享令牌控制。视觉上保持文档与产品展示之间的平衡，信息层级明确，桌面和手机都易于阅读。"
+    },
+    {
+      "id": "design-system-adoption",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "Design System 采用概览",
+      "expectedRoute": "/",
+      "expectedText": "Design System 采用概览",
+      "prompt": "请设计一个面向设计系统团队的“Design System 采用概览”页面，展示各产品线的组件采用率、令牌覆盖率、重复自建组件、升级进度和近期贡献者。页面需要有总体指标、采用趋势、团队排行榜、风险项目列表和下一步建议，所有数据使用明确标注的演示数据。整体专业、简洁，使用一致的卡片、表格和状态样式，并适配桌面与手机。"
+    },
+    {
+      "id": "component-usage-analytics",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "组件使用分析",
+      "expectedRoute": "/",
+      "expectedText": "组件使用分析",
+      "prompt": "请创建一个 Design System 的“组件使用分析”页面，让维护团队了解 Button、Form、Table、Modal 等组件在各产品中的版本分布、调用量和废弃 API 使用情况。页面包含总览指标、版本采用趋势、产品筛选、风险组件排行和升级建议，使用清楚标注的演示数据。请保持图表、表格和筛选器的视觉规范一致，并确保窄屏下信息仍可访问。"
+    },
+    {
+      "id": "content-design-guidelines",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "内容设计规范中心",
+      "expectedRoute": "/",
+      "expectedText": "内容设计规范中心",
+      "prompt": "请设计一个“内容设计规范中心”网站首页，作为 Design System 的内容标准入口。页面要覆盖按钮与表单文案、错误提示、空状态、日期数字格式和包容性语言，展示推荐与避免示例，并提供按场景浏览和搜索入口。整体像成熟企业设计系统的指南站点，排版易读、示例层级明确，桌面和手机均有良好体验。"
+    },
+    {
+      "id": "iconography-asset-library",
+      "kind": "website",
+      "locale": "zh-CN",
+      "title": "图标资产库",
+      "expectedRoute": "/",
+      "expectedText": "图标资产库",
+      "prompt": "请创建一个 Design System 的“图标资产库”页面，展示常用操作、导航、状态和行业类图标。页面需要有搜索、分类筛选、尺寸和描边规范、图标预览卡片、命名信息与复制入口，并说明无障碍标签和不推荐用法。图标可以使用简洁的内联 SVG 演示，界面保持统一网格和清晰状态，适配桌面与手机。"
+    }
+  ]
+}

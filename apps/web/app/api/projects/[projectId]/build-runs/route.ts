@@ -6,7 +6,10 @@ import { runtimeClient } from "@/lib/runtime";
 
 export const runtime = "nodejs";
 
-const StartBuildSchema = z.object({ briefId: z.string().trim().min(1) });
+const StartBuildSchema = z.object({
+  briefId: z.string().trim().min(1),
+  modelServiceId: z.string().trim().min(1).max(128),
+});
 
 export async function POST(
   request: Request,
@@ -17,14 +20,21 @@ export async function POST(
     const { projectId } = await context.params;
     const project = await getProject(projectId, ownerId);
     if (!project) return Response.json({ error: "project not found" }, { status: 404 });
-    const { briefId } = StartBuildSchema.parse(await request.json());
-    const brief = await runtimeClient({
+    const { briefId, modelServiceId } = StartBuildSchema.parse(await request.json());
+    const readClient = runtimeClient({
       userId: ownerId,
       projectId: project.runtimeProjectId,
       operations: ["project.read"],
-    }).getBrief(briefId);
+    });
+    const [brief, catalog] = await Promise.all([
+      readClient.getBrief(briefId),
+      readClient.listModelServices(project.runtimeProjectId, "build", "build"),
+    ]);
     if (brief.projectId !== project.runtimeProjectId || brief.status !== "confirmed") {
       return Response.json({ error: "confirmed brief not found" }, { status: 409 });
+    }
+    if (!catalog.items.some((item) => item.id === modelServiceId)) {
+      return Response.json({ error: "selected model service is unavailable" }, { status: 409 });
     }
     const result = await runtimeClient({
       userId: ownerId,
@@ -34,7 +44,7 @@ export async function POST(
       projectId: project.runtimeProjectId,
       phase: "build",
       agentProfile: "build",
-      inputContext: { briefId },
+      inputContext: { briefId, modelResourceId: modelServiceId },
     });
     await recordProjectRun({ runId: result.runId, projectId: project.id, phase: "build" });
     return Response.json(result, { status: 202 });

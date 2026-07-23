@@ -10,7 +10,7 @@ pub(super) fn render(request: &BuildOverlayRequest) -> Vec<RenderedFile> {
     vec![
         RenderedFile {
             path: "next.config.mjs".to_string(),
-            content: "import { createMDX } from 'fumadocs-mdx/next';\n\n/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  output: 'export',\n  reactStrictMode: true,\n};\n\nconst withMDX = createMDX();\n\nexport default withMDX(nextConfig);\n"
+            content: "import { createMDX } from 'fumadocs-mdx/next';\n\n/** @type {import('next').NextConfig} */\nconst nextConfig = {\n  output: 'export',\n  reactStrictMode: true,\n  trailingSlash: true,\n};\n\nconst withMDX = createMDX();\n\nexport default withMDX(nextConfig);\n"
                 .to_string(),
         },
         RenderedFile {

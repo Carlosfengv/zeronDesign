@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "generation-context-cohort-session-summary@1",
+  "sessionId": "deepseek-v4-pro-20260721T100257Z",
+  "createdAt": "2026-07-21T10:04:41.259Z",
+  "fixtureManifestSha256": "f8f3d93d8ff9a8171fa23b2c8bf646934bcd04705490eb2a97229fecdc225e78",
+  "provider": {
+    "gatewayMode": "internal_gateway",
+    "modelResourceId": "deepseek-v4-pro",
+    "resourceRevision": 4,
+    "modelVersion": "deepseek-v4-pro",
+    "providerParametersHash": "ed2363519305bf2fa8079fbe5518bed4730ef17b266b80d7c565828d4a0b659f",
+    "providerConfigSha256": "6e52f186b930407a4cc197692de9ca090b39879a6390ed87e7f42a13adcca98c"
+  },
+  "runtimes": {
+    "control": {
+      "generationContextMode": "off",
+      "deploymentRevision": "843f24d583c8f883d76dccafba5f56ee21f3732e34f176fa5740022cc7a5cd9a"
+    },
+    "candidate": {
+      "generationContextMode": "enabled",
+      "deploymentRevision": "e38ef07ecbef452215697676366f6d239fb3cba70eee6b722f6ea5ee8c41367d"
+    }
+  },
+  "sourceSha256": {
+    "session": "69f3aa2e47f61ccb6060408a1dcc91e47c3fc9c7ca699073f8af99fc6873692e",
+    "sessionMeta": "6c216bca5c1c153d0168321cbb451c171682e2bbaba5d5b80bcc73353d6a8f93",
+    "ledgerGenesis": "d2ae594be9af7054d3eb9011ff1fe3efd0e4c6b6cd914d447cfc16d70e42a89b",
+    "providerReconcile": "662d177dd4305b2b8904ee84cbcfdbfeba3d166b32a1057b4a99c4ba7400ca95",
+    "controlGateway": "ece2c6c9ba0477ab74365bf97c6f670405651b63b4efe41cf3e61d22f375471c",
+    "candidateGateway": "107221bd231e8372c9a16efc43de728c9e3345720ce2b13b74b16fd147915f29"
+  },
+  "ledgerGenesisRecordHash": "eaef18d6f38ecfeb8423ba9f92bba5f31258f5c33ed9841aaf7159f1944b8070",
+  "paidPairSamples": 0,
+  "status": "ready_for_first_pair"
+}

@@ -1,0 +1,118 @@
+{
+  "schemaVersion": "generation-context-warm-structural-second-pair-summary@1",
+  "recordedAt": "2026-07-22T05:11:47Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-05-oilfield-operations-dashboard-warm-structural",
+    "batchId": "batch-05",
+    "fixtureId": "oilfield-operations-dashboard",
+    "bucket": "warm_structural",
+    "templateVersion": "next-app",
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "no_progress",
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-16310610",
+      "recordHash": "1d41bd47a494c406a5bb9643a3d7f2b9efee835a854b5637372c9eb0de2350d2",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 90230,
+        "outputTokens": 1804,
+        "toolCalls": 12,
+        "totalDurationMs": 39190,
+        "timeToFirstSourceMutationMs": 23882,
+        "modelTurnAtFirstSourceMutation": 3,
+        "timeToIframeAppliedMs": 6983,
+        "timeToDurableSnapshotMs": 23882,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 1,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-9603803",
+      "recordHash": "afbd118f1eb0f8ddc21106367b06bd39d946faece190674c94ab5ca7b378603f",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 71752,
+        "outputTokens": 1173,
+        "toolCalls": 10,
+        "totalDurationMs": 34952,
+        "timeToFirstSourceMutationMs": 20814,
+        "modelTurnAtFirstSourceMutation": 2,
+        "timeToIframeAppliedMs": 4046,
+        "timeToDurableSnapshotMs": 20814,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -20.48,
+      "outputTokens": -34.98,
+      "toolCalls": -16.67,
+      "totalDurationMs": -10.81,
+      "timeToFirstSourceMutationMs": -12.85,
+      "modelTurnAtFirstSourceMutation": -33.33,
+      "timeToIframeAppliedMs": -42.06,
+      "timeToDurableSnapshotMs": -12.85,
+      "prebuildFsReadCount": -50.0,
+      "prebuildFsSearchCount": -100.0
+    },
+    "openFindings": [
+      "the candidate improved every measured point estimate in this pair and reached first mutation at model turn 2",
+      "candidate iframe applied at 4046ms, below the 5000ms structural P95 target but above the 2000ms P50 target",
+      "candidate durable snapshot at 20814ms remains far above the 5000ms P95 target",
+      "the two-pair structural median input-token reduction is approximately 16.41%, below the 50% target",
+      "two pairs across two batches cannot establish the required twenty-pair confidence gates"
+    ]
+  },
+  "ledger": {
+    "recordCount": 11,
+    "sampleCount": 10,
+    "completePairCount": 5,
+    "pendingPairCount": 0,
+    "headRecordHash": "afbd118f1eb0f8ddc21106367b06bd39d946faece190674c94ab5ca7b378603f",
+    "sha256": "2d2a8d6a3a630fe717d7d718bad1733da8e6632ad14e91cc30f229b87a7f7399"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "warmStructuralPairCount": 2,
+    "warmStructuralMinimumPairCount": 20,
+    "warmStructuralBatchCount": 2,
+    "warmStructuralCandidateMedianInputTokens": 72877,
+    "warmStructuralControlMedianInputTokens": 87183,
+    "warmStructuralCandidateMedianIframeAppliedMs": 3920,
+    "warmStructuralCandidateP95IframeAppliedMs": 4033.4,
+    "warmStructuralCandidateP95DurableSnapshotMs": 23186.15,
+    "rolloutEvidenceSha256": "7167dd0b03fe27ef960dde6f3be61e0641edfb5224084704c690286b949958d7"
+  },
+  "clusterAfterPair": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "sourceSha256": {
+    "pairSpec": "1b776228ce9686a94890372fdca4aba44670dadb42addaa9e1925c1740857032",
+    "pairResult": "be6312fa7ae77b917e38aaf0b30c97d87a7c6db9c902b309a475fe965c791c9c",
+    "controlCase": "f7ef3e5b1f3c28fd70c095cfab78f35c2a114beaf63c80860ed56857fc550bf4",
+    "candidateCase": "506b94bf9a97625a585bd25061c3f316ae6307f52a79d78ae96559b38346fedd",
+    "rolloutEvidence": "7167dd0b03fe27ef960dde6f3be61e0641edfb5224084704c690286b949958d7"
+  }
+}

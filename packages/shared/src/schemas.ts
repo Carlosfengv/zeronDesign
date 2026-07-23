@@ -24,6 +24,37 @@ export const AgentRunStatusSchema = z.enum([
   "cancelled",
 ]);
 
+export const RunTokenBudgetLimitsSchema = z.object({
+  maxTurns: z.number().int().positive(),
+  maxToolCalls: z.number().int().positive(),
+  maxInputTokens: z.number().int().positive(),
+  maxGrossInputTokens: z.number().int().positive(),
+  maxUncachedInputTokens: z.number().int().positive(),
+  maxPromptTokensPerTurn: z.number().int().positive(),
+  maxOutputTokens: z.number().int().positive(),
+}).strict();
+
+export const RunOperationBudgetLimitsSchema = z.object({
+  maxGrossInputTokens: z.number().int().positive(),
+  maxUncachedInputTokens: z.number().int().positive(),
+  maxOutputTokens: z.number().int().positive(),
+  maxTurns: z.number().int().positive(),
+  maxToolCalls: z.number().int().positive(),
+}).strict();
+
+export const RunBudgetProfileSchema = z.object({
+  schemaVersion: z.literal("run-budget-profile@1"),
+  profileId: z.string().min(1),
+  phase: AgentPhaseSchema,
+  rolloutMode: z.enum(["off", "shadow", "enforced"]),
+  tokenBudgetMode: z.enum(["legacy", "split_shadow", "split_enforced"]),
+  operationBudgetMode: z.enum(["shadow", "enforced"]),
+  enforcedLimits: RunTokenBudgetLimitsSchema,
+  phaseTargetLimits: RunTokenBudgetLimitsSchema,
+  operationLimits: RunOperationBudgetLimitsSchema,
+  profileHash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+
 export const AgentRunSchema = z.object({
   id: z.string().min(1),
   projectId: z.string().min(1),
@@ -32,6 +63,7 @@ export const AgentRunSchema = z.object({
   triggeredByEventId: OptionalStringFromRustOption,
   phase: AgentPhaseSchema,
   agentProfile: z.string().min(1),
+  budgetProfile: RunBudgetProfileSchema.nullish(),
   status: AgentRunStatusSchema,
   model: z.string().min(1),
   sandboxId: OptionalStringFromRustOption,
@@ -64,6 +96,11 @@ export const AgentRunSchema = z.object({
   designSourceRequiredSectionIds: z.array(z.string().min(1)).optional().default([]),
   designSourceReadSectionHashes: z.array(z.string().min(1)).optional().default([]),
   designContextReadFiles: z.array(z.string().min(1)).optional().default([]),
+  operationId: OptionalStringFromRustOption,
+  operationAttempt: z.number().int().positive().optional().default(1),
+  predecessorRunId: OptionalStringFromRustOption,
+  successorRunId: OptionalStringFromRustOption,
+  continuationSnapshotId: OptionalStringFromRustOption,
   baseVersionId: OptionalStringFromRustOption,
   outputVersionId: OptionalStringFromRustOption,
   findingIds: z.array(z.string().min(1)).nullish(),

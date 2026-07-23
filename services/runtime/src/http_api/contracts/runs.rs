@@ -51,6 +51,7 @@ impl From<StartRunRequest> for crate::run_lifecycle::StartRunCommand {
                 sandbox_binding_id: request.input_context.sandbox_binding_id,
                 parent_run_id: request.input_context.parent_run_id,
                 predecessor_run_id: request.input_context.predecessor_run_id,
+                continuation_snapshot_id: None,
                 design_profile_id: request.input_context.design_profile_id,
                 design_fidelity_mode: request.input_context.design_fidelity_mode,
                 model_resource_id: request.input_context.model_resource_id,

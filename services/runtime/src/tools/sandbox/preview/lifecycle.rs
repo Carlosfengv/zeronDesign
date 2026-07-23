@@ -204,7 +204,11 @@ impl Tool for PreviewStartTool {
         let static_output_dir =
             if explicit_url.is_none() || verify_preview_accessible(&url).await.is_err() {
                 let static_output = start_static_preview_server(&ctx, &cwd, &build, port).await?;
-                wait_for_preview_accessible(&url, Duration::from_secs(10)).await?;
+                wait_for_preview_accessible(
+                    &format!("{}/healthz", url.trim_end_matches('/')),
+                    Duration::from_secs(10),
+                )
+                .await?;
                 Some(static_output)
             } else {
                 optional_static_preview_output_dir(&ctx, &cwd, &build)
@@ -299,58 +303,47 @@ fn optional_static_preview_output_dir(
         .or_else(|| detect_static_preview_output_dir(ctx, app_root))
 }
 
-fn resolve_static_preview_output_dir(
-    ctx: &ToolContext,
-    app_root: &Path,
-    latest_build: &Value,
-) -> Result<PathBuf, ToolError> {
-    if let Some(resolved) = static_preview_output_dir_from_build(ctx, latest_build) {
-        return check_existing_path(&resolved, &ctx.workspace_root)
-            .map_err(|error| preview_static_output_missing(ctx, &resolved, error));
-    }
-
-    detect_static_preview_output_dir(ctx, app_root).ok_or_else(|| {
-        preview_static_output_missing(
-            ctx,
-            &app_root.join(
-                static_preview_output_candidates(ctx)
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("dist"),
-            ),
-            PermissionError::CannotResolve(app_root.to_path_buf()),
-        )
-    })
-}
-
-fn preview_static_output_missing(
-    ctx: &ToolContext,
-    path: &Path,
-    error: PermissionError,
-) -> ToolError {
-    typed_recoverable(
-        format!("preview.start missing dist/out static output: {error:?}"),
-        "preview.dist_missing",
-        json!({
-            "path": display_workspace_path(path, ctx),
-            "candidates": static_preview_output_candidates(ctx)
-                .into_iter()
-                .map(|name| display_workspace_path(&default_project_dir(ctx).join(name), ctx))
-                .collect::<Vec<_>>(),
-            "suggestedAction": "Run project.build successfully before starting static preview."
-        }),
-    )
-}
-
 async fn start_static_preview_server(
     ctx: &ToolContext,
-    app_root: &Path,
+    _app_root: &Path,
     latest_build: &Value,
     port: u16,
 ) -> Result<PathBuf, ToolError> {
-    let static_output = resolve_static_preview_output_dir(ctx, app_root, latest_build)?;
-    check_existing_path(&static_output, &ctx.workspace_root)
-        .map_err(|error| preview_static_output_missing(ctx, &static_output, error))?;
+    let build_id = latest_build
+        .get("buildId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            typed_recoverable(
+                "preview.start requires buildId evidence".to_string(),
+                "preview.build_evidence_invalid",
+                json!({ "latestBuild": latest_build }),
+            )
+        })?;
+    let candidate_output = latest_build
+        .get("candidateOutputPath")
+        .and_then(Value::as_str)
+        .map(|path| resolve_path(path, &ctx.workspace_root))
+        .ok_or_else(|| {
+            typed_recoverable(
+                "preview.start requires a frozen candidate output".to_string(),
+                "preview.candidate_manifest_missing",
+                json!({ "latestBuild": latest_build }),
+            )
+        })?;
+    if !candidate_output.is_dir() {
+        return Err(typed_recoverable(
+            "preview.start candidate output is unavailable".to_string(),
+            "preview.candidate_manifest_missing",
+            json!({ "candidateOutputPath": display_workspace_path(&candidate_output, ctx) }),
+        ));
+    }
+    check_existing_path(&candidate_output, &ctx.workspace_root).map_err(|error| {
+        typed_recoverable(
+            format!("preview.start candidate output is unavailable: {error:?}"),
+            "preview.candidate_manifest_missing",
+            json!({ "candidateOutputPath": display_workspace_path(&candidate_output, ctx) }),
+        )
+    })?;
     stop_preview_pid(ctx);
     let log_dir = ctx.workspace_root.join("outputs/preview");
     fs::create_dir_all(&log_dir).map_err(|error| ToolError::Recoverable(error.to_string()))?;
@@ -358,16 +351,22 @@ async fn start_static_preview_server(
         .map_err(|error| ToolError::Recoverable(error.to_string()))?;
     let stderr = fs::File::create(log_dir.join("preview.stderr.log"))
         .map_err(|error| ToolError::Recoverable(error.to_string()))?;
-    let mut command = TokioCommand::new("python3");
+    let installed_script = PathBuf::from("/opt/anydesign/bootstrap/static-preview-server.js");
+    let repository_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../infra/agent-sandbox/base/static-preview-server.js");
+    let script = if installed_script.is_file() {
+        installed_script
+    } else {
+        repository_script
+    };
+    let mut command = TokioCommand::new("node");
     command
-        .arg("-m")
-        .arg("http.server")
-        .arg(port.to_string())
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--directory")
-        .arg(&static_output)
-        .current_dir(app_root)
+        .arg(script)
+        .env("WORKSPACE_ROOT", &ctx.workspace_root)
+        .env("CANDIDATE_BUILD_ID", build_id)
+        .env("CANDIDATE_PREVIEW_HOST", "127.0.0.1")
+        .env("CANDIDATE_PREVIEW_PORT", port.to_string())
+        .current_dir(&ctx.workspace_root)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     let child = command.spawn().map_err(|error| {
@@ -376,7 +375,203 @@ async fn start_static_preview_server(
     let pid = child.id().unwrap_or_default();
     std::mem::drop(child);
     write_preview_pid(ctx, pid).map_err(|error| ToolError::Recoverable(error.to_string()))?;
-    Ok(static_output)
+    Ok(candidate_output)
+}
+
+fn claim_serving_restart(state: &mut Value) -> Result<u32, &'static str> {
+    if state.get("managed").and_then(Value::as_bool) != Some(true) {
+        return Err("preview is not Runtime-managed");
+    }
+    let attempts = state
+        .get("servingRestartAttempts")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if attempts >= 1 {
+        return Err("serving restart budget exhausted");
+    }
+    state["servingRestartAttempts"] = json!(attempts + 1);
+    Ok((attempts + 1) as u32)
+}
+
+pub(super) async fn restart_static_candidate_preview(
+    workspace: &dyn WorkspaceBackend,
+    command: Option<&dyn SandboxCommandBackend>,
+    ctx: &ToolContext,
+    latest_build: &Value,
+    preview_url: &str,
+) -> Result<Value, ToolError> {
+    let mut state = read_workspace_json(workspace, ctx, "state/preview.json")
+        .await
+        .ok_or_else(|| {
+            typed_recoverable(
+                "serving restart requires Runtime preview state".to_string(),
+                "preview.serving_restart_unavailable",
+                json!({ "repairAllowed": false }),
+            )
+        })?;
+    let attempt = claim_serving_restart(&mut state).map_err(|reason| {
+        typed_recoverable(
+            reason.to_string(),
+            "preview.serving_restart_exhausted",
+            json!({
+                "maxAttempts": 1,
+                "repairAllowed": false,
+            }),
+        )
+    })?;
+    state["servingRestart"] = json!({
+        "attempt": attempt,
+        "status": "restarting",
+        "owner": "serving",
+    });
+    state["accessible"] = json!(false);
+    write_workspace_json(workspace, ctx, "state/preview.json", &state).await?;
+
+    let restart_result = if ctx.remote_workspace {
+        let command = command.ok_or_else(|| {
+            typed_recoverable(
+                "remote serving restart requires a command backend".to_string(),
+                "preview.serving_restart_unavailable",
+                json!({ "repairAllowed": false }),
+            )
+        });
+        match command {
+            Ok(command) => {
+                let lease_id = state
+                    .get("leaseId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        typed_recoverable(
+                            "remote serving restart requires a preview lease".to_string(),
+                            "preview.lease_missing",
+                            json!({ "repairAllowed": false }),
+                        )
+                    });
+                match lease_id {
+                    Ok(lease_id) => {
+                        command.stop_process(ctx, &lease_id).await.ok();
+                        match command
+                            .start_process(
+                                ctx,
+                                &lease_id,
+                                &[
+                                    "node".to_string(),
+                                    "/opt/anydesign/bootstrap/static-preview-server.js"
+                                        .to_string(),
+                                ],
+                                &ctx.workspace_root,
+                            )
+                            .await
+                        {
+                            Ok(process) => match command
+                                .run(
+                                    ctx,
+                                    &[
+                                        "node".to_string(),
+                                        "-e".to_string(),
+                                        "const url='http://127.0.0.1:4321/healthz';const deadline=Date.now()+10000;const probe=()=>fetch(url).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`)}).then(()=>process.exit(0)).catch(error=>{if(Date.now()>=deadline){console.error(error.message);process.exit(1)}setTimeout(probe,100)});probe();".to_string(),
+                                    ],
+                                    &ctx.workspace_root,
+                                    12_000,
+                                )
+                                .await
+                            {
+                                Ok(readiness) if readiness.success => {
+                                    state["pid"] = json!(process.pid);
+                                    state["processStatus"] = json!(process.status);
+                                    Ok(())
+                                }
+                                Ok(readiness) => Err(typed_recoverable(
+                                    "restarted preview process did not become ready".to_string(),
+                                    "preview.process_not_ready",
+                                    json!({
+                                        "stderr": readiness.stderr.chars().take(512).collect::<String>(),
+                                        "repairAllowed": false,
+                                    }),
+                                )),
+                                Err(error) => Err(typed_recoverable(
+                                    format!("preview readiness probe failed: {error}"),
+                                    "preview.process_not_ready",
+                                    json!({ "repairAllowed": false }),
+                                )),
+                            },
+                            Err(error) => Err(typed_recoverable(
+                                format!("preview process restart failed: {error}"),
+                                "preview.process_failed",
+                                json!({ "repairAllowed": false }),
+                            )),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        let port = state
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .or_else(|| url_port(preview_url))
+            .ok_or_else(|| {
+                typed_recoverable(
+                    "local serving restart requires a preview port".to_string(),
+                    "preview.serving_restart_unavailable",
+                    json!({ "repairAllowed": false }),
+                )
+            });
+        match port {
+            Ok(port) => match start_static_preview_server(
+                ctx,
+                &default_project_dir(ctx),
+                latest_build,
+                port,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let health_url = format!("{}/healthz", preview_url.trim_end_matches('/'));
+                    match wait_for_preview_accessible(&health_url, Duration::from_secs(10)).await {
+                        Ok(()) => {
+                            state["pid"] = json!(read_preview_pid(ctx));
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    };
+
+    match restart_result {
+        Ok(()) => {
+            let evidence = json!({
+                "attempt": attempt,
+                "status": "ready",
+                "owner": "serving",
+            });
+            state["status"] = json!("running");
+            state["accessible"] = json!(true);
+            state["servingRestart"] = evidence.clone();
+            write_workspace_json(workspace, ctx, "state/preview.json", &state).await?;
+            Ok(evidence)
+        }
+        Err(error) => {
+            state["status"] = json!("failed");
+            state["accessible"] = json!(false);
+            state["servingRestart"] = json!({
+                "attempt": attempt,
+                "status": "failed",
+                "owner": "serving",
+                "diagnostic": format!("{error:?}").chars().take(512).collect::<String>(),
+            });
+            write_workspace_json(workspace, ctx, "state/preview.json", &state).await?;
+            Err(error)
+        }
+    }
 }
 
 async fn wait_for_preview_accessible(url: &str, timeout: Duration) -> Result<(), ToolError> {
@@ -539,5 +734,34 @@ impl Tool for PreviewStopTool {
         state["pid"] = Value::Null;
         write_workspace_json(&*self.workspace, &ctx, "state/preview.json", &state).await?;
         Ok(ToolResult::ok(state))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serving_restart_budget_is_durable_and_limited_to_one_attempt() {
+        let mut state = json!({ "managed": true });
+
+        assert_eq!(claim_serving_restart(&mut state), Ok(1));
+        assert_eq!(state["servingRestartAttempts"], json!(1));
+        assert_eq!(
+            claim_serving_restart(&mut state),
+            Err("serving restart budget exhausted")
+        );
+        assert_eq!(state["servingRestartAttempts"], json!(1));
+    }
+
+    #[test]
+    fn serving_restart_refuses_unmanaged_preview() {
+        let mut state = json!({ "managed": false });
+
+        assert_eq!(
+            claim_serving_restart(&mut state),
+            Err("preview is not Runtime-managed")
+        );
+        assert!(state.get("servingRestartAttempts").is_none());
     }
 }

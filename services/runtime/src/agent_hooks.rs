@@ -67,7 +67,12 @@ fn success_lifecycle_effect(observation: &ToolSuccessObservation) -> Option<Valu
         "project.build" => serde_json::json!({
             "effect": "build_state_updated",
             "status": content.get("status").cloned().unwrap_or(Value::Null),
+            "buildId": content.get("buildId").cloned().unwrap_or(Value::Null),
             "sourceSnapshotUri": content.get("sourceSnapshotUri").cloned().unwrap_or(Value::Null),
+            "sourceFingerprint": content.get("sourceFingerprint").cloned().unwrap_or(Value::Null),
+            "candidateManifestHash": content.get("candidateManifestHash").cloned().unwrap_or(Value::Null),
+            "artifactRouteManifestPath": content.get("artifactRouteManifestPath").cloned().unwrap_or(Value::Null),
+            "artifactRouteManifestHash": content.get("artifactRouteManifestHash").cloned().unwrap_or(Value::Null),
             "packageManager": content.get("packageManager").cloned().unwrap_or(Value::Null),
         }),
         "draft.snapshot_create" => serde_json::json!({
@@ -102,10 +107,17 @@ fn success_lifecycle_effect(observation: &ToolSuccessObservation) -> Option<Valu
         }),
         "preview.publish" => {
             let promotion = content.get("promotion").unwrap_or(&Value::Null);
+            let build = content.get("build").unwrap_or(&Value::Null);
             serde_json::json!({
                 "effect": "candidate_state_updated",
                 "versionId": promotion.get("versionId").cloned().unwrap_or(Value::Null),
                 "previewUrl": promotion.get("previewUrl").cloned().unwrap_or(Value::Null),
+                "buildId": build.get("buildId").cloned().unwrap_or(Value::Null),
+                "sourceSnapshotUri": build.get("sourceSnapshotUri").cloned().unwrap_or(Value::Null),
+                "sourceFingerprint": build.get("sourceFingerprint").cloned().unwrap_or(Value::Null),
+                "candidateManifestHash": build.get("candidateManifestHash").cloned().unwrap_or(Value::Null),
+                "artifactRouteManifestPath": build.get("artifactRouteManifestPath").cloned().unwrap_or(Value::Null),
+                "artifactRouteManifestHash": build.get("artifactRouteManifestHash").cloned().unwrap_or(Value::Null),
             })
         }
         _ => return None,
@@ -947,7 +959,12 @@ mod tests {
             tool_name: "project.build".to_string(),
             content: json!({
                 "status": "ok",
+                "buildId": "build-1",
                 "sourceSnapshotUri": "file:///workspace/outputs/build/source-snapshots/build-1",
+                "sourceFingerprint": "a".repeat(64),
+                "candidateManifestHash": "b".repeat(64),
+                "artifactRouteManifestPath": ".anydesign-artifact-routes.json",
+                "artifactRouteManifestHash": "c".repeat(64),
                 "packageManager": "pnpm"
             }),
             metadata: None,
@@ -961,6 +978,11 @@ mod tests {
             "build_state_updated"
         );
         assert_eq!(metadata["postToolUseSuccess"]["packageManager"], "pnpm");
+        assert_eq!(metadata["postToolUseSuccess"]["buildId"], "build-1");
+        assert_eq!(
+            metadata["postToolUseSuccess"]["artifactRouteManifestHash"],
+            "c".repeat(64)
+        );
     }
 
     #[test]
@@ -971,6 +993,14 @@ mod tests {
                 "promotion": {
                     "versionId": "version-1",
                     "previewUrl": "http://127.0.0.1:4321"
+                },
+                "build": {
+                    "buildId": "build-1",
+                    "sourceSnapshotUri": "runtime://source-snapshots/project/build-1",
+                    "sourceFingerprint": "a".repeat(64),
+                    "candidateManifestHash": "b".repeat(64),
+                    "artifactRouteManifestPath": ".anydesign-artifact-routes.json",
+                    "artifactRouteManifestHash": "c".repeat(64)
                 }
             }),
             metadata: None,
@@ -984,5 +1014,9 @@ mod tests {
             "candidate_state_updated"
         );
         assert_eq!(metadata["postToolUseSuccess"]["versionId"], "version-1");
+        assert_eq!(
+            metadata["postToolUseSuccess"]["artifactRouteManifestPath"],
+            ".anydesign-artifact-routes.json"
+        );
     }
 }

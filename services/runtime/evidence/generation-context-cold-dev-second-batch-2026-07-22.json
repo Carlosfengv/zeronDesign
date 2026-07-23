@@ -1,0 +1,126 @@
+{
+  "schemaVersion": "generation-context-cold-dev-second-batch-summary@1",
+  "recordedAt": "2026-07-22T06:24:10Z",
+  "sessionId": "deepseek-v4-pro-20260722-fidelity-fixed-001",
+  "pair": {
+    "pairId": "batch-11-zenova-agent-cloud-cold-dev",
+    "batchId": "batch-11",
+    "fixtureId": "zenova-agent-cloud",
+    "bucket": "cold_dev",
+    "templateVersion": "next-app",
+    "lifecycleContract": [
+      "source_mutation",
+      "dependency_restore",
+      "dev_stop",
+      "dev_start",
+      "dev_status_current_revision_ready",
+      "durable_snapshot"
+    ],
+    "control": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-16313141",
+      "recordHash": "cf202864319ed046c51d1b12bd4d3577411fee626f8c6797add74edcbc29b147",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 116513,
+        "outputTokens": 905,
+        "toolCalls": 14,
+        "totalDurationMs": 42130,
+        "timeToFirstSourceMutationMs": 17831,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 35931,
+        "timeToDurableSnapshotMs": 17831,
+        "prebuildFsReadCount": 2,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "candidate": {
+      "outerCaseStatus": "accepted",
+      "lifecycleStatus": "accepted",
+      "recordedStatus": "completed",
+      "requiredFidelityPassed": true,
+      "attempts": [
+        "accepted"
+      ],
+      "selectedFinalEditRunId": "run-9605116",
+      "recordHash": "0d9abf714a055b63d65dab22b84fa27b0d6e7975ebbe76b9d671762b2c6f47bd",
+      "sandboxReleaseVerified": true,
+      "metrics": {
+        "inputTokens": 113927,
+        "outputTokens": 1001,
+        "toolCalls": 14,
+        "totalDurationMs": 52095,
+        "timeToFirstSourceMutationMs": 22683,
+        "modelTurnAtFirstSourceMutation": 3,
+        "coldDevReadyMs": 42480,
+        "timeToDurableSnapshotMs": 22683,
+        "prebuildFsReadCount": 1,
+        "prebuildFsListCount": 0,
+        "prebuildFsSearchCount": 0,
+        "duplicateFullReadRateBasisPoints": 0,
+        "outOfScopeMutationCount": 0
+      }
+    },
+    "observedCandidateChangePercent": {
+      "inputTokens": -2.22,
+      "outputTokens": 10.61,
+      "toolCalls": 0.0,
+      "totalDurationMs": 23.65,
+      "timeToFirstSourceMutationMs": 27.21,
+      "modelTurnAtFirstSourceMutation": 0.0,
+      "coldDevReadyMs": 18.23,
+      "timeToDurableSnapshotMs": 27.21,
+      "prebuildFsReadCount": -50.0,
+      "prebuildFsSearchCount": 0.0
+    },
+    "openFindings": [
+      "the candidate reduced input tokens and prebuild reads while preserving tool count and required fidelity",
+      "output tokens, total duration, first mutation, Cold Dev Ready, and durable snapshot all regressed",
+      "candidate Cold Dev Ready at 42480ms is above the 30000ms P95 target",
+      "candidate durable snapshot at 22683ms is above the 5000ms P95 target",
+      "two pairs across two batches cannot establish the ten-pair or three-batch gates"
+    ]
+  },
+  "ledger": {
+    "recordCount": 21,
+    "sampleCount": 20,
+    "completePairCount": 10,
+    "pendingPairCount": 0,
+    "headRecordHash": "0d9abf714a055b63d65dab22b84fa27b0d6e7975ebbe76b9d671762b2c6f47bd",
+    "sha256": "4c50326eb523bb22d1d9f6c8ebb769cd6637c3eeda8d01daa25629f650fcb423"
+  },
+  "evaluation": {
+    "result": "insufficient_evidence",
+    "coveragePassed": false,
+    "coldDevPairCount": 2,
+    "coldDevMinimumPairCount": 10,
+    "coldDevBatchCount": 2,
+    "coldDevMinimumBatchCount": 3,
+    "coldDevControlMedianInputTokens": 128919.5,
+    "coldDevCandidateMedianInputTokens": 137993.5,
+    "coldDevCandidateP95ReadyMs": 42191.45,
+    "coldDevCandidateP95DurableSnapshotMs": 22459.35,
+    "rolloutEvidenceSha256": "ac0b13d92015a74f7ac391304975364df3c2925bd26e89c1e4b33d0390e1a4c1"
+  },
+  "clusterAfterPair": {
+    "context": "k3d-zerondesign-e2e",
+    "sandboxClaimCount": 0,
+    "sandboxCount": 0
+  },
+  "sourceSha256": {
+    "pairSpec": "e8732d5a38434d48d649ce416c875a7dbcb38d1d79e82ba4878267565214e432",
+    "pairResult": "6f319e10faaffd0df050578e0b7cfd8205e3b3bf42fa4f5cfb1b865473252798",
+    "controlCase": "e28ec942f68099be78d06ca08d0ac35c5f07f86e60606d82121792dad74d02a6",
+    "candidateCase": "c694c2dbda20b27d8c272e3c40d1c1d7a4267043d825f4a686290db477cc26f7",
+    "rolloutEvidence": "ac0b13d92015a74f7ac391304975364df3c2925bd26e89c1e4b33d0390e1a4c1"
+  }
+}

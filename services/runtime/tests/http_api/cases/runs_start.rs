@@ -1,7 +1,14 @@
 use super::*;
 
-#[tokio::test]
-async fn start_run_and_stream_events() {
+#[test]
+fn start_run_and_stream_events() {
+    run_with_http_test_stack(
+        "start-run-stream-events",
+        start_run_and_stream_events_inner(),
+    );
+}
+
+async fn start_run_and_stream_events_inner() {
     let store = RuntimeStore::new();
     let model = MockModelClient::new(vec![ModelResponse::ToolCalls(vec![ToolCall::new(
         "tool-1",
@@ -153,8 +160,15 @@ async fn continue_run_rejects_empty_user_message() {
     assert_eq!(payload["error"], "userMessage must not be empty");
 }
 
-#[tokio::test]
-async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments() {
+#[test]
+fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments() {
+    run_with_http_test_stack(
+        "stream-tool-input-parse-failure",
+        stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments_inner(),
+    );
+}
+
+async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_arguments_inner() {
     let store = RuntimeStore::new();
     let model = MockModelClient::new(vec![
         ModelResponse::ToolInputParseFailed {
@@ -257,8 +271,15 @@ async fn stream_events_exposes_tool_input_parse_failure_error_kind_without_raw_a
     assert!(!body.contains("fs.write requires path"));
 }
 
-#[tokio::test]
-async fn start_run_uses_configured_agent_model_for_real_provider_runs() {
+#[test]
+fn start_run_uses_configured_agent_model_for_real_provider_runs() {
+    run_with_http_test_stack(
+        "start-run-configured-model",
+        start_run_uses_configured_agent_model_for_real_provider_runs_inner(),
+    );
+}
+
+async fn start_run_uses_configured_agent_model_for_real_provider_runs_inner() {
     let store = RuntimeStore::new();
     let mut config = public_auth_disabled_config();
     config.agent_model = "deepseek-chat".to_string();

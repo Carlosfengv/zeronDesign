@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     fs,
+    future::Future,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -36,6 +37,27 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Mutex;
+
+const AGENT_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn run_with_agent_test_stack<F>(name: &str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(AGENT_TEST_STACK_BYTES)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("agent test runtime")
+                .block_on(future);
+        })
+        .expect("agent test thread")
+        .join()
+        .expect("agent test thread panicked");
+}
 
 fn design_profile_fixture(project_id: &str) -> DesignProfile {
     let now = Utc::now();
@@ -128,6 +150,18 @@ fn design_profile_fixture(project_id: &str) -> DesignProfile {
         created_at: now,
         updated_at: now,
     }
+}
+
+fn workflow_progress_text(request: &ModelRequest) -> &str {
+    request
+        .messages
+        .iter()
+        .find(|message| {
+            message.get("kind").and_then(Value::as_str) == Some("runtime_workflow_progress")
+        })
+        .and_then(|message| message.get("text"))
+        .and_then(Value::as_str)
+        .expect("model request should include runtime workflow progress")
 }
 
 #[tokio::test]
@@ -2907,98 +2941,112 @@ async fn rejected_approved_input_is_consumed_and_reported_once_to_model() {
         .contains("approved input is invalid"));
 }
 
-#[tokio::test]
-async fn agent_loop_deterministically_compacts_history_to_workspace_context() {
-    let workspace = unique_temp_dir("agent-loop-compact");
-    let store = RuntimeStore::new();
-    let run = store
-        .create_run(
-            "project-1".to_string(),
-            AgentPhase::Export,
-            "export".to_string(),
-            "internal-balanced".to_string(),
-            vec![],
-        )
-        .await;
-    store
-        .append_conversation_item(
-            &run.project_id,
-            Some(&run.id),
-            "user_message",
-            Some("user"),
-            "Original instruction must not be resurrected after compaction",
-            None,
-        )
-        .await;
-    let mut responses = Vec::new();
-    for index in 0..40 {
+#[test]
+fn agent_loop_deterministically_compacts_history_to_workspace_context() {
+    run_with_agent_test_stack("agent-loop-compaction", async move {
+        let workspace = unique_temp_dir("agent-loop-compact");
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "project-1".to_string(),
+                AgentPhase::Export,
+                "export".to_string(),
+                "internal-balanced".to_string(),
+                vec![],
+            )
+            .await;
+        store
+            .append_conversation_item(
+                &run.project_id,
+                Some(&run.id),
+                "user_message",
+                Some("user"),
+                "Original instruction must not be resurrected after compaction",
+                None,
+            )
+            .await;
+        let mut responses = Vec::new();
+        for index in 0..40 {
+            responses.push(ModelResponse::ToolCalls(vec![ToolCall::new(
+                format!("tool-missing-{index}"),
+                "missing.tool",
+                json!({ "index": index, "payload": "x".repeat(2_000) }),
+            )]));
+        }
         responses.push(ModelResponse::ToolCalls(vec![ToolCall::new(
-            format!("tool-missing-{index}"),
-            "missing.tool",
-            json!({ "index": index, "payload": "x".repeat(2_000) }),
+            "tool-complete",
+            "run.complete",
+            json!({ "status": "completed", "summary": "Compacted run completed" }),
         )]));
-    }
-    responses.push(ModelResponse::ToolCalls(vec![ToolCall::new(
-        "tool-complete",
-        "run.complete",
-        json!({ "status": "completed", "summary": "Compacted run completed" }),
-    )]));
-    let captured_requests = Arc::new(Mutex::new(Vec::new()));
-    let executor = control_plane_executor().with_workspace_root(&workspace);
-    let loop_runner = AgentLoop::with_tool_executor(
-        store.clone(),
-        Arc::new(RecordingModelClient::new(
-            responses,
-            captured_requests.clone(),
-        )),
-        executor,
-    )
-    .with_limits(AgentLoopLimits {
-        max_turns: 50,
-        max_tool_calls: 50,
-        max_input_tokens: 10_000_000,
-        max_output_tokens: 1_000_000,
-        max_no_progress_turns: 100,
-        ..AgentLoopLimits::default()
-    });
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let executor = control_plane_executor().with_workspace_root(&workspace);
+        let loop_runner = AgentLoop::with_tool_executor(
+            store.clone(),
+            Arc::new(RecordingModelClient::new(
+                responses,
+                captured_requests.clone(),
+            )),
+            executor,
+        )
+        .with_limits(AgentLoopLimits {
+            max_turns: 50,
+            max_tool_calls: 50,
+            max_input_tokens: 10_000_000,
+            max_output_tokens: 1_000_000,
+            max_no_progress_turns: 100,
+            ..AgentLoopLimits::default()
+        });
 
-    loop_runner.run(&run.id).await.unwrap();
+        loop_runner.run(&run.id).await.unwrap();
 
-    let run = store.get_run(&run.id).await.unwrap();
-    assert_eq!(run.status, AgentRunStatus::Completed);
-    let context = fs::read_to_string(workspace.join("state/context.md")).unwrap();
-    assert!(context.contains("<!-- runtime-context:conversation-compact:"));
-    assert!(context.contains("## Compaction Batch"));
-    assert!(!context.contains("## Previous Compact"));
-    assert!(context.contains("tool-missing-0"));
-    assert!(context.contains("tool-missing-6"));
-    assert!(context.contains("Compacted messages:"));
-    assert!(context.chars().count() > 48_000);
-    let requests = captured_requests.lock().await;
-    let instruction_presence = requests
-        .iter()
-        .map(|request| {
-            request.messages.iter().any(|message| {
-                message["text"] == "Original instruction must not be resurrected after compaction"
+        let run = store.get_run(&run.id).await.unwrap();
+        assert_eq!(run.status, AgentRunStatus::Completed);
+        let context = fs::read_to_string(workspace.join("state/context.md")).unwrap();
+        assert!(context.contains("<!-- runtime-context:conversation-compact:"));
+        assert!(context.contains("## Compaction Batch"));
+        assert!(!context.contains("## Previous Compact"));
+        assert!(context.contains("tool-missing-0"));
+        assert!(context.contains("tool-missing-6"));
+        assert!(context.contains("Compacted messages:"));
+        assert!(context.chars().count() > 48_000);
+        let requests = captured_requests.lock().await;
+        let instruction_presence = requests
+            .iter()
+            .map(|request| {
+                request.messages.iter().any(|message| {
+                    message["text"]
+                        == "Original instruction must not be resurrected after compaction"
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    let first_absent = instruction_presence
-        .iter()
-        .position(|present| !present)
-        .expect("old user instruction should eventually compact out of the active window");
-    assert!(instruction_presence[first_absent..]
-        .iter()
-        .all(|present| !present));
-    let events = store.events(&run.id).await;
-    assert!(events
+            .collect::<Vec<_>>();
+        let first_absent = instruction_presence
+            .iter()
+            .position(|present| !present)
+            .expect("old user instruction should eventually compact out of the active window");
+        assert!(instruction_presence[first_absent..]
+            .iter()
+            .all(|present| !present));
+        let events = store.events(&run.id).await;
+        assert!(events
         .iter()
         .any(|event| matches!(event, AgentEvent::ChunkCommitted { path, .. } if path == "/workspace/state/context.md")));
-    assert!(!events.iter().any(|event| matches!(
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MetricRecorded {
+                name,
+                metadata: Some(metadata),
+                ..
+            } if name == "context_window_epoch_advanced"
+                && metadata["triggerReasons"].as_array().is_some_and(|reasons| !reasons.is_empty())
+                && metadata["conversationBytes"].as_u64().is_some()
+                && metadata["largestMessageBytes"].as_u64().is_some()
+        )));
+        assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolFailed { metadata: Some(metadata), .. }
             if metadata["errorKind"] == "tool.input_too_large"
-    )));
+        )));
+    });
 }
 
 #[tokio::test]
@@ -3967,7 +4015,7 @@ async fn distinct_staged_chunks_count_as_progress_without_marking_source_authore
 }
 
 #[tokio::test]
-async fn first_unique_file_reads_count_as_bounded_progress_but_repeats_do_not() {
+async fn file_reads_are_observations_and_do_not_reset_no_progress() {
     let store = RuntimeStore::new();
     let run = store
         .create_run(
@@ -4026,7 +4074,7 @@ async fn first_unique_file_reads_count_as_bounded_progress_but_repeats_do_not() 
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(counters, vec![0, 0, 1, 2]);
+    assert_eq!(counters, vec![1, 2]);
 }
 
 #[tokio::test]
@@ -4301,7 +4349,7 @@ async fn missing_dependency_publish_failure_enters_repair_before_no_progress_sto
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 2);
-    assert!(requests[1].system_prompt.contains("diagnostic_required"));
+    assert!(workflow_progress_text(&requests[1]).contains("diagnostic_required"));
     assert!(store.events(&run.id).await.iter().any(|event| matches!(
         event,
         AgentEvent::RunObservationBudget {
@@ -4369,8 +4417,8 @@ async fn exhausted_repair_budget_directs_mutation_instead_of_more_observation() 
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 4);
-    assert!(requests[2].system_prompt.contains("diagnostic_required"));
-    assert!(requests[3].system_prompt.contains("diagnostic_required"));
+    assert!(workflow_progress_text(&requests[2]).contains("diagnostic_required"));
+    assert!(workflow_progress_text(&requests[3]).contains("diagnostic_required"));
     assert!(requests[3]
         .tools
         .iter()
@@ -4507,9 +4555,8 @@ async fn repair_mutation_directs_immediate_publish_without_more_exploration() {
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 4);
-    assert!(requests[3].system_prompt.contains("preview_ready_required"));
-    assert!(requests[3]
-        .system_prompt
+    assert!(workflow_progress_text(&requests[3]).contains("preview_ready_required"));
+    assert!(workflow_progress_text(&requests[3])
         .contains("bounded repair mutation needs Candidate validation"));
 }
 
@@ -4553,10 +4600,10 @@ async fn build_prompt_publishes_authoritative_workflow_stage_and_budget_remainin
 
     let requests = captured_requests.lock().await;
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].system_prompt.contains("discovering_inputs"));
-    assert!(requests[1].system_prompt.contains("loading_requirements"));
-    assert!(requests[1].system_prompt.contains("inputs_inventoried"));
-    assert!(requests[1].system_prompt.contains("\"remaining\":1"));
+    assert!(workflow_progress_text(&requests[0]).contains("discovering_inputs"));
+    assert!(workflow_progress_text(&requests[1]).contains("loading_requirements"));
+    assert!(workflow_progress_text(&requests[1]).contains("inputs_inventoried"));
+    assert!(workflow_progress_text(&requests[1]).contains("\"remaining\":1"));
     assert!(requests[0]
         .system_prompt
         .contains("shell.run defaults to the appRoot as its working directory"));

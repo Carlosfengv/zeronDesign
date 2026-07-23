@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "runtime-release-budget-policy@1",
+  "releaseStage": "production",
+  "requiredModes": {
+    "rolloutMode": "enforced",
+    "tokenBudgetMode": "split_enforced",
+    "operationBudgetMode": "enforced"
+  },
+  "phaseProfiles": {
+    "build": {
+      "allowedProfileHashes": [
+        "85c4860f60a54351f58232df0f7262fc8287f28f440de364fd6a7c5bb0c1b91b"
+      ],
+      "maximumLimits": {
+        "maxTurns": 16,
+        "maxToolCalls": 60,
+        "maxInputTokens": 300000,
+        "maxGrossInputTokens": 300000,
+        "maxUncachedInputTokens": 180000,
+        "maxPromptTokensPerTurn": 64000,
+        "maxOutputTokens": 40000
+      },
+      "maximumOperationLimits": {
+        "maxGrossInputTokens": 450000,
+        "maxUncachedInputTokens": 270000,
+        "maxOutputTokens": 80000,
+        "maxTurns": 30,
+        "maxToolCalls": 100
+      }
+    },
+    "edit": {
+      "allowedProfileHashes": [
+        "f9ffa0acca3909cd3cfc9b03747c26e2edfcda975fb2afff037d5dbb44e6b875"
+      ],
+      "maximumLimits": {
+        "maxTurns": 12,
+        "maxToolCalls": 60,
+        "maxInputTokens": 220000,
+        "maxGrossInputTokens": 220000,
+        "maxUncachedInputTokens": 120000,
+        "maxPromptTokensPerTurn": 48000,
+        "maxOutputTokens": 40000
+      },
+      "maximumOperationLimits": {
+        "maxGrossInputTokens": 450000,
+        "maxUncachedInputTokens": 270000,
+        "maxOutputTokens": 80000,
+        "maxTurns": 30,
+        "maxToolCalls": 100
+      }
+    },
+    "review": {
+      "allowedProfileHashes": [
+        "cf951ae9ea0b3313d5062623abdeb172d42d11a6ecca39b2dd7d0e8bb8e277d6"
+      ],
+      "maximumLimits": {
+        "maxTurns": 20,
+        "maxToolCalls": 60,
+        "maxInputTokens": 200000,
+        "maxGrossInputTokens": 300000,
+        "maxUncachedInputTokens": 180000,
+        "maxPromptTokensPerTurn": 64000,
+        "maxOutputTokens": 40000
+      },
+      "maximumOperationLimits": {
+        "maxGrossInputTokens": 450000,
+        "maxUncachedInputTokens": 270000,
+        "maxOutputTokens": 80000,
+        "maxTurns": 30,
+        "maxToolCalls": 100
+      }
+    },
+    "repair": {
+      "allowedProfileHashes": [
+        "79e9d4c07dfd1e417bf4c6bc77e6aca971554d03b333cfdb4e94de19a7d46c05"
+      ],
+      "maximumLimits": {
+        "maxTurns": 10,
+        "maxToolCalls": 60,
+        "maxInputTokens": 180000,
+        "maxGrossInputTokens": 180000,
+        "maxUncachedInputTokens": 100000,
+        "maxPromptTokensPerTurn": 48000,
+        "maxOutputTokens": 40000
+      },
+      "maximumOperationLimits": {
+        "maxGrossInputTokens": 450000,
+        "maxUncachedInputTokens": 270000,
+        "maxOutputTokens": 80000,
+        "maxTurns": 30,
+        "maxToolCalls": 100
+      }
+    }
+  }
+}

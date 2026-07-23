@@ -262,6 +262,19 @@ impl Tool for FsReadTool {
     ) -> Result<Value, ValidationError> {
         require_string(&input, "path", self.name())?;
         validate_workspace_path_input(&input, ctx, self.name())?;
+        let normalized = input["path"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("/workspace/");
+        if normalized == "state/validation-report.json"
+            || normalized.ends_with("/.anydesign-candidate-manifest.json")
+            || normalized.ends_with("/.anydesign-artifact-routes.json")
+        {
+            return Err(ValidationError::with_kind(
+                "full validation and candidate manifests are platform evidence; read state/repair-context.json for bounded source repair guidance",
+                "generation.repair_context_required",
+            ));
+        }
         Ok(input)
     }
 

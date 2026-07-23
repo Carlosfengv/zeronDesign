@@ -3,6 +3,7 @@ use crate::{
     artifact_publisher::FileArtifactPublisher,
     channel_manager::ChannelManager,
     config::{SandboxBackendMode, WorkRuntimeBackendMode},
+    design_profile_service::DesignProfileService,
     http_api::{self, AppState},
     object_storage::{S3ObjectStorage, S3ObjectStorageConfig},
     project::{
@@ -18,10 +19,14 @@ use crate::{
     release::{
         ProcessReleasePackagingBackend, ReleasePackagingController, TrustedReleasePackagingBackend,
     },
-    run_lifecycle::RunSessionLauncher,
-    runtime::RuntimeSessionLauncher,
+    run_lifecycle::{RunLifecycleService, RunSessionLauncher},
+    runtime::{
+        RunContinuationController, RuntimeBuildSandboxProvisioner, RuntimeEditWorkspaceRestorer,
+        RuntimeSessionLauncher,
+    },
     templates::BuiltInTemplateRegistry,
     tools::{
+        control_plane::sandbox_backend_for_config,
         runtime::ToolContext,
         sandbox::{LocalWorkspaceBackend, SandboxChannelWorkspaceBackend, WorkspaceBackend},
     },
@@ -80,6 +85,28 @@ pub async fn recover_startup_runs(state: AppState) -> anyhow::Result<AppState> {
             state.store.clone(),
             state.config.clone(),
         )),
+        Duration::from_millis(500),
+    )
+    .spawn(&state.supervisor)?;
+    let continuation_lifecycle = Arc::new(RunLifecycleService::new(
+        state.config.clone(),
+        state.store.clone(),
+        Arc::new(RuntimeSessionLauncher::new(
+            state.config.clone(),
+            state.store.clone(),
+            state.model.clone(),
+            state.supervisor.clone(),
+        )),
+        Arc::new(RuntimeBuildSandboxProvisioner::new(
+            sandbox_backend_for_config(&state.config),
+        )),
+        Arc::new(RuntimeEditWorkspaceRestorer),
+        DesignProfileService::new(state.store.clone()),
+    ));
+    RunContinuationController::new(
+        state.config.clone(),
+        state.store.clone(),
+        continuation_lifecycle,
         Duration::from_millis(500),
     )
     .spawn(&state.supervisor)?;

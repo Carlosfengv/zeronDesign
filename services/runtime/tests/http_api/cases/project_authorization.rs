@@ -180,6 +180,8 @@ async fn required_public_auth_protects_project_reads_and_permission_mutations() 
     let write_token = scoped_token(&issuer, "owner-1", "project-1", PROJECT_WRITE_OPERATION);
     let wrong_project_token =
         scoped_token(&issuer, "owner-1", "project-2", PROJECT_WRITE_OPERATION);
+    let wrong_project_read_token =
+        scoped_token(&issuer, "owner-1", "project-2", PROJECT_READ_OPERATION);
     let app = http_api::router_with_state(state.clone());
 
     let unauthorized_read = app
@@ -205,6 +207,27 @@ async fn required_public_auth_protects_project_reads_and_permission_mutations() 
         .await
         .unwrap();
     assert_eq!(authorized_read.status(), StatusCode::OK);
+
+    for (token, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(write_token.as_str()), StatusCode::FORBIDDEN),
+        (
+            Some(wrong_project_read_token.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (Some(read_token.as_str()), StatusCode::OK),
+    ] {
+        let mut request = Request::builder().uri(format!("/runs/{}/budget-profile", run.id));
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
 
     let decision_body = json!({ "decision": "ask" }).to_string();
     for (token, expected) in [

@@ -1,0 +1,120 @@
+{
+  "schemaVersion": "generation-context-release-terminal-smoke-and-infrastructure-freeze@1",
+  "recordedAt": "2026-07-22T08:10:00Z",
+  "decision": "infrastructure_frozen_quantitative_collection_paused",
+  "diagnosis": {
+    "initialIncident": "release returned HTTP 200 and marked the binding deleted before SandboxClaim and Sandbox were absent",
+    "firstRepairGap": "kubectl delete used its default wait=true behavior and could block before Runtime terminal-absence polling began",
+    "secondRepairGap": "the production Arc<dyn SandboxKubeClient> path did not delegate sandbox_resources_absent and fell back to claim_phase, producing HTTP 500 after deletion returned NotFound",
+    "dockerOrK3dFailure": false,
+    "providerFailure": false
+  },
+  "remediation": {
+    "deleteRequest": "kubectl delete sandboxclaim --ignore-not-found=true --wait=false",
+    "terminalCondition": "both SandboxClaim and Sandbox must be absent before the binding is marked Deleted",
+    "timeoutBehavior": "return an error and leave the binding non-deleted",
+    "dynamicDispatch": "Arc<T> delegates sandbox_resources_absent to the wrapped Kubernetes client",
+    "runnerDefense": {
+      "maximumReleaseAttempts": 3,
+      "requiredSuccessfulResponses": 2,
+      "failureClassification": "sandbox_release_failed"
+    }
+  },
+  "validation": {
+    "unit": {
+      "command": "cargo test --manifest-path services/runtime/Cargo.toml --test sandbox_adapter",
+      "testCount": 20,
+      "passed": true
+    },
+    "k3dAdapterSmoke": {
+      "command": "RUN_SANDBOX_RELEASE_E2E=1 cargo test --manifest-path services/runtime/Cargo.toml --test k8s_sandbox_e2e k8s_sandbox_release_waits_for_terminal_absence -- --nocapture",
+      "productionEquivalentDynamicDispatch": true,
+      "projectId": "release-terminal-smoke-20260722-02",
+      "releaseDurationMs": 87,
+      "bindingStatus": "deleted",
+      "resourcesAbsentAtReturn": true,
+      "passed": true
+    },
+    "deployedHttpSmoke": {
+      "deployment": "anydesign-runtime-generation-control",
+      "projectId": "real-20260722073228-private-ai-security-runbook",
+      "liveClaimReadyBeforeRelease": true,
+      "firstResponse": {
+        "httpStatus": 200,
+        "durationSeconds": 0.280642
+      },
+      "secondResponse": {
+        "httpStatus": 200,
+        "durationSeconds": 0.095665
+      },
+      "requiredSuccessfulResponsesSatisfied": true,
+      "terminalSandboxClaimCount": 0,
+      "terminalSandboxCount": 0,
+      "providerCalls": 0,
+      "cohortSamplesAppended": 0,
+      "passed": true
+    },
+    "runnerRegression": {
+      "command": "node infra/generation-reliability/run-real-provider-examples.test.mjs",
+      "passed": true
+    },
+    "fullContractGate": {
+      "command": "bash infra/generation-reliability/check-contract.sh",
+      "passed": true
+    }
+  },
+  "freeze": {
+    "cluster": "k3d-zerondesign-e2e",
+    "workspaceNamespace": "ws-runtime-rc",
+    "runtimeImage": "anydesign/runtime:6a5603c0a464-dirty-0b333f162a0b",
+    "runtimeManifestListSha256": "acec0518b58072c25c0ebc85363d34d0fcc743983b175d333528f6fc9eb2fd3c",
+    "runtimeConfigImageSha256": "1a08bd76b151a2c8f2207257da545d68f9a1880cb4dee626f865cd9648aa7930",
+    "repositoryCommit": "6a5603c0a4649856855e799cff50ea271fe88e7d",
+    "repositoryDirty": true,
+    "control": {
+      "deployment": "anydesign-runtime-generation-control",
+      "uid": "238d4646-94d2-49de-a512-9fde8220d512",
+      "generation": 20,
+      "podUid": "86dcf1df-1c5b-4011-b33a-4ca0cdc3b963",
+      "generationContextMode": "off",
+      "readyReplicas": 1,
+      "restartCount": 0
+    },
+    "candidate": {
+      "deployment": "anydesign-runtime-generation-candidate",
+      "uid": "c5e81241-f9b3-47b1-a866-8f17d5554930",
+      "generation": 20,
+      "podUid": "46337385-512c-4573-9bb2-6c7a38914592",
+      "generationContextMode": "enabled",
+      "readyReplicas": 1,
+      "restartCount": 0
+    },
+    "provider": {
+      "resourceId": "deepseek-v4-pro",
+      "resourceRevision": 4,
+      "physicalModel": "deepseek-v4-pro",
+      "configMapResourceVersion": "4147"
+    },
+    "gateway": {
+      "image": "zerondesign/provider-gateway:6a5603c0a464-dirty-997a4e0fbfbc",
+      "deploymentGeneration": 4,
+      "readyReplicas": 1
+    },
+    "deploymentIdentitySha256": "cfca32c5ee606fda6f4fecde55616e8f0a393ada72b9d2938427a82ea26a7820",
+    "quantitativeCollectionPaused": true,
+    "activePreparedSession": null,
+    "preparedSessionsInvalidated": [
+      "deepseek-v4-pro-20260722-fidelity-fixed-001",
+      "deepseek-v4-pro-20260722-release-terminal-fixed-001"
+    ]
+  },
+  "sourceSha256": {
+    "sandboxAdapter": "0b333f162a0b25daf1d9b108cca4e85ebac08d1743e4ae8da935b25fda65dd76",
+    "sandboxAdapterTest": "b2732a0a195fcdac42c23bd1cbe7f57c6fd0c1c2bd83c5fdbe1821b138fce17a",
+    "k3dSandboxSmokeTest": "ecc540db223d94a4b78e12d4e94d4d65ea91cc0272fcabdd91690550cb91537c",
+    "runner": "432de0961f00d5e0176ab98bee7adbd6ce50d3dc0adb2dc7016828da3b9ab092",
+    "runnerTest": "8b703e9d76028871434e5189badd2cc025194236509ba697b397a55c07afdf50",
+    "deploymentEvidence": "24852621480d029db3069cb9818d5fbb4e77e8235aa489285b6eae525f00b9a3",
+    "pausedSessionInvalidation": "d1afd0bc0921f6fa709448a525fb9269187f1f600e352792a553a59f3911b028"
+  }
+}

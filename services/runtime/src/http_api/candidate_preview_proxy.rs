@@ -66,6 +66,14 @@ pub(in crate::http_api) async fn proxy_candidate_preview(
             )));
         }
     }
+    let resolved_artifact_path = upstream_response
+        .headers()
+        .get("x-anydesign-artifact-path")
+        .cloned();
+    let resolved_artifact_sha256 = upstream_response
+        .headers()
+        .get("x-anydesign-artifact-sha256")
+        .cloned();
     let content_type = upstream_response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -85,11 +93,24 @@ pub(in crate::http_api) async fn proxy_candidate_preview(
             bytes = rewrite_preview_html(&html, &preview_prefix, &lease_id).into_bytes();
         }
     }
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "private, no-store")
-        .header("x-anydesign-preview-lease", access.lease_id)
+        .header("x-anydesign-preview-lease", &access.lease_id);
+    if access.mode == PreviewLeaseMode::Static {
+        response = response.header(
+            "x-anydesign-candidate-manifest-hash",
+            &access.candidate_manifest_hash,
+        );
+    }
+    if let Some(value) = resolved_artifact_path {
+        response = response.header("x-anydesign-artifact-path", value);
+    }
+    if let Some(value) = resolved_artifact_sha256 {
+        response = response.header("x-anydesign-artifact-sha256", value);
+    }
+    response
         .body(Body::from(bytes))
         .map_err(|error| internal_error(anyhow::anyhow!(error)))
 }

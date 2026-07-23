@@ -1,0 +1,543 @@
+{
+  "schemaVersion": "content-plan-approval-migration-evidence@1",
+  "recordedAt": "2026-07-21T09:54:06Z",
+  "source": {
+    "authority": "runtime-control-plane-postgres:k3d-zerondesign-e2e/anydesign-runtime/runtime_control_plane_files",
+    "file": "briefs.jsonl",
+    "revision": 91,
+    "updatedAt": "2026-07-21 07:45:13.776768+00",
+    "contentSha256": "a14b2f8013166963da50fdbdf526cf81d28f8363595f34b9354999fe409d4f85",
+    "complete": true
+  },
+  "mappingRule": {
+    "version": "content-plan-approval-legacy-mapping@1",
+    "requiredFields": [
+      "planId",
+      "revision",
+      "contentHash",
+      "confirmationEventId"
+    ],
+    "briefConfirmationAloneIsApproval": false,
+    "acceptanceOrBuildEvidenceAloneIsApproval": false,
+    "unmappableRecordsBecomeVerified": false
+  },
+  "inventory": {
+    "rawRecordCount": 91,
+    "uniqueBriefCount": 46,
+    "latestStatusCounts": {
+      "confirmed": 45,
+      "draft": 1
+    },
+    "confirmedCandidateCount": 45,
+    "mappableCount": 0,
+    "unmappableCount": 45
+  },
+  "candidates": [
+    {
+      "legacyIdentityHash": "097cac858f2021b725ea77d9f8f3bb47c3db1187924099a8baaa73e724c5e335",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "0a1a5118098f5f467aa6d7b50f98ab36b1a9ff9af97530bef4ec6b7c4daa41e9",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "14d64c0fdcb9c4c58fb797254f99cdf90c6efe079ba720a3b9ea6984b2bc7deb",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "19e16437a8de9a470e6b7bfb83044458899b1d5f01d300bee2791dcc0eed6a04",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "1c358ab79fcfa55c136b2441e8099940309f070a221c8d674b8d164679779c5c",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "253fc692cbd53b83aaadfb1687af3fc0f9e753683676f54aa4c1a97aecc69cbb",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "2d72fab25ccec5e31a1063a912453a5627256c5217b5a13774da1f9ccbb9ddbd",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "39e0f113ea14c024a8e0e5fab05f84714d59d268d92f07127a095e438e788c25",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "3d720e60642a45bab9404bdaeed8682ffe2c8b6f6f8c6c9225984ef339dfe82f",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "3e4de4702ab58c7bc6537775d78746b60ab613ff50410d216d5c3eafdcc5fbff",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "3f6b2dab8f12abda8919f5631a0db483a2d7e4b9bc74f16031e66ab96a199ea8",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "405b4b86c070c0315483e57081600aecc690622c65434ec7600eb835086db1ac",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "40646349deaa282f856e81edde8f107ff2523e501da7473109a2b070a6802ddb",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "636a74ce125ea4a079d5aa702232a42fe78dcc4c10aee7503be8bc27d7da824d",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "6576a4fbb8415f659280750f2fb993441a773cc5e530b84ceebb2491436ceff9",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "6caace97763c9c1f6980cbf4786f1802abc10fbfe55546a3c5b6e10eb9ef206b",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "6fb8de5497d5238b67b3a1e7f4ed57fad3fbd9b751af6b63ce17749524308380",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "70e1d6f0d86c0bd342513901a1cfee20fff1cd1e1ffc5569b8f82c892355686f",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "79c858f0493c1e52167ccbf1ca0f61e2bb6e0ead57e2bf39389f3b84fac66a59",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "7dddf6e1217021eb2b52f7de95ac6a38ac9345058b443cfcfe51ae6938f85068",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "7eaf0553f2298182b766a329658efa258f0855a7856235b4605cf61ccbc02cb3",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "82840fb64961655982bf3ec45f638da81ab7eee28a2c1632b407b59987bd40fe",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "82fd56b34c19295f99c8f4a2ceea4ba61ad39e90619b4c02302c48fba0ad8a0f",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "84692775f132f9c8968aab420541d01164afe7e2003f14f92e529b50c665e02b",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "8959b1060ed5262f380d74ff99c3193730eafe1ee47b902e9730e4b7a5e29736",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "8a379b15d16775f3c96b5b2f236f44ef40cefdbb1f971f006ff558b10b799e7f",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "95d42ac3fb512738694024f10722c24fefd30d6f4b78e2835e0285887340ba46",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "a0a70876f028dc00dec0f2484320a967c61d3db0a360a9886acdc7d78f10f87a",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "a4843cd68a04fbef5e97ef5299f33217e422da7ff2f7b61a988aa33a34869289",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "a7a9ae2cd29405db5e7b0544431ae2c47ffb9c205d57660f8daaae4a10e08fbd",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "a9da8893a42f25e9dbb62985f292939f6791a88c392be715bc9bae111ebfb123",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "b04a9f186dc0b06df1a3a9df505ee81db3de9f8784f2f6994c844b2447dbbc0c",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "b122ef725896ab3621bc77535c39271ac578aec1e2407100747c99ca6c997f70",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "c17596da443daae259c513739f6163c85f2ee5ef39c144945f5abcf2a9e6950a",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "c42a2732f05e1c21264ce3299e49ca42a7867004544212ec8b50db602b1bec86",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "c44605a262d16d6bc52c4be73ef30bf25d398a3d911d57f87470aa2f8f8e68d6",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "c4cd17b71789d589abd9911bff367520e3faf1cff4842b49451613b586a87bbb",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "c8297a87818804a570950203e59dd19f477c03a49d34443260bf6e00efcb927e",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "cc0c7131f3c8b0ac8ed0813b47904900c79d52458d582df6d37187731da3db9e",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "ccad8a27ffdf335a34b199d20bffd0b9a30e16245470b88b6f7b0cc6d6353812",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "e11979ed1849ae0b637e65f0f0bb7c3552a2195edfc713a423d4328c27a30f78",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "e242b1fd53b8b0657583f2e2f60b5537f636fd55d0a970acf892ac8b0daaa9f5",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "e4db9fc237aaba10cedd4ac70286039db8dc604f79d9eff106033784b2b87d07",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "e769d137ed632389416e28a13a8862d78301e815e3239286b7ff1c2c27c89a62",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    },
+    {
+      "legacyIdentityHash": "f022b3c9937b0e698cbb4a7690b43965637abcc775283d54d56c297627450a38",
+      "classification": "unmappable",
+      "reasons": [
+        "missing_plan_id",
+        "missing_revision",
+        "missing_content_hash",
+        "missing_confirmation_event_id"
+      ],
+      "wouldCreateVerifiedApproval": false
+    }
+  ],
+  "migration": {
+    "verifiedApprovalsCreated": 0,
+    "requiresProducerMigration": false,
+    "allUnmappableRecordsKeptUnverified": true
+  },
+  "gate": {
+    "status": "complete",
+    "enabledOrEnforceAllowed": true
+  },
+  "evidenceSha256": "271591c77684f73c8110fbfbba33988f972a543ea748552c0a3d92badf06d1b3",
+  "passed": true
+}

@@ -522,8 +522,9 @@ async fn preview_report_candidate_requires_latest_build_source_snapshot() {
 }
 
 #[tokio::test]
-async fn preview_start_requires_built_dist_directory() {
-    let workspace = setup_passing_promotion_workspace("preview-dist-missing");
+async fn preview_start_requires_frozen_candidate_output() {
+    let workspace = setup_passing_promotion_workspace("preview-candidate-output-missing");
+    fs::remove_dir_all(workspace.join("outputs/candidates/build-test")).unwrap();
     let store = RuntimeStore::new();
     let run_id = create_run(&store, AgentPhase::Build).await;
 
@@ -541,7 +542,7 @@ async fn preview_start_requires_built_dist_directory() {
 
     assert_eq!(results.len(), 1);
     assert!(results[0].result.is_error);
-    assert_error_kind(&results[0].result, "preview.dist_missing");
+    assert_error_kind(&results[0].result, "preview.candidate_manifest_missing");
 }
 
 #[tokio::test]

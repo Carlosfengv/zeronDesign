@@ -3,6 +3,16 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  extractBuildEvidence,
+  redactEvidenceObject,
+  sanitizeModelExecutionEvent,
+  sanitizePersistedRuntimeEvent,
+} from "./runtime-evidence-redaction.mjs";
+import {
+  attachSandboxReleaseEvidence,
+  confirmSandboxRelease,
+} from "./sandbox-release-confirmation.mjs";
 
 const [baseUrl, privateKeyFile, adminTokenFile, projectId, prompt, evidenceRoot] =
   process.argv.slice(2);
@@ -53,6 +63,20 @@ const contentPlan = process.env.GENERATION_REAL_CONTENT_PLAN_JSON
 const draftBriefId = (process.env.GENERATION_REAL_BRIEF_ID || "").trim();
 const keepSandbox = process.env.GENERATION_REAL_KEEP_SANDBOX === "true";
 const existingRunId = (process.env.GENERATION_REAL_EXISTING_RUN_ID || "").trim();
+const sandboxReleaseMaxAttempts = Number.parseInt(
+  process.env.GENERATION_REAL_SANDBOX_RELEASE_MAX_ATTEMPTS || "4",
+  10,
+);
+const sandboxReleaseRetryCooldownMs = Number.parseInt(
+  process.env.GENERATION_REAL_SANDBOX_RELEASE_RETRY_COOLDOWN_MS || "1000",
+  10,
+);
+if (!Number.isSafeInteger(sandboxReleaseMaxAttempts) || sandboxReleaseMaxAttempts < 2) {
+  throw new Error("GENERATION_REAL_SANDBOX_RELEASE_MAX_ATTEMPTS must be an integer >= 2");
+}
+if (!Number.isSafeInteger(sandboxReleaseRetryCooldownMs) || sandboxReleaseRetryCooldownMs < 0) {
+  throw new Error("GENERATION_REAL_SANDBOX_RELEASE_RETRY_COOLDOWN_MS must be an integer >= 0");
+}
 const modelResourceId = (
   process.env.GENERATION_REAL_MODEL_RESOURCE_ID || "deepseek-v4-pro"
 ).trim();
@@ -193,14 +217,18 @@ try {
   const stream = await readRunEvents(runId, eventFile);
   editRunEvidence = summarizeRun(runId, stream.events, stream.evidence);
   editRunEvidence.efficiency = await fetchRunEfficiencyMetrics(runId);
+  editRunEvidence.promptEfficiency = await fetchRunPromptEfficiency(runId);
+  editRunEvidence.budgetProfile = await fetchRunBudgetProfile(runId);
   if (editRunEvidence.status !== "completed") {
     throw new Error(
       `Edit did not complete: ${editRunEvidence.summary || editRunEvidence.status}`,
     );
   }
-  const generationContextStatus = visualReferenceMode
-    ? await signedJson(`/runs/${encodeURIComponent(runId)}/generation-context-status`)
-    : null;
+  const generationContextStatus = await signedJson(
+    `/runs/${encodeURIComponent(runId)}/generation-context-status`,
+  );
+  editRunEvidence.generationContextStatus = generationContextStatus;
+  editRunEvidence.designProfileIdentity = await fetchRunDesignProfileIdentity(runId);
   const visualUnavailableMetricRecorded = stream.events.some(
     (event) =>
       event.type === "metric.recorded" &&
@@ -296,13 +324,14 @@ try {
       }
     : await readReleaseEvidence();
   result = {
-    schemaVersion: "generation-real-provider-edit-evidence@1",
+    schemaVersion: "generation-real-provider-edit-evidence@2",
     startedAt,
     finishedAt: new Date().toISOString(),
     status: "accepted",
     projectId,
     workspaceNamespace,
-    prompt,
+    promptSha256: sha256(prompt),
+    promptBytes: Buffer.byteLength(prompt),
     baseVersionId: before.currentVersionId,
     versionId: after.currentVersionId,
     baseDraftSnapshotId: before.draftSnapshotId || null,
@@ -376,12 +405,13 @@ try {
   }
 } catch (error) {
   result = {
-    schemaVersion: "generation-real-provider-edit-evidence@1",
+    schemaVersion: "generation-real-provider-edit-evidence@2",
     startedAt,
     finishedAt: new Date().toISOString(),
     status: "failed",
     projectId,
-    prompt,
+    promptSha256: sha256(prompt),
+    promptBytes: Buffer.byteLength(prompt),
     runId,
     warmEditKind: draftWarmEditMode ? draftWarmEditKind : null,
     lifecycleProfile: draftColdDevEditMode ? "cold_dev" : draftWarmEditMode ? "warm_hmr" : null,
@@ -390,7 +420,17 @@ try {
     secretMaterialPersisted: false,
   };
 } finally {
-  if (!existingRunId && !keepSandbox) await releaseSandbox();
+  const sandboxRelease = existingRunId || keepSandbox
+    ? {
+        required: false,
+        released: false,
+        reason: existingRunId ? "existing-run-owned-by-caller" : "keep-sandbox-requested",
+        attempts: [],
+        maxAttempts: sandboxReleaseMaxAttempts,
+        requiredSuccessfulResponses: 2,
+      }
+    : await releaseSandboxWithRetry();
+  result = attachSandboxReleaseEvidence(result, sandboxRelease);
 }
 
 const finalDirectory = evidenceDirectory.replace(
@@ -399,7 +439,7 @@ const finalDirectory = evidenceDirectory.replace(
 );
 fs.writeFileSync(
   path.join(evidenceDirectory, "real-provider-edit-summary.json"),
-  `${JSON.stringify(result, null, 2)}\n`,
+  `${JSON.stringify(redactEvidenceObject(result), null, 2)}\n`,
   { mode: 0o600 },
 );
 fs.renameSync(evidenceDirectory, finalDirectory);
@@ -423,6 +463,49 @@ async function fetchRunEfficiencyMetrics(editRunId) {
     throw new Error("run efficiency metrics identity or schema mismatch");
   }
   return metrics;
+}
+
+async function fetchRunPromptEfficiency(editRunId) {
+  const metrics = await signedJson(
+    `/runs/${encodeURIComponent(editRunId)}/prompt-efficiency`,
+  );
+  if (
+    metrics.schemaVersion !== "run-prompt-efficiency@1" ||
+    metrics.runId !== editRunId
+  ) {
+    throw new Error("run prompt efficiency identity or schema mismatch");
+  }
+  return metrics;
+}
+
+async function fetchRunDesignProfileIdentity(editRunId) {
+  const manifest = await signedJson(
+    `/runs/${encodeURIComponent(editRunId)}/design-context-manifest`,
+  );
+  if (manifest.runId !== editRunId
+    || !/^[a-f0-9]{64}$/.test(manifest.package?.effectiveProfileHash || "")) {
+    throw new Error("run Design Profile identity or schema mismatch");
+  }
+  return {
+    schemaVersion: "run-design-profile-identity@1",
+    runId: editRunId,
+    designProfileId: manifest.package.designProfileId ?? null,
+    designProfileVersion: manifest.package.designProfileVersion ?? null,
+    effectiveProfileHash: manifest.package.effectiveProfileHash,
+  };
+}
+
+async function fetchRunBudgetProfile(editRunId) {
+  const profile = await signedJson(
+    `/runs/${encodeURIComponent(editRunId)}/budget-profile`,
+  );
+  if (profile.schemaVersion !== "run-budget-profile@1"
+    || profile.phase !== "edit"
+    || typeof profile.profileId !== "string"
+    || !/^[a-f0-9]{64}$/.test(profile.profileHash || "")) {
+    throw new Error("run budget profile identity or schema mismatch");
+  }
+  return profile;
 }
 
 async function getDraftPreview() {
@@ -592,10 +675,13 @@ async function readReleaseEvidence() {
   }
   const evidence = JSON.parse(body);
   return {
+    available: true,
     schemaVersion: evidence.schemaVersion,
     projectId: evidence.projectId,
     baseVersionId: evidence.baseVersionId,
     currentVersionId: evidence.currentVersionId,
+    versionId: evidence.currentVersionId,
+    releaseId: evidence.releaseId || null,
     artifactManifestHash: evidence.artifactManifestHash,
     sourceFingerprint: evidence.sourceFingerprint,
     terminalToolFailureCount: evidence.terminalToolFailureCount,
@@ -823,9 +909,9 @@ function declaredIconHref(html) {
   return null;
 }
 
-async function releaseSandbox() {
+async function releaseSandboxOnce() {
   try {
-    await fetch(
+    const response = await fetch(
       new URL(`/internal/projects/${encodeURIComponent(projectId)}/release-sandbox`, baseUrl),
       {
         method: "POST",
@@ -836,9 +922,29 @@ async function releaseSandbox() {
         signal: AbortSignal.timeout(120_000),
       },
     );
-  } catch {
-    // Best-effort cleanup; the summary retains the primary result.
+    await response.text();
+    return {
+      ok: response.ok,
+      status: response.status,
+      error: response.ok ? null : `http_${response.status}`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: null,
+      error: error?.name || "release_request_failed",
+    };
   }
+}
+
+async function releaseSandboxWithRetry() {
+  return confirmSandboxRelease({
+    requestRelease: releaseSandboxOnce,
+    maxAttempts: sandboxReleaseMaxAttempts,
+    retryCooldownMs: sandboxReleaseRetryCooldownMs,
+    requiredSuccessfulResponses: 2,
+    delay,
+  });
 }
 
 async function signedJson(target, options = {}) {
@@ -894,9 +1000,12 @@ async function readRunEvents(editRunId, destination) {
         if (!line.startsWith("data:")) continue;
         const payload = line.slice(5).trimStart();
         if (!payload) continue;
-        const event = sanitizeEvidenceEvent(JSON.parse(payload));
+        const event = sanitizeModelExecutionEvent(JSON.parse(payload));
         events.push(event);
-        fs.writeSync(descriptor, `${JSON.stringify(event)}\n`);
+        fs.writeSync(
+          descriptor,
+          `${JSON.stringify(sanitizePersistedRuntimeEvent(event))}\n`,
+        );
         terminalSeen = event.type === "run.completed";
         if (terminalSeen) await reader.cancel();
       }
@@ -938,6 +1047,8 @@ function summarizeRun(editRunId, events, eventStream) {
     runId: editRunId,
     status: terminal?.status || "unknown",
     summary: terminal?.summary || null,
+    terminalClassification: terminal?.status === "completed" ? "completed" : "failed",
+    buildEvidence: extractBuildEvidence(events),
     usage,
     turns: usageEvents.length,
     toolCalls: events.filter((event) => event.type === "tool.started").length,
@@ -946,19 +1057,6 @@ function summarizeRun(editRunId, events, eventStream) {
       .filter((event) => event.type === "model.execution")
       .map((event) => event.snapshot),
     eventStream,
-  };
-}
-
-function sanitizeEvidenceEvent(event) {
-  if (event?.type !== "model.execution" || !event.snapshot) return event;
-  const { providerRequestId, ...snapshot } = event.snapshot;
-  return {
-    ...event,
-    snapshot: {
-      ...snapshot,
-      providerRequestIdPresent:
-        typeof providerRequestId === "string" && providerRequestId.length > 0,
-    },
   };
 }
 

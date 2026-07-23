@@ -148,6 +148,9 @@ if (session.schemaVersion !== "generation-context-paired-cohort-session@1") thro
 if (meta.schemaVersion !== "generation-context-cohort-session-meta@1" || meta.sessionId !== session.sessionId) {
   throw new Error("cohort session metadata mismatch");
 }
+if (session.source?.commit !== meta.sourceCommit || session.source?.dirty !== meta.sourceDirty) {
+  throw new Error("cohort session source identity mismatch");
+}
 const fixture = cases.cases?.find(item => item.id === caseId);
 if (!fixture) throw new Error(`unknown fixture: ${caseId}`);
 if (!["website", "docs"].includes(fixture.kind)) throw new Error(`unsupported fixture kind: ${fixture.kind}`);
