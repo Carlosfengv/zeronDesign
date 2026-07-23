@@ -475,7 +475,12 @@ function managedProcessStatus(leaseId) {
 async function startManagedProcess(request, payload) {
   const leaseId = validateProcessLeaseId(payload.leaseId);
   const existing = processLeases.get(leaseId);
-  if (existing) return managedProcessStatus(leaseId);
+  if (existing && !["stopped", "exited", "failed"].includes(existing.status)) {
+    return managedProcessStatus(leaseId);
+  }
+  if (existing) {
+    processLeases.delete(leaseId);
+  }
   if (!Array.isArray(payload.argv) || !payload.argv.every((item) => typeof item === "string")) {
     throw new Error("process.start argv must be a string array");
   }

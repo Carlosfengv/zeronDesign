@@ -3925,6 +3925,29 @@ async fn workspace_channel_server_script_serves_runtime_fs_protocol() {
             .status,
         "stopped"
     );
+    let restarted = command_backend
+        .start_process(
+            &ctx,
+            "process-lease-test-0001",
+            &[
+                "node".to_string(),
+                "-e".to_string(),
+                "setInterval(() => {}, 1000)".to_string(),
+            ],
+            &workspace.join("project"),
+        )
+        .await
+        .expect("terminal process lease must restart");
+    assert_eq!(restarted.status, "running");
+    assert_ne!(restarted.pid, process.pid);
+    assert_eq!(
+        command_backend
+            .stop_process(&ctx, "process-lease-test-0001")
+            .await
+            .unwrap()
+            .status,
+        "stopped"
+    );
     let heartbeat = workspace.join("project/process-timeout-heartbeat.txt");
     let heartbeat_script = r#"
 const { spawn } = require('node:child_process');
