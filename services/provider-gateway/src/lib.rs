@@ -6078,9 +6078,20 @@ fn normalize_messages(
             continue;
         }
         pending_tool_call_ids.clear();
+        let structured_control_fallback = (role == "system"
+            && message.get("kind").and_then(Value::as_str).is_some())
+        .then(|| {
+            serde_json::to_value(message).unwrap_or_else(|_| {
+                json!({
+                    "kind": message.get("kind").and_then(Value::as_str).unwrap_or("runtime_control"),
+                    "summary": "Runtime control message"
+                })
+            })
+        });
         let content = message
             .get("content")
             .or_else(|| message.get("text"))
+            .or(structured_control_fallback.as_ref())
             .ok_or_else(|| "message requires content or text".to_string())?;
         if let Some(multimodal) = provider_content_blocks(content)? {
             if role == "user" {
@@ -7223,6 +7234,29 @@ mod tests {
             messages[1]["content"],
             "Continue without visual references."
         );
+    }
+
+    #[test]
+    fn structured_runtime_control_messages_without_text_are_serialized_defensively() {
+        let mut turn_request = request(Some("allowed"));
+        turn_request.input.messages = vec![json!({
+            "role": "system",
+            "kind": "runtime_tool_exchange_summary",
+            "schemaVersion": "runtime-tool-exchange-summary@1",
+            "exchanges": [{
+                "toolUseId": "call-build",
+                "toolName": "project.build",
+                "isError": true
+            }]
+        })];
+        let aliases = ProviderToolAliasMap::from_request(&turn_request).unwrap();
+
+        let messages = normalize_messages(&turn_request, &aliases).unwrap();
+
+        assert_eq!(messages[1]["role"], "system");
+        let content = messages[1]["content"].as_str().unwrap();
+        assert!(content.contains("runtime_tool_exchange_summary"));
+        assert!(content.contains("project.build"));
     }
 
     #[test]

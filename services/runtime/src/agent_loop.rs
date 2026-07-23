@@ -5510,12 +5510,18 @@ fn microcompact_completed_tool_exchanges(message_window: &mut Vec<Value>) -> Mic
                 }))
             })
             .collect::<Vec<_>>();
+        let summary_text = serde_json::to_string(&json!({
+            "schemaVersion": "runtime-tool-exchange-summary@1",
+            "exchanges": summaries,
+        }))
+        .expect("microcompact summary must serialize");
         let summary = json!({
             "role": "system",
             "kind": "runtime_tool_exchange_summary",
             "turn": original[index].get("turn").cloned().unwrap_or(Value::Null),
             "schemaVersion": "runtime-tool-exchange-summary@1",
             "exchanges": summaries,
+            "text": summary_text,
         });
         let summary_tokens = estimate_serialized_tokens(&summary);
         stats.compacted_exchanges = stats
@@ -10219,6 +10225,13 @@ mod design_capsule_tests {
         assert!(!serialized.contains(&"x".repeat(1_000)));
         assert!(serialized.contains("project/app/page.tsx"));
         assert!(serialized.contains("workspaceRevision"));
+        assert!(messages.iter().any(|message| {
+            message.get("kind").and_then(Value::as_str) == Some("runtime_tool_exchange_summary")
+                && message
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("runtime-tool-exchange-summary@1"))
+        }));
     }
 
     #[test]
