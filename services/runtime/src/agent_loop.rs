@@ -2807,10 +2807,24 @@ impl AgentLoop {
             }
         }
 
-        let template = generation_run_template_key(run)
-            .ok_or_else(|| anyhow!("frozen Build identity is missing templateId"))?
-            .to_string();
-        let app_root = run
+        let template = match generation_run_template_key(run) {
+            Some(template_id) => template_id.to_string(),
+            None if self.generation_context_enabled => {
+                return Err(anyhow!("frozen Build identity is missing templateId"));
+            }
+            None => {
+                let brief_id = run
+                    .brief_version
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("legacy Build identity is missing briefId"))?;
+                self.store
+                    .get_brief(brief_id)
+                    .await
+                    .map(|brief| brief.recommended_template)
+                    .ok_or_else(|| anyhow!("legacy Build identity references a missing Brief"))?
+            }
+        };
+        let frozen_app_root = run
             .generation_context
             .as_ref()
             .and_then(|context| context.pointer("/payload/identity/appRoot"))
@@ -2819,9 +2833,14 @@ impl AgentLoop {
                 run.project_state_snapshot
                     .as_ref()
                     .map(|project| project.app_root.as_str())
-            })
-            .ok_or_else(|| anyhow!("frozen Build identity is missing appRoot"))?
-            .to_string();
+            });
+        let app_root = match frozen_app_root {
+            Some(app_root) => app_root.to_string(),
+            None if self.generation_context_enabled => {
+                return Err(anyhow!("frozen Build identity is missing appRoot"));
+            }
+            None => "project".to_string(),
+        };
         let mut init_call = ToolCall::new(
             format!("bootstrap:project.init:{}", run.id),
             "project.init",
@@ -9033,6 +9052,105 @@ mod design_capsule_tests {
                     })
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn build_bootstrap_uses_confirmed_brief_identity_in_shadow_mode() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "legacy-generation-bootstrap-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        store
+            .write_brief(
+                &run.id,
+                Brief {
+                    project_type: "docs".to_string(),
+                    audience: "developers".to_string(),
+                    content_hierarchy: vec!["Overview".to_string()],
+                    page_structure: json!([]),
+                    visual_direction: "developer documentation".to_string(),
+                    recommended_template: "fumadocs-docs".to_string(),
+                    assumptions: Vec::new(),
+                    missing_information: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let run = store.get_run(&run.id).await.unwrap();
+        let (init, init_calls) = workflow_fixture_tool(
+            "project.init",
+            json!({
+                "appRoot": "project",
+                "template": "fumadocs-docs",
+                "sourceObservations": [{
+                    "path": "/workspace/project/app/docs/[[...slug]]/page.jsx",
+                    "text": "export default function Page() { return <main />; }",
+                    "contentSha256": "a".repeat(64),
+                    "view": "full",
+                    "purpose": "source"
+                }]
+            }),
+        );
+        let (read, read_calls) = workflow_fixture_tool(
+            "fs.read",
+            json!({
+                "path": "fixture",
+                "text": "fixture context"
+            }),
+        );
+        let executor = ToolExecutor::new(
+            vec![init, read],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store, model, executor);
+        let mut state = RunProgressState::default();
+        let mut messages = Vec::new();
+
+        let results = loop_runner
+            .bootstrap_generation_project_if_needed(&run, &mut state, &mut messages)
+            .await
+            .expect("shadow-mode Runtime bootstrap should use the confirmed Brief");
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(init_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(read_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(state.completed_steps.contains("project_initialized"));
+    }
+
+    #[tokio::test]
+    async fn build_bootstrap_rejects_missing_frozen_identity_when_context_is_enabled() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "strict-generation-bootstrap-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let executor = ToolExecutor::new(Vec::new(), crate::permission::PermissionRules::default());
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store, model, executor)
+            .with_generation_context_enabled(true);
+        let mut state = RunProgressState::default();
+        let mut messages = Vec::new();
+
+        let error = loop_runner
+            .bootstrap_generation_project_if_needed(&run, &mut state, &mut messages)
+            .await
+            .expect_err("enabled Generation Context must require frozen identity");
+
+        assert!(error
+            .to_string()
+            .contains("frozen Build identity is missing templateId"));
     }
 
     #[tokio::test]

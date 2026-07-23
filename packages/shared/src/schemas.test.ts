@@ -665,6 +665,25 @@ describe("shared schemas", () => {
     expect(brief.recommendedTemplate).toBe("next-app");
   });
 
+  it("accepts heterogeneous Brief page plans produced by the runtime", () => {
+    const brief = BriefSchema.parse({
+      projectType: "docs",
+      audience: "TypeScript developers",
+      contentHierarchy: ["Overview", "Quick start"],
+      pageStructure: [{
+        route: "/docs/quick-start",
+        title: "Quick start",
+        sections: [{ heading: "Install", body: "Run locally" }],
+      }],
+      visualDirection: "clear developer documentation",
+      recommendedTemplate: "fumadocs-docs",
+      assumptions: [],
+      missingInformation: [],
+    });
+
+    expect(brief.pageStructure[0]).toMatchObject({ route: "/docs/quick-start" });
+  });
+
   it("accepts Brief lifecycle statuses used by the runtime gate", () => {
     expect(BriefStatusSchema.options).toEqual(["draft", "confirmed", "superseded"]);
   });

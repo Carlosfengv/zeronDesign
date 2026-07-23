@@ -225,14 +225,18 @@ export const BriefSectionSchema = z.object({
   content: z.string(),
 });
 
+// The Runtime accepts page plans authored as route-oriented outlines. Keep this
+// form in the public contract as well so BFF clients can render and confirm
+// briefs produced by the real provider without rejecting a valid draft.
 export const BriefSchema = z.object({
   projectType: z.enum(["website", "docs"]),
   audience: z.string().min(1),
   contentHierarchy: z.array(z.string().min(1)),
-  pageStructure: z.union([
-    z.array(BriefPageSchema),
-    z.array(BriefSectionSchema),
-  ]),
+  // Runtime deliberately treats a brief page plan as an extensible JSON array;
+  // different templates and providers produce different item shapes. Constrain
+  // only the invariant that Runtime itself enforces so the BFF remains forward
+  // compatible with real generated briefs.
+  pageStructure: z.array(z.unknown()),
   visualDirection: z.string().min(1),
   recommendedTemplate: z.enum([
     "fumadocs-docs",
