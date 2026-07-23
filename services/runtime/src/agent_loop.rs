@@ -6101,6 +6101,31 @@ fn workflow_progress_snapshot(
                     "the bounded repair mutation needs Candidate validation",
                 ),
             )
+        } else if next_app && has("build_failed") && !has("build_diagnostics_read") {
+            (
+                "diagnostic_required",
+                workflow_action(
+                    "diagnostics.build_log",
+                    "read the failed production build output exactly once before repairing source",
+                ),
+            )
+        } else if next_app && has("build_failed") {
+            let target_paths = state
+                .authored_source_paths
+                .iter()
+                .filter(|path| path.starts_with("project/"))
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                "source_repair_required",
+                json!({
+                    "tool": "fs.patch",
+                    "reason": "the production build diagnostic is available; make one bounded source mutation that fixes it, using an exact workspace-relative target path beginning with project/",
+                    "allowedMutationTools": ["fs.write", "fs.patch", "fs.multi_patch", "style.update_tokens"],
+                    "mutationRequiredThisTurn": true,
+                    "targetPaths": target_paths,
+                }),
+            )
         } else {
             (
                 "diagnostic_required",
@@ -6588,6 +6613,7 @@ fn update_progress_state(
             if preview_failure_requires_repair(error_kind) {
                 state.completed_steps.insert("repair_required".to_string());
                 state.completed_steps.remove("repair_mutated");
+                state.completed_steps.remove("build_diagnostics_read");
                 if let Some(error_kind) = error_kind {
                     state
                         .substantive_progress
@@ -6596,6 +6622,23 @@ fn update_progress_state(
                 if error_kind.is_some_and(|kind| kind.starts_with("build.")) {
                     state.completed_steps.insert("build_failed".to_string());
                 }
+            }
+            if state.completed_steps.contains("repair_required")
+                && is_source_mutation_tool(&call.name)
+                && matches!(
+                    error_kind,
+                    Some(
+                        "mutation.target_missing"
+                            | "patch.old_str_missing"
+                            | "patch.old_str_ambiguous"
+                    )
+                )
+            {
+                state.substantive_progress.insert(format!(
+                    "recoverable-repair-attempt:{}:{}",
+                    error_kind.unwrap_or("unknown"),
+                    canonical_json_hash(&call.input)
+                ));
             }
             state.seed_substantive_progress();
             continue;
@@ -6684,6 +6727,17 @@ fn update_progress_state(
                 state
                     .completed_steps
                     .insert("dependencies_ready".to_string());
+            }
+            "diagnostics.build_log" => {
+                state
+                    .completed_steps
+                    .insert("build_diagnostics_read".to_string());
+            }
+            "project.build" => {
+                state.completed_steps.remove("repair_required");
+                state.completed_steps.remove("repair_mutated");
+                state.completed_steps.remove("build_failed");
+                state.completed_steps.remove("build_diagnostics_read");
             }
             "preview.dev_start" => {
                 state
@@ -7029,6 +7083,7 @@ fn workflow_tool_denial(
 ) -> Option<String> {
     greenfield_authoring_tool_denial(run, state, call)
         .or_else(|| greenfield_lifecycle_tool_denial(run, state, call))
+        .or_else(|| greenfield_build_repair_tool_denial(run, state, call))
         .or_else(|| targeted_review_tool_denial(run, state, call))
         .or_else(|| targeted_fumadocs_repair_tool_denial(run, state, call))
         .or_else(|| {
@@ -7041,6 +7096,48 @@ fn workflow_tool_denial(
         })
         .or_else(|| fumadocs_repair_tool_denial(run, state, generation_context_enabled, call))
         .or_else(|| cold_dev_tool_denial(run, state, call).map(str::to_string))
+}
+
+fn greenfield_build_repair_tool_denial(
+    run: &AgentRun,
+    state: &RunProgressState,
+    call: &ToolCall,
+) -> Option<String> {
+    if run.phase != AgentPhase::Build
+        || generation_run_template_key(run) != Some("next-app")
+        || !state.completed_steps.contains("repair_required")
+        || !state.completed_steps.contains("build_failed")
+        || state.completed_steps.contains("repair_mutated")
+    {
+        return None;
+    }
+    if !state.completed_steps.contains("build_diagnostics_read") {
+        return (call.name != "diagnostics.build_log").then(|| {
+            "The production build failed. Read its captured output exactly once with diagnostics.build_log before any other action.".to_string()
+        });
+    }
+    let mutation_tool = is_direct_source_file_mutation_tool(&call.name)
+        || is_staged_source_progress_tool(&call.name)
+        || call.name == "style.update_tokens";
+    if mutation_tool
+        && source_mutation_paths(call)
+            .iter()
+            .any(|path| !path.starts_with("project/"))
+    {
+        let targets = state
+            .authored_source_paths
+            .iter()
+            .filter(|path| path.starts_with("project/"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Use an exact workspace-relative source path beginning with project/. Repair one of these observed targets: {targets}."
+        ));
+    }
+    (!mutation_tool).then(|| {
+        "The production build diagnostic is already available. Make one bounded source mutation now with fs.write, fs.patch, fs.multi_patch, fs.commit_chunks, or style.update_tokens; do not read, inspect, or run shell diagnostics again.".to_string()
+    })
 }
 
 fn greenfield_authoring_tool_denial(
@@ -8583,7 +8680,7 @@ fn prompt_context_sections_for_run(run: &AgentRun) -> Vec<PromptContextSection> 
             "Create a structured Brief draft from the provided content sources only. First call content.list_sources, and pass to content.read_source only an exact content source id returned by that call. A DesignProfile id such as design-profile-* is runtime metadata, not a Content Source; its effective visual guidance is already included in this prompt, so never pass a DesignProfile id to content.read_source. If content.list_sources returns no readable sources, draft the Brief directly from the user request and supplied prompt context. Do not inspect the filesystem or browser during Brief runs because no sandbox workspace is available yet. Set recommendedTemplate to next-app for website projects or fumadocs-docs for docs projects. Keep acceptanceCriteria conservative and limited to user-observable release gates. For requiredRoutes, copy literal URL paths only when the user explicitly provides them; otherwise include exactly one template entry route: / for next-app or /docs/ for fumadocs-docs. Never turn a section heading, feature, topic, checklist item, or document chapter into a route. For requiredText, copy only wording the user explicitly marks as an exact title, headline, visible brand, or quoted phrase. Do not promote feature lists, requested topics, prose instructions, or section coverage into exact-text assertions. Include forbidden template placeholders or explicitly rejected content. Copy genuine exact text literally without translating or paraphrasing it. Call brief.write_draft with the complete Brief and acceptance criteria, then call brief.request_confirmation and wait for user confirmation before completing."
         }
         AgentPhase::Build if next_app && generation_context_enabled => {
-            "GenerationContext already contains the frozen Brief, approved Content Plan, applicable DCP constraints, and Editable Surface. Do not list or read inputs/, Design Context files, or state/style-contract.json. Initialize and inspect the declared project, read only existing project source files that are necessary for safe replacement, then author without browsing component directories. Restore dependencies and run project.build. Follow each Runtime Workflow Progress nextAction directly. If preview.dev_start reports preview.dev_unavailable, call preview.start and then draft.snapshot_create immediately; do not call preview.status, browser.open, browser.screenshot, sandbox.claim, or sandbox.wait_ready unless preview.start itself fails. Call run.complete as soon as Runtime reports draft_ready."
+            "GenerationContext already contains the frozen Brief, approved Content Plan, applicable DCP constraints, and Editable Surface. Do not list or read inputs/, Design Context files, or state/style-contract.json. Initialize and inspect the declared project, read only existing project source files that are necessary for safe replacement, then author without browsing component directories. Keep App Router pages as Server Components unless interactivity is essential; never add an event handler such as onSubmit or onClick to a Server Component, and do not import a local component unless it exists in the Editable Surface. Restore dependencies and run project.build. Follow each Runtime Workflow Progress nextAction directly. If preview.dev_start reports preview.dev_unavailable, call preview.start and then draft.snapshot_create immediately; do not call preview.status, browser.open, browser.screenshot, sandbox.claim, or sandbox.wait_ready unless preview.start itself fails. Call run.complete as soon as Runtime reports draft_ready."
         }
         AgentPhase::Build if generation_context_enabled => {
             "GenerationContext already contains the frozen Brief, approved Content Plan, applicable DCP constraints, and Editable Surface. Do not list or read inputs/ or Design Context files. Initialize and inspect the declared project, read only existing source files necessary for safe mutation, author the requested result, and follow Runtime Workflow Progress nextAction directly through validation, durable snapshot, and run.complete."
@@ -9784,6 +9881,227 @@ mod design_capsule_tests {
                 | AgentEvent::ToolCompleted { tool_use_id, .. }
                 if tool_use_id.len() == 64
         )));
+    }
+
+    #[tokio::test]
+    async fn runtime_workflow_driver_completes_validated_fumadocs_candidate_without_model_turn() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "fumadocs-workflow-driver-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let mut run = next_app_workflow_run(run, "legacy_static");
+        let project = run
+            .project_state_snapshot
+            .as_mut()
+            .expect("fixture project state");
+        project.template_key = "fumadocs-docs".to_string();
+        project.template_version = "fumadocs-docs@1".to_string();
+        project.sandbox_execution_profile_id = Some("fumadocs-docs".to_string());
+        let (complete, complete_calls) = workflow_fixture_tool(
+            "run.complete",
+            json!({
+                "status": "completed",
+                "summary": "Runtime workflow promoted the validated Candidate."
+            }),
+        );
+        let executor = ToolExecutor::new(
+            vec![complete],
+            crate::permission::PermissionRules::default(),
+        );
+        let model = Arc::new(crate::model_gateway::MockModelClient::new(Vec::new()));
+        let loop_runner = AgentLoop::with_tool_executor(store, model, executor)
+            .with_generation_context_enabled(true)
+            .with_limits(AgentLoopLimits {
+                workflow_driver_mode: RuntimeWorkflowDriverMode::Enforced,
+                ..AgentLoopLimits::default()
+            });
+        let mut state = RunProgressState::default();
+        state.candidate_digest = Some("candidate-digest".to_string());
+        let mut fingerprint = state.fingerprint();
+        let mut no_progress = 0;
+        let mut messages = Vec::new();
+
+        assert!(workflow_driver_supports(&run));
+        let outcome = loop_runner
+            .drive_runtime_workflow(
+                &run,
+                2,
+                &mut state,
+                &mut messages,
+                &mut fingerprint,
+                &mut no_progress,
+                ObservationBudgetUsage::default(),
+            )
+            .await;
+
+        assert_eq!(
+            outcome.completion.as_ref().map(|value| value.0),
+            Some(AgentRunStatus::Completed)
+        );
+        assert_eq!(outcome.action_count, 1);
+        assert_eq!(complete_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.completed_steps.contains("run_completed"));
+    }
+
+    #[tokio::test]
+    async fn greenfield_build_repair_requires_one_diagnostic_then_one_source_mutation() {
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "greenfield-build-repair-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let run = next_app_workflow_run(run, "greenfield_static");
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "project_initialized",
+                "project_source_read",
+                "source_authored",
+                "source_file_authored",
+                "dependencies_ready",
+                "repair_required",
+                "build_failed",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state
+            .authored_source_paths
+            .insert("project/app/page.tsx".to_string());
+        let diagnostic = ToolCall::new("diagnostic", "diagnostics.build_log", json!({}));
+        let reread = ToolCall::new(
+            "reread",
+            "fs.read",
+            json!({ "path": "project/app/page.tsx" }),
+        );
+        let patch = ToolCall::new(
+            "patch",
+            "fs.patch",
+            json!({
+                "path": "project/app/page.tsx",
+                "oldStr": "onSubmit={handleSubmit}",
+                "newStr": ""
+            }),
+        );
+        let wrong_path_patch = ToolCall::new(
+            "wrong-path-patch",
+            "fs.patch",
+            json!({
+                "path": "app/page.tsx",
+                "oldStr": "onSubmit={handleSubmit}",
+                "newStr": ""
+            }),
+        );
+
+        let diagnostic_workflow = workflow_progress_snapshot(
+            run.phase,
+            Some("next-app"),
+            &state,
+            ObservationBudgetUsage::default(),
+            AgentLoopLimits::default(),
+            true,
+        );
+        assert_eq!(diagnostic_workflow.stage, "diagnostic_required");
+        assert_eq!(
+            diagnostic_workflow.next_action["tool"],
+            "diagnostics.build_log"
+        );
+        assert!(greenfield_build_repair_tool_denial(&run, &state, &diagnostic).is_none());
+        assert!(greenfield_build_repair_tool_denial(&run, &state, &reread).is_some());
+        assert!(greenfield_build_repair_tool_denial(&run, &state, &patch).is_some());
+
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&diagnostic),
+            &[ToolResultMessage {
+                tool_use_id: diagnostic.id.clone(),
+                tool_name: diagnostic.name.clone(),
+                is_error: false,
+                content: json!({ "stderr": "Event handlers cannot be passed" }),
+                metadata: None,
+            }],
+        );
+        let repair_workflow = workflow_progress_snapshot(
+            run.phase,
+            Some("next-app"),
+            &state,
+            ObservationBudgetUsage::default(),
+            AgentLoopLimits::default(),
+            true,
+        );
+        assert_eq!(repair_workflow.stage, "source_repair_required");
+        assert_eq!(repair_workflow.next_action["tool"], "fs.patch");
+        assert_eq!(
+            repair_workflow.next_action["targetPaths"],
+            json!(["project/app/page.tsx"])
+        );
+        assert!(greenfield_build_repair_tool_denial(&run, &state, &patch).is_none());
+        assert!(greenfield_build_repair_tool_denial(&run, &state, &reread).is_some());
+        assert!(
+            greenfield_build_repair_tool_denial(&run, &state, &wrong_path_patch)
+                .is_some_and(|reason| reason.contains("project/app/page.tsx"))
+        );
+
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&wrong_path_patch),
+            &[ToolResultMessage {
+                tool_use_id: wrong_path_patch.id.clone(),
+                tool_name: wrong_path_patch.name.clone(),
+                is_error: true,
+                content: json!({ "error": "fs.patch target does not exist" }),
+                metadata: Some(json!({
+                    "errorKind": "mutation.target_missing",
+                    "recoverable": true
+                })),
+            }],
+        );
+        assert!(state
+            .substantive_progress
+            .iter()
+            .any(|entry| entry.starts_with("recoverable-repair-attempt:mutation.target_missing:")));
+
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&patch),
+            &[ToolResultMessage {
+                tool_use_id: patch.id.clone(),
+                tool_name: patch.name.clone(),
+                is_error: false,
+                content: json!({ "path": "project/app/page.tsx" }),
+                metadata: None,
+            }],
+        );
+        assert!(state.completed_steps.contains("repair_mutated"));
+
+        let build = ToolCall::new("build", "project.build", json!({}));
+        update_progress_state(
+            &mut state,
+            std::slice::from_ref(&build),
+            &[ToolResultMessage {
+                tool_use_id: build.id.clone(),
+                tool_name: build.name.clone(),
+                is_error: false,
+                content: json!({ "status": "success", "success": true }),
+                metadata: None,
+            }],
+        );
+        assert!(!state.completed_steps.contains("repair_required"));
+        assert!(!state.completed_steps.contains("repair_mutated"));
+        assert!(!state.completed_steps.contains("build_failed"));
+        assert!(!state.completed_steps.contains("build_diagnostics_read"));
+        assert!(state.completed_steps.contains("project.build"));
     }
 
     #[tokio::test]
