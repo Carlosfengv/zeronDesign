@@ -1,0 +1,228 @@
+{
+  "schemaVersion": "design-profile@2",
+  "name": "Monad — Editorial Tech Journal",
+  "status": "active",
+  "scope": { "platform": true },
+  "source": {
+    "kind": "imported",
+    "sourceArtifactIds": ["design-source-676525848"],
+    "primarySourceArtifactId": "design-source-676525848",
+    "sourceHash": "50a25fe9838c5f543a39ee25f6a7653ee0987bc414b5ce3914ef4fda394a21a8",
+    "converterVersion": "monad-profile-curation@1",
+    "integrity": "verified",
+    "notes": "Curated from monad.md: warm editorial technology journal with a serif-and-mono type system."
+  },
+  "product": {
+    "name": "Monad",
+    "category": "editorial technology journal website",
+    "audience": ["technical product teams", "data-platform buyers", "design-conscious developers"],
+    "primaryUseCases": ["product marketing website", "technical editorial landing page", "data pipeline showcase"],
+    "productQualities": ["editorial", "calm", "technical", "warm", "precise"]
+  },
+  "brand": {
+    "voice": {
+      "tone": ["editorial", "calm", "technical", "confident"],
+      "sentenceStyle": "concise and literate",
+      "vocabulary": {
+        "prefer": ["signal", "pipeline", "data", "clarity", "flow"],
+        "avoid": ["hype", "shouty", "generic SaaS", "rainbow"]
+      },
+      "writingRules": [
+        "Use Untitled Serif for hierarchy and ABC Diatype Mono for functional language.",
+        "Keep marketing copy specific, measured, and technically legible.",
+        "Use uppercase, tightly tracked mono labels for navigation, controls, and tags."
+      ]
+    },
+    "messaging": {
+      "headlineStyle": "quiet editorial serif statement",
+      "bodyStyle": "short monospace technical explanation",
+      "ctaStyle": "one Lake Blue primary action per screen; supporting actions are black or ghost pills",
+      "proofStyle": "show pipeline diagrams, product capabilities, and restrained logo proof",
+      "forbiddenClaims": ["unqualified superlatives", "generic AI jargon", "multi-color CTA systems"]
+    }
+  },
+  "visual": {
+    "direction": "An editorial technology journal on a warm parchment canvas: refined light serif headlines, functional monospace text, hairline ash borders, and atmospheric pastel data-flow washes.",
+    "principles": [
+      "Use Parchment rather than pure white as the dominant canvas.",
+      "Create hierarchy through the Untitled Serif and whitespace, never bold display type.",
+      "Use pill controls and 40px soft cards with borders instead of heavy elevation.",
+      "Treat Lake Blue as a singular functional action color; pastels are decorative only."
+    ],
+    "moodKeywords": ["warm parchment", "editorial", "technical manual", "calm", "spacious", "atmospheric"],
+    "avoidKeywords": ["pure white SaaS", "bold serif", "drop-shadow cards", "sharp corners", "scattered accents"],
+    "composition": {
+      "hero": "Centered typographic hero on Parchment with 80px serif headline, mono supporting copy, and two pill actions.",
+      "layout": "1432px maximum page width, 64px section rhythm, 40px card padding, and generous breathing room.",
+      "productSignal": "Use a custom pill-node data pipeline diagram with thin curved connectors and a soft central glow."
+    },
+    "imagery": {
+      "strategy": "No photography. Use diagrams, desaturated partner marks, and blurred Coral-to-Sky-to-Mint atmospheric washes.",
+      "decorativeRule": "Gradient washes stay soft, blurred, and behind content; they never become functional surfaces."
+    },
+    "motion": { "level": "subtle", "reducedMotion": "Respect reduced motion and keep decorative movement nonessential." }
+  },
+  "tokens": {
+    "color": {
+      "background": "#f6f3f1",
+      "surface": "#f6f3f1",
+      "surfaceStrong": "#242424",
+      "text": "#242424",
+      "muted": "#4e4d4d",
+      "primary": "#2b59d1",
+      "primaryContrast": "#f6f3f1",
+      "border": "#cecac8",
+      "periwinkleMist": "#cfdaf5",
+      "skyBlue": "#a0b5eb",
+      "mint": "#a7fccd",
+      "coral": "#ff9473",
+      "gold": "#ecda98",
+      "ink": "#000000",
+      "smoke": "#797776"
+    },
+    "typography": {
+      "families": {
+        "body": "ABC Diatype Mono, JetBrains Mono, IBM Plex Mono, monospace",
+        "display": "Untitled Serif, Times New Roman, Georgia, serif",
+        "mono": "ABC Diatype Mono, JetBrains Mono, IBM Plex Mono, monospace",
+        "sans": "Untitled Sans, Inter, sans-serif"
+      },
+      "scale": {
+        "display": { "fontSize": "80px", "lineHeight": "1.2", "fontWeight": "400", "letterSpacing": "-0.02em" },
+        "heading": { "fontSize": "48px", "lineHeight": "1.2", "fontWeight": "400", "letterSpacing": "-0.02em" },
+        "subheading": { "fontSize": "24px", "lineHeight": "1.2", "fontWeight": "400", "letterSpacing": "-0.02em" },
+        "body": { "fontSize": "16px", "lineHeight": "1.35", "fontWeight": "400", "letterSpacing": "-0.025em" },
+        "label": { "fontSize": "14px", "lineHeight": "1.2", "fontWeight": "500", "letterSpacing": "-0.02em" }
+      }
+    },
+    "gradients": {
+      "atmosphericCoralSky": "linear-gradient(135deg, rgba(255,148,115,0.8), rgba(160,181,235,0.8))",
+      "atmosphericSkyMint": "linear-gradient(135deg, rgba(160,181,235,0.8), rgba(167,252,205,0.8))"
+    },
+    "radius": {
+      "scale": { "tag": "9999px", "button": "100px", "card": "40px", "pill": "9999px" },
+      "byComponent": { "featureCard": "40px", "primaryButton": "100px", "pipelineNode": "9999px" }
+    },
+    "spacing": {
+      "baseUnit": "8px",
+      "layout": { "pageMaxWidth": "1432px", "section": "64px", "cardPadding": "40px", "elementGap": "16px", "heroBreathingRoom": "80px" }
+    },
+    "shadow": { "soft": "0 0 10px rgba(0,0,0,0.1)" }
+  },
+  "runtimeTokenMapping": {
+    "color.background": "#f6f3f1",
+    "color.surface": "#f6f3f1",
+    "color.surfaceStrong": "#242424",
+    "color.text": "#242424",
+    "color.muted": "#4e4d4d",
+    "color.primary": "#2b59d1",
+    "color.primaryContrast": "#f6f3f1",
+    "color.border": "#cecac8",
+    "radius.card": "40px",
+    "radius.control": "100px",
+    "font.sans": "ABC Diatype Mono, JetBrains Mono, IBM Plex Mono, monospace",
+    "shadow.soft": "0 0 10px rgba(0,0,0,0.1)"
+  },
+  "extendedTokenMapping": {
+    "color.periwinkleMist": "#cfdaf5",
+    "color.ink": "#000000",
+    "font.display": "Untitled Serif, Times New Roman, Georgia, serif",
+    "font.mono": "ABC Diatype Mono, JetBrains Mono, IBM Plex Mono, monospace",
+    "type.display.size": "80px",
+    "type.display.lineHeight": "1.2",
+    "type.display.letterSpacing": "-0.02em",
+    "type.body.letterSpacing": "-0.025em",
+    "spacing.pageMaxWidth": "1432px",
+    "spacing.section": "64px",
+    "spacing.cardPadding": "40px",
+    "radius.button": "100px",
+    "radius.tag": "9999px",
+    "gradient.atmosphericCoralSky": "linear-gradient(135deg, rgba(255,148,115,0.8), rgba(160,181,235,0.8))",
+    "gradient.atmosphericSkyMint": "linear-gradient(135deg, rgba(160,181,235,0.8), rgba(167,252,205,0.8))"
+  },
+  "components": {
+    "primitives": {
+      "button": { "role": "conversion and navigation action", "usage": ["Use pill geometry.", "Use Lake Blue once for the page-primary CTA."], "avoid": ["multiple blue CTAs", "square controls"] },
+      "card": { "role": "capability and feature surface", "usage": ["Use 1px Ash border, 40px radius, and 40px padding."], "avoid": ["drop shadows", "hard corners"] },
+      "tag": { "role": "pipeline node or metadata label", "usage": ["Use mono uppercase text in a bordered full pill."], "avoid": ["rectangular tag chips"] },
+      "accordion": { "role": "FAQ disclosure row", "usage": ["Use serif question, Ash bottom border, and right-aligned chevron."], "avoid": ["card treatment", "heavy hover fills"] }
+    },
+    "patterns": {
+      "hero": { "role": "centered editorial website introduction", "requiredElements": ["serif headline", "mono supporting copy", "one Lake Blue pill CTA", "one supporting action"] },
+      "pipelineDiagram": { "role": "custom technical product signal", "requiredElements": ["pill-shaped nodes", "thin curved connectors", "subtle central glow"] },
+      "featureCard": { "role": "product capability card", "requiredElements": ["serif title", "mono body", "Ash border or Periwinkle focal surface"] }
+    },
+    "recipes": [
+      {
+        "id": "monad-editorial-hero",
+        "priority": "required",
+        "role": "website hero",
+        "verification": [
+          { "kind": "computed-style", "route": "/", "selector": "h1, [data-monad-hero] h1", "property": "font-family", "expected": "Untitled Serif", "comparator": { "kind": "contains" }, "minMatches": 1, "matchPolicy": "any" }
+        ]
+      },
+      {
+        "id": "monad-pipeline-signal",
+        "priority": "preferred",
+        "role": "data pipeline diagram",
+        "verification": [
+          { "kind": "dom", "route": "/", "selector": "[data-pipeline-node], .pipeline-node", "minMatches": 1 }
+        ]
+      }
+    ]
+  },
+  "websiteContext": {
+    "enforcementMode": "enforced",
+    "craftPacks": ["accessibility-baseline", "responsive-layout", "anti-generic-ui"],
+    "layoutGuidance": [
+      "Keep the page in a 1432px maximum-width editorial container.",
+      "Use 64px section gaps and 40px card padding.",
+      "On narrow screens preserve the serif-mono hierarchy while reducing display size and keeping pill controls legible."
+    ]
+  },
+  "content": {
+    "website": { "requiredSections": ["announcement bar", "navigation", "editorial hero", "pipeline/product signal", "feature cards", "logo strip", "FAQ"] },
+    "docs": { "pageRules": ["Keep Parchment and the serif-mono pairing, but reduce decorative washes and preserve reading density."] }
+  },
+  "accessibility": {
+    "wcag": "AA",
+    "motion": ["Respect prefers-reduced-motion.", "Do not make atmospheric decoration necessary for comprehension."],
+    "semantics": ["Use native buttons for actions.", "Use headings in document order.", "Use accessible labels for accordion controls and close actions."]
+  },
+  "technical": {
+    "allowedTemplates": ["next-app", "fumadocs-docs"],
+    "preferredTemplates": { "website": "next-app", "docs": "fumadocs-docs" },
+    "cssStrategy": "runtime-style-contract",
+    "dependencyPolicy": { "preferExisting": true },
+    "filePolicy": {
+      "designProfilePath": "/workspace/inputs/design-profile.json",
+      "designMarkdownPath": "/workspace/inputs/design.md",
+      "styleContractPath": "/workspace/state/style-contract.json"
+    }
+  },
+  "governance": { "conflictBehavior": "ask", "review": { "requireVisualReview": true } },
+  "signatureRules": [
+    { "id": "monad-parchment-canvas", "category": "color", "statement": "The page canvas is warm Parchment #f6f3f1, not pure white.", "priority": "required", "appliesTo": ["website", "docs"], "sourceSectionIds": ["Tokens — Colors"], "verification": { "kind": "token", "token": "color.background", "expected": "#f6f3f1", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "monad-lake-blue-action", "category": "color", "statement": "Lake Blue #2b59d1 is the functional primary action color.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Primary Pill Button (Blue)"], "verification": { "kind": "token", "token": "color.primary", "expected": "#2b59d1", "comparator": { "kind": "color-equivalent" } } },
+    { "id": "monad-editorial-display", "category": "typography", "statement": "Display headings use an Untitled Serif-style family at weight 400 with tight tracking.", "priority": "required", "appliesTo": ["website", "docs"], "sourceSectionIds": ["Untitled Serif — Display and heading type only"], "verification": { "kind": "token", "token": "font.display", "expected": "Untitled Serif", "comparator": { "kind": "contains" } } },
+    { "id": "monad-mono-ui", "category": "typography", "statement": "Body and functional UI use the ABC Diatype Mono role.", "priority": "required", "appliesTo": ["website", "docs"], "sourceSectionIds": ["ABC Diatype Mono — Body text"], "verification": { "kind": "token", "token": "font.sans", "expected": "ABC Diatype Mono", "comparator": { "kind": "contains" } } },
+    { "id": "monad-soft-card", "category": "component", "statement": "Feature cards use a 40px radius and hairline Ash borders instead of heavy shadows.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Feature Card"], "verification": { "kind": "token", "token": "radius.card", "expected": "40px", "comparator": { "kind": "exact" } } },
+    { "id": "monad-pill-controls", "category": "component", "statement": "Buttons use 100px pill geometry and tags use full-pill geometry.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Tokens — Spacing & Shapes"], "verification": { "kind": "token", "token": "radius.control", "expected": "100px", "comparator": { "kind": "exact" } } },
+    { "id": "monad-quiet-elevation", "category": "elevation", "statement": "Elevation is a subtle ambient shadow only; cards do not use drop shadows.", "priority": "required", "appliesTo": ["website", "docs"], "sourceSectionIds": ["Elevation"], "verification": { "kind": "token", "token": "shadow.soft", "expected": "0 0 10px", "comparator": { "kind": "contains" } } },
+    { "id": "monad-pipeline-composition", "category": "composition", "statement": "The product signal favors pill-shaped pipeline nodes and thin connector lines.", "priority": "required", "appliesTo": ["website"], "sourceSectionIds": ["Imagery"], "verification": { "kind": "dom", "route": "/", "selector": "[data-pipeline-node], .pipeline-node", "minMatches": 1 } },
+    { "id": "monad-gradient-wash", "category": "imagery", "statement": "Pastel Coral, Sky, and Mint appear only as soft atmospheric decorative washes.", "priority": "preferred", "appliesTo": ["website"], "sourceSectionIds": ["Gradient Atmospheric Wash"], "verification": { "kind": "visual-review", "rubric": "Verify any pastel gradient is blurred, behind content, and not used as a functional control fill." } },
+    { "id": "monad-no-pure-white", "category": "color", "statement": "Pure white is not used as the primary page background.", "priority": "preferred", "appliesTo": ["website"], "sourceSectionIds": ["Do's and Don'ts"], "verification": { "kind": "computed-style", "route": "/", "selector": "body", "property": "background-color", "expected": "#ffffff", "comparator": { "kind": "forbidden-anywhere" }, "minMatches": 1 } }
+  ],
+  "overrides": {
+    "surfaces": {
+      "docs": {
+        "visual": { "imagery": { "decorativeRule": "Use Parchment and quiet hairline structure; omit large atmospheric washes from reading surfaces." } },
+        "content": { "website": { "requiredSections": [] } }
+      }
+    },
+    "templates": {
+      "next-app": { "content": { "requiredDataHooks": ["data-monad-hero", "data-pipeline-node"] } },
+      "fumadocs-docs": { "websiteContext": { "enforcementMode": "observe" } }
+    }
+  }
+}
