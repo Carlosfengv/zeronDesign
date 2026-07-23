@@ -87,6 +87,15 @@ impl Tool for ProjectBuildTool {
             &package_manager,
         )
         .await?;
+        verify_project_build_dependencies(
+            &*self.workspace,
+            &*self.command,
+            &ctx,
+            &progress,
+            &cwd,
+            &package_manager,
+        )
+        .await?;
         let argv = project_build_argv(&package_manager);
         let started_at = Utc::now();
         let output = self.command.run(&ctx, &argv, &cwd, timeout_ms).await;

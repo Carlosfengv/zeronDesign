@@ -42,11 +42,12 @@ pub(super) async fn maybe_restore_project_dependencies(
             format!("runtime dependency restore before project.build: {reason}\n"),
         )
         .await;
+    prepare_dependency_install_workspace(workspace, ctx, cwd).await?;
     let argv = package_install_argv(package_manager, "restore", &[], &registry);
     let mut attempts = 0;
     let (output, log_path) = loop {
         attempts += 1;
-        let output = command
+        let output = match command
             .run_with_output_events(
                 ctx,
                 &argv,
@@ -56,9 +57,28 @@ pub(super) async fn maybe_restore_project_dependencies(
                 "package.install",
             )
             .await
-            .map_err(|error| {
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let failure_kind = if error.kind() == io::ErrorKind::TimedOut {
+                    "dependency.install_timeout"
+                } else if error.kind() == io::ErrorKind::Interrupted {
+                    "dependency.install_interrupted"
+                } else {
+                    "dependency.install_failed"
+                };
+                mark_dependency_install_incomplete(
+                    workspace,
+                    ctx,
+                    cwd,
+                    package_manager,
+                    "restore",
+                    &[],
+                    failure_kind,
+                )
+                .await?;
                 if error.kind() == io::ErrorKind::TimedOut {
-                    typed_recoverable(
+                    return Err(typed_recoverable(
                         "project.build dependency restore timed out".to_string(),
                         "build.missing_dependency",
                         json!({
@@ -67,11 +87,11 @@ pub(super) async fn maybe_restore_project_dependencies(
                             "attempts": attempts,
                             "suggestedAction": "Retry project.build or run project.ensure_dependencies after checking package registry connectivity."
                         }),
-                    )
+                    ));
                 } else if error.kind() == io::ErrorKind::Interrupted {
-                    ToolError::Recoverable(error.to_string())
+                    return Err(ToolError::Recoverable(error.to_string()));
                 } else {
-                    typed_recoverable(
+                    return Err(typed_recoverable(
                         format!("project.build dependency restore failed to start {package_manager}: {error}"),
                         "build.missing_dependency",
                         json!({
@@ -80,15 +100,27 @@ pub(super) async fn maybe_restore_project_dependencies(
                             "attempts": attempts,
                             "suggestedAction": "Run project.ensure_dependencies or verify the package manager is available."
                         }),
-                    )
+                    ));
                 }
-            })?;
+            }
+        };
         let restore_tool_use_id = format!("{}-restore-attempt-{attempts}", progress.tool_use_id());
         let log_path =
             write_package_install_log(workspace, ctx, &restore_tool_use_id, &argv, &output).await?;
         if !should_retry_automatic_dependency_restore(output.success, &output.stderr, attempts) {
             break (output, log_path);
         }
+        mark_dependency_install_incomplete(
+            workspace,
+            ctx,
+            cwd,
+            package_manager,
+            "restore",
+            &[],
+            dependency_install_failure_kind(&output.stderr),
+        )
+        .await?;
+        prepare_dependency_install_workspace(workspace, ctx, cwd).await?;
         progress
             .emit_tool_output(
                 "package.install",
@@ -111,6 +143,7 @@ pub(super) async fn maybe_restore_project_dependencies(
         "attempts": attempts,
         "status": output.status,
         "success": output.success,
+        "cleanupNodeModules": !output.success,
     });
     write_workspace_json(workspace, ctx, "state/dependency-state.json", &state).await?;
     if !output.success {
@@ -317,12 +350,13 @@ pub(super) async fn run_package_install(
 
     let package_manager =
         package_manager_from_input_or_project(workspace, &input, &ctx, &cwd).await?;
+    prepare_dependency_install_workspace(workspace, &ctx, &cwd).await?;
     let argv = package_install_argv(&package_manager, &mode, &packages, &registry);
     let timeout_ms = input
         .get("timeoutMs")
         .and_then(Value::as_u64)
         .unwrap_or(120_000);
-    let output = command
+    let output = match command
         .run_with_output_events(
             &ctx,
             &argv,
@@ -332,9 +366,27 @@ pub(super) async fn run_package_install(
             tool_name,
         )
         .await
-        .map_err(|error| {
+    {
+        Ok(output) => output,
+        Err(error) => {
+            mark_dependency_install_incomplete(
+                workspace,
+                &ctx,
+                &cwd,
+                &package_manager,
+                &mode,
+                &packages,
+                if error.kind() == io::ErrorKind::TimedOut {
+                    "dependency.install_timeout"
+                } else if error.kind() == io::ErrorKind::Interrupted {
+                    "dependency.install_interrupted"
+                } else {
+                    "dependency.install_failed"
+                },
+            )
+            .await?;
             if error.kind() == io::ErrorKind::TimedOut {
-                ToolError::typed_recoverable(
+                return Err(ToolError::typed_recoverable(
                     format!("{tool_name} timed out"),
                     "dependency.install_timeout",
                     json!({
@@ -347,11 +399,11 @@ pub(super) async fn run_package_install(
                         "timeoutMs": timeout_ms,
                         "suggestedAction": "Retry project.ensure_dependencies with a larger timeoutMs after checking registry connectivity, then rerun project.build or preview.publish.",
                     }),
-                )
+                ));
             } else if error.kind() == io::ErrorKind::Interrupted {
-                ToolError::Recoverable(error.to_string())
+                return Err(ToolError::Recoverable(error.to_string()));
             } else {
-                ToolError::typed_recoverable(
+                return Err(ToolError::typed_recoverable(
                     format!("{tool_name} failed to start {package_manager}: {error}"),
                     "dependency.install_failed",
                     json!({
@@ -363,9 +415,10 @@ pub(super) async fn run_package_install(
                         "cwd": display_workspace_path(&cwd, &ctx),
                         "suggestedAction": "Verify the package manager is available and retry project.ensure_dependencies before building.",
                     }),
-                )
+                ));
             }
-        })?;
+        }
+    };
     let log_path =
         write_package_install_log(workspace, &ctx, progress.tool_use_id(), &argv, &output).await?;
     let dependency_state = json!({
@@ -378,6 +431,7 @@ pub(super) async fn run_package_install(
         "packages": packages.clone(),
         "status": output.status,
         "success": output.success,
+        "cleanupNodeModules": !output.success,
     });
     write_workspace_json(
         workspace,
@@ -433,6 +487,107 @@ pub(super) async fn run_package_install(
         "stderr": output.stderr,
         "draftPreview": draft_preview,
     }))
+}
+
+async fn prepare_dependency_install_workspace(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    cwd: &Path,
+) -> Result<bool, ToolError> {
+    let Some(mut state) = read_workspace_json(workspace, ctx, "state/dependency-state.json").await
+    else {
+        return Ok(false);
+    };
+    let cleanup_required = state.get("needsRestore").and_then(Value::as_bool) == Some(true)
+        && state.get("cleanupNodeModules").and_then(Value::as_bool) == Some(true);
+    if !cleanup_required {
+        return Ok(false);
+    }
+
+    let node_modules = cwd.join("node_modules");
+    match workspace.path_kind(ctx, &node_modules).await {
+        Ok(WorkspacePathKind::Dir) => workspace
+            .remove_dir_all(ctx, &node_modules)
+            .await
+            .map_err(|error| {
+                ToolError::typed_recoverable(
+                    format!(
+                        "failed to clean incomplete dependency tree before restore: {error}"
+                    ),
+                    "dependency.cleanup_failed",
+                    json!({
+                        "cwd": display_workspace_path(cwd, ctx),
+                        "path": display_workspace_path(&node_modules, ctx),
+                        "suggestedAction": "Repair the Sandbox workspace or start a fresh Build before retrying dependency restore."
+                    }),
+                )
+            })?,
+        Ok(WorkspacePathKind::File) => workspace
+            .remove_file(ctx, &node_modules)
+            .await
+            .map_err(|error| ToolError::Recoverable(error.to_string()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ToolError::typed_recoverable(
+                format!("failed to inspect dependency tree before restore: {error}"),
+                "dependency.cleanup_failed",
+                json!({
+                    "cwd": display_workspace_path(cwd, ctx),
+                    "path": display_workspace_path(&node_modules, ctx),
+                }),
+            ));
+        }
+    }
+
+    if let Some(object) = state.as_object_mut() {
+        object.insert("cleanupNodeModules".to_string(), Value::Bool(false));
+        object.insert(
+            "lastCleanupAt".to_string(),
+            Value::String(Utc::now().to_rfc3339()),
+        );
+    }
+    write_workspace_json(workspace, ctx, "state/dependency-state.json", &state).await?;
+    Ok(true)
+}
+
+async fn mark_dependency_install_incomplete(
+    workspace: &dyn WorkspaceBackend,
+    ctx: &ToolContext,
+    cwd: &Path,
+    package_manager: &str,
+    mode: &str,
+    packages: &[String],
+    failure_kind: &str,
+) -> Result<(), ToolError> {
+    let state = json!({
+        "needsRestore": true,
+        "reason": "previous_dependency_install_incomplete",
+        "lastRestoreAt": Utc::now().to_rfc3339(),
+        "lastRestoreLogPath": Value::Null,
+        "packageManager": package_manager,
+        "mode": mode,
+        "packages": packages,
+        "status": Value::Null,
+        "success": false,
+        "failureKind": failure_kind,
+        "cleanupNodeModules": true,
+        "cwd": display_workspace_path(cwd, ctx),
+    });
+    write_workspace_json(workspace, ctx, "state/dependency-state.json", &state)
+        .await
+        .map_err(|error| {
+            ToolError::typed_recoverable(
+                format!(
+                    "dependency install failed and its cleanup state could not be recorded: {error:?}"
+                ),
+                "dependency.install_state_failed",
+                json!({
+                    "failureKind": failure_kind,
+                    "cwd": display_workspace_path(cwd, ctx),
+                    "suggestedAction": "Start a fresh Build workspace before retrying dependency installation."
+                }),
+            )
+        })
 }
 
 pub(super) fn dependency_install_failure_kind(stderr: &str) -> &'static str {
@@ -504,6 +659,102 @@ pub(super) fn package_json_declares_dependencies(package_json: &str) -> bool {
                     .is_some_and(|dependencies| !dependencies.is_empty())
             })
     })
+}
+
+pub(super) fn package_json_declares_next(package_json: &str) -> bool {
+    serde_json::from_str::<Value>(package_json).is_ok_and(|value| {
+        ["dependencies", "devDependencies", "optionalDependencies"]
+            .iter()
+            .any(|key| {
+                value
+                    .get(key)
+                    .and_then(Value::as_object)
+                    .is_some_and(|dependencies| dependencies.contains_key("next"))
+            })
+    })
+}
+
+pub(super) async fn verify_project_build_dependencies(
+    workspace: &dyn WorkspaceBackend,
+    command: &dyn SandboxCommandBackend,
+    ctx: &ToolContext,
+    progress: &ProgressSink,
+    cwd: &Path,
+    package_manager: &str,
+) -> Result<(), ToolError> {
+    let package_json = workspace
+        .read_to_string(ctx, &cwd.join("package.json"))
+        .await
+        .map_err(|error| ToolError::Recoverable(error.to_string()))?;
+    if !package_json_declares_next(&package_json) {
+        return Ok(());
+    }
+
+    let script = r#"const libc = process.report?.getReport?.().header?.glibcVersionRuntime ? "gnu" : "musl"; const pkg = `@next/swc-linux-${process.arch}-${libc}`; require(pkg); process.stdout.write(JSON.stringify({ package: pkg, arch: process.arch, libc }));"#;
+    let argv = vec!["node".to_string(), "-e".to_string(), script.to_string()];
+    let output = match command.run(ctx, &argv, cwd, 15_000).await {
+        Ok(output) => output,
+        Err(error) => {
+            mark_dependency_install_incomplete(
+                workspace,
+                ctx,
+                cwd,
+                package_manager,
+                "restore",
+                &[],
+                "environment.next_swc_unavailable",
+            )
+            .await?;
+            return Err(ToolError::typed_recoverable(
+                format!("Next.js native compiler preflight failed to start: {error}"),
+                "environment.next_swc_unavailable",
+                json!({
+                    "cwd": display_workspace_path(cwd, ctx),
+                    "packageManager": package_manager,
+                    "suggestedAction": "Retry project.build; Runtime will discard the incomplete dependency tree and restore dependencies from a clean state."
+                }),
+            ));
+        }
+    };
+    if output.success {
+        progress
+            .emit_tool_output(
+                "project.build",
+                "stdout",
+                format!(
+                    "Next.js native compiler preflight passed: {}\n",
+                    output.stdout
+                ),
+            )
+            .await;
+        return Ok(());
+    }
+
+    mark_dependency_install_incomplete(
+        workspace,
+        ctx,
+        cwd,
+        package_manager,
+        "restore",
+        &[],
+        "environment.next_swc_unavailable",
+    )
+    .await?;
+    Err(ToolError::typed_recoverable(
+        format!(
+            "Next.js native compiler is unavailable or corrupt (status {:?})",
+            output.status
+        ),
+        "environment.next_swc_unavailable",
+        json!({
+            "cwd": display_workspace_path(cwd, ctx),
+            "packageManager": package_manager,
+            "status": output.status,
+            "stdout": truncate_for_metadata(&output.stdout),
+            "stderr": truncate_for_metadata(&output.stderr),
+            "suggestedAction": "Retry project.build; Runtime will discard the incomplete dependency tree and restore dependencies from a clean state."
+        }),
+    ))
 }
 
 pub(super) async fn write_package_install_log(
@@ -709,7 +960,7 @@ pub(super) fn is_public_registry(registry: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_retry_automatic_dependency_restore;
+    use super::*;
 
     #[test]
     fn automatic_restore_retries_only_bounded_transient_registry_failures() {
@@ -733,5 +984,72 @@ mod tests {
             "npm error code ECONNRESET",
             1,
         ));
+    }
+
+    #[test]
+    fn next_preflight_only_applies_to_projects_declaring_next() {
+        assert!(package_json_declares_next(
+            r#"{"dependencies":{"next":"16.2.10"}}"#
+        ));
+        assert!(package_json_declares_next(
+            r#"{"devDependencies":{"next":"16.2.10"}}"#
+        ));
+        assert!(!package_json_declares_next(
+            r#"{"dependencies":{"react":"19.0.0"}}"#
+        ));
+        assert!(!package_json_declares_next("not-json"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_install_marker_forces_clean_dependency_restore() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "zerondesign-dependency-cleanup-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cwd = workspace_root.join("project");
+        let node_modules = cwd.join("node_modules");
+        fs::create_dir_all(node_modules.join("@next/swc-linux-arm64-gnu")).unwrap();
+        fs::write(
+            node_modules.join("@next/swc-linux-arm64-gnu/next-swc.node"),
+            b"truncated",
+        )
+        .unwrap();
+        let store = RuntimeStore::new();
+        let run = store
+            .create_run(
+                "dependency-cleanup-project".to_string(),
+                AgentPhase::Build,
+                "build".to_string(),
+                "fixture".to_string(),
+                Vec::new(),
+            )
+            .await;
+        let ctx = ToolContext::new(store, run, workspace_root.clone());
+
+        mark_dependency_install_incomplete(
+            &LocalWorkspaceBackend,
+            &ctx,
+            &cwd,
+            "npm",
+            "restore",
+            &[],
+            "dependency.install_timeout",
+        )
+        .await
+        .unwrap();
+        let cleaned = prepare_dependency_install_workspace(&LocalWorkspaceBackend, &ctx, &cwd)
+            .await
+            .unwrap();
+
+        assert!(cleaned);
+        assert!(!node_modules.exists());
+        let state =
+            read_workspace_json(&LocalWorkspaceBackend, &ctx, "state/dependency-state.json")
+                .await
+                .unwrap();
+        assert_eq!(state["needsRestore"], true);
+        assert_eq!(state["cleanupNodeModules"], false);
+        fs::remove_dir_all(workspace_root).unwrap();
     }
 }
