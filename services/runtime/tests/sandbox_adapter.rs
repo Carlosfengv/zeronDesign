@@ -531,6 +531,7 @@ async fn arc_kube_client_delegates_terminal_absence_verification() {
             "anydesign-sandboxes",
             "project-demo-claim",
             "project-demo-sandbox",
+            "workspace-project-demo-claim",
         )
         .await
         .unwrap());
@@ -540,6 +541,8 @@ async fn arc_kube_client_delegates_terminal_absence_verification() {
             "get",
             "sandboxclaim/project-demo-claim",
             "sandbox/project-demo-sandbox",
+            "pvc/workspace-project-demo-sandbox",
+            "pvc/workspace-project-demo-claim",
             "-n",
             "anydesign-sandboxes",
             "--ignore-not-found=true",

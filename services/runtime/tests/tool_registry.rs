@@ -87,6 +87,7 @@ impl SandboxKubeClient for FakeSandboxClient {
         namespace: &str,
         claim_name: &str,
         _sandbox_name: &str,
+        _workspace_pvc_name: &str,
     ) -> Result<bool> {
         Ok(self
             .deleted

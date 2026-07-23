@@ -115,8 +115,9 @@ pub trait SandboxKubeClient: Send + Sync {
         namespace: &str,
         claim_name: &str,
         sandbox_name: &str,
+        workspace_pvc_name: &str,
     ) -> Result<bool> {
-        let _ = sandbox_name;
+        let _ = (sandbox_name, workspace_pvc_name);
         Ok(self.claim_phase(namespace, claim_name).await? == SandboxClaimPhase::Deleted)
     }
 }
@@ -172,9 +173,10 @@ where
         namespace: &str,
         claim_name: &str,
         sandbox_name: &str,
+        workspace_pvc_name: &str,
     ) -> Result<bool> {
         (**self)
-            .sandbox_resources_absent(namespace, claim_name, sandbox_name)
+            .sandbox_resources_absent(namespace, claim_name, sandbox_name, workspace_pvc_name)
             .await
     }
 }
@@ -296,17 +298,25 @@ where
         namespace: &str,
         claim_name: &str,
         sandbox_name: &str,
+        workspace_pvc_name: &str,
     ) -> Result<bool> {
-        let args = vec![
+        let controller_pvc_name = controller_workspace_pvc_name(sandbox_name);
+        let mut args = vec![
             "get".to_string(),
             format!("sandboxclaim/{claim_name}"),
             format!("sandbox/{sandbox_name}"),
+            format!("pvc/{controller_pvc_name}"),
+        ];
+        if workspace_pvc_name != controller_pvc_name {
+            args.push(format!("pvc/{workspace_pvc_name}"));
+        }
+        args.extend([
             "-n".to_string(),
             namespace.to_string(),
             "--ignore-not-found=true".to_string(),
             "-o".to_string(),
             "name".to_string(),
-        ];
+        ]);
         let output = self.runner.run(&self.kubectl, &args, None).await?;
         if !output.status_success {
             return Err(anyhow!(
@@ -835,6 +845,7 @@ where
                     &binding.namespace,
                     &binding.sandbox_claim_name,
                     &binding.sandbox_name,
+                    &binding.workspace_pvc_name,
                 )
                 .await?
             {
@@ -842,9 +853,10 @@ where
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
-                    "sandbox release did not remove SandboxClaim and Sandbox before timeout: claim={} sandbox={} binding={}",
+                    "sandbox release did not remove SandboxClaim, Sandbox, and workspace PVC before timeout: claim={} sandbox={} pvc={} binding={}",
                     binding.sandbox_claim_name,
                     binding.sandbox_name,
+                    binding.workspace_pvc_name,
                     binding.id
                 ));
             }
@@ -910,6 +922,10 @@ pub fn workspace_pvc_name(sandbox_claim_name: &str) -> String {
         .trim_start_matches('-')
         .to_string();
     format!("workspace-{prefix}-{suffix}")
+}
+
+fn controller_workspace_pvc_name(sandbox_name: &str) -> String {
+    format!("workspace-{}", sanitize_k8s_name(sandbox_name))
 }
 
 pub fn sandbox_channel_endpoint(
