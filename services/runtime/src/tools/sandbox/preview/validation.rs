@@ -2,14 +2,14 @@ use super::preview_fidelity::{collect_browser_evidence, internal_browser_evidenc
 use super::*;
 use crate::{
     artifact_publisher::StagedArtifact,
-    artifact_routes::ArtifactRouteManifest,
+    artifact_routes::{equivalent_next_not_found_alias, ArtifactRouteManifest},
     generation_contract::{
         GenerationContract, ValidationCheckResult, ValidationCheckStatus, ValidationReport,
         VALIDATION_REPORT_SCHEMA,
     },
     runtime_storage::FileValidationReportStore,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) async fn collect_and_persist_generation_validation(
     workspace: &dyn WorkspaceBackend,
@@ -247,12 +247,22 @@ async fn collect_entry_route_probe(
         base.trim_end_matches('/'),
         route_contract.entry_route.trim_start_matches('/')
     );
-    let response = match reqwest::Client::new()
-        .get(&probe_url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-    {
+    let (request_url, host_header) = match entry_route_request_target(
+        ctx.remote_workspace,
+        &ctx.runtime_browser_proxy_base_url,
+        &probe_url,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            return json!({ "status": "failed", "owner": "runtime", "reason": "probe_target_invalid", "route": route_contract.entry_route, "diagnostic": error });
+        }
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.get(request_url).timeout(Duration::from_secs(10));
+    if let Some(host_header) = host_header {
+        request = request.header(reqwest::header::HOST, host_header);
+    }
+    let response = match request.timeout(Duration::from_secs(10)).send().await {
         Ok(response) => response,
         Err(error) => {
             return json!({ "status": "failed", "owner": "serving", "reason": "request_failed", "route": route_contract.entry_route, "diagnostic": error.to_string() });
@@ -303,6 +313,31 @@ async fn collect_entry_route_probe(
         "resolvedArtifactSha256": resolved_hash,
         "candidateManifestHash": candidate_hash,
     })
+}
+
+fn entry_route_request_target(
+    remote_workspace: bool,
+    capture_base_url: &str,
+    probe_url: &str,
+) -> Result<(reqwest::Url, Option<String>), String> {
+    let probe = reqwest::Url::parse(probe_url)
+        .map_err(|error| format!("entry route probe URL is invalid: {error}"))?;
+    if !remote_workspace {
+        return Ok((probe, None));
+    }
+    let host = probe
+        .host_str()
+        .ok_or_else(|| "entry route probe URL has no host".to_string())?;
+    let host_header = probe
+        .port()
+        .map(|port| format!("{host}:{port}"))
+        .unwrap_or_else(|| host.to_string());
+    let mut direct = reqwest::Url::parse(capture_base_url)
+        .map_err(|error| format!("Runtime capture base URL is invalid: {error}"))?;
+    direct.set_path(probe.path());
+    direct.set_query(probe.query());
+    direct.set_fragment(None);
+    Ok((direct, Some(host_header)))
 }
 
 pub(super) fn validation_failure_owners(
@@ -694,15 +729,34 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn candidate_has_duplicate_routes(manifest: &Value) -> bool {
-    let mut routes = HashSet::new();
-    manifest
+    let mut routes = HashMap::<String, (&str, &str)>::new();
+    for file in manifest
         .get("files")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|file| file.get("path").and_then(Value::as_str))
-        .filter_map(static_route_for_path)
-        .any(|route| !routes.insert(route))
+    {
+        let Some(path) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(route) = static_route_for_path(path) else {
+            continue;
+        };
+        let sha256 = file
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some((existing_path, existing_sha256)) = routes.get(&route).copied() {
+            if equivalent_next_not_found_alias(existing_path, existing_sha256, path, sha256)
+                .is_none()
+            {
+                return true;
+            }
+            continue;
+        }
+        routes.insert(route, (path, sha256));
+    }
+    false
 }
 
 fn static_route_for_path(path: &str) -> Option<String> {
@@ -871,6 +925,33 @@ mod tests {
         assert!(contract
             .required_checks
             .contains(&"duplicate-slugs".to_string()));
+    }
+
+    #[test]
+    fn equivalent_next_not_found_aliases_do_not_fail_duplicate_slug_validation() {
+        let manifest = json!({
+            "schemaVersion": "candidate-manifest@1",
+            "buildId": "build-1",
+            "files": [
+                { "path": "docs/index.html", "sha256": "a".repeat(64) },
+                { "path": "404.html", "sha256": "b".repeat(64) },
+                { "path": "404/index.html", "sha256": "b".repeat(64) }
+            ]
+        });
+        assert!(!candidate_has_duplicate_routes(&manifest));
+    }
+
+    #[test]
+    fn remote_entry_route_probe_connects_to_capture_listener_with_lease_host() {
+        let (url, host) = entry_route_request_target(
+            true,
+            "http://127.0.0.1:8081",
+            "http://lease-123.preview.local:8081/docs/",
+        )
+        .unwrap();
+
+        assert_eq!(url.as_str(), "http://127.0.0.1:8081/docs/");
+        assert_eq!(host.as_deref(), Some("lease-123.preview.local:8081"));
     }
 
     #[test]

@@ -149,14 +149,41 @@ function routeForHtmlFile(file) {
   return null;
 }
 
+function equivalentNextNotFoundAlias(left, right) {
+  const validSha256 = /^[a-f0-9]{64}$/;
+  if (
+    left.sha256 !== right.sha256
+    || !validSha256.test(left.sha256)
+    || !validSha256.test(right.sha256)
+  ) {
+    return null;
+  }
+  const paths = new Set([left.path, right.path]);
+  return paths.size === 2
+    && paths.has("404.html")
+    && paths.has("404/index.html")
+    ? "404.html"
+    : null;
+}
+
 export function buildRouteProjection(contract, files) {
   const routes = {};
+  const sources = {};
   for (const file of files) {
     const rawRoute = routeForHtmlFile(file.path);
     if (!rawRoute) continue;
     const route = canonicalizeRoute(rawRoute, contract.canonicalPolicy);
-    invariant(!routes[route], `artifact.route_ambiguous:${route}`);
+    if (routes[route]) {
+      const preferred = equivalentNextNotFoundAlias(sources[route], file);
+      invariant(preferred, `artifact.route_ambiguous:${route}`);
+      if (preferred === file.path) {
+        routes[route] = file.path;
+        sources[route] = file;
+      }
+      continue;
+    }
     routes[route] = file.path;
+    sources[route] = file;
   }
   invariant(routes[contract.entryRoute], `artifact.entry_route_missing:${contract.entryRoute}`);
   const aliases = {};
@@ -165,7 +192,10 @@ export function buildRouteProjection(contract, files) {
     if (contract.canonicalPolicy === "trailing_slash") aliases[route.replace(/\/$/, "")] = route;
     if (contract.canonicalPolicy === "clean_html") aliases[`${route}/`] = route;
   }
-  return { routes, aliases };
+  return {
+    routes: Object.fromEntries(Object.entries(routes).sort(([left], [right]) => left.localeCompare(right))),
+    aliases,
+  };
 }
 
 export async function runRouteConformance(corpusPath) {

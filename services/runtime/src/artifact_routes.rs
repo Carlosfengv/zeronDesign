@@ -89,7 +89,7 @@ impl ArtifactRouteManifest {
             ));
         }
 
-        let mut routes = BTreeMap::new();
+        let mut routes = BTreeMap::<String, ArtifactRouteTarget>::new();
         let mut sources_by_route = HashMap::<String, String>::new();
         for file in files {
             validate_artifact_path(&file.path)?;
@@ -98,12 +98,37 @@ impl ArtifactRouteManifest {
                 continue;
             };
             let route = canonicalize_route(&raw_route, contract.canonical_policy);
-            if let Some(existing) = sources_by_route.insert(route.clone(), file.path.clone()) {
+            if let Some(existing) = sources_by_route.get(&route).cloned() {
+                let existing_target = routes.get(&route).ok_or_else(|| {
+                    ArtifactRouteError::invalid_manifest(format!(
+                        "route source index is missing target for {route}"
+                    ))
+                })?;
+                if let Some(preferred) = equivalent_next_not_found_alias(
+                    &existing,
+                    &existing_target.sha256,
+                    &file.path,
+                    &file.sha256,
+                ) {
+                    if preferred == file.path {
+                        sources_by_route.insert(route.clone(), file.path.clone());
+                        routes.insert(
+                            route,
+                            ArtifactRouteTarget {
+                                file: file.path,
+                                sha256: file.sha256,
+                                content_type: "text/html; charset=utf-8".to_string(),
+                            },
+                        );
+                    }
+                    continue;
+                }
                 return Err(ArtifactRouteError::ambiguous(
                     route,
                     vec![existing, file.path],
                 ));
             }
+            sources_by_route.insert(route.clone(), file.path.clone());
             routes.insert(
                 route,
                 ArtifactRouteTarget {
@@ -295,6 +320,26 @@ fn route_for_html_file(path: &str) -> Option<String> {
         .map(|prefix| format!("/{}", prefix.trim_matches('/')))
 }
 
+pub(crate) fn equivalent_next_not_found_alias<'a>(
+    left_path: &'a str,
+    left_sha256: &str,
+    right_path: &'a str,
+    right_sha256: &str,
+) -> Option<&'a str> {
+    if left_sha256 != right_sha256
+        || left_sha256.len() != 64
+        || !left_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    match (left_path, right_path) {
+        ("404.html", "404/index.html") | ("404/index.html", "404.html") => Some("404.html"),
+        _ => None,
+    }
+}
+
 fn canonicalize_route(route: &str, policy: RoutePolicy) -> String {
     if route == "/" {
         return route.to_string();
@@ -459,6 +504,35 @@ mod tests {
         assert_eq!(error.error_kind, "artifact.route_ambiguous");
         assert_eq!(error.route.as_deref(), Some("/docs/"));
         assert_eq!(error.files, vec!["docs.html", "docs/index.html"]);
+    }
+
+    #[test]
+    fn identical_next_export_not_found_aliases_use_the_stable_flat_file() {
+        let manifest = ArtifactRouteManifest::build(
+            "build-1",
+            &ArtifactRouteContract::docs(),
+            [
+                file("docs/index.html", 'a'),
+                file("404/index.html", 'b'),
+                file("404.html", 'b'),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(manifest.routes["/404/"].file, "404.html");
+        assert_eq!(manifest.aliases["/404"], "/404/");
+
+        let error = ArtifactRouteManifest::build(
+            "build-2",
+            &ArtifactRouteContract::docs(),
+            [
+                file("docs/index.html", 'a'),
+                file("404.html", 'b'),
+                file("404/index.html", 'c'),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.error_kind, "artifact.route_ambiguous");
     }
 
     #[test]

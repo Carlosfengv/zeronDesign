@@ -13,7 +13,7 @@ test("Node route projection passes the shared Rust conformance corpus", async ()
   const result = await runRouteConformance(
     resolve(repositoryRoot, "services/runtime/evidence/replay/contracts/artifact-route-conformance@1.json"),
   );
-  assert.equal(result.cases.length, 5);
+  assert.equal(result.cases.length, 6);
   assert.ok(result.cases.every((testCase) => testCase.status === "passed"));
 });
 

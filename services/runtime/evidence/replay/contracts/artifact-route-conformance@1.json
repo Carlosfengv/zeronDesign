@@ -56,6 +56,45 @@
       ]
     },
     {
+      "id": "next-not-found-equivalent-alias",
+      "contract": {
+        "entryRoute": "/docs/",
+        "canonicalPolicy": "trailing_slash"
+      },
+      "files": [
+        {
+          "path": "docs/index.html",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "404/index.html",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "path": "404.html",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "expectedRoutes": {
+        "/404/": "404.html",
+        "/docs/": "docs/index.html"
+      },
+      "expectedAliases": {
+        "/404": "/404/",
+        "/docs": "/docs/"
+      },
+      "resolutions": [
+        {
+          "requestPath": "/404",
+          "expectedFile": "404.html"
+        },
+        {
+          "requestPath": "/404/",
+          "expectedFile": "404.html"
+        }
+      ]
+    },
+    {
       "id": "website-root-entry",
       "contract": {
         "entryRoute": "/",
