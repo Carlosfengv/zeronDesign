@@ -110,7 +110,7 @@ spec:
             - name: RUNTIME_AGENT_MAX_OPERATION_TOOL_CALLS
               value: "100"
             - name: RUNTIME_AGENT_WORKFLOW_DRIVER_MODE
-              value: shadow
+              value: enforced
             - name: RUNTIME_AGENT_WORKFLOW_DRIVER_MAX_ACTIONS
               value: "8"
             - name: RUNTIME_AGENT_WORKFLOW_DRIVER_WAIT_TIMEOUT_MS
