@@ -3926,10 +3926,17 @@ impl AgentLoop {
         template_key: Option<&str>,
         observation_budget_usage: ObservationBudgetUsage,
     ) -> Option<String> {
+        let prior_observation_count = state.observations.len();
         update_progress_state(state, calls, results);
+        let novel_authoring_observation =
+            novel_observation_advances_authoring_grace(phase, state, prior_observation_count);
         let fingerprint = state.fingerprint();
         if fingerprint == *last_fingerprint {
-            *consecutive_no_progress = consecutive_no_progress.saturating_add(1);
+            if novel_authoring_observation {
+                *consecutive_no_progress = 0;
+            } else {
+                *consecutive_no_progress = consecutive_no_progress.saturating_add(1);
+            }
         } else {
             *consecutive_no_progress = 0;
         }
@@ -3948,6 +3955,7 @@ impl AgentLoop {
             "substantiveProgress": state.substantive_progress,
             "toolSequenceDigest": canonical_json_hash(&json!(tool_sequence)),
             "toolNames": calls.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
+            "noProgressSuppressedByNovelAuthoringObservation": novel_authoring_observation,
         });
         let _ = self
             .store
@@ -6134,10 +6142,7 @@ fn workflow_progress_snapshot(
     {
         (
             "source_authoring",
-            workflow_action(
-                "fs.write",
-                "author the requested change inside the verified Editable Surface",
-            ),
+            source_authoring_workflow_action(template_key, state),
         )
     } else if next_app && cold_dev && !has("dependencies_ready") {
         (
@@ -6286,15 +6291,91 @@ fn workflow_action(tool: &str, reason: &str) -> Value {
     json!({ "tool": tool, "reason": reason })
 }
 
+fn source_authoring_workflow_action(template_key: Option<&str>, state: &RunProgressState) -> Value {
+    let mut target_paths = BTreeSet::new();
+    match template_key {
+        Some("fumadocs-docs") => {
+            for route in &state.required_routes {
+                let route = route
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(route)
+                    .trim_matches('/');
+                let slug = route
+                    .strip_prefix("docs")
+                    .unwrap_or(route)
+                    .trim_matches('/');
+                let source = if slug.is_empty() {
+                    "project/content/docs/index.mdx".to_string()
+                } else {
+                    format!("project/content/docs/{slug}.mdx")
+                };
+                target_paths.insert(source);
+            }
+            target_paths.extend(
+                [
+                    "project/lib/layout.shared.jsx",
+                    "project/app/global.css",
+                    "project/app/tokens.css",
+                ]
+                .into_iter()
+                .map(str::to_string),
+            );
+        }
+        Some("next-app") => {
+            target_paths.insert("project/app/page.tsx".to_string());
+            target_paths.insert("project/app/globals.css".to_string());
+        }
+        _ => {}
+    }
+    for observation in &state.observations {
+        let Some(path) = observation.strip_prefix("fs.read:") else {
+            continue;
+        };
+        if path.starts_with("project/")
+            && (path.ends_with(".mdx")
+                || path.ends_with(".tsx")
+                || path.ends_with(".jsx")
+                || path.ends_with(".css"))
+        {
+            target_paths.insert(path.to_string());
+        }
+    }
+    let target_paths = target_paths.into_iter().take(16).collect::<Vec<_>>();
+    json!({
+        "tool": "fs.write",
+        "allowedMutationTools": ["fs.write", "fs.patch", "fs.multi_patch"],
+        "mutationRequiredThisTurn": true,
+        "targetPaths": target_paths,
+        "requiredRouteText": state.required_route_text,
+        "reason": "Make at least one source mutation now inside this verified Editable Surface. Do not call fs.read, fs.list, or fs.search again; use fs.write for a missing route file, or fs.patch/fs.multi_patch for an existing file already observed."
+    })
+}
+
+fn novel_observation_advances_authoring_grace(
+    phase: AgentPhase,
+    state: &RunProgressState,
+    prior_observation_count: usize,
+) -> bool {
+    matches!(
+        phase,
+        AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
+    ) && !state.completed_steps.contains("source_authored")
+        && state.observations.len() > prior_observation_count
+}
+
 fn workflow_driver_supports(run: &AgentRun) -> bool {
-    run.project_state_snapshot
+    let template_key = run
+        .project_state_snapshot
         .as_ref()
-        .is_some_and(|project| project.template_key == "next-app")
+        .map(|project| project.template_key.as_str());
+    matches!(template_key, Some("next-app" | "fumadocs-docs"))
         && matches!(
             run.phase,
             AgentPhase::Build | AgentPhase::Edit | AgentPhase::Repair
         )
-        && (run.phase == AgentPhase::Build
+        && (template_key == Some("fumadocs-docs")
+            || run.phase == AgentPhase::Build
             || matches!(
                 run.execution_profile.as_deref(),
                 Some("cold_dev" | "warm_hmr" | "repair_cold_dev" | "repair_warm")
@@ -6404,7 +6485,7 @@ fn render_workflow_progress_context(
         generation_context_enabled,
     );
     format!(
-        "Runtime Workflow Progress (authoritative; do not redo completed steps):\n{}",
+        "Runtime Workflow Progress (authoritative; do not redo completed steps, and execute nextAction in this turn):\n{}",
         serde_json::to_string(&json!({
             "stage": workflow.stage,
             "completedSteps": workflow.completed_steps,
@@ -10486,6 +10567,84 @@ mod design_capsule_tests {
         );
         assert_eq!(workflow.stage, "source_authoring");
         assert_eq!(workflow.next_action["tool"], "fs.write");
+    }
+
+    #[test]
+    fn docs_authoring_progress_names_concrete_route_targets_and_requires_mutation() {
+        let mut state = RunProgressState::default();
+        state.completed_steps.extend(
+            [
+                "inputs_inventoried",
+                "brief_loaded",
+                "content_sources_loaded",
+                "project_initialized",
+                "project_inspected",
+                "project_source_read",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        state.required_routes.extend(
+            ["/docs/", "/docs/quick-start", "/docs/api"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        state
+            .required_route_text
+            .entry("/docs/".to_string())
+            .or_default()
+            .insert("MonoKit".to_string());
+
+        let workflow = workflow_progress_snapshot(
+            AgentPhase::Build,
+            Some("fumadocs-docs"),
+            &state,
+            ObservationBudgetUsage::default(),
+            AgentLoopLimits::default(),
+            false,
+        );
+
+        assert_eq!(workflow.stage, "source_authoring");
+        assert_eq!(workflow.next_action["mutationRequiredThisTurn"], true);
+        let targets = workflow.next_action["targetPaths"].as_array().unwrap();
+        assert!(targets.contains(&json!("project/content/docs/index.mdx")));
+        assert!(targets.contains(&json!("project/content/docs/quick-start.mdx")));
+        assert!(targets.contains(&json!("project/content/docs/api.mdx")));
+        assert_eq!(
+            workflow.next_action["requiredRouteText"]["/docs/"][0],
+            "MonoKit"
+        );
+    }
+
+    #[test]
+    fn novel_source_observation_resets_only_the_pre_authoring_no_progress_grace() {
+        let mut state = RunProgressState::default();
+        state
+            .observations
+            .insert("fs.read:project/app/page.tsx".to_string());
+
+        assert!(novel_observation_advances_authoring_grace(
+            AgentPhase::Build,
+            &state,
+            0,
+        ));
+        assert!(!novel_observation_advances_authoring_grace(
+            AgentPhase::Brief,
+            &state,
+            0,
+        ));
+        assert!(!novel_observation_advances_authoring_grace(
+            AgentPhase::Build,
+            &state,
+            state.observations.len(),
+        ));
+
+        state.completed_steps.insert("source_authored".to_string());
+        assert!(!novel_observation_advances_authoring_grace(
+            AgentPhase::Build,
+            &state,
+            0,
+        ));
     }
 
     #[test]
